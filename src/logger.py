@@ -8,7 +8,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Iterator
 
-LOGGER_NAME = "agent_harness"
+LOGGER_NAME = "harness"
 _LOG_CONTEXT: ContextVar[dict[str, Any]] = ContextVar("agent_harness_log_context", default={})
 
 

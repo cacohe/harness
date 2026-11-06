@@ -25,7 +25,7 @@ def test_local_tools_cover_the_agent_file_and_shell_set():
 
 
 def test_write_read_edit_and_search(monkeypatch):
-    root = Path(__file__).resolve().parents[1] / ".tmp-local-tools"
+    root = Path(__file__).resolve().parents[3] / ".tmp-local-tools"
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir()
     try:

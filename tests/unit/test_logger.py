@@ -8,9 +8,9 @@ from src.logger import get_logger, log_context, setup_logging
 
 
 def test_get_logger_uses_the_project_namespace():
-    assert get_logger().name == "agent_harness"
-    assert get_logger("core.loop").name == "agent_harness.core.loop"
-    assert get_logger("agent_harness.core.loop").name == "agent_harness.core.loop"
+    assert get_logger().name == "harness"
+    assert get_logger("core.loop").name == "harness.core.loop"
+    assert get_logger("harness.core.loop").name == "harness.core.loop"
 
 
 def test_text_log_includes_the_active_context(capsys):
@@ -22,7 +22,7 @@ def test_text_log_includes_the_active_context(capsys):
 
     lines = capsys.readouterr().err.splitlines()
     assert "INFO" in lines[0]
-    assert "agent_harness.core.loop" in lines[0]
+    assert "harness.core.loop" in lines[0]
     assert "step finished" in lines[0]
     assert "task_id=t1" in lines[0]
     assert "step=2" in lines[0]
@@ -47,7 +47,7 @@ def test_json_log_is_one_object_per_line(capsys):
 
     payload = json.loads(capsys.readouterr().err.strip())
     assert payload["level"] == "WARNING"
-    assert payload["logger"] == "agent_harness.core.llm"
+    assert payload["logger"] == "harness.core.llm"
     assert payload["message"] == "retrying"
     assert payload["context"] == {"task_id": "t1"}
     assert "time" in payload

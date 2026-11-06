@@ -1,12 +1,13 @@
 from src.core.context import (
     DEFAULT_SYSTEM_PROMPT_FOR_INFER,
     DEFAULT_SYSTEM_PROMPT_FOR_PLANNING,
-    Context,
     ContextBuilder,
     ContextBuilderError,
-    Message,
 )
 from src.core.task import Task
+from src.schema.context import Context, Message
+from src.schema.skills import Skill
+from src.schema.tool import Tool
 
 
 class DefaultContextBuilder(ContextBuilder):
@@ -40,27 +41,36 @@ class DefaultContextBuilder(ContextBuilder):
         except Exception as error:
             raise ContextBuilderError(f"Failed to build planning context: {error}") from error
 
-    def build_infer_context(self, system_prompt: str, task: Task, **kwargs) -> Context:
+    def build_infer_context(
+        self,
+        system_prompt: str,
+        task: Task,
+        tools: list[Tool],
+        skills: list[Skill],
+        **kwargs,
+    ) -> Context:
         """
         Build the context for one execution step.
         Args:
             system_prompt: Extra instructions from the harness.
-            task: The task being executed.
-            **kwargs: history is the prior assistant and tool transcript.
+            task: The task being executed. Its history is the prior transcript.
+            tools: Tools supplied by the harness for this call.
+            skills: Skills supplied by the harness for this call.
+            **kwargs: Unused.
         Returns:
             The system instruction, the original request, history, the current plan,
             and the tools for this call.
         """
         try:
             messages = [
-                Message(role="system", content=_infer_system_prompt(system_prompt, task)),
+                Message(role="system", content=_infer_system_prompt(system_prompt, skills)),
                 Message(role="user", content=task.original_input),
-                *list(kwargs.get("history") or []),
+                *list(task.history or []),
             ]
             plan = _plan_message(task)
             if plan is not None:
                 messages.append(plan)
-            return Context(messages=messages, tools=list(task.tools))
+            return Context(messages=messages, tools=list(tools))
         except Exception as error:
             raise ContextBuilderError(f"Failed to build infer context: {error}") from error
 
@@ -73,12 +83,12 @@ def _with_extra_prompt(base: str, extra: str) -> str:
     return f"{text}\n\n{addition}"
 
 
-def _infer_system_prompt(system_prompt: str, task: Task) -> str:
+def _infer_system_prompt(system_prompt: str, skills: list[Skill]) -> str:
     text = _with_extra_prompt(DEFAULT_SYSTEM_PROMPT_FOR_INFER, system_prompt)
-    skills = _format_skills(getattr(task, "skills", None) or [])
-    if not skills:
+    formatted = _format_skills(skills)
+    if not formatted:
         return text
-    return f"{text}\n\n{skills}"
+    return f"{text}\n\n{formatted}"
 
 
 def _format_skills(skills) -> str:

@@ -7,4 +7,5 @@ class GuardError(Exception):
         self.reason = reason
 
 
-def guard(task: Task) -> None: ...
+class HarnessGuard:
+    def guard_input(self, task: Task) -> None: ...

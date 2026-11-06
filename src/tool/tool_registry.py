@@ -1,4 +1,5 @@
-from src.core.tool import Tool, ToolRegistry
+from src.core.tool import ToolRegistry
+from src.schema.tool import Tool
 
 
 class DefaultToolRegistry(ToolRegistry):

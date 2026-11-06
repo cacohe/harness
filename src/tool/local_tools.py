@@ -2,7 +2,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from src.core.tool import Tool
+from src.schema.tool import Tool
 
 _MAX_READ_LINES = 2000
 _MAX_MATCHES = 200

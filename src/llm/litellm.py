@@ -4,16 +4,10 @@ from typing import Any, Iterator
 import litellm
 from pydantic import BaseModel
 
-from src.core.llm import (
-    ROLE_TOOL,
-    Context,
-    FinishReason,
-    LlmGateway,
-    LLMOutput,
-    LlmToolCall,
-    LlmUsage,
-)
-from src.core.tool import Tool
+from src.core.llm import LlmGateway
+from src.schema.context import Context
+from src.schema.llm import ROLE_TOOL, FinishReason, LLMOutput, LlmToolCall, LlmUsage
+from src.schema.tool import Tool
 
 
 def _is_deepseek(model: str, api_base: str | None) -> bool:

@@ -1,7 +1,7 @@
 from pydantic import BaseModel
-from src.core.context import Context, Message
-from src.core.llm import FinishReason, LlmToolCall
 from src.llm.litellm import LiteLLMGateway
+from src.schema.context import Context, Message
+from src.schema.llm import FinishReason, LlmToolCall
 
 
 def _context() -> Context:

@@ -3,7 +3,7 @@ from typing import Any
 
 from fastmcp import Client
 
-from src.core.tool import Tool
+from src.schema.tool import Tool
 
 
 class MCPManager:

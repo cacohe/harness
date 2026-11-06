@@ -1,62 +1,96 @@
 from src.core.sandbox import Sandbox
-from src.core.tool import ToolExecutor, ToolRegistry, ToolResult
+from src.core.tool import ToolExecutor, ToolRegistry
+from src.schema.tool import (
+    Tool,
+    ToolExecutionFailReason,
+    ToolExecutionResult,
+    ToolExecutionState,
+)
 
 
 class DefaultToolExecutor(ToolExecutor):
     def __init__(self, tool_registry: ToolRegistry):
         self.tool_registry = tool_registry
 
-    def is_need_approval(self, tool_id: str) -> bool:
+    def is_need_approval(self, tool: Tool) -> bool:
         """
         Check if the tool needs approval.
         Args:
-            tool_id: The id of the tool.
+            tool: The tool to check.
         Returns:
             True if the tool needs approval, False otherwise.
         """
-        ...
+        return False
 
-    def launch_approval(self, tool_id: str) -> bool:
+    def launch_approval(self, tool: Tool) -> bool:
         """
         Launch the approval process.
         Args:
-            tool_id: The id of the tool.
+            tool: The tool to launch the approval process for.
         Returns:
             True if the approval process is launched, False otherwise.
         """
-        ...
+        return False
 
-    def approve(self, tool_id: str) -> bool:
-        """
-        Approve a tool.
-        Args:
-            tool_id: The id of the tool.
-        Returns:
-            True if the tool is approved, False otherwise.
-        """
-        ...
-
-    def is_need_sandbox(self, tool_id: str) -> bool:
+    def is_need_sandbox(self, tool: Tool) -> bool:
         """
         Check if the tool needs sandbox.
         Args:
-            tool_id: The id of the tool.
+            tool: The tool to check.
         Returns:
             True if the tool needs sandbox, False otherwise.
         """
-        ...
+        return False
 
-    def get_sandbox(self, tool_id: str) -> Sandbox:
+    def find_tool(self, name: str) -> Tool | None:
+        """
+        Find a registered tool by name or id.
+        Args:
+            name: The tool name from the model.
+        Returns:
+            The matching tool, or None when no tool has that name.
+        """
+        for tool in self.tool_registry.get_all_tools():
+            if tool.name == name or tool.id == name:
+                return tool
+        return None
+
+    def get_sandbox(self) -> Sandbox:
         """
         Get the sandbox for a tool.
-        Args:
-            tool_id: The id of the tool.
         Returns:
             The sandbox for the tool.
         """
-        ...
+        raise NotImplementedError
 
-    def execute(self, tool_id: str, inputs: dict) -> ToolResult:
+    def execute_without_sandbox(self, tool_id: str, inputs: dict) -> ToolExecutionResult:
+        """
+        Execute a registered tool outside a sandbox.
+        Args:
+            tool_id: The id of the tool.
+            inputs: The inputs to the tool.
+        Returns:
+            The completed tool execution.
+        """
+        tool = self.tool_registry.get_tool(tool_id)
+        try:
+            output = tool.executer(inputs)
+        except Exception:
+            return ToolExecutionResult(
+                tool_id=tool.id,
+                tool_name=tool.name,
+                state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
+                output=None,
+                fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_UNKNOWN,
+            )
+        return ToolExecutionResult(
+            tool_id=tool.id,
+            tool_name=tool.name,
+            state=ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED,
+            output=output,
+        )
+
+    def execute(self, tool: Tool, inputs: dict) -> ToolExecutionResult:
         """
         Execute a tool.
         Args:
@@ -65,22 +99,16 @@ class DefaultToolExecutor(ToolExecutor):
         Returns:
             The result of the tool execution.
         """
-        is_need_approval = self.is_need_approval(tool_id)
-        is_need_sandbox = self.is_need_sandbox(tool_id)
-        if is_need_approval:
-            self.launch_approval(tool_id)
-
-        if is_need_sandbox:
-            sandbox = self.get_sandbox(tool_id)
-            return self.execute_with_sandbox(tool_id, inputs, sandbox)
-
-        return self.tool_registry.get_tool(tool_id).executer(inputs)
+        if self.is_need_sandbox(tool) is True:
+            return self.execute_with_sandbox(tool.id, inputs, self.get_sandbox())
+        return self.execute_without_sandbox(tool.id, inputs)
 
     def execute_with_sandbox(
         self,
         tool_id: str,
         inputs: dict,
-    ) -> ToolResult:
+        sandbox: Sandbox,
+    ) -> ToolExecutionResult:
         """
         Execute a tool with a sandbox.
         Args:
@@ -90,6 +118,5 @@ class DefaultToolExecutor(ToolExecutor):
         Returns:
             The result of the tool execution.
         """
-        sandbox = self.get_sandbox(tool_id)
         sandbox.execute(inputs)
-        return self.tool_registry.get_tool(tool_id).executer(inputs)
+        return self.execute_without_sandbox(tool_id, inputs)

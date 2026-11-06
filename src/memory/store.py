@@ -1,4 +1,5 @@
-from src.core.memory import MemoryItem, MemoryStore
+from src.core.memory import MemoryStore
+from src.schema.memory import MemoryItem
 
 
 class InMemoryStore(MemoryStore):

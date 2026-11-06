@@ -1,7 +1,9 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 
 from src.core.task import Task
+from src.schema.context import Context, Message
+from src.schema.llm import ROLE_ASSISTANT, ROLE_TOOL, LLMOutput
+from src.schema.tool import ToolCallResult
 
 DEFAULT_SYSTEM_PROMPT_FOR_PLANNING = """
 You are an expert in task management, skilled at converting vague inputs into clear task objectives, and designing reasonable execution steps based on those task objectives.
@@ -9,27 +11,6 @@ You are an expert in task management, skilled at converting vague inputs into cl
 DEFAULT_SYSTEM_PROMPT_FOR_INFER = """
 You are an expert in task execution, skilled at executing tasks based on the given task objectives and execution steps.
 """
-
-
-@dataclass
-class Message:
-    """One chat message replayed on the next model call."""
-
-    role: str
-    content: str | None = None
-    tool_calls: list | None = None
-    tool_call_id: str | None = None
-    name: str | None = None
-    reasoning_content: str | None = None
-    thinking_blocks: list | None = None
-
-
-@dataclass
-class Context:
-    """One LiteLLM call: ordered messages with unified roles, and the tool catalog."""
-
-    messages: list[Message]
-    tools: list
 
 
 class ContextBuilderError(Exception):
@@ -55,14 +36,67 @@ class ContextBuilder(ABC):
         ...
 
     @abstractmethod
-    def build_infer_context(self, system_prompt: str, task: Task, **kwargs) -> Context:
+    def build_infer_context(
+        self, system_prompt: str, task: Task, tools: list, skills: list, **kwargs
+    ) -> Context:
         """
         Build the context for the step.
         Args:
             system_prompt: The system prompt.
-            task: The task for the step.
-            **kwargs: Additional keyword arguments. history is the prior transcript.
+            task: The task for the step. Its history is the prior transcript.
+            tools: Tools available for this call.
+            skills: Skills available for this call.
+            **kwargs: Additional keyword arguments.
         Returns:
             Messages for one execution call, and the tools available for that call.
         """
         ...
+
+
+def build_history_message(llm_output: LLMOutput) -> Message:
+    return Message(
+        role=ROLE_ASSISTANT,
+        content=llm_output.content,
+        tool_calls=list(llm_output.tool_calls),
+        reasoning_content=llm_output.reasoning_content,
+        thinking_blocks=llm_output.thinking_blocks,
+    )
+
+
+def build_tool_messages(result: ToolCallResult) -> list[Message]:
+    """
+    Build the tool messages for one batch of tool results.
+    Args:
+        result: Completed and failed tool executions from one batch.
+    Returns:
+        One tool message per completed or failed execution.
+    """
+    messages = []
+    for item in result.completed_tools:
+        messages.append(
+            Message(
+                role=ROLE_TOOL,
+                content="" if item.output is None else str(item.output),
+                tool_call_id=item.tool_id,
+                name=item.tool_name,
+            )
+        )
+    for item in result.failed_tools:
+        messages.append(
+            Message(
+                role=ROLE_TOOL,
+                content=item.fail_reason.value if item.fail_reason else "",
+                tool_call_id=item.tool_id,
+                name=item.tool_name,
+            )
+        )
+    for item in result.pending_tools:
+        messages.append(
+            Message(
+                role=ROLE_TOOL,
+                content="The tool was not executed because it is waiting for approval.",
+                tool_call_id=item.tool_id,
+                name=item.tool_name,
+            )
+        )
+    return messages

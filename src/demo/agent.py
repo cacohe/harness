@@ -1,11 +1,13 @@
 from src.config import Config
 from src.context.context_builder import DefaultContextBuilder
 from src.core.context import ContextBuilder
+from src.core.guard import HarnessGuard
 from src.core.llm import LlmGateway
-from src.core.loop import Harness
+from src.core.loop import DEFAULT_SYSTEM_PROMPT, Harness
 from src.core.task import Task
 from src.core.tool import ToolExecutor
 from src.llm.litellm import LiteLLMGateway
+from src.schema.hook import HarnessHook
 from src.tool.local_tools import LOCAL_TOOLS
 from src.tool.tool_executor import DefaultToolExecutor
 from src.tool.tool_registry import DefaultToolRegistry
@@ -42,9 +44,14 @@ class Agent:
         self.tool_executor = tool_executor or DefaultToolExecutor(self.tool_registry)
         self.context_builder = context_builder or DefaultContextBuilder()
         self.harness = Harness(
+            DEFAULT_SYSTEM_PROMPT,
             self.llm_gateway,
+            self.tool_registry.get_all_tools(),
+            [],
             self.tool_executor,
             self.context_builder,
+            harness_hooks=HarnessHook(),
+            harness_guard=HarnessGuard(),
             max_steps=self.config.max_steps,
             max_seconds=self.config.max_seconds,
         )
@@ -57,7 +64,7 @@ class Agent:
         Returns:
             The task after the harness stops. Its state records completion or failure.
         """
-        task = Task(original_input=input, tools=self.tool_registry.get_all_tools(), skills=[])
+        task = Task(original_input=input)
         self.harness.run(task)
         return task
 
