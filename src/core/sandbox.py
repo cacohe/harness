@@ -1,0 +1,6 @@
+class Sandbox:
+    """Sandbox."""
+
+    def __init__(self): ...
+
+    def execute(self): ...

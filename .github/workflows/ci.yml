@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    env:
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install
+        run: uv sync --locked
+
+      - name: Check format
+        run: uv run --locked ruff format --check .
+
+      - name: Check lint
+        run: uv run --locked ruff check .
+
+      - name: Run tests
+        run: uv run --locked python -m pytest
