@@ -1,5 +1,4 @@
-import pytest
-from src.core.guard import GuardError, guard
+from src.core.guard import guard
 
 
 class Task:
