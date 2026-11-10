@@ -48,3 +48,31 @@ def test_write_read_edit_and_search(monkeypatch):
         assert "Exit code: 0" in shell('python -c "print(123)"', cwd=str(root))
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_shell_decodes_utf8_and_gbk_output(monkeypatch):
+    class Completed:
+        def __init__(self, stdout):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = b""
+
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs)
+        return Completed(captured["payload"])
+
+    monkeypatch.setattr("src.tool.local_tools.subprocess.run", fake_run)
+
+    captured["payload"] = "目录".encode("utf-8")
+    assert "目录" in shell("dir")
+    assert "text" not in captured
+
+    captured["payload"] = "中".encode("gbk")
+    assert "中" in shell("dir")
+
+    captured["payload"] = b"ok\xaf"
+    rendered = shell("dir")
+    assert "Exit code: 0" in rendered
+    assert "ok" in rendered

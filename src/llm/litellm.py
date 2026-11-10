@@ -142,7 +142,8 @@ class LiteLLMGateway(LlmGateway):
             stream: True yields each streamed piece. False returns the finished output.
             response_format: Pydantic model or JSON schema dict the assistant text must follow.
                 LiteLLM sends a Pydantic model as json_schema. DeepSeek Chat Completions
-                receives json_object instead, and the prompt includes a json example.
+                receives json_object instead, the prompt includes a json example, and
+                thinking is disabled so the JSON is written to content.
                 The parsed value is output.structured.
         Returns:
             The finish reason, assistant text, tool calls, reasoning, token usage, and,
@@ -160,6 +161,10 @@ class LiteLLMGateway(LlmGateway):
             options.setdefault("tool_choice", "auto")
         if wire_format is not None:
             options["response_format"] = wire_format
+            if _is_deepseek(self.model, self.api_base) and wire_format == {"type": "json_object"}:
+                extra_body = dict(options.get("extra_body") or {})
+                extra_body["thinking"] = {"type": "disabled"}
+                options["extra_body"] = extra_body
         if stream:
             stream_options = dict(options.get("stream_options") or {})
             stream_options.setdefault("include_usage", True)

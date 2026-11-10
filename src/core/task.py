@@ -27,14 +27,11 @@ class Task:
     """A task to be executed by the harness."""
 
     TRANSITIONS: dict[TaskState, FrozenSet[TaskState]] = {
-        TaskState.TASK_CREATED: frozenset(
-            [TaskState.TASK_QUEUE, TaskState.TASK_RUNNING, TaskState.TASK_FAILED]
-        ),
-        TaskState.TASK_QUEUE: frozenset([TaskState.TASK_RUNNING]),
+        TaskState.TASK_CREATED: frozenset([TaskState.TASK_RUNNING]),
         TaskState.TASK_RUNNING: frozenset(
             [TaskState.TASK_PAUSED, TaskState.TASK_FAILED, TaskState.TASK_COMPLETED]
         ),
-        TaskState.TASK_PAUSED: frozenset([TaskState.TASK_QUEUE, TaskState.TASK_RUNNING]),
+        TaskState.TASK_PAUSED: frozenset([TaskState.TASK_RUNNING]),
         TaskState.TASK_FAILED: frozenset([]),
         TaskState.TASK_COMPLETED: frozenset([]),
     }
@@ -94,12 +91,6 @@ class Task:
 
         self.persist()
 
-    def queue(self) -> None:
-        """
-        Queue the task.
-        """
-        self._transition_to(TaskState.TASK_QUEUE)
-
     def transition_to_running(self, reason: TaskRunningReason) -> None:
         """
         Run the task.
@@ -116,10 +107,12 @@ class Task:
 
     def transition_to_failed(self, reason: TaskFailReason) -> None:
         """
-        Fail the task.
+        Fail the task and keep an empty result when the task has none.
         Args:
             reason: The reason for the task failure.
         """
+        if self.result is None:
+            self.result = TaskResult()
         self._transition_to(TaskState.TASK_FAILED, reason)
 
     def transition_to_completed(self) -> None:
@@ -135,14 +128,6 @@ class Task:
             True if the task is created, False otherwise.
         """
         return self.state == TaskState.TASK_CREATED
-
-    def is_queued(self) -> bool:
-        """
-        Check if the task is queued.
-        Returns:
-            True if the task is queued, False otherwise.
-        """
-        return self.state == TaskState.TASK_QUEUE
 
     def is_running(self) -> bool:
         """

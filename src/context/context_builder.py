@@ -15,24 +15,26 @@ class DefaultContextBuilder(ContextBuilder):
 
     def __init__(self): ...
 
-    def build_planning_context(self, system_prompt: str, task: Task, **kwargs) -> Context:
+    def build_planning_context(
+        self, system_prompt: str, task: Task, tools: list[Tool] | None = None, **kwargs
+    ) -> Context:
         """
         Build the context for planning.
         Args:
             system_prompt: Extra instructions from the harness.
             task: The task to plan.
+            tools: Tools the execution loop can call. Their names are listed for the planner.
             **kwargs: Unused. Accepted so callers can pass the same arguments as inference.
         Returns:
-            A system instruction, the original request, and no tools.
+            A system instruction that names the available tools, the original request,
+            and no callable tools.
         """
         try:
             return Context(
                 messages=[
                     Message(
                         role="system",
-                        content=_with_extra_prompt(
-                            DEFAULT_SYSTEM_PROMPT_FOR_PLANNING, system_prompt
-                        ),
+                        content=_planning_system_prompt(system_prompt, tools),
                     ),
                     Message(role="user", content=task.original_input),
                 ],
@@ -83,6 +85,23 @@ def _with_extra_prompt(base: str, extra: str) -> str:
     return f"{text}\n\n{addition}"
 
 
+def _planning_system_prompt(system_prompt: str, tools: list[Tool] | None) -> str:
+    text = _with_extra_prompt(DEFAULT_SYSTEM_PROMPT_FOR_PLANNING, system_prompt)
+    catalog = _format_tools(tools)
+    if not catalog:
+        return text
+    return f"{text}\n\n{catalog}"
+
+
+def _format_tools(tools: list[Tool] | None) -> str:
+    if not tools:
+        return ""
+    lines = ["Available tools:"]
+    for tool in tools:
+        lines.append(f"- {tool.name}: {tool.description}")
+    return "\n".join(lines)
+
+
 def _infer_system_prompt(system_prompt: str, skills: list[Skill]) -> str:
     text = _with_extra_prompt(DEFAULT_SYSTEM_PROMPT_FOR_INFER, system_prompt)
     formatted = _format_skills(skills)
@@ -104,17 +123,16 @@ def _plan_message(task: Task) -> Message | None:
     plan = task.plan
     if not _plan_has_work(plan):
         return None
-    return Message(
-        role="user",
-        content="\n".join(
+    lines = [f"Goal: {plan.goal}"]
+    if not task.history:
+        lines.extend(
             [
-                f"Goal: {plan.goal}",
                 f"Current: {plan.current}",
                 f"Completed: {plan.completed}",
                 f"Remaining: {plan.remaining}",
             ]
-        ),
-    )
+        )
+    return Message(role="user", content="\n".join(lines))
 
 
 def _plan_has_work(plan) -> bool:

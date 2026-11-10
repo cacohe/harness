@@ -3,7 +3,7 @@ from src.context.context_builder import DefaultContextBuilder
 from src.core.context import ContextBuilder
 from src.core.guard import HarnessGuard
 from src.core.llm import LlmGateway
-from src.core.loop import DEFAULT_SYSTEM_PROMPT, Harness
+from src.core.loop import Harness
 from src.core.task import Task
 from src.core.tool import ToolExecutor
 from src.llm.litellm import LiteLLMGateway
@@ -11,6 +11,8 @@ from src.schema.hook import HarnessHook
 from src.tool.local_tools import LOCAL_TOOLS
 from src.tool.tool_executor import DefaultToolExecutor
 from src.tool.tool_registry import DefaultToolRegistry
+
+SYSTEM_PROMPT = "You are a helpful AI Agent that can help with tasks."
 
 
 class Agent:
@@ -45,7 +47,7 @@ class Agent:
         self.tool_executor = tool_executor or DefaultToolExecutor(self.tool_registry)
         self.context_builder = context_builder or DefaultContextBuilder()
         self.harness = Harness(
-            DEFAULT_SYSTEM_PROMPT,
+            SYSTEM_PROMPT,
             self.llm_gateway,
             self.tool_registry.get_all_tools(),
             [],
@@ -57,18 +59,6 @@ class Agent:
             max_seconds=self.config.max_seconds,
         )
 
-    def run(self, input: str) -> Task:
-        """
-        Run one task with the registered local tools.
-        Args:
-            input: The user's request.
-        Returns:
-            The task after the harness stops. Its state records completion or failure.
-        """
-        task = Task(original_input=input)
-        self.harness.run(task)
-        return task
-
     def chat(self, message: str) -> Task:
         """
         Plan one message, run it to an answer, and remember the turn.
@@ -79,8 +69,6 @@ class Agent:
         """
         task = Task(original_input=self._with_transcript(message))
         self.harness.run(task)
-        if task.is_running():
-            self.harness.run(task)
         if task.is_completed() and task.result is not None:
             self.transcript.append(("user", message))
             self.transcript.append(("assistant", task.result.output))
@@ -91,14 +79,3 @@ class Agent:
             return message
         prior = "\n".join(f"{role}: {content}" for role, content in self.transcript)
         return f"{prior}\nuser: {message}"
-
-    def to_dict(self) -> dict:
-        """
-        Describe the wired agent.
-        Returns:
-            The model name and the registered tool names.
-        """
-        return {
-            "model": getattr(self.llm_gateway, "model", None),
-            "tools": [tool.name for tool in self.tool_registry.get_all_tools()],
-        }

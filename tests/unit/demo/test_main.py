@@ -15,6 +15,7 @@ class ScriptedAgent:
             raise result
         task = Task(original_input=message)
         if isinstance(result, TaskFailReason):
+            task.transition_to_running(TaskRunningReason.TASK_RUNNING_CREATE)
             task.transition_to_failed(result)
             return task
         task.transition_to_running(TaskRunningReason.TASK_RUNNING_CREATE)
@@ -44,8 +45,8 @@ def test_repl_prints_each_answer_until_exit():
 
     assert agent.messages == ["hi", "again"]
     assert printed[0].startswith("agent-harness")
-    assert "hello" in printed
-    assert "there" in printed
+    assert "hello" not in printed
+    assert "there" not in printed
 
 
 def test_repl_skips_blank_lines_and_reports_failures():

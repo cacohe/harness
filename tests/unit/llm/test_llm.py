@@ -165,6 +165,7 @@ def test_deepseek_structured_output_uses_json_object(monkeypatch):
 
     def fake_completion(**kwargs):
         assert kwargs["response_format"] == {"type": "json_object"}
+        assert kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
         assert "json" in kwargs["messages"][0]["content"]
         assert '"city": "example"' in kwargs["messages"][0]["content"]
         return Response()

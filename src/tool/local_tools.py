@@ -3,6 +3,7 @@ import subprocess
 from pathlib import Path
 
 from src.schema.tool import Tool
+from src.utils.util import decode_output
 
 _MAX_READ_LINES = 2000
 _MAX_MATCHES = 200
@@ -47,15 +48,18 @@ def shell(command: str, timeout: int = _DEFAULT_TIMEOUT_SECONDS, cwd: str | None
             shell=True,
             cwd=workdir,
             capture_output=True,
-            text=True,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
         return _truncate(
-            f"Exit code: timeout\nStdout:\n{exc.stdout or ''}\nStderr:\n{exc.stderr or ''}"
+            "Exit code: timeout\n"
+            f"Stdout:\n{decode_output(exc.stdout)}\n"
+            f"Stderr:\n{decode_output(exc.stderr)}"
         )
     return _truncate(
-        f"Exit code: {completed.returncode}\nStdout:\n{completed.stdout}\nStderr:\n{completed.stderr}"
+        f"Exit code: {completed.returncode}\n"
+        f"Stdout:\n{decode_output(completed.stdout)}\n"
+        f"Stderr:\n{decode_output(completed.stderr)}"
     )
 
 

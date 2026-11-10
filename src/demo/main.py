@@ -21,7 +21,7 @@ def main() -> None:
 
 def repl(agent, input_fn=input, output_fn=print) -> None:
     """
-    Read lines from the terminal and print each agent reply.
+    Read lines from the terminal and print errors or pauses. Completed answers are streamed.
     Args:
         agent: Object with chat(message) -> Task.
         input_fn: Reads one line. Receives the prompt and raises EOFError at end of input.
@@ -55,21 +55,21 @@ def repl(agent, input_fn=input, output_fn=print) -> None:
         except Exception as error:
             output_fn(f"error: {error}")
             continue
-        output_fn(format_turn(task))
+        rendered = format_turn(task)
+        if rendered:
+            output_fn(rendered)
 
 
 def format_turn(task: Task) -> str:
     """
-    Render one finished turn for the terminal.
+    Render a turn that the event stream did not already show.
     Args:
         task: The task returned by chat.
     Returns:
-        The assistant text, or a short error or pause line.
+        A short error or pause line. A completed answer is empty because it was streamed.
     """
     if task.is_completed():
-        if task.result is None:
-            return ""
-        return task.result.output
+        return ""
     if task.is_failed():
         reason = task.state_reason.value if task.state_reason else "failed"
         return f"error: {reason}"

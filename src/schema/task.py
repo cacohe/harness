@@ -7,7 +7,6 @@ class TaskState(Enum):
     """Task state."""
 
     TASK_CREATED = "created"
-    TASK_QUEUE = "queue"
     TASK_RUNNING = "running"
     TASK_PAUSED = "paused"
     TASK_FAILED = "failed"

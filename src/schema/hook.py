@@ -4,7 +4,7 @@ from typing import Any, Callable, Optional
 
 @dataclass
 class HarnessHook:
-    """Optional callbacks. Each one is called with keyword arguments and may accept any subset.
+    """Harness hooks. Each one is called with keyword arguments and may accept any subset.
 
     before_think may receive task and context.
     after_think may receive task and output.

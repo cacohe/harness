@@ -1,8 +1,9 @@
 import json
+import uuid
 from abc import ABC, abstractmethod
 
 from src.core.sandbox import Sandbox
-from src.logger import get_logger
+from src.schema.event import Event, EventType, ToolEventPayload
 from src.schema.llm import LlmToolCall
 from src.schema.tool import (
     ApprovalDecision,
@@ -12,8 +13,6 @@ from src.schema.tool import (
     ToolExecutionResult,
     ToolExecutionState,
 )
-
-logger = get_logger("src.core.tool")
 
 
 class ToolRegistry(ABC):
@@ -152,7 +151,9 @@ class ToolExecutor(ABC):
 
         return self.execute_without_sandbox(tool, inputs)
 
-    def execute_tool_calls(self, tool_calls: list[LlmToolCall]) -> ToolCallResult:
+    def execute_tool_calls(
+        self, tool_calls: list[LlmToolCall], task_id: str | None = None
+    ) -> ToolCallResult:
         """
         Run model tool calls.
         Args:
@@ -167,24 +168,19 @@ class ToolExecutor(ABC):
         for call in tool_calls:
             tool_execution_result = self._execute_model_call(call)
             if tool_execution_result.is_completed():
-                logger.info(
-                    "tool finished",
-                    extra={"context": {"tool": tool_execution_result.tool_name}},
+                self._emit_tool(
+                    EventType.TOOL_EXECUTION_COMPLETED,
+                    tool_execution_result,
+                    task_id,
+                    call.arguments,
                 )
                 completed_tools.append(tool_execution_result)
             elif tool_execution_result.is_failed():
-                logger.warning(
-                    "tool failed",
-                    extra={
-                        "context": {
-                            "tool": tool_execution_result.tool_name,
-                            "reason": (
-                                tool_execution_result.fail_reason.value
-                                if tool_execution_result.fail_reason
-                                else None
-                            ),
-                        }
-                    },
+                self._emit_tool(
+                    EventType.TOOL_EXECUTION_FAILED,
+                    tool_execution_result,
+                    task_id,
+                    call.arguments,
                 )
                 failed_tools.append(tool_execution_result)
             else:
@@ -194,6 +190,33 @@ class ToolExecutor(ABC):
             pending_tools=pending_tools,
             completed_tools=completed_tools,
             failed_tools=failed_tools,
+        )
+
+    def _emit_tool(
+        self,
+        event_type: EventType,
+        result: ToolExecutionResult,
+        task_id: str | None,
+        arguments: str | None,
+    ) -> None:
+        handler = getattr(self, "event_handler", None)
+        if handler is None:
+            return
+        reason = result.fail_reason.value if result.fail_reason else None
+        content = None if result.output is None else str(result.output)
+        handler.emit(
+            Event(
+                id=str(uuid.uuid4()),
+                type=event_type,
+                payload=ToolEventPayload(
+                    tool_call_id=result.tool_id,
+                    name=result.tool_name,
+                    arguments=arguments or None,
+                    reason=reason,
+                    content=content,
+                ),
+                task_id=task_id,
+            )
         )
 
     def _execute_model_call(self, call: LlmToolCall) -> ToolExecutionResult:
