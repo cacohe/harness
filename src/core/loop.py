@@ -45,7 +45,7 @@ class Harness:
         context_builder: ContextBuilder,
         harness_hooks: HarnessHook = HarnessHook(),
         harness_guard: HarnessGuard = HarnessGuard(),
-        event_handler: EventHandler = EventHandler(),
+        event_handler: EventHandler | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
         max_seconds: int = DEFAULT_MAX_SECONDS,
     ):
@@ -57,7 +57,7 @@ class Harness:
         self.context_builder = context_builder
         self.harness_hooks = harness_hooks
         self.harness_guard = harness_guard
-        self.event_handler = event_handler
+        self.event_handler = event_handler or EventHandler()
         self.tool_executor.event_handler = self.event_handler
         self._max_steps = max_steps
         self._max_seconds = max_seconds
