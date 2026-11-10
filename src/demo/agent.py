@@ -32,6 +32,7 @@ class Agent:
             context_builder: Builder to use. When omitted, the default builder is created.
         """
         self.config = config or Config.load()
+        self.transcript: list[tuple[str, str]] = []
         self.tool_registry = DefaultToolRegistry()
         self.tool_registry.tools = {}
         for tool in LOCAL_TOOLS:
@@ -67,6 +68,29 @@ class Agent:
         task = Task(original_input=input)
         self.harness.run(task)
         return task
+
+    def chat(self, message: str) -> Task:
+        """
+        Plan one message, run it to an answer, and remember the turn.
+        Args:
+            message: The user's next line.
+        Returns:
+            The task after planning and execution. A failed turn is not remembered.
+        """
+        task = Task(original_input=self._with_transcript(message))
+        self.harness.run(task)
+        if task.is_running():
+            self.harness.run(task)
+        if task.is_completed() and task.result is not None:
+            self.transcript.append(("user", message))
+            self.transcript.append(("assistant", task.result.output))
+        return task
+
+    def _with_transcript(self, message: str) -> str:
+        if not self.transcript:
+            return message
+        prior = "\n".join(f"{role}: {content}" for role, content in self.transcript)
+        return f"{prior}\nuser: {message}"
 
     def to_dict(self) -> dict:
         """

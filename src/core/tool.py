@@ -218,4 +218,6 @@ class ToolExecutor(ABC):
                 output=None,
                 fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_NOT_SUPPORTED,
             )
-        return self.execute(tool, parsed)
+        result = self.execute(tool, parsed)
+        result.tool_id = call.id
+        return result
