@@ -54,7 +54,7 @@ class ContextBuilder(ABC):
             Messages for one execution call, and the tools available for that call.
         """
         ...
-    
+
     @abstractmethod
     def build_final_context(self, system_prompt: str, task: Task, **kwargs) -> Context:
         """

@@ -3,8 +3,6 @@ from __future__ import annotations
 import uuid
 from typing import FrozenSet, Optional
 
-from pydantic import Field
-
 from src.schema.context import Message
 from src.schema.task import (
     TaskFailReason,

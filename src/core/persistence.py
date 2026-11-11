@@ -1,22 +1,20 @@
 from typing import Any
 
 
-class CheckpointStore:
-    ...
+class CheckpointStore: ...
 
 
-class ArtifactStore:
-    ...
+class ArtifactStore: ...
 
 
-class TraceStore:
-    ...
+class TraceStore: ...
 
 
 class HarnessPersistence:
     """
     Harness persistence interface.
     """
+
     def __init__(self):
         self.checkpoint_store = CheckpointStore()
         self.artifact_store = ArtifactStore()
