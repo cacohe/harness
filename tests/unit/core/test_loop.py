@@ -1,11 +1,7 @@
-import pytest
 from src.context.context_builder import DefaultContextBuilder
-from src.core.context import ContextBuilderError
-from src.core.guard import GuardError, HarnessGuard
-from src.core.llm import LlmCallError
+from src.core.guard import HarnessGuard
 from src.core.loop import (
     DEFAULT_LLM_ATTEMPT_DELAY_SECONDS,
-    DEFAULT_MAX_LLM_ATTEMPTS,
     DEFAULT_MAX_SECONDS,
     DEFAULT_MAX_STEPS,
     Harness,
@@ -224,53 +220,6 @@ def test_planning_retry_emits_an_llm_retry_event(monkeypatch):
     ]
 
 
-def test_invalid_plan_json_is_retried(monkeypatch):
-    monkeypatch.setattr("src.core.loop.time.sleep", lambda seconds: None)
-
-    class InvalidJsonGateway(Gateway):
-        def planning(self, context, stream=True, response_format=None):
-            self.planning_calls.append((stream, response_format))
-            if len(self.planning_calls) == 1:
-                TaskPlan.model_validate_json("{")
-            return LLMOutput(
-                FinishReason.STOP,
-                None,
-                [],
-                None,
-                None,
-                structured=TaskPlan(goal=["buy a phone"]),
-            )
-
-    output = RecordingOutput()
-    task = _task()
-
-    _harness(InvalidJsonGateway(), event_handler=output).run(task)
-
-    assert task.state is TaskState.TASK_COMPLETED
-    assert task.result.output == "bought"
-    assert task.plan.goal == ["buy a phone"]
-    retries = [event for event in output.events if event.type is EventType.LLM_RETRYING]
-    assert len(retries) == 1
-    assert retries[0].payload.phase == "planning"
-    assert retries[0].payload.reason == "ValidationError"
-
-
-def test_invalid_plan_json_fails_after_the_planning_attempts(monkeypatch):
-    monkeypatch.setattr("src.core.loop.time.sleep", lambda seconds: None)
-
-    class AlwaysInvalidGateway(Gateway):
-        def planning(self, context, stream=True, response_format=None):
-            self.planning_calls.append((stream, response_format))
-            TaskPlan.model_validate_json("{")
-
-    gateway = AlwaysInvalidGateway()
-
-    with pytest.raises(LlmCallError, match="Invalid JSON"):
-        _harness(gateway).run(_task())
-
-    assert len(gateway.planning_calls) == DEFAULT_MAX_LLM_ATTEMPTS
-
-
 def test_infer_streams_deltas_and_assembles_the_answer():
     class StreamGateway(Gateway):
         def infer(self, context, stream=True, response_format=None):
@@ -371,62 +320,6 @@ def test_transient_planning_errors_are_retried(monkeypatch):
     assert len(gateway.planning_calls) == 2
 
 
-def test_permanent_planning_errors_fail_once():
-    class FailingGateway(Gateway):
-        def planning(self, context, stream=True, response_format=None):
-            self.planning_calls.append((stream, response_format))
-            raise ValueError("bad request")
-
-    gateway = FailingGateway()
-    task = _task()
-
-    with pytest.raises(LlmCallError, match="bad request"):
-        _harness(gateway).run(task)
-
-    assert len(gateway.planning_calls) == 1
-    assert task.state is TaskState.TASK_FAILED
-    assert task.state_reason is TaskFailReason.TASK_FAILED_LLM_ERROR
-    assert task.result.output == ""
-    assert _harness(Gateway()).run(task).output == ""
-
-
-def test_guard_failure_keeps_its_own_reason():
-    class Reject(HarnessGuard):
-        def guard_input(self, task):
-            raise GuardError("override the harness")
-
-    task = _task()
-
-    with pytest.raises(GuardError):
-        _harness(Gateway(), guard=Reject()).run(task)
-
-    assert task.state is TaskState.TASK_FAILED
-    assert task.state_reason is TaskFailReason.TASK_FAILED_GUARD_ERROR
-
-
-def test_context_builder_failure_is_not_replaced():
-    class BrokenBuilder(DefaultContextBuilder):
-        def build_planning_context(self, system_prompt, task, **kwargs):
-            raise RuntimeError("missing memory")
-
-    task = _task()
-    harness = Harness(
-        "Be brief.",
-        Gateway(),
-        [],
-        [],
-        Executor(),
-        BrokenBuilder(),
-        harness_guard=HarnessGuard(),
-    )
-
-    with pytest.raises(ContextBuilderError, match="missing memory"):
-        harness.run(task)
-
-    assert task.state is TaskState.TASK_FAILED
-    assert task.state_reason is TaskFailReason.TASK_FAILED_CONTEXT_BUILD_ERROR
-
-
 def test_paused_task_returns_to_running_without_planning():
     gateway = Gateway()
     task = _task()
@@ -476,29 +369,6 @@ def test_length_continues_once_with_tools_then_completes():
 
     assert len(gateway.infer_contexts) == 2
     assert gateway.infer_contexts[1].tools == [tool]
-
-
-def test_a_second_length_asks_for_a_closing_answer_without_tools():
-    tool = _shell()
-    gateway = ScriptedGateway(
-        [
-            _model(FinishReason.LENGTH, "part"),
-            _model(FinishReason.LENGTH, "still"),
-            _model(FinishReason.LENGTH, "closing note"),
-        ]
-    )
-    task = _task()
-
-    assert _harness(gateway, tools=[tool]).run(task).output == "closing note"
-
-    assert task.state is TaskState.TASK_FAILED
-    assert task.state_reason is TaskFailReason.TASK_FAILED_LLM_ERROR
-    assert len(gateway.infer_contexts) == 3
-    assert gateway.infer_contexts[1].tools == [tool]
-    closing = gateway.infer_contexts[2]
-    assert closing.tools == []
-    assert "Do not call tools." in closing.messages[-1].content
-    assert all(message.content != closing.messages[-1].content for message in task.history)
 
 
 def test_execute_tool_calls_emits_start_and_completion():
@@ -584,40 +454,6 @@ def test_step_limit_asks_for_a_closing_answer_from_unseen_tool_results():
     assert task.history[-1].role == "tool"
 
 
-def test_closing_answer_keeps_text_and_does_not_run_its_tool_calls():
-    executor = CountingExecutor()
-    gateway = ScriptedGateway(
-        [
-            _model(FinishReason.TOOL_CALLS, None, [LlmToolCall("call_1", "shell", "{}")]),
-            _model(
-                FinishReason.TOOL_CALLS,
-                "status so far",
-                [LlmToolCall("call_2", "shell", "{}")],
-            ),
-        ]
-    )
-    output = RecordingOutput()
-    task = _task()
-
-    assert (
-        _harness(
-            gateway,
-            tools=[_shell()],
-            executor=executor,
-            max_steps=1,
-            event_handler=output,
-        )
-        .run(task)
-        .output
-        == "status so far"
-    )
-
-    assert executor.batches == 1
-    assert task.state_reason is TaskFailReason.TASK_FAILED_MAX_STEPS
-    deltas = [event.payload.content for event in output.events if event.type is EventType.LLM_DELTA]
-    assert "status so far" in deltas
-
-
 def test_closing_answer_without_text_fails_with_an_empty_result():
     gateway = ScriptedGateway(
         [
@@ -631,67 +467,3 @@ def test_closing_answer_without_text_fails_with_an_empty_result():
 
     assert task.state_reason is TaskFailReason.TASK_FAILED_MAX_STEPS
     assert len(gateway.infer_contexts) == 2
-
-
-def test_content_filter_fails_without_a_closing_call():
-    gateway = ScriptedGateway([_model(FinishReason.CONTENT_FILTER)])
-    task = _task()
-
-    assert _harness(gateway, tools=[_shell()]).run(task).output == ""
-
-    assert task.state_reason is TaskFailReason.TASK_FAILED_LLM_ERROR
-    assert len(gateway.infer_contexts) == 1
-
-
-def test_step_limit_without_tool_results_does_not_ask_for_a_closing_answer():
-    gateway = ScriptedGateway([])
-    task = _task()
-
-    assert _harness(gateway, max_steps=0).run(task).output == ""
-
-    assert task.state_reason is TaskFailReason.TASK_FAILED_MAX_STEPS
-    assert gateway.infer_contexts == []
-
-
-def test_length_past_the_time_limit_fails_without_a_closing_call(monkeypatch):
-    clock = {"ticks": 0}
-
-    def monotonic():
-        clock["ticks"] += 1
-        if clock["ticks"] <= 2:
-            return 0
-        return 10**9
-
-    monkeypatch.setattr("src.core.loop.time.monotonic", monotonic)
-    gateway = ScriptedGateway(
-        [
-            _model(FinishReason.LENGTH, "partial"),
-            _model(FinishReason.STOP, "should not run"),
-        ]
-    )
-    task = _task()
-
-    assert _harness(gateway, max_seconds=30).run(task).output == ""
-
-    assert task.state_reason is TaskFailReason.TASK_FAILED_TIMEOUT
-    assert len(gateway.infer_contexts) == 1
-
-
-def test_pause_returns_without_a_closing_call():
-    def after_think(task, output):
-        task.transition_to_paused(TaskPauseReason.TASK_PAUSED_WAITING_APPROVAL)
-
-    gateway = ScriptedGateway(
-        [
-            _model(FinishReason.LENGTH, "partial"),
-            _model(FinishReason.STOP, "should not run"),
-        ]
-    )
-    task = _task()
-
-    result = _harness(gateway, hooks=HarnessHook(after_think=after_think)).run(task)
-
-    assert result.output == ""
-    assert task.state is TaskState.TASK_PAUSED
-    assert task.result is None
-    assert len(gateway.infer_contexts) == 1

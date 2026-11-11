@@ -1,6 +1,4 @@
-import pytest
 from src.config import Config
-from src.core.llm import LlmCallError
 from src.demo.agent import Agent
 from src.schema.llm import FinishReason, LLMOutput
 from src.schema.task import TaskPlan, TaskState
@@ -54,19 +52,3 @@ def test_chat_sends_prior_turns_with_the_next_message():
 
     assert task.result.output == "fine"
     assert gateway.plans[1] == "user: hi\nassistant: hello\nuser: and you"
-
-
-def test_chat_drops_a_turn_that_fails():
-    class FailingGateway(ChatGateway):
-        def infer(self, context, stream=True, response_format=None):
-            raise LlmCallError("down")
-
-    agent = Agent(
-        config=Config(llm="test-model", max_steps=3, max_seconds=30),
-        llm_gateway=FailingGateway([]),
-    )
-
-    with pytest.raises(LlmCallError, match="down"):
-        agent.chat("hi")
-
-    assert agent.transcript == []

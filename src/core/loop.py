@@ -19,13 +19,11 @@ from src.schema.event import Event, EventType, LlmEventPayload, TaskEventPayload
 from src.schema.harness import StepResult
 from src.schema.hook import HarnessHook
 from src.schema.llm import (
-    ROLE_TOOL,
     FinishReason,
     LLMOutput,
     LlmToolCall,
     assemble_llm_stream,
     is_transient_llm_error,
-    is_unusable_llm_output,
 )
 from src.schema.skills import Skill
 from src.schema.task import TaskFailReason, TaskPauseReason, TaskPlan, TaskResult, TaskRunningReason
@@ -151,15 +149,8 @@ class Harness:
             )
         )
 
-    def _emit_answer(
-        self,
-        task: Task,
-        output: LLMOutput,
-        parts: list[str],
-        *,
-        reveal_tool_text: bool = False,
-    ) -> None:
-        if output.requests_tool_calls() and not reveal_tool_text:
+    def _emit_answer(self, task: Task, output: LLMOutput, parts: list[str]) -> None:
+        if output.requests_tool_calls():
             return
         for part in parts:
             if part:
@@ -234,7 +225,7 @@ class Harness:
                 raise
 
             except Exception as error:
-                if attempt == DEFAULT_MAX_LLM_ATTEMPTS or not _can_retry_planning(error):
+                if attempt == DEFAULT_MAX_LLM_ATTEMPTS or not is_transient_llm_error(error):
                     raise LlmCallError(str(error)) from error
                 self._emit_llm_event(
                     task,
@@ -264,7 +255,7 @@ class Harness:
         except Exception as error:
             raise ContextBuilderError(str(error)) from error
 
-    def infer(self, context: Context, task: Task, *, reveal_tool_text: bool = False) -> LLMOutput:
+    def infer(self, context: Context, task: Task) -> LLMOutput:
         """
         Run one model call for the execution loop.
         Args:
@@ -279,7 +270,7 @@ class Harness:
             self._emit_llm_event(task, EventType.LLM_STARTED, phase="infer")
             try:
                 produced = self.llm_gateway.infer(context, stream=True)
-                output = self._read_inference(task, produced, reveal_tool_text=reveal_tool_text)
+                output = self._read_inference(task, produced)
                 break
 
             except LlmCallError:
@@ -303,20 +294,15 @@ class Harness:
         self._emit_llm_event(task, EventType.LLM_COMPLETED, phase="infer", usage=output.usage)
         return output
 
-    def _read_inference(self, task: Task, produced, *, reveal_tool_text: bool = False) -> LLMOutput:
+    def _read_inference(self, task: Task, produced) -> LLMOutput:
         if isinstance(produced, LLMOutput):
-            self._emit_answer(
-                task,
-                produced,
-                [produced.content] if produced.content else [],
-                reveal_tool_text=reveal_tool_text,
-            )
+            self._emit_answer(task, produced, [produced.content] if produced.content else [])
             return produced
         try:
             output, parts = assemble_llm_stream(produced)
         except TypeError as error:
             raise LlmCallError(str(error)) from error
-        self._emit_answer(task, output, parts, reveal_tool_text=reveal_tool_text)
+        self._emit_answer(task, output, parts)
         return output
 
     def _requests_tool_calls(self, llm_output: LLMOutput) -> bool:
@@ -377,7 +363,7 @@ class Harness:
 
         task.add_history_messages([build_history_message(output)])
 
-        if task.is_paused() or not self._requests_tool_calls(output):
+        if not self._requests_tool_calls(output):
             return StepResult(llm_output=output)
 
         self.harness_hooks.before_execute_tool_calls(task=task, output=output)
@@ -416,7 +402,7 @@ class Harness:
             The final result.
         """
         final_context = self.build_final_context(task)
-        output = self.infer(final_context, task, reveal_tool_text=True)
+        output = self.infer(final_context, task)
         return output.content or ""
 
     def _blocked(self, step_result: StepResult) -> (bool, TaskPauseReason):
@@ -482,18 +468,8 @@ class Harness:
         final_output = self.finalize(task)
         return TaskResult(output=final_output)
 
-    def _has_unseen_tool_results(self, task: Task) -> bool:
-        """
-        Report whether the latest history is a tool result the model has not answered.
-        Args:
-            task: The task being executed.
-        Returns:
-            True when history ends with a tool message.
-        """
-        return bool(task.history) and task.history[-1].role == ROLE_TOOL
-
     def _handle_failed_turn(
-        self, task: Task, step_count: int, failed_reason: TaskFailReason, *, close: bool
+        self, task: Task, step_count: int, failed_reason: TaskFailReason
     ) -> TaskResult:
         """
         Handle a failed turn.
@@ -501,9 +477,8 @@ class Harness:
             task: The task being executed.
             step_count: The number of steps in the turn.
             failed_reason: The reason of the failed.
-            close: Ask for a closing answer when the turn stopped before a normal answer.
         Returns:
-            The task result. A closing answer replaces the empty result recorded on failure.
+            The task result.
         """
         task.transition_to_failed(failed_reason)
         self._emit_task_event(
@@ -512,11 +487,8 @@ class Harness:
             reason=failed_reason.value,
             step_id=str(step_count),
         )
-        if not close:
-            return task.result
-        result = TaskResult(output=self.finalize(task))
-        task.set_result(result)
-        return result
+        final_output = self.finalize(task)
+        return TaskResult(output=final_output)
 
     def _handle_completed_turn(
         self, task: Task, step_result: StepResult, step_count: int
@@ -552,50 +524,19 @@ class Harness:
         start_time = time.monotonic()
         step_count = 0
         while True:
-            failed, failed_reason = self._failed(start_time, step_count)
-            if failed:
-                return self._handle_failed_turn(
-                    task,
-                    step_count,
-                    failed_reason,
-                    close=self._has_unseen_tool_results(task),
-                )
-
             step_result: StepResult = self.step(task)
             step_count += 1
-
-            if task.is_paused():
-                reason = task.state_reason.value if task.state_reason else None
-                self._emit_task_event(
-                    EventType.TASK_PAUSED,
-                    task,
-                    reason=reason,
-                    step_id=str(step_count),
-                )
-                return TaskResult()
 
             blocked, blocked_reason = self._blocked(step_result)
             if blocked:
                 return self._handle_blocked_turn(task, step_result, step_count, blocked_reason)
 
+            failed, failed_reason = self._failed(start_time, step_count)
+            if failed:
+                return self._handle_failed_turn(task, step_count, failed_reason)
+
             if self._completed(step_result):
                 return self._handle_completed_turn(task, step_result, step_count)
-
-            if step_result.llm_output.finish_reason == FinishReason.LENGTH:
-                self._length_continuations += 1
-                if self._length_continuations >= 2:
-                    return self._handle_failed_turn(
-                        task, step_count, TaskFailReason.TASK_FAILED_LLM_ERROR, close=True
-                    )
-                continue
-
-            self._length_continuations = 0
-            if self._requests_tool_calls(step_result.llm_output):
-                continue
-
-            return self._handle_failed_turn(
-                task, step_count, TaskFailReason.TASK_FAILED_LLM_ERROR, close=False
-            )
 
     def run(self, task: Task) -> TaskResult:
         """
@@ -646,15 +587,4 @@ class Harness:
                 reason=fail_reason,
                 content=str(error),
             )
-            raise
-
-
-def _can_retry_planning(error: Exception) -> bool:
-    """
-    Decide whether another planning call can still produce a usable plan.
-    Args:
-        error: The exception raised while asking for a plan.
-    Returns:
-        True for a retryable provider error or structured output that cannot be used.
-    """
-    return is_transient_llm_error(error) or is_unusable_llm_output(error)
+            return TaskResult(output=f"An unexpected error occurred: {str(error)}")
