@@ -37,7 +37,7 @@ def test_llm_delta_is_written_without_a_newline(capsys):
         Event(
             id="delta-1",
             type=EventType.LLM_DELTA,
-            payload=LlmEventPayload(llm_id="delta-1", content="hel"),
+            payload=LlmEventPayload(content="hel"),
         ),
         EventChannel.CLIENT,
     )
@@ -71,3 +71,17 @@ def test_channel_selects_one_emitter(capsys):
     output = capsys.readouterr().out
     assert "client task_completed" in output
     assert "tracing " not in output
+
+
+def test_emitter_errors_do_not_escape(capsys):
+    def boom(event):
+        raise RuntimeError("down")
+
+    EventHandler(client_emitter=boom).emit(_event(), EventChannel.CLIENT)
+    EventHandler(tracing_emitter=boom, client_emitter=lambda event: None).emit(
+        _event(), EventChannel.TRACING
+    )
+    EventHandler(client_emitter=boom).emit(_event(), EventChannel.ALL)
+
+    assert "tracing " in capsys.readouterr().out
+    assert "client " not in capsys.readouterr().out

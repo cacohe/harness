@@ -1,9 +1,7 @@
 import json
-import uuid
 from abc import ABC, abstractmethod
 
 from src.core.sandbox import Sandbox
-from src.schema.event import Event, EventType, ToolEventPayload
 from src.schema.llm import LlmToolCall
 from src.schema.tool import (
     ApprovalDecision,
@@ -166,22 +164,10 @@ class ToolExecutor(ABC):
         failed_tools = []
 
         for call in tool_calls:
-            tool_execution_result = self._execute_model_call(call)
+            tool_execution_result = self.execute_tool_call(call)
             if tool_execution_result.is_completed():
-                self._emit_tool(
-                    EventType.TOOL_EXECUTION_COMPLETED,
-                    tool_execution_result,
-                    task_id,
-                    call.arguments,
-                )
                 completed_tools.append(tool_execution_result)
             elif tool_execution_result.is_failed():
-                self._emit_tool(
-                    EventType.TOOL_EXECUTION_FAILED,
-                    tool_execution_result,
-                    task_id,
-                    call.arguments,
-                )
                 failed_tools.append(tool_execution_result)
             else:
                 pending_tools.append(tool_execution_result)
@@ -192,34 +178,14 @@ class ToolExecutor(ABC):
             failed_tools=failed_tools,
         )
 
-    def _emit_tool(
-        self,
-        event_type: EventType,
-        result: ToolExecutionResult,
-        task_id: str | None,
-        arguments: str | None,
-    ) -> None:
-        handler = getattr(self, "event_handler", None)
-        if handler is None:
-            return
-        reason = result.fail_reason.value if result.fail_reason else None
-        content = None if result.output is None else str(result.output)
-        handler.emit(
-            Event(
-                id=str(uuid.uuid4()),
-                type=event_type,
-                payload=ToolEventPayload(
-                    tool_call_id=result.tool_id,
-                    name=result.tool_name,
-                    arguments=arguments or None,
-                    reason=reason,
-                    content=content,
-                ),
-                task_id=task_id,
-            )
-        )
-
-    def _execute_model_call(self, call: LlmToolCall) -> ToolExecutionResult:
+    def execute_tool_call(self, call: LlmToolCall) -> ToolExecutionResult:
+        """
+        Run one model tool call.
+        Args:
+            call: The tool call from the model. It has id, name, and arguments.
+        Returns:
+            The execution result for that call.
+        """
         try:
             parsed = json.loads(call.arguments) if call.arguments else {}
         except json.JSONDecodeError:

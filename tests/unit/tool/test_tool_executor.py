@@ -1,5 +1,4 @@
 from src.core.context import build_tool_messages
-from src.schema.event import EventType
 from src.schema.llm import LlmToolCall
 from src.schema.tool import Tool
 from src.tool.tool_executor import DefaultToolExecutor
@@ -35,7 +34,7 @@ def test_completed_tool_message_keeps_the_model_call_id():
     assert message.name == "shell"
 
 
-def test_completed_tool_emits_the_tool_name():
+def test_executor_does_not_emit_events():
     class Handler:
         def __init__(self):
             self.events = []
@@ -51,12 +50,7 @@ def test_completed_tool_emits_the_tool_name():
         task_id="task-1",
     )
 
-    event = executor.event_handler.events[0]
-    assert event.type is EventType.TOOL_EXECUTION_COMPLETED
-    assert event.payload.name == "shell"
-    assert event.payload.arguments == '{"command": "dir"}'
-    assert event.payload.tool_call_id == "call_0_abc"
-    assert event.task_id == "task-1"
+    assert executor.event_handler.events == []
 
 
 def test_failed_tool_message_keeps_the_model_call_id():
@@ -72,3 +66,4 @@ def test_failed_tool_message_keeps_the_model_call_id():
     message = build_tool_messages(result)[0]
     assert message.tool_call_id == "call_0_abc"
     assert message.name == "shell"
+    assert message.content == "RuntimeError: nope"

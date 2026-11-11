@@ -51,3 +51,7 @@ agent-harness. Enter a message, or /exit to quit.
 ```
 
 `/help` 查看命令。`/exit`、`/quit`、`exit`、`quit` 或 Ctrl+C 退出。空行会被忽略。同一会话里，后面的输入会带上之前的问答。
+
+
+## TODO
+1、harness增加外部取消机制

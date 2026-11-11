@@ -1,12 +1,20 @@
 import pytest
 from src.context.context_builder import DefaultContextBuilder
+from src.core.context import ContextBuilderError
 from src.core.guard import GuardError, HarnessGuard
 from src.core.llm import LlmCallError
-from src.core.loop import DEFAULT_LLM_ATTEMPT_DELAY_SECONDS, DEFAULT_MAX_LLM_ATTEMPTS, Harness
+from src.core.loop import (
+    DEFAULT_LLM_ATTEMPT_DELAY_SECONDS,
+    DEFAULT_MAX_LLM_ATTEMPTS,
+    DEFAULT_MAX_SECONDS,
+    DEFAULT_MAX_STEPS,
+    Harness,
+)
 from src.core.task import Task
 from src.core.tool import ToolExecutor
 from src.schema.context import Context
 from src.schema.event import EventType
+from src.schema.hook import HarnessHook
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
 from src.schema.task import (
     TaskFailReason,
@@ -16,7 +24,12 @@ from src.schema.task import (
     TaskRunningReason,
     TaskState,
 )
-from src.schema.tool import Tool, ToolExecutionResult, ToolExecutionState
+from src.schema.tool import (
+    Tool,
+    ToolExecutionFailReason,
+    ToolExecutionResult,
+    ToolExecutionState,
+)
 
 
 class Gateway:
@@ -71,7 +84,10 @@ class Executor(ToolExecutor):
 
 
 def _task() -> Task:
-    return Task(original_input="buy a phone")
+    task = Task(original_input="buy a phone")
+    task.history = []
+    task.pending_tool_calls = []
+    return task
 
 
 class RecordingOutput:
@@ -82,17 +98,65 @@ class RecordingOutput:
         self.events.append(event)
 
 
-def _harness(gateway, guard=None, event_handler=None) -> Harness:
+def _harness(
+    gateway,
+    guard=None,
+    event_handler=None,
+    max_steps=DEFAULT_MAX_STEPS,
+    max_seconds=DEFAULT_MAX_SECONDS,
+    hooks=None,
+    tools=None,
+    executor=None,
+) -> Harness:
     return Harness(
         "Be brief.",
         gateway,
+        [] if tools is None else tools,
         [],
-        [],
-        Executor(),
+        executor or Executor(),
         DefaultContextBuilder(),
+        harness_hooks=hooks or HarnessHook(),
         harness_guard=guard or HarnessGuard(),
         event_handler=event_handler,
+        max_steps=max_steps,
+        max_seconds=max_seconds,
     )
+
+
+class ScriptedGateway(Gateway):
+    def __init__(self, answers):
+        super().__init__()
+        self.answers = list(answers)
+        self.infer_contexts = []
+
+    def infer(self, context, stream=True, response_format=None):
+        self.infer_contexts.append(context)
+        if not self.answers:
+            raise AssertionError("unexpected infer")
+        return self.answers.pop(0)
+
+
+class CountingExecutor(Executor):
+    def __init__(self):
+        self.batches = 0
+
+    def execute_tool_call(self, call):
+        self.batches += 1
+        return super().execute_tool_call(call)
+
+
+def _shell() -> Tool:
+    return Tool(
+        id="shell",
+        name="shell",
+        description="Run a command.",
+        input_schema={},
+        executer=lambda inputs: "",
+    )
+
+
+def _model(reason, content=None, calls=None) -> LLMOutput:
+    return LLMOutput(reason, content, calls or [], None, None)
 
 
 def test_run_plans_a_new_task_and_returns_the_answer():
@@ -116,11 +180,24 @@ def test_planning_run_emits_task_events():
     assert [event.type for event in output.events] == [
         EventType.TASK_STARTED,
         EventType.TASK_PLANNING,
+        EventType.LLM_STARTED,
+        EventType.LLM_COMPLETED,
         EventType.TASK_PLANNED,
+        EventType.LLM_STARTED,
         EventType.LLM_DELTA,
+        EventType.LLM_COMPLETED,
         EventType.TASK_COMPLETED,
     ]
-    assert output.events[2].payload.goal == ["buy a phone"]
+    planned = output.events[4]
+    assert planned.payload.goal == ["buy a phone"]
+    llm = [event for event in output.events if event.type.name.startswith("LLM_")]
+    assert [event.payload.phase for event in llm] == [
+        "planning",
+        "planning",
+        "infer",
+        "infer",
+        "infer",
+    ]
 
 
 def test_planning_retry_emits_an_llm_retry_event(monkeypatch):
@@ -136,6 +213,15 @@ def test_planning_retry_emits_an_llm_retry_event(monkeypatch):
     assert retries[0].payload.phase == "planning"
     assert retries[0].payload.attempt == 1
     assert retries[0].payload.reason == "TimeoutError"
+    assert [event.type for event in output.events if event.type.name.startswith("LLM_")] == [
+        EventType.LLM_STARTED,
+        EventType.LLM_RETRYING,
+        EventType.LLM_STARTED,
+        EventType.LLM_COMPLETED,
+        EventType.LLM_STARTED,
+        EventType.LLM_DELTA,
+        EventType.LLM_COMPLETED,
+    ]
 
 
 def test_invalid_plan_json_is_retried(monkeypatch):
@@ -200,8 +286,14 @@ def test_infer_streams_deltas_and_assembles_the_answer():
 
     assert result.content == "hello"
     assert result.finish_reason is FinishReason.STOP
-    deltas = [event for event in output.events if event.type is EventType.LLM_DELTA]
-    assert [event.payload.content for event in deltas] == ["hel", "lo"]
+    assert [event.type for event in output.events] == [
+        EventType.LLM_STARTED,
+        EventType.LLM_DELTA,
+        EventType.LLM_DELTA,
+        EventType.LLM_COMPLETED,
+    ]
+    assert [event.payload.content for event in output.events[1:3]] == ["hel", "lo"]
+    assert output.events[0].payload.phase == "infer"
 
 
 def test_infer_hides_text_that_accompanies_tool_calls():
@@ -223,7 +315,10 @@ def test_infer_hides_text_that_accompanies_tool_calls():
 
     assert result.content == "checking"
     assert result.tool_calls[0].name == "shell"
-    assert [event for event in output.events if event.type is EventType.LLM_DELTA] == []
+    assert [event.type for event in output.events] == [
+        EventType.LLM_STARTED,
+        EventType.LLM_COMPLETED,
+    ]
 
 
 def test_planning_context_names_tools_but_does_not_offer_them():
@@ -315,7 +410,6 @@ def test_context_builder_failure_is_not_replaced():
             raise RuntimeError("missing memory")
 
     task = _task()
-    task.transition_to_running(TaskRunningReason.TASK_RUNNING_CREATE)
     harness = Harness(
         "Be brief.",
         Gateway(),
@@ -326,9 +420,10 @@ def test_context_builder_failure_is_not_replaced():
         harness_guard=HarnessGuard(),
     )
 
-    with pytest.raises(RuntimeError, match="missing memory"):
-        harness.build_planning_context(task)
+    with pytest.raises(ContextBuilderError, match="missing memory"):
+        harness.run(task)
 
+    assert task.state is TaskState.TASK_FAILED
     assert task.state_reason is TaskFailReason.TASK_FAILED_CONTEXT_BUILD_ERROR
 
 
@@ -366,3 +461,237 @@ def test_builder_reads_history_from_the_task():
     assert context.messages[0].role == "system"
     assert context.messages[1].content == "buy a phone"
     assert context.tools == []
+
+
+def test_length_continues_once_with_tools_then_completes():
+    tool = _shell()
+    gateway = ScriptedGateway(
+        [
+            _model(FinishReason.LENGTH, "hel"),
+            _model(FinishReason.STOP, "hello"),
+        ]
+    )
+
+    assert _harness(gateway, tools=[tool]).run(_task()).output == "hello"
+
+    assert len(gateway.infer_contexts) == 2
+    assert gateway.infer_contexts[1].tools == [tool]
+
+
+def test_a_second_length_asks_for_a_closing_answer_without_tools():
+    tool = _shell()
+    gateway = ScriptedGateway(
+        [
+            _model(FinishReason.LENGTH, "part"),
+            _model(FinishReason.LENGTH, "still"),
+            _model(FinishReason.LENGTH, "closing note"),
+        ]
+    )
+    task = _task()
+
+    assert _harness(gateway, tools=[tool]).run(task).output == "closing note"
+
+    assert task.state is TaskState.TASK_FAILED
+    assert task.state_reason is TaskFailReason.TASK_FAILED_LLM_ERROR
+    assert len(gateway.infer_contexts) == 3
+    assert gateway.infer_contexts[1].tools == [tool]
+    closing = gateway.infer_contexts[2]
+    assert closing.tools == []
+    assert "Do not call tools." in closing.messages[-1].content
+    assert all(message.content != closing.messages[-1].content for message in task.history)
+
+
+def test_execute_tool_calls_emits_start_and_completion():
+    class Completing(Executor):
+        def execute_tool_call(self, call):
+            return ToolExecutionResult(
+                tool_id=call.id,
+                tool_name=call.name,
+                state=ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED,
+                output="listed",
+            )
+
+    output = RecordingOutput()
+    executor = Completing()
+    harness = _harness(Gateway(), event_handler=output, executor=executor)
+    task = _task()
+
+    result = harness.execute_tool_calls(
+        [LlmToolCall("call_0_abc", "shell", '{"command": "dir"}')],
+        task,
+    )
+
+    assert result.completed_tools[0].output == "listed"
+    assert [event.type for event in output.events] == [
+        EventType.TOOL_EXECUTION_STARTED,
+        EventType.TOOL_EXECUTION_COMPLETED,
+    ]
+    completed = output.events[1]
+    assert completed.payload.name == "shell"
+    assert completed.payload.arguments == '{"command": "dir"}'
+    assert completed.payload.tool_call_id == "call_0_abc"
+    assert completed.payload.content == "listed"
+    assert completed.task_id == str(task.id)
+    assert not hasattr(executor, "event_handler")
+
+
+def test_execute_tool_calls_emits_failure():
+    class Failing(Executor):
+        def execute_tool_call(self, call):
+            return ToolExecutionResult(
+                tool_id=call.id,
+                tool_name=call.name,
+                state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
+                output="RuntimeError: nope",
+                fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_UNKNOWN,
+            )
+
+    output = RecordingOutput()
+    harness = _harness(Gateway(), event_handler=output, executor=Failing())
+
+    result = harness.execute_tool_calls(
+        [LlmToolCall("call_1", "shell", "{}")],
+        _task(),
+    )
+
+    assert result.failed_tools[0].output == "RuntimeError: nope"
+    assert [event.type for event in output.events] == [
+        EventType.TOOL_EXECUTION_STARTED,
+        EventType.TOOL_EXECUTION_FAILED,
+    ]
+    assert output.events[1].payload.reason == "unknown"
+    assert output.events[1].payload.content == "RuntimeError: nope"
+
+
+def test_step_limit_asks_for_a_closing_answer_from_unseen_tool_results():
+    executor = CountingExecutor()
+    gateway = ScriptedGateway(
+        [
+            _model(FinishReason.TOOL_CALLS, None, [LlmToolCall("call_1", "shell", "{}")]),
+            _model(FinishReason.STOP, "based on the tool"),
+        ]
+    )
+    task = _task()
+
+    assert (
+        _harness(gateway, tools=[_shell()], executor=executor, max_steps=1).run(task).output
+        == "based on the tool"
+    )
+
+    assert task.state_reason is TaskFailReason.TASK_FAILED_MAX_STEPS
+    assert executor.batches == 1
+    assert gateway.infer_contexts[1].tools == []
+    assert task.history[-1].role == "tool"
+
+
+def test_closing_answer_keeps_text_and_does_not_run_its_tool_calls():
+    executor = CountingExecutor()
+    gateway = ScriptedGateway(
+        [
+            _model(FinishReason.TOOL_CALLS, None, [LlmToolCall("call_1", "shell", "{}")]),
+            _model(
+                FinishReason.TOOL_CALLS,
+                "status so far",
+                [LlmToolCall("call_2", "shell", "{}")],
+            ),
+        ]
+    )
+    output = RecordingOutput()
+    task = _task()
+
+    assert (
+        _harness(
+            gateway,
+            tools=[_shell()],
+            executor=executor,
+            max_steps=1,
+            event_handler=output,
+        )
+        .run(task)
+        .output
+        == "status so far"
+    )
+
+    assert executor.batches == 1
+    assert task.state_reason is TaskFailReason.TASK_FAILED_MAX_STEPS
+    deltas = [event.payload.content for event in output.events if event.type is EventType.LLM_DELTA]
+    assert "status so far" in deltas
+
+
+def test_closing_answer_without_text_fails_with_an_empty_result():
+    gateway = ScriptedGateway(
+        [
+            _model(FinishReason.TOOL_CALLS, None, [LlmToolCall("call_1", "shell", "{}")]),
+            _model(FinishReason.TOOL_CALLS, None, [LlmToolCall("call_2", "shell", "{}")]),
+        ]
+    )
+    task = _task()
+
+    assert _harness(gateway, tools=[_shell()], max_steps=1).run(task).output == ""
+
+    assert task.state_reason is TaskFailReason.TASK_FAILED_MAX_STEPS
+    assert len(gateway.infer_contexts) == 2
+
+
+def test_content_filter_fails_without_a_closing_call():
+    gateway = ScriptedGateway([_model(FinishReason.CONTENT_FILTER)])
+    task = _task()
+
+    assert _harness(gateway, tools=[_shell()]).run(task).output == ""
+
+    assert task.state_reason is TaskFailReason.TASK_FAILED_LLM_ERROR
+    assert len(gateway.infer_contexts) == 1
+
+
+def test_step_limit_without_tool_results_does_not_ask_for_a_closing_answer():
+    gateway = ScriptedGateway([])
+    task = _task()
+
+    assert _harness(gateway, max_steps=0).run(task).output == ""
+
+    assert task.state_reason is TaskFailReason.TASK_FAILED_MAX_STEPS
+    assert gateway.infer_contexts == []
+
+
+def test_length_past_the_time_limit_fails_without_a_closing_call(monkeypatch):
+    clock = {"ticks": 0}
+
+    def monotonic():
+        clock["ticks"] += 1
+        if clock["ticks"] <= 2:
+            return 0
+        return 10**9
+
+    monkeypatch.setattr("src.core.loop.time.monotonic", monotonic)
+    gateway = ScriptedGateway(
+        [
+            _model(FinishReason.LENGTH, "partial"),
+            _model(FinishReason.STOP, "should not run"),
+        ]
+    )
+    task = _task()
+
+    assert _harness(gateway, max_seconds=30).run(task).output == ""
+
+    assert task.state_reason is TaskFailReason.TASK_FAILED_TIMEOUT
+    assert len(gateway.infer_contexts) == 1
+
+
+def test_pause_returns_without_a_closing_call():
+    def after_think(task, output):
+        task.transition_to_paused(TaskPauseReason.TASK_PAUSED_WAITING_APPROVAL)
+
+    gateway = ScriptedGateway(
+        [
+            _model(FinishReason.LENGTH, "partial"),
+            _model(FinishReason.STOP, "should not run"),
+        ]
+    )
+    task = _task()
+
+    result = _harness(gateway, hooks=HarnessHook(after_think=after_think)).run(task)
+
+    assert result.output == ""
+    assert task.state is TaskState.TASK_PAUSED
+    assert task.result is None
+    assert len(gateway.infer_contexts) == 1

@@ -1,4 +1,5 @@
 from src.core.context import (
+    DEFAULT_SYSTEM_PROMPT_FOR_FINAL,
     DEFAULT_SYSTEM_PROMPT_FOR_INFER,
     DEFAULT_SYSTEM_PROMPT_FOR_PLANNING,
     ContextBuilder,
@@ -75,6 +76,25 @@ class DefaultContextBuilder(ContextBuilder):
             return Context(messages=messages, tools=list(tools))
         except Exception as error:
             raise ContextBuilderError(f"Failed to build infer context: {error}") from error
+
+    def build_final_context(self, system_prompt: str, task: Task, **kwargs) -> Context:
+        """
+        Build the context for one closing model call.
+        Args:
+            system_prompt: Extra instructions from the harness.
+            task: The task being closed. Its history is the prior transcript and is left unchanged.
+            **kwargs: tools and skills used to assemble the execution transcript. Tools are not offered.
+        Returns:
+            The execution messages, a closing instruction, and no callable tools.
+        """
+        tools = list(kwargs.get("tools") or [])
+        skills = list(kwargs.get("skills") or [])
+        context = self.build_infer_context(system_prompt, task, tools, skills)
+        context.tools = []
+        context.messages.append(
+            Message(role="user", content=DEFAULT_SYSTEM_PROMPT_FOR_FINAL.strip())
+        )
+        return context
 
 
 def _with_extra_prompt(base: str, extra: str) -> str:

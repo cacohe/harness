@@ -75,12 +75,12 @@ class DefaultToolExecutor(ToolExecutor):
         tool = self.tool_registry.get_tool(tool_id)
         try:
             output = tool.executer(inputs)
-        except Exception:
+        except Exception as error:
             return ToolExecutionResult(
                 tool_id=tool.id,
                 tool_name=tool.name,
                 state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
-                output=None,
+                output=f"{type(error).__name__}: {error}",
                 fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_UNKNOWN,
             )
         return ToolExecutionResult(

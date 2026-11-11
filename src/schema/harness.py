@@ -1,11 +1,9 @@
-from enum import Enum
+from pydantic import BaseModel, Field
+from src.schema.llm import LLMOutput
+from src.schema.tool import ToolCallResult
 
 
-class HarnessState(Enum):
-    HARNESS_STATE_STARTING = "starting"
-    HARNESS_STATE_GUARDING = "guarding"
-    HARNESS_STATE_PLANNING = "planning"
-    HARNESS_STATE_INFERING = "inferring"
-    HARNESS_STATE_TOOL_CALLING = "tool_calling"
-    HARNESS_STATE_RUNNING = "running"
-    HARNESS_STATE_FINISHED = "finished"
+class StepResult(BaseModel):
+    """The result of a step."""
+    llm_output: LLMOutput = Field(default_factory=LLMOutput)
+    tool_call_result: ToolCallResult = Field(default_factory=ToolCallResult)

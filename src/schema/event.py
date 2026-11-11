@@ -47,7 +47,6 @@ class ToolEventPayload:
 
 @dataclass
 class LlmEventPayload:
-    llm_id: str
     reason: str | None = None
     usage: LlmUsage | None = None
     attempt: int | None = None

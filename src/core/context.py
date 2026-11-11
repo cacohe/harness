@@ -11,6 +11,9 @@ You are an expert in task management, skilled at converting vague inputs into cl
 DEFAULT_SYSTEM_PROMPT_FOR_INFER = """
 You are an expert in task execution, skilled at executing tasks based on the given task objectives and execution steps.
 """
+DEFAULT_SYSTEM_PROMPT_FOR_FINAL = """
+Answer the original goal from the results above. Do not call tools. Based on the current task state, explain the execution status: what was done, what remains, and why it was not completed.
+"""
 
 
 class ContextBuilderError(Exception):
@@ -51,6 +54,19 @@ class ContextBuilder(ABC):
             Messages for one execution call, and the tools available for that call.
         """
         ...
+    
+    @abstractmethod
+    def build_final_context(self, system_prompt: str, task: Task, **kwargs) -> Context:
+        """
+        Build the context for the final.
+        Args:
+            system_prompt: The system prompt of the harness.
+            task: The task for the step.
+            **kwargs: Additional keyword arguments.
+        Returns:
+            The execution messages, a closing instruction, and no callable tools.
+        """
+        ...
 
 
 def build_history_message(llm_output: LLMOutput) -> Message:
@@ -82,10 +98,14 @@ def build_tool_messages(result: ToolCallResult) -> list[Message]:
             )
         )
     for item in result.failed_tools:
+        if item.output is not None:
+            content = str(item.output)
+        else:
+            content = item.fail_reason.value if item.fail_reason else ""
         messages.append(
             Message(
                 role=ROLE_TOOL,
-                content=item.fail_reason.value if item.fail_reason else "",
+                content=content,
                 tool_call_id=item.tool_id,
                 name=item.tool_name,
             )

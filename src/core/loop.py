@@ -1,11 +1,9 @@
 """Run a task by planning once, then alternating model calls and tool calls."""
 
-import json
 import time
 import uuid
 
-from pydantic import ValidationError
-
+from src.schema.harness import StepResult
 from src.core.context import (
     ContextBuilder,
     ContextBuilderError,
@@ -18,12 +16,18 @@ from src.core.llm import LlmCallError, LlmGateway
 from src.core.task import Task
 from src.core.tool import ToolExecutor
 from src.schema.context import Context
-from src.schema.event import Event, EventType, LlmEventPayload, TaskEventPayload
+from src.schema.event import Event, EventType, LlmEventPayload, TaskEventPayload, ToolEventPayload
 from src.schema.hook import HarnessHook
-from src.schema.llm import FinishReason, LLMOutput, LlmToolCall, is_transient_llm_error
+from src.schema.llm import (
+    FinishReason,
+    LLMOutput,
+    LlmToolCall,
+    assemble_llm_stream,
+    is_transient_llm_error,
+)
 from src.schema.skills import Skill
-from src.schema.task import TaskFailReason, TaskPlan, TaskResult, TaskRunningReason
-from src.schema.tool import Tool, ToolCallResult
+from src.schema.task import TaskFailReason, TaskPauseReason, TaskPlan, TaskResult, TaskRunningReason
+from src.schema.tool import Tool, ToolCallResult, ToolExecutionResult
 
 DEFAULT_MAX_STEPS = 10
 DEFAULT_MAX_SECONDS = 60 * 30
@@ -58,9 +62,9 @@ class Harness:
         self.harness_hooks = harness_hooks
         self.harness_guard = harness_guard
         self.event_handler = event_handler or EventHandler()
-        self.tool_executor.event_handler = self.event_handler
         self._max_steps = max_steps
         self._max_seconds = max_seconds
+        self._length_continuations = 0
 
     def _emit_task_event(
         self,
@@ -87,22 +91,75 @@ class Harness:
                 step_id=step_id,
             )
         )
-
-    def _emit_llm_retry_event(self, task: Task, phase: str, attempt: int, error: Exception) -> None:
-        event_id = str(uuid.uuid4())
+    
+    def _emit_tool_event(
+        self,
+        event_type: EventType,
+        task: Task,
+        call: LlmToolCall,
+        result=None,
+    ) -> None:
+        reason = None
+        content = None
+        name = call.name
+        tool_call_id = call.id
+        if result is not None:
+            name = result.tool_name or call.name
+            tool_call_id = result.tool_id or call.id
+            reason = result.fail_reason.value if result.fail_reason else None
+            content = None if result.output is None else str(result.output)
         self.event_handler.emit(
             Event(
-                id=event_id,
-                type=EventType.LLM_RETRYING,
-                payload=LlmEventPayload(
-                    llm_id=event_id,
-                    reason=type(error).__name__,
-                    attempt=attempt,
-                    phase=phase,
+                id=str(uuid.uuid4()),
+                type=event_type,
+                payload=ToolEventPayload(
+                    tool_call_id=tool_call_id,
+                    name=name,
+                    arguments=call.arguments or None,
+                    reason=reason,
+                    content=content,
                 ),
                 task_id=str(task.id),
             )
         )
+
+    def _emit_llm_event(
+        self,
+        task: Task,
+        event_type: EventType,
+        *,
+        phase: str,
+        reason: str | None = None,
+        attempt: int | None = None,
+        content: str | None = None,
+        usage=None,
+    ) -> None:
+        self.event_handler.emit(
+            Event(
+                id=str(uuid.uuid4()),
+                type=event_type,
+                payload=LlmEventPayload(
+                    reason=reason,
+                    usage=usage,
+                    attempt=attempt,
+                    phase=phase,
+                    content=content,
+                ),
+                task_id=str(task.id),
+            )
+        )
+
+    def _emit_answer(self, task: Task, output: LLMOutput, parts: list[str]) -> None:
+        if output.requests_tool_calls():
+            return
+        for part in parts:
+            if part:
+                self._emit_llm_event(
+                    task,
+                    EventType.LLM_DELTA,
+                    phase="infer",
+                    content=part,
+                )
 
     def guard_input(self, task: Task) -> None:
         """
@@ -110,21 +167,10 @@ class Harness:
         Args:
             task: The task whose original input is checked.
         Raises:
-            GuardError: The input tries to override the harness. The task is already failed.
+            GuardError: The input tries to override the harness.
         """
-        try:
-            if self.harness_guard is not None:
-                self.harness_guard.guard_input(task)
-        except GuardError:
-            if not task.is_failed():
-                task.transition_to_failed(TaskFailReason.TASK_FAILED_GUARD_ERROR)
-            self._emit_task_event(
-                EventType.TASK_FAILED,
-                task,
-                reason=TaskFailReason.TASK_FAILED_GUARD_ERROR.value,
-                content="input rejected",
-            )
-            raise
+        if self.harness_guard is not None:
+            self.harness_guard.guard_input(task)
 
     def build_planning_context(self, task: Task) -> Context:
         """
@@ -134,16 +180,16 @@ class Harness:
         Returns:
             The planning context.
         Raises:
-            ContextBuilderError: The builder failed. The task is already failed.
+            ContextBuilderError: The builder failed.
         """
         try:
             return self.context_builder.build_planning_context(
                 self.system_prompt, task, tools=self.tools
             )
-        except Exception:
-            if not task.is_failed():
-                task.transition_to_failed(TaskFailReason.TASK_FAILED_CONTEXT_BUILD_ERROR)
+        except ContextBuilderError:
             raise
+        except Exception as error:
+            raise ContextBuilderError(str(error)) from error
 
     def planning(self, context: Context, task: Task) -> TaskPlan:
         """
@@ -158,6 +204,7 @@ class Harness:
                 or the retries ran out. Invalid structured output is retried.
         """
         for attempt in range(1, DEFAULT_MAX_LLM_ATTEMPTS + 1):
+            self._emit_llm_event(task, EventType.LLM_STARTED, phase="planning")
             try:
                 output = self.llm_gateway.planning(context, stream=False, response_format=TaskPlan)
                 if not isinstance(output, LLMOutput):
@@ -166,15 +213,27 @@ class Harness:
                 if not isinstance(output.structured, TaskPlan):
                     raise LlmCallError("planning did not return a task plan")
 
+                self._emit_llm_event(
+                    task,
+                    EventType.LLM_COMPLETED,
+                    phase="planning",
+                    usage=output.usage,
+                )
                 return output.structured
 
             except LlmCallError:
                 raise
 
             except Exception as error:
-                if attempt == DEFAULT_MAX_LLM_ATTEMPTS or not _can_retry_planning(error):
+                if attempt == DEFAULT_MAX_LLM_ATTEMPTS or not is_transient_llm_error(error):
                     raise LlmCallError(str(error)) from error
-                self._emit_llm_retry_event(task, "planning", attempt, error)
+                self._emit_llm_event(
+                    task,
+                    EventType.LLM_RETRYING,
+                    phase="planning",
+                    reason=type(error).__name__,
+                    attempt=attempt,
+                )
                 time.sleep(DEFAULT_LLM_ATTEMPT_DELAY_SECONDS)
 
     def build_infer_context(self, task: Task) -> Context:
@@ -185,16 +244,16 @@ class Harness:
         Returns:
             The inference context.
         Raises:
-            ContextBuilderError: The builder failed. The task is already failed.
+            ContextBuilderError: The builder failed.
         """
         try:
             return self.context_builder.build_infer_context(
                 self.system_prompt, task, self.tools, self.skills
             )
-        except Exception:
-            if not task.is_failed():
-                task.transition_to_failed(TaskFailReason.TASK_FAILED_CONTEXT_BUILD_ERROR)
+        except ContextBuilderError:
             raise
+        except Exception as error:
+            raise ContextBuilderError(str(error)) from error
 
     def infer(self, context: Context, task: Task) -> LLMOutput:
         """
@@ -208,6 +267,7 @@ class Harness:
             LlmCallError: The model call failed with a permanent error, or the retries ran out.
         """
         for attempt in range(1, DEFAULT_MAX_LLM_ATTEMPTS + 1):
+            self._emit_llm_event(task, EventType.LLM_STARTED, phase="infer")
             try:
                 produced = self.llm_gateway.infer(context, stream=True)
                 output = self._read_inference(task, produced)
@@ -219,73 +279,33 @@ class Harness:
             except Exception as error:
                 if attempt == DEFAULT_MAX_LLM_ATTEMPTS or not is_transient_llm_error(error):
                     raise LlmCallError(str(error)) from error
-                self._emit_llm_retry_event(task, "infer", attempt, error)
+                self._emit_llm_event(
+                    task,
+                    EventType.LLM_RETRYING,
+                    phase="infer",
+                    reason=type(error).__name__,
+                    attempt=attempt,
+                )
                 time.sleep(DEFAULT_LLM_ATTEMPT_DELAY_SECONDS)
 
         if not isinstance(output, LLMOutput):
             raise LlmCallError("infer did not return a complete model output")
 
+        self._emit_llm_event(
+            task, EventType.LLM_COMPLETED, phase="infer", usage=output.usage
+        )
         return output
 
     def _read_inference(self, task: Task, produced) -> LLMOutput:
         if isinstance(produced, LLMOutput):
             self._emit_answer(task, produced, [produced.content] if produced.content else [])
             return produced
-        return self._consume_llm_stream(task, produced)
-
-    def _consume_llm_stream(self, task: Task, pieces) -> LLMOutput:
-        text: list[str] = []
-        calls: list[LlmToolCall] = []
-        finish_reason = None
-        usage = None
-        reasoning = None
-        thinking = None
-        structured = None
-        for piece in pieces:
-            if not isinstance(piece, LLMOutput):
-                raise LlmCallError("infer did not return a model output")
-            if piece.content:
-                text.append(piece.content)
-            _merge_tool_calls(calls, piece.tool_calls)
-            if piece.finish_reason is not None:
-                finish_reason = piece.finish_reason
-            if piece.usage is not None:
-                usage = piece.usage
-            if piece.reasoning_content:
-                reasoning = piece.reasoning_content
-            if piece.thinking_blocks:
-                thinking = piece.thinking_blocks
-            if piece.structured is not None:
-                structured = piece.structured
-        output = LLMOutput(
-            finish_reason,
-            "".join(text) or None,
-            calls,
-            reasoning,
-            thinking,
-            usage,
-        )
-        output.structured = structured
-        self._emit_answer(task, output, text)
+        try:
+            output, parts = assemble_llm_stream(produced)
+        except TypeError as error:
+            raise LlmCallError(str(error)) from error
+        self._emit_answer(task, output, parts)
         return output
-
-    def _emit_answer(self, task: Task, output: LLMOutput, parts: list[str]) -> None:
-        if output.requests_tool_calls():
-            return
-        for part in parts:
-            if part:
-                self._emit_llm_delta(task, part)
-
-    def _emit_llm_delta(self, task: Task, content: str) -> None:
-        event_id = str(uuid.uuid4())
-        self.event_handler.emit(
-            Event(
-                id=event_id,
-                type=EventType.LLM_DELTA,
-                payload=LlmEventPayload(llm_id=event_id, content=content, phase="infer"),
-                task_id=str(task.id),
-            )
-        )
 
     def _requests_tool_calls(self, llm_output: LLMOutput) -> bool:
         """
@@ -307,9 +327,26 @@ class Harness:
             Completed, failed, and pending tool executions.
         """
 
-        return self.tool_executor.execute_tool_calls(list(tool_calls), task_id=str(task.id))
+        pending_tools = []
+        completed_tools = []
+        failed_tools = []
 
-    def step(self, task: Task) -> LLMOutput:
+        for call in tool_calls:
+            self._emit_tool_event(EventType.TOOL_EXECUTION_STARTED, task, call)
+
+            result: ToolExecutionResult = self.tool_executor.execute_tool_call(call)
+            if result.is_completed():
+                completed_tools.append(result)
+                self._emit_tool_event(EventType.TOOL_EXECUTION_COMPLETED, task, call, result)
+            elif result.is_failed():
+                failed_tools.append(result)
+                self._emit_tool_event(EventType.TOOL_EXECUTION_FAILED, task, call, result)
+            else:
+                pending_tools.append(result)
+
+        return ToolCallResult(pending_tools=pending_tools, completed_tools=completed_tools, failed_tools=failed_tools)
+
+    def step(self, task: Task) -> StepResult:
         """
         Build the context, run one inference, and execute any requested tool calls.
         Args:
@@ -320,94 +357,180 @@ class Harness:
         """
         context = self.build_infer_context(task)
 
-        if self.harness_hooks.before_think:
-            self.harness_hooks.before_think(task=task, context=context)
+        self.harness_hooks.before_think(task=task, context=context)
         output: LLMOutput = self.infer(context, task)
-        if self.harness_hooks.after_think:
-            self.harness_hooks.after_think(task=task, output=output)
+        self.harness_hooks.after_think(task=task, output=output)
 
-        task.add_history_message(build_history_message(output))
+        task.add_history_messages([build_history_message(output)])
+        
         if not self._requests_tool_calls(output):
-            return output
+            return StepResult(llm_output=output)
 
-        if self.harness_hooks.before_execute_tool_calls:
-            self.harness_hooks.before_execute_tool_calls(task=task, output=output)
+        self.harness_hooks.before_execute_tool_calls(task=task, output=output)
         result: ToolCallResult = self.execute_tool_calls(output.tool_calls, task)
-        if self.harness_hooks.after_execute_tool_calls:
-            self.harness_hooks.after_execute_tool_calls(task=task, result=result)
+        self.harness_hooks.after_execute_tool_calls(task=task, result=result)
 
-        messages = build_tool_messages(result)
-        for message in messages:
-            task.add_history_message(message)
+        task.add_history_messages(build_tool_messages(result))
 
-        if result.pending_tools:
-            task.set_pending_tool_calls(result.pending_tools)
+        return StepResult(llm_output=output, tool_call_result=result)
 
-        return output
+    def build_final_context(self, task: Task) -> Context:
+        """
+        Build one closing model call from the current transcript.
+        Args:
+            task: The task being closed. Its history is left unchanged.
+        Returns:
+            The inference messages plus a closing instruction, and no tools.
+        Raises:
+            ContextBuilderError: The builder failed.
+        """
+        try:
+            return self.context_builder.build_final_context(
+                self.system_prompt, task, tools=self.tools, skills=self.skills
+            )
+        except ContextBuilderError:
+            raise
+        except Exception as error:
+            raise ContextBuilderError(str(error)) from error
 
-    def turn(self, task: Task) -> TaskResult:
-        started = time.monotonic()
-        step_count = 0
-        while True:
-            if time.monotonic() - started > self._max_seconds:
-                task.transition_to_failed(TaskFailReason.TASK_FAILED_TIMEOUT)
-                self._emit_task_event(
-                    EventType.TASK_FAILED,
-                    task,
-                    reason=TaskFailReason.TASK_FAILED_TIMEOUT.value,
-                    content="task timed out",
-                    step_id=str(step_count),
-                )
-                return task.result
+    def finalize(self, task: Task) -> str:
+        """
+        Close a turn that stopped before a normal answer.
+        Args:
+            context: The final context.
+        Returns:
+            The final result.
+        """
+        final_context = self.build_final_context(task)
+        output = self.infer(final_context, task)
+        return output.content or ""
 
-            if step_count >= self._max_steps:
-                task.transition_to_failed(TaskFailReason.TASK_FAILED_MAX_STEPS)
-                self._emit_task_event(
-                    EventType.TASK_FAILED,
-                    task,
-                    reason=TaskFailReason.TASK_FAILED_MAX_STEPS.value,
-                    content="step limit reached",
-                    step_id=str(step_count),
-                )
-                return task.result
+    def _blocked(self, step_result: StepResult) -> (bool, TaskPauseReason):
+        """
+        Check if the turn is blocked.
+        Args:
+            step_result: The one step result of the turn.
+        Returns:
+            True if the turn is blocked, False otherwise. And the reason of the blocked.
+        """
+        if step_result.tool_call_result.pending_tools:
+            return True, TaskPauseReason.TASK_PAUSED_WAITING_APPROVAL
+        return False, None
 
-            output: LLMOutput = self.step(task)
+    def _failed(self, start_time: float, step_count: int) -> (bool, TaskFailReason):
+        """
+        Check if the turn is failed.
+        Args:
+            start_time: The time when the turn started.
+            step_count: The number of steps in the turn.
+        Returns:
+            True if the turn is failed, False otherwise. And the reason of the failed.
+        """
+        if time.monotonic() - start_time > self._max_seconds:
+            return True, TaskFailReason.TASK_FAILED_TIMEOUT
+        if step_count >= self._max_steps:
+            return True, TaskFailReason.TASK_FAILED_MAX_STEPS
+        return False, None
 
-            if task.is_paused():
-                reason = task.state_reason.value if task.state_reason else None
-                self._emit_task_event(
-                    EventType.TASK_PAUSED,
-                    task,
-                    reason=reason,
-                    step_id=str(step_count),
-                )
-                return TaskResult()
+    def _completed(self, step_result: StepResult) -> bool:
+        """
+        Check if the turn is completed.
+        Args:
+            step_result: The one step result of the turn.
+        Returns:
+            True if the turn is completed, False otherwise.
+        """
+        return step_result.llm_output.finish_reason == FinishReason.STOP
 
-            if output.finish_reason == FinishReason.STOP:
-                result = TaskResult(output.content or "")
-                task.set_result(result)
-                task.transition_to_completed()
-                self._emit_task_event(
-                    EventType.TASK_COMPLETED,
-                    task,
-                    content=result.output,
-                    step_id=str(step_count),
-                )
-                return result
-
-            if self._requests_tool_calls(output):
-                step_count += 1
-                continue
-
-            task.transition_to_failed(TaskFailReason.TASK_FAILED_LLM_ERROR)
+    def _handle_blocked_turn(self, task: Task, step_result: StepResult, step_count: int, blocked_reason: TaskPauseReason) -> TaskResult:
+        """
+        Handle a blocked turn.
+        Args:
+            task: The task being executed.
+            step_result: The one step result of the turn.
+            step_count: The number of steps in the turn.
+            blocked_reason: The reason of the blocked.
+        Returns:
+            The task result.
+        """
+        if blocked_reason == TaskPauseReason.TASK_PAUSED_WAITING_APPROVAL:
+            task.set_pending_tool_calls(step_result.tool_call_result.pending_tools)
+            task.transition_to_paused(blocked_reason)
             self._emit_task_event(
-                EventType.TASK_FAILED,
+                EventType.TASK_PAUSED,
                 task,
-                reason=TaskFailReason.TASK_FAILED_LLM_ERROR.value,
-                content="model stopped without an answer",
+                reason=TaskPauseReason.TASK_PAUSED_WAITING_APPROVAL.value,
                 step_id=str(step_count),
             )
-            return task.result
+        
+        final_output = self.finalize(task)
+        return TaskResult(output=final_output)
+
+    def _handle_failed_turn(
+        self, task: Task, step_count: int, failed_reason: TaskFailReason
+    ) -> TaskResult:
+        """
+        Handle a failed turn.
+        Args:
+            task: The task being executed.
+            step_count: The number of steps in the turn.
+            failed_reason: The reason of the failed.
+        Returns:
+            The task result.
+        """
+        task.transition_to_failed(failed_reason)
+        self._emit_task_event(
+            EventType.TASK_FAILED,
+            task,
+            reason=failed_reason.value,
+            step_id=str(step_count),
+        )
+        final_output = self.finalize(task)
+        return TaskResult(output=final_output)
+
+    def _handle_completed_turn(self, task: Task, step_result: StepResult, step_count: int) -> TaskResult:
+        """
+        Handle a completed turn.
+        Args:
+            task: The task being executed.
+            step_result: The one step result of the turn.
+            step_count: The number of steps in the turn.
+        Returns:
+            The task result.
+        """
+        result = TaskResult(output=step_result.llm_output.content)
+
+        task.set_result(result)
+        task.transition_to_completed()
+        self._emit_task_event(EventType.TASK_COMPLETED, task, content=result.output, step_id=str(step_count))
+
+        return result
+
+    def turn(self, task: Task) -> TaskResult:
+        """
+        Infer and execute tools until the model answers or a limit is hit.
+        Args:
+            task: The task being executed.
+        Returns:
+            The task result. A completed task carries the assistant text. A paused or
+            failed task carries the result recorded while closing the turn.
+        """
+        start_time = time.monotonic()
+        step_count = 0
+        while True:
+            step_result: StepResult = self.step(task)
+            step_count += 1
+
+            blocked, blocked_reason = self._blocked(step_result)
+            if blocked:
+                return self._handle_blocked_turn(task, step_result, step_count, blocked_reason)
+
+            failed, failed_reason = self._failed(start_time, step_count)
+            if failed:
+                return self._handle_failed_turn(task, step_count, failed_reason)
+
+            if self._completed(step_result):
+                return self._handle_completed_turn(task, step_result, step_count)
 
     def run(self, task: Task) -> TaskResult:
         """
@@ -427,8 +550,8 @@ class Harness:
             if task.is_created():
                 task.transition_to_running(TaskRunningReason.TASK_RUNNING_CREATE)
                 self.guard_input(task)
-                self._emit_task_event(EventType.TASK_PLANNING, task)
 
+                self._emit_task_event(EventType.TASK_PLANNING, task)
                 task.set_plan(self.planning(self.build_planning_context(task), task))
                 self._emit_task_event(EventType.TASK_PLANNED, task, goal=list(task.plan.goal))
 
@@ -439,15 +562,14 @@ class Harness:
             result = self.turn(task)
             return result
 
-        except GuardError:
-            raise
-
         except Exception as error:
             if not task.is_failed():
-                if isinstance(error, LlmCallError):
-                    reason = TaskFailReason.TASK_FAILED_LLM_ERROR
+                if isinstance(error, GuardError):
+                    reason = TaskFailReason.TASK_FAILED_GUARD_ERROR
                 elif isinstance(error, ContextBuilderError):
                     reason = TaskFailReason.TASK_FAILED_CONTEXT_BUILD_ERROR
+                elif isinstance(error, LlmCallError):
+                    reason = TaskFailReason.TASK_FAILED_LLM_ERROR
                 else:
                     reason = TaskFailReason.TASK_FAILED_UNKNOWN
                 task.transition_to_failed(reason)
@@ -459,21 +581,4 @@ class Harness:
                 reason=fail_reason,
                 content=str(error),
             )
-            raise
-
-
-def _can_retry_planning(error: Exception) -> bool:
-    return is_transient_llm_error(error) or isinstance(
-        error, (ValidationError, json.JSONDecodeError)
-    )
-
-
-def _merge_tool_calls(calls: list[LlmToolCall], deltas: list[LlmToolCall]) -> None:
-    for delta in deltas:
-        if delta.id or not calls:
-            calls.append(LlmToolCall(delta.id, delta.name, delta.arguments))
-            continue
-        current = calls[-1]
-        if delta.name and not current.name:
-            current.name = delta.name
-        current.arguments += delta.arguments
+            return TaskResult(output=f"An unexpected error occurred: {str(error)}")

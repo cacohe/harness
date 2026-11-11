@@ -3,6 +3,8 @@ from __future__ import annotations
 import uuid
 from typing import FrozenSet, Optional
 
+from pydantic import Field
+
 from src.schema.context import Message
 from src.schema.task import (
     TaskFailReason,
@@ -27,7 +29,7 @@ class Task:
     """A task to be executed by the harness."""
 
     TRANSITIONS: dict[TaskState, FrozenSet[TaskState]] = {
-        TaskState.TASK_CREATED: frozenset([TaskState.TASK_RUNNING]),
+        TaskState.TASK_CREATED: frozenset([TaskState.TASK_RUNNING, TaskState.TASK_FAILED]),
         TaskState.TASK_RUNNING: frozenset(
             [TaskState.TASK_PAUSED, TaskState.TASK_FAILED, TaskState.TASK_COMPLETED]
         ),
@@ -43,7 +45,7 @@ class Task:
         state: TaskState = TaskState.TASK_CREATED,
         state_reason: TaskStateReason = None,
         plan: TaskPlan = None,
-        history: list = [],
+        history: list[Message] = [],
         pending_tool_calls: list[ToolExecutionResult] = [],
         result: TaskResult = None,
     ):
@@ -178,13 +180,13 @@ class Task:
         self.plan = plan
         self.persist()
 
-    def add_history_message(self, message: Message) -> None:
+    def add_history_messages(self, messages: list[Message]) -> None:
         """
         Add a message to the task history.
         Args:
             message: The message to add to the task history.
         """
-        self.history.append(message)
+        self.history.extend(messages)
         self.persist()
 
     def set_pending_tool_calls(self, pending_tool_calls: list[ToolExecutionResult]) -> None:

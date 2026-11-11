@@ -74,13 +74,19 @@ class EventHandler:
         """Emit the event to the client."""
         if self.client_emitter is None:
             return
-        self.client_emitter(event)
+        try:
+            self.client_emitter(event)
+        except Exception:
+            return
 
     def emit_tracing(self, event: Event) -> None:
         """Emit the event to the tracing."""
         if self.tracing_emitter is None:
             return
-        self.tracing_emitter(event)
+        try:
+            self.tracing_emitter(event)
+        except Exception:
+            return
 
     def emit(self, event: Event, channel: EventChannel = EventChannel.CLIENT) -> None:
         """Emit the event to the specified channel."""
