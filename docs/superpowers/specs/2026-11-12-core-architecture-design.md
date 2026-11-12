@@ -29,7 +29,7 @@ Agent (composition root)
        -> LlmGateway / ContextBuilder
        -> ToolExecutor
             -> ToolCatalog / ToolRunner / ApprovalPolicy / SandboxRunner
-       -> TaskRepository / HarnessGuard / EventHandler
+       -> TaskRepository / HarnessGuard / EventSink
 ```
 
 纯依赖注入契约使用 `Protocol`；只有共享模板算法且必须禁止直接实例化时才使用 `ABC`。
@@ -38,12 +38,13 @@ Agent (composition root)
 
 ## Compatibility
 
-- 现有公开导入在本次改造中尽量保留；新端口可从现有模块重新导出。
-- `DefaultToolExecutor` 在迁移期保留名称，但内部委托给新的核心 `ToolExecutor`。
-- 先稳定行为和契约，再做必要的文件移动；不进行纯粹为了目录美观的改名。
+- `DefaultToolExecutor` 保留名称，但内部委托给核心 `ToolExecutor`。
+- 0.1.0 架构收尾删除了 `ToolRegistry`、`Sandbox` 和 `src.schema.hook` 兼容导出；
+  调用方直接使用 `ToolCatalog`、`SandboxRunner` 和 `src.core.hook`。
+- 不进行纯粹为了目录美观的改名。
 
 ## Verification
 
 - 每个行为变化都遵循测试先行，先观察失败再实现。
-- 完整验证包括 `pytest`、`ruff`，并为核心模块增加静态类型检查。
+- 完整验证包括 `pytest`、`ruff` 和覆盖整个 `src` 的 `mypy` 检查。
 - 工具执行重点覆盖未知工具、错误参数、审批、拒绝、沙箱和执行异常。

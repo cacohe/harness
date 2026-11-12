@@ -73,7 +73,7 @@ harness = Harness(
 )
 ```
 
-`LlmGateway`、`ContextBuilder`、`ToolCatalog`、`ToolRunner`、`ApprovalPolicy`、
+`LlmGateway`、`ContextBuilder`、`EventSink`、`ToolCatalog`、`ToolRunner`、`ApprovalPolicy`、
 `SandboxRunner`、`MemoryStore`、`MemoryRetriever`、`TaskRepository` 和
 `HarnessGuard` 使用 `Protocol` 描述。自定义实现只需满足方法签名，不必继承这些类型。
 
