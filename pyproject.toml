@@ -7,7 +7,7 @@ readme = "README.md"
 dependencies = ["fastmcp>=2.4", "litellm", "pydantic>=2"]
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.8"]
+dev = ["mypy>=1.15", "pytest>=8", "ruff>=0.8"]
 
 [tool.uv]
 package = false
@@ -15,6 +15,12 @@ default-groups = ["dev"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+no_implicit_optional = true
+warn_unused_ignores = true
 
 [tool.ruff]
 target-version = "py311"

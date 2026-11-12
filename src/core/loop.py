@@ -2,6 +2,7 @@
 
 import time
 import uuid
+from typing import cast
 
 from src.core.context import (
     ContextBuilder,
@@ -253,6 +254,7 @@ class Harness:
                     attempt=attempt,
                 )
                 time.sleep(DEFAULT_LLM_ATTEMPT_DELAY_SECONDS)
+        raise LlmCallError("planning retries exhausted")
 
     def build_infer_context(self, task: Task) -> Context:
         """
@@ -416,7 +418,7 @@ class Harness:
         output = self.infer(final_context, task)
         return output.content or ""
 
-    def _blocked(self, step_result: StepResult) -> (bool, TaskPauseReason):
+    def _blocked(self, step_result: StepResult) -> tuple[bool, TaskPauseReason | None]:
         """
         Check if the turn is blocked.
         Args:
@@ -428,7 +430,7 @@ class Harness:
             return True, TaskPauseReason.TASK_PAUSED_WAITING_APPROVAL
         return False, None
 
-    def _failed(self, start_time: float, step_count: int) -> (bool, TaskFailReason):
+    def _failed(self, start_time: float, step_count: int) -> tuple[bool, TaskFailReason | None]:
         """
         Check if the turn is failed.
         Args:
@@ -513,7 +515,7 @@ class Harness:
         Returns:
             The task result.
         """
-        result = TaskResult(output=step_result.llm_output.content)
+        result = TaskResult(output=step_result.llm_output.content or "")
 
         task.set_result(result)
         task.transition_to_completed()
@@ -541,11 +543,13 @@ class Harness:
 
             blocked, blocked_reason = self._blocked(step_result)
             if blocked:
+                assert blocked_reason is not None
                 task.set_progress(step_count, time.monotonic() - start_time)
                 return self._handle_blocked_turn(task, step_result, step_count, blocked_reason)
 
             failed, failed_reason = self._failed(start_time, step_count)
             if failed:
+                assert failed_reason is not None
                 return self._handle_failed_turn(task, step_count, failed_reason)
 
             if self._completed(step_result):
@@ -566,7 +570,7 @@ class Harness:
         try:
             if task.is_finished():
                 self._emit_task_event(EventType.TASK_FINISHED, task)
-                return task.result
+                return cast(TaskResult, task.result)
 
             self._emit_task_event(EventType.TASK_STARTED, task)
 
@@ -576,10 +580,11 @@ class Harness:
                 self.guard_input(task)
 
                 self._emit_task_event(EventType.TASK_PLANNING, task)
-                task.set_plan(self.planning(self.build_planning_context(task), task))
+                plan = self.planning(self.build_planning_context(task), task)
+                task.set_plan(plan)
                 self._save_task(task)
-                self._emit_task_event(EventType.TASK_PLANNED, task, goal=list(task.plan.goal))
-                question = (task.plan.clarification or "").strip()
+                self._emit_task_event(EventType.TASK_PLANNED, task, goal=list(plan.goal))
+                question = (plan.clarification or "").strip()
                 if question:
                     return self._ask_clarification(task, question)
 

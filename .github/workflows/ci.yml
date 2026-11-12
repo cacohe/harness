@@ -29,5 +29,8 @@ jobs:
       - name: Check lint
         run: uv run --locked ruff check .
 
+      - name: Check types
+        run: uv run --locked mypy src
+
       - name: Run tests
         run: uv run --locked python -m pytest

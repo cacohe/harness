@@ -80,6 +80,15 @@ harness = Harness(
 `Harness`、`Task`、`ToolExecutor` 和 `MemoryManager` 是核心具体类；扩展行为应优先通过
 注入端口、hook 和策略完成，而不是继承并覆盖主循环。
 
+## 验证
+
+```powershell
+uv run --locked ruff format --check src tests
+uv run --locked ruff check --no-cache src tests
+uv run --locked mypy src
+uv run --locked python -m pytest -q -p no:cacheprovider
+```
+
 ## 启动
 
 在仓库根目录启动交互式 CLI。它会读取当前目录的配置，然后等待输入；每一行发给 agent，回答打印在下一行。

@@ -7,6 +7,7 @@ from src.core.context import (
 from src.core.task import Task
 from src.schema.context import Context, Message
 from src.schema.skills import Skill
+from src.schema.task import TaskPlan
 from src.schema.tool import Tool
 
 
@@ -138,7 +139,7 @@ def _format_skills(skills) -> str:
 
 def _plan_message(task: Task) -> Message | None:
     plan = task.plan
-    if not _plan_has_work(plan):
+    if plan is None or not _plan_has_work(plan):
         return None
     lines = [f"Goal: {plan.goal}"]
     if not task.history:
@@ -152,5 +153,5 @@ def _plan_message(task: Task) -> Message | None:
     return Message(role="user", content="\n".join(lines))
 
 
-def _plan_has_work(plan) -> bool:
+def _plan_has_work(plan: TaskPlan) -> bool:
     return bool(plan.goal or plan.current or plan.remaining or plan.completed)

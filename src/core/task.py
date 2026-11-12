@@ -42,7 +42,7 @@ class Task:
         original_input: str,
         id: str | None = None,
         state: TaskState = TaskState.TASK_CREATED,
-        state_reason: TaskStateReason = None,
+        state_reason: TaskStateReason | None = None,
         plan: TaskPlan | None = None,
         history: list[Message] | None = None,
         pending_tool_calls: list[ToolExecutionResult] | None = None,
