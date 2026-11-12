@@ -144,7 +144,7 @@ def ask_yes_no(input_fn, output_fn) -> bool | None:
         output_fn("Enter y or n.")
 
 
-def format_turn(task: Task) -> str:
+def format_turn(task: Task) -> str | None:
     """
     Render a turn that the event stream did not already show.
     Args:

@@ -1,6 +1,6 @@
 # Core Architecture Refactor Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** 修复实例共享和空实现风险，并把 harness 整理为核心编排依赖稳定端口、`Agent` 注入默认适配器的结构。
 
@@ -41,11 +41,11 @@
 **Interfaces:**
 - Produces: 独立的 `Task` 状态、独立的 `DefaultToolRegistry`、按实例创建的 hook/guard。
 
-- [ ] 写回归测试并确认在远程基线上因共享 ID、共享列表、共享 registry 或默认对象而失败。
-- [ ] 用 `None`/实例初始化修复默认值，并让 `Task.to_dict()` 支持空计划。
-- [ ] 删除 `Agent` 对 `registry.tools = {}` 的补丁式重置。
-- [ ] 运行目标测试和完整测试套件。
-- [ ] 提交 `fix: isolate harness runtime state`。
+- [x] 写回归测试并确认在远程基线上因共享 ID、共享列表、共享 registry 或默认对象而失败。
+- [x] 用 `None`/实例初始化修复默认值，并让 `Task.to_dict()` 支持空计划。
+- [x] 删除 `Agent` 对 `registry.tools = {}` 的补丁式重置。
+- [x] 运行目标测试和完整测试套件。
+- [x] 提交 `fix: isolate harness runtime state`。
 
 ### Task 2: 将纯扩展边界统一为 Protocol
 
@@ -64,11 +64,11 @@
 **Interfaces:**
 - Produces: `ContextBuilder`、`LlmGateway`、`HarnessGuard`、`MemoryStore`、`MemoryRetriever` 结构化端口；`NoOpGuard` 默认策略。
 
-- [ ] 写测试证明不显式继承的对象也能注入，并确认当前 ABC/具体 guard 结构不满足目标。
-- [ ] 将纯端口改为 `Protocol`，删除无意义的空构造函数和显式继承。
-- [ ] 让 `MemoryManager` 的 store/retriever 成为必需依赖并覆盖缺失依赖场景。
-- [ ] 运行目标测试和完整测试套件。
-- [ ] 提交 `refactor: define core dependency ports`。
+- [x] 写测试证明不显式继承的对象也能注入，并确认当前 ABC/具体 guard 结构不满足目标。
+- [x] 将纯端口改为 `Protocol`，删除无意义的空构造函数和显式继承。
+- [x] 让 `MemoryManager` 的 store/retriever 成为必需依赖并覆盖缺失依赖场景。
+- [x] 运行目标测试和完整测试套件。
+- [x] 提交 `refactor: define core dependency ports`。
 
 ### Task 3: 重构工具执行边界
 
@@ -85,11 +85,11 @@
 - Produces: `ToolCatalog`、`ToolRunner`、`ApprovalPolicy`、`SandboxRunner` Protocol；具体核心 `ToolExecutor`。
 - Compatibility: `ToolRegistry` 和 `DefaultToolExecutor` 保留兼容名称。
 
-- [ ] 分别为未知工具、错误 JSON、异常、审批、拒绝和沙箱路径写失败测试。
-- [ ] 实现端口和唯一的工具执行编排路径，删除 bool/Enum、Tool/id 和沙箱签名冲突。
-- [ ] 让 `Harness` 委托批量执行，不再复制结果分类算法，并从 catalog 动态获得工具。
-- [ ] 运行目标测试和完整测试套件。
-- [ ] 提交 `refactor: separate tool execution ports`。
+- [x] 分别为未知工具、错误 JSON、异常、审批、拒绝和沙箱路径写失败测试。
+- [x] 实现端口和唯一的工具执行编排路径，删除 bool/Enum、Tool/id 和沙箱签名冲突。
+- [x] 让 `Harness` 委托批量执行，不再复制结果分类算法，并从 catalog 动态获得工具。
+- [x] 运行目标测试和完整测试套件。
+- [x] 提交 `refactor: separate tool execution ports`。
 
 ### Task 4: 引入真实持久化边界
 
@@ -105,11 +105,11 @@
 **Interfaces:**
 - Produces: `TaskRepository.save(task) -> None`、`TaskRepository.get(task_id) -> Task | None`、`InMemoryTaskRepository`。
 
-- [ ] 写测试证明状态变化由 repository 保存而不是 `Task.persist()` 空调用。
-- [ ] 删除 `Task.persist()`，将保存时机放入 `Harness`。
-- [ ] 用 Protocol 替代可实例化的持久化占位类；删除未使用的通用 kind 分发外观。
-- [ ] 运行目标测试和完整测试套件。
-- [ ] 提交 `refactor: inject task repository`。
+- [x] 写测试证明状态变化由 repository 保存而不是 `Task.persist()` 空调用。
+- [x] 删除 `Task.persist()`，将保存时机放入 `Harness`。
+- [x] 用 Protocol 替代可实例化的持久化占位类；删除未使用的通用 kind 分发外观。
+- [x] 运行目标测试和完整测试套件。
+- [x] 提交 `refactor: inject task repository`。
 
 ### Task 5: 完成 Agent 默认组装和行为对象归位
 
@@ -124,12 +124,12 @@
 **Interfaces:**
 - Produces: `Agent.from_config(config)` 默认组装；`HarnessHook` 从 core 导出；事件失败可通过 logger 观测。
 
-- [ ] 写测试覆盖显式假值依赖、默认组装和事件 emitter 异常日志。
-- [ ] 将 `Agent` 中的默认选择改为显式 `is None`，集中组装端口实现。
-- [ ] 将 hook 行为移出 schema，并保留兼容导出。
-- [ ] 记录 emitter 异常后继续，不改变事件分发的容错语义。
-- [ ] 运行目标测试和完整测试套件。
-- [ ] 提交 `refactor: clarify agent composition root`。
+- [x] 写测试覆盖显式假值依赖、默认组装和事件 emitter 异常日志。
+- [x] 将 `Agent` 中的默认选择改为显式 `is None`，集中组装端口实现。
+- [x] 将 hook 行为移出 schema，并保留兼容导出。
+- [x] 记录 emitter 异常后继续，不改变事件分发的容错语义。
+- [x] 运行目标测试和完整测试套件。
+- [x] 提交 `refactor: clarify agent composition root`。
 
 ### Task 6: 文档、清理与最终验证
 
@@ -141,9 +141,9 @@
 **Interfaces:**
 - Produces: 默认使用和自定义注入示例；无死代码的公共契约。
 
-- [ ] 删除确认未使用的字段、参数和过时兼容实现，保留必要迁移别名。
-- [ ] 更新 README，展示 `Agent.from_config` 与显式 `Harness` 注入。
-- [ ] 运行 `pytest -q -p no:cacheprovider`。
-- [ ] 运行 `ruff check --no-cache src tests` 和格式检查。
-- [ ] 检查 `git diff --check`、分支状态和相对 `origin/main` 的完整 diff。
-- [ ] 提交 `docs: describe harness extension architecture`。
+- [x] 删除确认未使用的字段、参数和过时兼容实现，保留必要迁移别名。
+- [x] 更新 README，展示 `Agent.from_config` 与显式 `Harness` 注入。
+- [x] 运行 `pytest -q -p no:cacheprovider`。
+- [x] 运行 `ruff check --no-cache src tests` 和格式检查。
+- [x] 检查 `git diff --check`、分支状态和相对 `origin/main` 的完整 diff。
+- [x] 提交 `docs: describe harness extension architecture`。

@@ -1,12 +1,19 @@
 import sys
 from dataclasses import asdict
 from datetime import datetime
-from typing import Callable
+from typing import Callable, Protocol, runtime_checkable
 
 from src.logger import get_logger
 from src.schema.event import Event, EventChannel, EventType
 
 logger = get_logger("core.event")
+
+
+@runtime_checkable
+class EventSink(Protocol):
+    """Receive harness events without constraining the concrete transport."""
+
+    def emit(self, event: Event, channel: EventChannel = EventChannel.CLIENT) -> None: ...
 
 
 def _client_line(event: Event) -> str:

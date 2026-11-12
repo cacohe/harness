@@ -1,3 +1,5 @@
+from typing import get_type_hints
+
 import pytest
 from src.context.context_builder import DefaultContextBuilder
 from src.core.context import HELD_TOOL_MESSAGE, PENDING_TOOL_MESSAGE
@@ -81,6 +83,21 @@ class RecordingOutput:
 
     def emit(self, event):
         self.events.append(event)
+
+
+class FalseyEventSink(RecordingOutput):
+    def __bool__(self):
+        return False
+
+
+def test_harness_preserves_falsey_event_sink():
+    sink = FalseyEventSink()
+    harness = _harness(Gateway(), event_handler=sink)
+
+    harness.run(_task())
+
+    assert harness.event_handler is sink
+    assert sink.events
 
 
 def test_harness_default_collaborators_are_isolated():
@@ -372,6 +389,21 @@ def test_paused_task_returns_to_running_without_planning():
     assert gateway.planning_calls == []
     assert task.state is TaskState.TASK_COMPLETED
     assert task.result.output == "bought"
+
+
+def test_run_declares_that_finished_tasks_may_have_no_result():
+    assert get_type_hints(Harness.run)["return"] == TaskResult | None
+
+
+def test_completed_turn_preserves_missing_model_content():
+    gateway = ScriptedGateway([_model(FinishReason.STOP)])
+    task = _task()
+
+    result = _harness(gateway).run(task)
+
+    assert result is not None
+    assert result.output is None
+    assert task.result is result
 
 
 def test_finished_task_returns_its_result():

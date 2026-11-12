@@ -73,12 +73,21 @@ harness = Harness(
 )
 ```
 
-`LlmGateway`、`ContextBuilder`、`ToolCatalog`、`ToolRunner`、`ApprovalPolicy`、
+`LlmGateway`、`ContextBuilder`、`EventSink`、`ToolCatalog`、`ToolRunner`、`ApprovalPolicy`、
 `SandboxRunner`、`MemoryStore`、`MemoryRetriever`、`TaskRepository` 和
 `HarnessGuard` 使用 `Protocol` 描述。自定义实现只需满足方法签名，不必继承这些类型。
 
 `Harness`、`Task`、`ToolExecutor` 和 `MemoryManager` 是核心具体类；扩展行为应优先通过
 注入端口、hook 和策略完成，而不是继承并覆盖主循环。
+
+## 验证
+
+```powershell
+uv run --locked ruff format --check src tests
+uv run --locked ruff check --no-cache src tests
+uv run --locked mypy src
+uv run --locked python -m pytest -q -p no:cacheprovider
+```
 
 ## 启动
 
