@@ -4,7 +4,6 @@ from typing import Any, Iterator
 import litellm
 from pydantic import BaseModel
 
-from src.core.llm import LlmGateway
 from src.schema.context import Context
 from src.schema.llm import ROLE_TOOL, FinishReason, LLMOutput, LlmToolCall, LlmUsage
 from src.schema.tool import Tool
@@ -89,7 +88,7 @@ def _json_example(schema: dict[str, Any], defs: dict[str, Any] | None = None) ->
     return "example"
 
 
-class LiteLLMGateway(LlmGateway):
+class LiteLLMGateway:
     """Call an LLM through LiteLLM and return the fields an agent loop consumes."""
 
     def __init__(

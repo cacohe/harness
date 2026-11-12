@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Callable, Protocol, Sequence, runtime_checkable
 
 from src.schema.memory import MemoryItem, MemoryType
 
 
+@runtime_checkable
 class MemoryStore(Protocol):
     def add(self, item: MemoryItem) -> None: ...
     def update(self, item: MemoryItem) -> None: ...
@@ -13,6 +14,7 @@ class MemoryStore(Protocol):
     def all(self) -> list[MemoryItem]: ...
 
 
+@runtime_checkable
 class MemoryRetriever(Protocol):
     def retrieve(self, query: str, items: Sequence[MemoryItem], top_k: int) -> list[MemoryItem]: ...
 
@@ -22,8 +24,8 @@ class MemoryManager:
 
     def __init__(
         self,
-        store: MemoryStore | None = None,
-        retriever: MemoryRetriever | None = None,
+        store: MemoryStore,
+        retriever: MemoryRetriever,
         embedder: Callable[[str], list[float]] | None = None,
         token_counter: Callable[[str], int] | None = None,
         default_token_budget: int = 2000,

@@ -1,6 +1,3 @@
-class Sandbox:
-    """Sandbox."""
+from src.core.tool import SandboxRunner
 
-    def __init__(self): ...
-
-    def execute(self): ...
+Sandbox = SandboxRunner

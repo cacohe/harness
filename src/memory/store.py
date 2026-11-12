@@ -1,8 +1,7 @@
-from src.core.memory import MemoryStore
 from src.schema.memory import MemoryItem
 
 
-class InMemoryStore(MemoryStore):
+class InMemoryStore:
     def __init__(self) -> None:
         self._items: dict[str, MemoryItem] = {}
 

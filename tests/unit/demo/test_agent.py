@@ -1,3 +1,6 @@
+import importlib
+import importlib.util
+
 from src.config import Config
 from src.demo.agent import Agent
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
@@ -23,6 +26,22 @@ class ChatGateway:
 
     def infer(self, context, stream=True, response_format=None):
         return LLMOutput(FinishReason.STOP, self.answers.pop(0), [], None, None)
+
+
+class FalseyConfig:
+    llm = "test-model"
+    llm_api_key = None
+    llm_api_base = None
+    max_steps = 3
+    max_seconds = 30
+
+    def __bool__(self):
+        return False
+
+
+class FalseyGateway(ChatGateway):
+    def __bool__(self):
+        return False
 
 
 def test_chat_plans_then_returns_the_answer():
@@ -86,3 +105,36 @@ def test_failed_resume_clears_the_waiting_task():
     assert task.state is TaskState.TASK_FAILED
     assert agent.pending_task is None
     assert agent.approval_requests() == []
+
+
+def test_agent_preserves_explicit_falsey_dependencies(monkeypatch):
+    monkeypatch.setattr(Config, "load", lambda: (_ for _ in ()).throw(AssertionError("loaded")))
+    config = FalseyConfig()
+    gateway = FalseyGateway(["hello"])
+
+    agent = Agent(config=config, llm_gateway=gateway)
+
+    assert agent.config is config
+    assert agent.llm_gateway is gateway
+
+
+def test_from_config_builds_the_default_composition():
+    config = Config(llm="test-model", max_steps=3, max_seconds=30)
+    gateway = ChatGateway(["hello"])
+
+    agent = Agent.from_config(config, llm_gateway=gateway)
+
+    assert agent.config is config
+    assert agent.llm_gateway is gateway
+
+
+def test_hook_behavior_lives_in_core_with_a_schema_compatibility_export():
+    try:
+        spec = importlib.util.find_spec("src.core.hook")
+    except ModuleNotFoundError:
+        spec = None
+    assert spec is not None
+    core_hook = importlib.import_module("src.core.hook")
+    schema_hook = importlib.import_module("src.schema.hook")
+
+    assert schema_hook.HarnessHook is core_hook.HarnessHook

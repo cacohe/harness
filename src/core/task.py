@@ -40,21 +40,21 @@ class Task:
     def __init__(
         self,
         original_input: str,
-        id: str = uuid.uuid4(),
+        id: str | None = None,
         state: TaskState = TaskState.TASK_CREATED,
         state_reason: TaskStateReason = None,
-        plan: TaskPlan = None,
-        history: list[Message] = [],
-        pending_tool_calls: list[ToolExecutionResult] = [],
-        result: TaskResult = None,
+        plan: TaskPlan | None = None,
+        history: list[Message] | None = None,
+        pending_tool_calls: list[ToolExecutionResult] | None = None,
+        result: TaskResult | None = None,
     ):
-        self.id = id
+        self.id = id if id is not None else str(uuid.uuid4())
         self.original_input = original_input
         self.state = state
         self.state_reason = state_reason
         self.plan = plan
-        self.history = history
-        self.pending_tool_calls = pending_tool_calls
+        self.history = list(history) if history is not None else []
+        self.pending_tool_calls = list(pending_tool_calls) if pending_tool_calls is not None else []
         self.result = result
         self.step_count = 0
         self.elapsed_seconds = 0.0
@@ -70,7 +70,7 @@ class Task:
             "original_input": self.original_input,
             "state": self.state.value,
             "state_reason": self.state_reason.value if self.state_reason else None,
-            "plan": self.plan.to_dict(),
+            "plan": self.plan.to_dict() if self.plan else None,
             "history": self.history,
             "pending_tool_calls": self.pending_tool_calls,
             "result": self.result.to_dict() if self.result else None,
@@ -93,8 +93,6 @@ class Task:
         self.state = state
         if state_reason is not None:
             self.state_reason = state_reason
-
-        self.persist()
 
     def transition_to_running(self, reason: TaskRunningReason) -> None:
         """
@@ -181,7 +179,6 @@ class Task:
             plan: The plan produced for this task.
         """
         self.plan = plan
-        self.persist()
 
     def add_history_messages(self, messages: list[Message]) -> None:
         """
@@ -190,7 +187,6 @@ class Task:
             message: The message to add to the task history.
         """
         self.history.extend(messages)
-        self.persist()
 
     def set_pending_tool_calls(self, pending_tool_calls: list[ToolExecutionResult]) -> None:
         """
@@ -199,7 +195,6 @@ class Task:
             pending_tool_calls: Tool executions that have not finished.
         """
         self.pending_tool_calls = pending_tool_calls
-        self.persist()
 
     def approval_requests(self) -> list[ToolExecutionResult]:
         """
@@ -229,7 +224,6 @@ class Task:
                     if approved
                     else ApprovalDecision.APPROVAL_DECISION_REJECTED
                 )
-                self.persist()
                 return
         raise ValueError(f"no tool call waits for approval with id {tool_id}")
 
@@ -244,7 +238,6 @@ class Task:
             if message.role == ROLE_TOOL and message.tool_call_id in by_call_id:
                 self.history[index] = by_call_id.pop(message.tool_call_id)
         self.history.extend(by_call_id.values())
-        self.persist()
 
     def set_progress(self, step_count: int, elapsed_seconds: float) -> None:
         """
@@ -255,7 +248,6 @@ class Task:
         """
         self.step_count = step_count
         self.elapsed_seconds = elapsed_seconds
-        self.persist()
 
     def set_result(self, result: TaskResult) -> None:
         """
@@ -264,13 +256,6 @@ class Task:
             result: The result produced for this task.
         """
         self.result = result
-        self.persist()
-
-    def persist(self) -> None:
-        """
-        Persist the task.
-        """
-        ...
 
 
 def get_task_status(task: Task) -> dict:

@@ -3,7 +3,10 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import Callable
 
+from src.logger import get_logger
 from src.schema.event import Event, EventChannel, EventType
+
+logger = get_logger("core.event")
 
 
 def _client_line(event: Event) -> str:
@@ -77,6 +80,7 @@ class EventHandler:
         try:
             self.client_emitter(event)
         except Exception:
+            logger.exception("event emitter failed", extra={"context": {"channel": "client"}})
             return
 
     def emit_tracing(self, event: Event) -> None:
@@ -86,6 +90,7 @@ class EventHandler:
         try:
             self.tracing_emitter(event)
         except Exception:
+            logger.exception("event emitter failed", extra={"context": {"channel": "tracing"}})
             return
 
     def emit(self, event: Event, channel: EventChannel = EventChannel.CLIENT) -> None:

@@ -1,13 +1,15 @@
 from src.config import Config
 from src.context.context_builder import DefaultContextBuilder
 from src.core.context import ContextBuilder
-from src.core.guard import HarnessGuard
+from src.core.guard import NoOpGuard
+from src.core.hook import HarnessHook
 from src.core.llm import LlmGateway
 from src.core.loop import Harness
+from src.core.persistence import TaskRepository
 from src.core.task import Task
-from src.core.tool import ToolExecutor
+from src.core.tool import ToolCatalog, ToolExecutor
 from src.llm.litellm import LiteLLMGateway
-from src.schema.hook import HarnessHook
+from src.persistence.in_memory import InMemoryTaskRepository
 from src.schema.tool import ToolExecutionResult
 from src.tool.local_tools import LOCAL_TOOLS
 from src.tool.tool_executor import DefaultToolExecutor
@@ -25,6 +27,8 @@ class Agent:
         llm_gateway: LlmGateway | None = None,
         tool_executor: ToolExecutor | None = None,
         context_builder: ContextBuilder | None = None,
+        tool_catalog: ToolCatalog | None = None,
+        task_repository: TaskRepository | None = None,
     ):
         """
         Create an agent with a model gateway, a context builder, and the local tools.
@@ -34,33 +38,49 @@ class Agent:
             tool_executor: Executor to use. When omitted, the local tools are registered.
             context_builder: Builder to use. When omitted, the default builder is created.
         """
-        self.config = config or Config.load()
+        self.config = config if config is not None else Config.load()
         self.transcript: list[tuple[str, str]] = []
-        self.tool_registry = DefaultToolRegistry()
-        self.tool_registry.tools = {}
-        for tool in LOCAL_TOOLS:
-            self.tool_registry.register(tool)
-        self.llm_gateway = llm_gateway or LiteLLMGateway(
-            model=self.config.llm,
-            api_key=self.config.llm_api_key,
-            api_base=self.config.llm_api_base,
+        self.tool_registry = tool_catalog if tool_catalog is not None else DefaultToolRegistry()
+        if tool_catalog is None:
+            for tool in LOCAL_TOOLS:
+                self.tool_registry.register(tool)
+        self.llm_gateway = (
+            llm_gateway
+            if llm_gateway is not None
+            else LiteLLMGateway(
+                model=self.config.llm,
+                api_key=self.config.llm_api_key,
+                api_base=self.config.llm_api_base,
+            )
         )
-        self.tool_executor = tool_executor or DefaultToolExecutor(self.tool_registry)
-        self.context_builder = context_builder or DefaultContextBuilder()
+        self.tool_executor = (
+            tool_executor if tool_executor is not None else DefaultToolExecutor(self.tool_registry)
+        )
+        self.context_builder = (
+            context_builder if context_builder is not None else DefaultContextBuilder()
+        )
+        self.task_repository = (
+            task_repository if task_repository is not None else InMemoryTaskRepository()
+        )
         self.pending_task: Task | None = None
         self.pending_message: str | None = None
         self.harness = Harness(
             SYSTEM_PROMPT,
             self.llm_gateway,
-            self.tool_registry.get_all_tools(),
             [],
             self.tool_executor,
             self.context_builder,
             harness_hooks=HarnessHook(),
-            harness_guard=HarnessGuard(),
+            harness_guard=NoOpGuard(),
+            task_repository=self.task_repository,
             max_steps=self.config.max_steps,
             max_seconds=self.config.max_seconds,
         )
+
+    @classmethod
+    def from_config(cls, config: Config, **dependencies) -> "Agent":
+        """Build the default composition from an explicit runtime config."""
+        return cls(config=config, **dependencies)
 
     def chat(self, message: str) -> Task:
         """
@@ -103,6 +123,7 @@ class Agent:
         if self.pending_task is None:
             raise ValueError("nothing is waiting for approval")
         self.pending_task.decide_tool_call(tool_id, approved)
+        self.task_repository.save(self.pending_task)
 
     def resume(self) -> Task:
         """

@@ -1,124 +1,47 @@
-from src.core.sandbox import Sandbox
-from src.core.tool import ToolExecutor, ToolRegistry
-from src.schema.tool import (
-    Tool,
-    ToolExecutionFailReason,
-    ToolExecutionResult,
-    ToolExecutionState,
+from src.core.tool import (
+    ApprovalPolicy,
+    SandboxRunner,
+    ToolCatalog,
+    ToolExecutor,
+    ToolRunner,
 )
+from src.schema.tool import ApprovalDecision, Tool
 
-_NEED_APPROVAL_TOOLS = {"shell", "write_file", "edit_file"}
+
+class LocalToolRunner:
+    """Run the callable attached to a local tool."""
+
+    def run(self, tool: Tool, inputs: dict):
+        return tool.executer(inputs)
+
+
+class DefaultApprovalPolicy:
+    """Pause local tools that can execute commands or mutate files."""
+
+    _NEED_APPROVAL_TOOLS = {"shell", "write_file", "edit_file"}
+
+    def decide(self, tool: Tool, inputs: dict) -> ApprovalDecision | None:
+        if tool.name in self._NEED_APPROVAL_TOOLS:
+            return None
+        return ApprovalDecision.APPROVAL_DECISION_APPROVED
 
 
 class DefaultToolExecutor(ToolExecutor):
-    def __init__(self, tool_registry: ToolRegistry):
-        self.tool_registry = tool_registry
+    """Tool executor wired to the local callable runner and approval policy."""
 
-    def is_need_approval(self, tool: Tool) -> bool:
-        """
-        Check if the tool needs approval.
-        Args:
-            tool: The tool to check.
-        Returns:
-            True when the tool can run commands or change files.
-        """
-        return tool.name in _NEED_APPROVAL_TOOLS
-
-    def launch_approval(self, tool: Tool) -> bool:
-        """
-        Launch the approval process.
-        Args:
-            tool: The tool to launch the approval process for.
-        Returns:
-            True if the approval process is launched, False otherwise.
-        """
-        return False
-
-    def is_need_sandbox(self, tool: Tool) -> bool:
-        """
-        Check if the tool needs sandbox.
-        Args:
-            tool: The tool to check.
-        Returns:
-            True if the tool needs sandbox, False otherwise.
-        """
-        return False
-
-    def find_tool(self, name: str) -> Tool | None:
-        """
-        Find a registered tool by name or id.
-        Args:
-            name: The tool name from the model.
-        Returns:
-            The matching tool, or None when no tool has that name.
-        """
-        for tool in self.tool_registry.get_all_tools():
-            if tool.name == name or tool.id == name:
-                return tool
-        return None
-
-    def get_sandbox(self) -> Sandbox:
-        """
-        Get the sandbox for a tool.
-        Returns:
-            The sandbox for the tool.
-        """
-        raise NotImplementedError
-
-    def execute_without_sandbox(self, tool_id: str, inputs: dict) -> ToolExecutionResult:
-        """
-        Execute a registered tool outside a sandbox.
-        Args:
-            tool_id: The id of the tool.
-            inputs: The inputs to the tool.
-        Returns:
-            The completed tool execution.
-        """
-        tool = self.tool_registry.get_tool(tool_id)
-        try:
-            output = tool.executer(inputs)
-        except Exception as error:
-            return ToolExecutionResult(
-                tool_id=tool.id,
-                tool_name=tool.name,
-                state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
-                output=f"{type(error).__name__}: {error}",
-                fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_UNKNOWN,
-            )
-        return ToolExecutionResult(
-            tool_id=tool.id,
-            tool_name=tool.name,
-            state=ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED,
-            output=output,
-        )
-
-    def execute(self, tool: Tool, inputs: dict) -> ToolExecutionResult:
-        """
-        Execute a tool.
-        Args:
-            tool: The tool to execute.
-            inputs: The inputs to the tool.
-        Returns:
-            The result of the tool execution.
-        """
-        if self.is_need_sandbox(tool) is True:
-            return self.execute_with_sandbox(tool.id, inputs, self.get_sandbox())
-        return self.execute_without_sandbox(tool.id, inputs)
-
-    def execute_with_sandbox(
+    def __init__(
         self,
-        tool_id: str,
-        inputs: dict,
-        sandbox: Sandbox,
-    ) -> ToolExecutionResult:
-        """
-        Execute a tool with a sandbox.
-        Args:
-            tool_id: The id of the tool.
-            inputs: The inputs to the tool.
-            sandbox: The sandbox to use.
-        Returns:
-            The result of the tool execution.
-        """
-        sandbox.execute(inputs)
-        return self.execute_without_sandbox(tool_id, inputs)
+        tool_registry: ToolCatalog,
+        *,
+        runner: ToolRunner | None = None,
+        approval_policy: ApprovalPolicy | None = None,
+        sandbox_runner: SandboxRunner | None = None,
+    ) -> None:
+        super().__init__(
+            tool_registry,
+            runner if runner is not None else LocalToolRunner(),
+            approval_policy=(
+                approval_policy if approval_policy is not None else DefaultApprovalPolicy()
+            ),
+            sandbox_runner=sandbox_runner,
+        )

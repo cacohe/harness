@@ -1,7 +1,8 @@
 import pytest
 from src.context.context_builder import DefaultContextBuilder
 from src.core.context import HELD_TOOL_MESSAGE, PENDING_TOOL_MESSAGE
-from src.core.guard import HarnessGuard
+from src.core.guard import NoOpGuard
+from src.core.hook import HarnessHook
 from src.core.loop import (
     DEFAULT_LLM_ATTEMPT_DELAY_SECONDS,
     DEFAULT_MAX_SECONDS,
@@ -12,7 +13,6 @@ from src.core.task import Task
 from src.core.tool import ToolExecutor
 from src.schema.context import Context
 from src.schema.event import EventType
-from src.schema.hook import HarnessHook
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
 from src.schema.task import (
     TaskFailReason,
@@ -56,31 +56,16 @@ class Gateway:
 
 
 class Executor(ToolExecutor):
-    def is_need_approval(self, tool: Tool) -> bool:
-        return False
+    def __init__(self, tools=None):
+        registry = DefaultToolRegistry()
+        for tool in tools or []:
+            registry.register(tool)
+        super().__init__(registry, LocalRunner())
 
-    def launch_approval(self, tool: Tool) -> bool:
-        return False
 
-    def is_need_sandbox(self, tool: Tool) -> bool:
-        return False
-
-    def get_sandbox(self):
-        raise NotImplementedError
-
-    def find_tool(self, name: str) -> Tool | None:
-        return None
-
-    def execute_without_sandbox(self, tool_id: str, inputs: dict) -> ToolExecutionResult:
-        return ToolExecutionResult(
-            tool_id=tool_id,
-            tool_name=tool_id,
-            state=ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED,
-            output=None,
-        )
-
-    def execute(self, tool: Tool, inputs: dict) -> ToolExecutionResult:
-        return self.execute_without_sandbox(tool.id, inputs)
+class LocalRunner:
+    def run(self, tool, inputs):
+        return tool.executer(inputs)
 
 
 def _task() -> Task:
@@ -98,6 +83,14 @@ class RecordingOutput:
         self.events.append(event)
 
 
+def test_harness_default_collaborators_are_isolated():
+    first = Harness("", None, [], Executor(), None)
+    second = Harness("", None, [], Executor(), None)
+
+    assert first.harness_hooks is not second.harness_hooks
+    assert first.harness_guard is not second.harness_guard
+
+
 def _harness(
     gateway,
     guard=None,
@@ -107,20 +100,34 @@ def _harness(
     hooks=None,
     tools=None,
     executor=None,
+    repository=None,
 ) -> Harness:
     return Harness(
         "Be brief.",
         gateway,
-        [] if tools is None else tools,
         [],
-        executor or Executor(),
+        executor or Executor(tools),
         DefaultContextBuilder(),
         harness_hooks=hooks or HarnessHook(),
-        harness_guard=guard or HarnessGuard(),
+        harness_guard=guard or NoOpGuard(),
         event_handler=event_handler,
+        task_repository=repository,
         max_steps=max_steps,
         max_seconds=max_seconds,
     )
+
+
+class RecordingRepository:
+    def __init__(self):
+        self.tasks = {}
+        self.states = []
+
+    def save(self, task):
+        self.tasks[task.id] = task
+        self.states.append(task.state)
+
+    def get(self, task_id):
+        return self.tasks.get(task_id)
 
 
 class ScriptedGateway(Gateway):
@@ -137,7 +144,8 @@ class ScriptedGateway(Gateway):
 
 
 class CountingExecutor(Executor):
-    def __init__(self):
+    def __init__(self, tools=None):
+        super().__init__(tools)
         self.batches = 0
 
     def execute_tool_call(self, call, approved=False, hold=False):
@@ -167,6 +175,17 @@ def test_run_plans_a_new_task_and_returns_the_answer():
     assert harness.run(task).output == "bought"
 
     assert gateway.planning_calls == [(False, TaskPlan)]
+
+
+def test_run_saves_state_changes_through_the_repository():
+    repository = RecordingRepository()
+    task = _task()
+
+    _harness(Gateway(), repository=repository).run(task)
+
+    assert repository.get(task.id) is task
+    assert repository.states[0] is TaskState.TASK_RUNNING
+    assert repository.states[-1] is TaskState.TASK_COMPLETED
     assert task.state is TaskState.TASK_COMPLETED
     assert task.plan.goal == ["buy a phone"]
     assert task.plan.current == "compare"
@@ -285,16 +304,33 @@ def test_planning_context_names_tools_but_does_not_offer_them():
     harness = Harness(
         "Be brief.",
         Gateway(),
-        [tool],
         [],
-        Executor(),
+        Executor([tool]),
         DefaultContextBuilder(),
-        harness_guard=HarnessGuard(),
+        harness_guard=NoOpGuard(),
     )
 
     context = harness.build_planning_context(_task())
 
     assert context.tools == []
+    assert "shell: Run a command." in context.messages[0].content
+
+
+def test_context_reads_tools_from_the_executor_catalog_at_call_time():
+    registry = DefaultToolRegistry()
+    executor = DefaultToolExecutor(registry)
+    harness = Harness(
+        "Be brief.",
+        Gateway(),
+        [],
+        executor,
+        DefaultContextBuilder(),
+        harness_guard=NoOpGuard(),
+    )
+    registry.register(_shell())
+
+    context = harness.build_planning_context(_task())
+
     assert "shell: Run a command." in context.messages[0].content
 
 
@@ -438,7 +474,7 @@ def test_execute_tool_calls_emits_failure():
 
 
 def test_step_limit_asks_for_a_closing_answer_from_unseen_tool_results():
-    executor = CountingExecutor()
+    executor = CountingExecutor([_shell()])
     gateway = ScriptedGateway(
         [
             _model(FinishReason.TOOL_CALLS, None, [LlmToolCall("call_1", "shell", "{}")]),
@@ -447,10 +483,7 @@ def test_step_limit_asks_for_a_closing_answer_from_unseen_tool_results():
     )
     task = _task()
 
-    assert (
-        _harness(gateway, tools=[_shell()], executor=executor, max_steps=1).run(task).output
-        == "based on the tool"
-    )
+    assert _harness(gateway, executor=executor, max_steps=1).run(task).output == "based on the tool"
 
     assert task.state_reason is TaskFailReason.TASK_FAILED_MAX_STEPS
     assert executor.batches == 1

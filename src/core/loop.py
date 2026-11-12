@@ -11,14 +11,15 @@ from src.core.context import (
     build_tool_messages,
 )
 from src.core.event import EventHandler
-from src.core.guard import GuardError, HarnessGuard
+from src.core.guard import GuardError, HarnessGuard, NoOpGuard
+from src.core.hook import HarnessHook
 from src.core.llm import LlmCallError, LlmGateway
+from src.core.persistence import NoOpTaskRepository, TaskRepository
 from src.core.task import Task
 from src.core.tool import ToolExecutor
 from src.schema.context import Context
 from src.schema.event import Event, EventType, LlmEventPayload, TaskEventPayload, ToolEventPayload
 from src.schema.harness import StepResult
-from src.schema.hook import HarnessHook
 from src.schema.llm import (
     FinishReason,
     LLMOutput,
@@ -44,28 +45,35 @@ class Harness:
         self,
         system_prompt: str,
         llm_gateway: LlmGateway,
-        tools: list[Tool],
         skills: list[Skill],
         tool_executor: ToolExecutor,
         context_builder: ContextBuilder,
-        harness_hooks: HarnessHook = HarnessHook(),
-        harness_guard: HarnessGuard = HarnessGuard(),
+        harness_hooks: HarnessHook | None = None,
+        harness_guard: HarnessGuard | None = None,
         event_handler: EventHandler | None = None,
+        task_repository: TaskRepository | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
         max_seconds: int = DEFAULT_MAX_SECONDS,
     ):
         self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
         self.llm_gateway = llm_gateway
-        self.tools = tools
         self.skills = skills
         self.tool_executor = tool_executor
         self.context_builder = context_builder
-        self.harness_hooks = harness_hooks
-        self.harness_guard = harness_guard
+        self.harness_hooks = harness_hooks if harness_hooks is not None else HarnessHook()
+        self.harness_guard = harness_guard if harness_guard is not None else NoOpGuard()
         self.event_handler = event_handler or EventHandler()
+        self.task_repository = (
+            task_repository if task_repository is not None else NoOpTaskRepository()
+        )
         self._max_steps = max_steps
         self._max_seconds = max_seconds
-        self._length_continuations = 0
+
+    def _save_task(self, task: Task) -> None:
+        self.task_repository.save(task)
+
+    def _available_tools(self) -> list[Tool]:
+        return self.tool_executor.get_all_tools()
 
     def _emit_task_event(
         self,
@@ -194,7 +202,7 @@ class Harness:
         """
         try:
             return self.context_builder.build_planning_context(
-                self.system_prompt, task, tools=self.tools
+                self.system_prompt, task, tools=self._available_tools()
             )
         except ContextBuilderError:
             raise
@@ -258,7 +266,7 @@ class Harness:
         """
         try:
             return self.context_builder.build_infer_context(
-                self.system_prompt, task, self.tools, self.skills
+                self.system_prompt, task, self._available_tools(), self.skills
             )
         except ContextBuilderError:
             raise
@@ -335,26 +343,16 @@ class Harness:
             Completed, failed, and pending tool executions.
         """
 
-        pending_tools = []
-        completed_tools = []
-        failed_tools = []
-
-        for call in tool_calls:
+        def before_call(call: LlmToolCall) -> None:
             self._emit_tool_event(EventType.TOOL_EXECUTION_STARTED, task, call)
 
-            result: ToolExecutionResult = self.tool_executor.execute_tool_call(
-                call, hold=bool(pending_tools)
-            )
-            if result.is_completed():
-                completed_tools.append(result)
-            elif result.is_failed():
-                failed_tools.append(result)
-            else:
-                pending_tools.append(result)
+        def after_call(call: LlmToolCall, result: ToolExecutionResult) -> None:
             self._emit_tool_result(task, call, result)
 
-        return ToolCallResult(
-            pending_tools=pending_tools, completed_tools=completed_tools, failed_tools=failed_tools
+        return self.tool_executor.execute_tool_calls(
+            tool_calls,
+            before_call=before_call,
+            after_call=after_call,
         )
 
     def step(self, task: Task) -> StepResult:
@@ -373,6 +371,7 @@ class Harness:
         self.harness_hooks.after_think(task=task, output=output)
 
         task.add_history_messages([build_history_message(output)])
+        self._save_task(task)
 
         if not self._requests_tool_calls(output):
             return StepResult(llm_output=output)
@@ -382,6 +381,7 @@ class Harness:
         self.harness_hooks.after_execute_tool_calls(task=task, result=result)
 
         task.add_history_messages(build_tool_messages(result))
+        self._save_task(task)
 
         return StepResult(llm_output=output, tool_call_result=result)
 
@@ -397,7 +397,7 @@ class Harness:
         """
         try:
             return self.context_builder.build_final_context(
-                self.system_prompt, task, tools=self.tools, skills=self.skills
+                self.system_prompt, task, tools=self._available_tools(), skills=self.skills
             )
         except ContextBuilderError:
             raise
@@ -469,6 +469,7 @@ class Harness:
         if blocked_reason == TaskPauseReason.TASK_PAUSED_WAITING_APPROVAL:
             task.set_pending_tool_calls(step_result.tool_call_result.pending_tools)
             task.transition_to_paused(blocked_reason)
+            self._save_task(task)
             self._emit_task_event(
                 EventType.TASK_PAUSED,
                 task,
@@ -490,6 +491,7 @@ class Harness:
             The task result.
         """
         task.transition_to_failed(failed_reason)
+        self._save_task(task)
         self._emit_task_event(
             EventType.TASK_FAILED,
             task,
@@ -515,6 +517,7 @@ class Harness:
 
         task.set_result(result)
         task.transition_to_completed()
+        self._save_task(task)
         self._emit_task_event(
             EventType.TASK_COMPLETED, task, content=result.output, step_id=str(step_count)
         )
@@ -569,10 +572,12 @@ class Harness:
 
             if task.is_created():
                 task.transition_to_running(TaskRunningReason.TASK_RUNNING_CREATE)
+                self._save_task(task)
                 self.guard_input(task)
 
                 self._emit_task_event(EventType.TASK_PLANNING, task)
                 task.set_plan(self.planning(self.build_planning_context(task), task))
+                self._save_task(task)
                 self._emit_task_event(EventType.TASK_PLANNED, task, goal=list(task.plan.goal))
                 question = (task.plan.clarification or "").strip()
                 if question:
@@ -582,6 +587,7 @@ class Harness:
                 self._emit_task_event(EventType.TASK_RESUMED, task)
                 task.transition_to_running(TaskRunningReason.TASK_RUNNING_RESUME)
                 self._finish_pending_tool_calls(task)
+                self._save_task(task)
 
             result = self.turn(task)
             return result
@@ -597,6 +603,7 @@ class Harness:
                 else:
                     reason = TaskFailReason.TASK_FAILED_UNKNOWN
                 task.transition_to_failed(reason)
+                self._save_task(task)
 
             fail_reason = task.state_reason.value if task.state_reason else None
             self._emit_task_event(

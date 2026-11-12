@@ -2,11 +2,10 @@ import math
 from datetime import datetime, timezone
 from typing import Callable, Sequence
 
-from src.core.memory import MemoryRetriever
 from src.schema.memory import MemoryItem
 
 
-class HybridRetriever(MemoryRetriever):
+class HybridRetriever:
     """Relevance + recency + importance weighted scoring."""
 
     def __init__(

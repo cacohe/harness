@@ -1,5 +1,7 @@
 import pytest
+from src.core import tool as core_tool
 from src.core.context import build_tool_messages
+from src.core.tool import ToolExecutor
 from src.schema.llm import LlmToolCall
 from src.schema.tool import (
     ApprovalDecision,
@@ -9,6 +11,200 @@ from src.schema.tool import (
 )
 from src.tool.tool_executor import DefaultToolExecutor
 from src.tool.tool_registry import DefaultToolRegistry
+
+
+def test_core_exposes_tool_execution_ports():
+    assert hasattr(core_tool, "ToolCatalog")
+    assert hasattr(core_tool, "ToolRunner")
+    assert hasattr(core_tool, "ApprovalPolicy")
+    assert hasattr(core_tool, "SandboxRunner")
+
+
+class Runner:
+    def __init__(self, output="ran", error=None):
+        self.output = output
+        self.error = error
+        self.calls = []
+
+    def run(self, tool, inputs):
+        self.calls.append((tool, inputs))
+        if self.error is not None:
+            raise self.error
+        return self.output
+
+
+class FalseyRunner(Runner):
+    def __bool__(self):
+        return False
+
+
+class Policy:
+    def __init__(self, decision=ApprovalDecision.APPROVAL_DECISION_APPROVED):
+        self.decision = decision
+
+    def decide(self, tool, inputs):
+        return self.decision
+
+
+class FalseyPolicy(Policy):
+    def __bool__(self):
+        return False
+
+
+class SequencePolicy:
+    def __init__(self):
+        self.calls = 0
+
+    def decide(self, tool, inputs):
+        self.calls += 1
+        if self.calls == 2:
+            raise RuntimeError("approval offline")
+        return ApprovalDecision.APPROVAL_DECISION_APPROVED
+
+
+class Sandbox:
+    def __init__(self, supported=True, output="sandboxed"):
+        self.supported = supported
+        self.output = output
+        self.calls = []
+
+    def supports(self, tool):
+        return self.supported
+
+    def run(self, tool, inputs):
+        self.calls.append((tool, inputs))
+        return self.output
+
+
+def _core_executor(*, runner=None, policy=None, sandbox=None):
+    registry = DefaultToolRegistry()
+    registry.register(
+        Tool(
+            id="shell",
+            name="shell",
+            description="Run a command.",
+            input_schema={},
+            executer=lambda inputs: "legacy",
+        )
+    )
+    return ToolExecutor(
+        registry,
+        runner if runner is not None else Runner(),
+        approval_policy=policy if policy is not None else Policy(),
+        sandbox_runner=sandbox,
+    )
+
+
+def test_unknown_tool_returns_not_supported():
+    result = _core_executor().execute_tool_call(
+        LlmToolCall(id="call-1", name="missing", arguments="{}")
+    )
+
+    assert result.state is ToolExecutionState.TOOL_EXECUTION_STATE_FAILED
+    assert result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_NOT_SUPPORTED
+
+
+def test_non_object_arguments_fail_before_runner_is_called():
+    runner = Runner()
+    result = _core_executor(runner=runner).execute_tool_call(
+        LlmToolCall(id="call-1", name="shell", arguments="[]")
+    )
+
+    assert result.state is ToolExecutionState.TOOL_EXECUTION_STATE_FAILED
+    assert result.output == "tool arguments are not a JSON object"
+    assert runner.calls == []
+
+
+def test_runner_exception_becomes_a_failed_result():
+    result = _core_executor(runner=Runner(error=RuntimeError("nope"))).execute_tool_call(
+        LlmToolCall(id="call-1", name="shell", arguments="{}")
+    )
+
+    assert result.state is ToolExecutionState.TOOL_EXECUTION_STATE_FAILED
+    assert result.output == "RuntimeError: nope"
+
+
+def test_rejected_tool_does_not_run():
+    runner = Runner()
+    result = _core_executor(
+        runner=runner, policy=Policy(ApprovalDecision.APPROVAL_DECISION_REJECTED)
+    ).execute_tool_call(LlmToolCall(id="call-1", name="shell", arguments="{}"))
+
+    assert result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_REJECTED
+    assert runner.calls == []
+
+
+def test_undecided_tool_is_pending_with_its_arguments():
+    runner = Runner()
+    result = _core_executor(runner=runner, policy=Policy(None)).execute_tool_call(
+        LlmToolCall(id="call-1", name="shell", arguments='{"command": "dir"}')
+    )
+
+    assert result.state is ToolExecutionState.TOOL_EXECUTION_STATE_PENDING
+    assert result.arguments == '{"command": "dir"}'
+    assert runner.calls == []
+
+
+def test_supported_tool_runs_only_inside_sandbox():
+    runner = Runner()
+    sandbox = Sandbox()
+    result = _core_executor(runner=runner, sandbox=sandbox).execute_tool_call(
+        LlmToolCall(id="call-1", name="shell", arguments='{"command": "dir"}')
+    )
+
+    assert result.state is ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED
+    assert result.output == "sandboxed"
+    assert len(sandbox.calls) == 1
+    assert runner.calls == []
+
+
+def test_falsey_rejecting_policy_is_not_replaced_by_allow_all():
+    runner = Runner()
+    policy = FalseyPolicy(ApprovalDecision.APPROVAL_DECISION_REJECTED)
+
+    result = _core_executor(runner=runner, policy=policy).execute_tool_call(
+        LlmToolCall(id="call-1", name="shell", arguments="{}")
+    )
+
+    assert result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_REJECTED
+    assert runner.calls == []
+
+
+def test_falsey_custom_runner_is_not_replaced_by_local_runner():
+    runner = FalseyRunner(output="custom")
+    registry = DefaultToolRegistry()
+    registry.register(
+        Tool(
+            id="read_file",
+            name="read_file",
+            description="Read a file.",
+            input_schema={},
+            executer=lambda inputs: "legacy",
+        )
+    )
+    executor = DefaultToolExecutor(registry, runner=runner)
+
+    result = executor.execute_tool_call(LlmToolCall(id="call-1", name="read_file", arguments="{}"))
+
+    assert result.output == "custom"
+    assert len(runner.calls) == 1
+
+
+def test_approval_exception_fails_only_that_call_and_batch_continues():
+    runner = Runner()
+    executor = _core_executor(runner=runner, policy=SequencePolicy())
+
+    result = executor.execute_tool_calls(
+        [
+            LlmToolCall(id="call-1", name="shell", arguments="{}"),
+            LlmToolCall(id="call-2", name="shell", arguments="{}"),
+        ]
+    )
+
+    assert [item.tool_id for item in result.completed_tools] == ["call-1"]
+    assert [item.tool_id for item in result.failed_tools] == ["call-2"]
+    assert result.failed_tools[0].output == "RuntimeError: approval offline"
+    assert len(runner.calls) == 1
 
 
 def _executor(executer, *names: str) -> DefaultToolExecutor:
@@ -53,8 +249,7 @@ def test_executor_does_not_emit_events():
     executor.event_handler = Handler()
 
     executor.execute_tool_calls(
-        [LlmToolCall(id="call_0_abc", name="read_file", arguments='{"path": "README.md"}')],
-        task_id="task-1",
+        [LlmToolCall(id="call_0_abc", name="read_file", arguments='{"path": "README.md"}')]
     )
 
     assert executor.event_handler.events == []
