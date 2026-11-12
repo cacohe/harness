@@ -161,9 +161,7 @@ def test_call_held_behind_another_runs_without_a_decision():
 def test_read_only_tools_run_without_approval(name):
     executor = _executor(lambda inputs: "ran", name)
 
-    result = executor.execute_tool_calls(
-        [LlmToolCall(id="call_1", name=name, arguments="{}")]
-    )
+    result = executor.execute_tool_calls([LlmToolCall(id="call_1", name=name, arguments="{}")])
 
     assert result.pending_tools == []
     assert result.completed_tools[0].output == "ran"

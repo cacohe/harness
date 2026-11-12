@@ -553,9 +553,7 @@ def test_rejected_shell_is_recorded_before_the_next_inference():
 
     assert called == []
     assert result.output == "skipped"
-    assert [message.content for message in _tool_messages(task)] == [
-        "The tool call was rejected."
-    ]
+    assert [message.content for message in _tool_messages(task)] == ["The tool call was rejected."]
 
 
 def test_calls_after_a_held_call_wait_and_run_in_order():
