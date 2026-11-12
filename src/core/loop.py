@@ -68,7 +68,6 @@ class Harness:
         )
         self._max_steps = max_steps
         self._max_seconds = max_seconds
-        self._length_continuations = 0
 
     def _save_task(self, task: Task) -> None:
         self.task_repository.save(task)

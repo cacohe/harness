@@ -54,9 +54,7 @@ class Task:
         self.state_reason = state_reason
         self.plan = plan
         self.history = list(history) if history is not None else []
-        self.pending_tool_calls = (
-            list(pending_tool_calls) if pending_tool_calls is not None else []
-        )
+        self.pending_tool_calls = list(pending_tool_calls) if pending_tool_calls is not None else []
         self.result = result
         self.step_count = 0
         self.elapsed_seconds = 0.0

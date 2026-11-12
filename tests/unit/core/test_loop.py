@@ -2,6 +2,7 @@ import pytest
 from src.context.context_builder import DefaultContextBuilder
 from src.core.context import HELD_TOOL_MESSAGE, PENDING_TOOL_MESSAGE
 from src.core.guard import NoOpGuard
+from src.core.hook import HarnessHook
 from src.core.loop import (
     DEFAULT_LLM_ATTEMPT_DELAY_SECONDS,
     DEFAULT_MAX_SECONDS,
@@ -12,7 +13,6 @@ from src.core.task import Task
 from src.core.tool import ToolExecutor
 from src.schema.context import Context
 from src.schema.event import EventType
-from src.schema.hook import HarnessHook
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
 from src.schema.task import (
     TaskFailReason,
@@ -483,10 +483,7 @@ def test_step_limit_asks_for_a_closing_answer_from_unseen_tool_results():
     )
     task = _task()
 
-    assert (
-        _harness(gateway, executor=executor, max_steps=1).run(task).output
-        == "based on the tool"
-    )
+    assert _harness(gateway, executor=executor, max_steps=1).run(task).output == "based on the tool"
 
     assert task.state_reason is TaskFailReason.TASK_FAILED_MAX_STEPS
     assert executor.batches == 1

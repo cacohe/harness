@@ -40,9 +40,7 @@ class Agent:
         """
         self.config = config if config is not None else Config.load()
         self.transcript: list[tuple[str, str]] = []
-        self.tool_registry = (
-            tool_catalog if tool_catalog is not None else DefaultToolRegistry()
-        )
+        self.tool_registry = tool_catalog if tool_catalog is not None else DefaultToolRegistry()
         if tool_catalog is None:
             for tool in LOCAL_TOOLS:
                 self.tool_registry.register(tool)
@@ -56,9 +54,7 @@ class Agent:
             )
         )
         self.tool_executor = (
-            tool_executor
-            if tool_executor is not None
-            else DefaultToolExecutor(self.tool_registry)
+            tool_executor if tool_executor is not None else DefaultToolExecutor(self.tool_registry)
         )
         self.context_builder = (
             context_builder if context_builder is not None else DefaultContextBuilder()
