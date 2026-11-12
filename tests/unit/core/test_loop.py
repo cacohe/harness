@@ -395,14 +395,14 @@ def test_run_declares_that_finished_tasks_may_have_no_result():
     assert get_type_hints(Harness.run)["return"] == TaskResult | None
 
 
-def test_completed_turn_preserves_missing_model_content():
+def test_completed_turn_normalizes_missing_model_content():
     gateway = ScriptedGateway([_model(FinishReason.STOP)])
     task = _task()
 
     result = _harness(gateway).run(task)
 
     assert result is not None
-    assert result.output is None
+    assert result.output == ""
     assert task.result is result
 
 
