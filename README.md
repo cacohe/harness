@@ -80,6 +80,15 @@ harness = Harness(
 `Harness`、`Task`、`ToolExecutor` 和 `MemoryManager` 是核心具体类；扩展行为应优先通过
 注入端口、hook 和策略完成，而不是继承并覆盖主循环。
 
+## 任务状态与持久化
+
+`Task` 及其消息、计划、工具执行和结果状态使用 Pydantic 模型。`Task.to_dict()` 生成
+JSON-safe 快照，`Task.from_dict()` 可恢复完整状态；完成和失败任务始终包含字符串结果。
+
+默认的 `InMemoryTaskRepository` 仅适用于单进程生命周期，但保存和读取使用相互独立的
+可序列化快照，不会因调用方继续修改原 Task 或读取结果而隐式改变仓库内容。需要跨进程恢复时，
+可实现同一 `TaskRepository` 端口，将这些快照保存到数据库或其他 durable storage。
+
 ## 验证
 
 ```powershell
