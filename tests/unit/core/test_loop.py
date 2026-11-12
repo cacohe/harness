@@ -83,6 +83,21 @@ class RecordingOutput:
         self.events.append(event)
 
 
+class FalseyEventSink(RecordingOutput):
+    def __bool__(self):
+        return False
+
+
+def test_harness_preserves_falsey_event_sink():
+    sink = FalseyEventSink()
+    harness = _harness(Gateway(), event_handler=sink)
+
+    harness.run(_task())
+
+    assert harness.event_handler is sink
+    assert sink.events
+
+
 def test_harness_default_collaborators_are_isolated():
     first = Harness("", None, [], Executor(), None)
     second = Harness("", None, [], Executor(), None)

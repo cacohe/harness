@@ -11,7 +11,7 @@ from src.core.context import (
     build_tool_message,
     build_tool_messages,
 )
-from src.core.event import EventHandler
+from src.core.event import EventHandler, EventSink
 from src.core.guard import GuardError, HarnessGuard, NoOpGuard
 from src.core.hook import HarnessHook
 from src.core.llm import LlmCallError, LlmGateway
@@ -51,7 +51,7 @@ class Harness:
         context_builder: ContextBuilder,
         harness_hooks: HarnessHook | None = None,
         harness_guard: HarnessGuard | None = None,
-        event_handler: EventHandler | None = None,
+        event_handler: EventSink | None = None,
         task_repository: TaskRepository | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
         max_seconds: int = DEFAULT_MAX_SECONDS,
@@ -63,7 +63,7 @@ class Harness:
         self.context_builder = context_builder
         self.harness_hooks = harness_hooks if harness_hooks is not None else HarnessHook()
         self.harness_guard = harness_guard if harness_guard is not None else NoOpGuard()
-        self.event_handler = event_handler or EventHandler()
+        self.event_handler = event_handler if event_handler is not None else EventHandler()
         self.task_repository = (
             task_repository if task_repository is not None else NoOpTaskRepository()
         )
