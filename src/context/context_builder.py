@@ -2,7 +2,6 @@ from src.core.context import (
     DEFAULT_SYSTEM_PROMPT_FOR_FINAL,
     DEFAULT_SYSTEM_PROMPT_FOR_INFER,
     DEFAULT_SYSTEM_PROMPT_FOR_PLANNING,
-    ContextBuilder,
     ContextBuilderError,
 )
 from src.core.task import Task
@@ -11,10 +10,8 @@ from src.schema.skills import Skill
 from src.schema.tool import Tool
 
 
-class DefaultContextBuilder(ContextBuilder):
+class DefaultContextBuilder:
     """Build the planning prompt and the execution transcript."""
-
-    def __init__(self): ...
 
     def build_planning_context(
         self, system_prompt: str, task: Task, tools: list[Tool] | None = None, **kwargs

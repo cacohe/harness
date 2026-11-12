@@ -1,7 +1,7 @@
 import pytest
 from src.context.context_builder import DefaultContextBuilder
 from src.core.context import HELD_TOOL_MESSAGE, PENDING_TOOL_MESSAGE
-from src.core.guard import HarnessGuard
+from src.core.guard import NoOpGuard
 from src.core.loop import (
     DEFAULT_LLM_ATTEMPT_DELAY_SECONDS,
     DEFAULT_MAX_SECONDS,
@@ -124,7 +124,7 @@ def _harness(
         executor or Executor(),
         DefaultContextBuilder(),
         harness_hooks=hooks or HarnessHook(),
-        harness_guard=guard or HarnessGuard(),
+        harness_guard=guard or NoOpGuard(),
         event_handler=event_handler,
         max_steps=max_steps,
         max_seconds=max_seconds,
@@ -297,7 +297,7 @@ def test_planning_context_names_tools_but_does_not_offer_them():
         [],
         Executor(),
         DefaultContextBuilder(),
-        harness_guard=HarnessGuard(),
+        harness_guard=NoOpGuard(),
     )
 
     context = harness.build_planning_context(_task())

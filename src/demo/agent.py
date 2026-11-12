@@ -1,7 +1,7 @@
 from src.config import Config
 from src.context.context_builder import DefaultContextBuilder
 from src.core.context import ContextBuilder
-from src.core.guard import HarnessGuard
+from src.core.guard import NoOpGuard
 from src.core.llm import LlmGateway
 from src.core.loop import Harness
 from src.core.task import Task
@@ -56,7 +56,7 @@ class Agent:
             self.tool_executor,
             self.context_builder,
             harness_hooks=HarnessHook(),
-            harness_guard=HarnessGuard(),
+            harness_guard=NoOpGuard(),
             max_steps=self.config.max_steps,
             max_seconds=self.config.max_seconds,
         )

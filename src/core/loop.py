@@ -11,7 +11,7 @@ from src.core.context import (
     build_tool_messages,
 )
 from src.core.event import EventHandler
-from src.core.guard import GuardError, HarnessGuard
+from src.core.guard import GuardError, HarnessGuard, NoOpGuard
 from src.core.llm import LlmCallError, LlmGateway
 from src.core.task import Task
 from src.core.tool import ToolExecutor
@@ -61,7 +61,7 @@ class Harness:
         self.tool_executor = tool_executor
         self.context_builder = context_builder
         self.harness_hooks = harness_hooks if harness_hooks is not None else HarnessHook()
-        self.harness_guard = harness_guard if harness_guard is not None else HarnessGuard()
+        self.harness_guard = harness_guard if harness_guard is not None else NoOpGuard()
         self.event_handler = event_handler or EventHandler()
         self._max_steps = max_steps
         self._max_seconds = max_seconds

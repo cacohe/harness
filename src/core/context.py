@@ -1,4 +1,4 @@
-from abc import ABC, abstractmethod
+from typing import Protocol, runtime_checkable
 
 from src.core.task import Task
 from src.schema.context import Context, Message
@@ -28,10 +28,8 @@ class ContextBuilderError(Exception):
         super().__init__(self.message)
 
 
-class ContextBuilder(ABC):
-    def __init__(self): ...
-
-    @abstractmethod
+@runtime_checkable
+class ContextBuilder(Protocol):
     def build_planning_context(self, system_prompt: str, task: Task, **kwargs) -> Context:
         """
         Build the context for the planning.
@@ -44,7 +42,6 @@ class ContextBuilder(ABC):
         """
         ...
 
-    @abstractmethod
     def build_infer_context(
         self, system_prompt: str, task: Task, tools: list, skills: list, **kwargs
     ) -> Context:
@@ -61,7 +58,6 @@ class ContextBuilder(ABC):
         """
         ...
 
-    @abstractmethod
     def build_final_context(self, system_prompt: str, task: Task, **kwargs) -> Context:
         """
         Build the context for the final.

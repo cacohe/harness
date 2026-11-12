@@ -1,6 +1,5 @@
-from abc import ABC, abstractmethod
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from src.schema.context import Context
 from src.schema.llm import FinishReason, LLMOutput
@@ -10,10 +9,10 @@ class LlmCallError(Exception):
     """A model call failed and will not be retried."""
 
 
-class LlmGateway(ABC):
+@runtime_checkable
+class LlmGateway(Protocol):
     """LLM Gateway"""
 
-    @abstractmethod
     def planning(
         self,
         context: Context,
@@ -31,7 +30,6 @@ class LlmGateway(ABC):
         """
         ...
 
-    @abstractmethod
     def infer(
         self,
         context: Context,
