@@ -22,9 +22,6 @@ class ToolCatalog(Protocol):
     def get_all_tools(self) -> list[Tool]: ...
 
 
-ToolRegistry = ToolCatalog
-
-
 @runtime_checkable
 class ToolRunner(Protocol):
     def run(self, tool: Tool, inputs: dict) -> Any: ...

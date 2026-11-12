@@ -1,4 +1,4 @@
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from src.core.task import Task
 
@@ -17,19 +17,3 @@ class NoOpTaskRepository:
 
     def get(self, task_id: str) -> Task | None:
         return None
-
-
-class CheckpointStore(Protocol):
-    def save(self, key: str, data: Any, metadata: dict | None = None) -> None: ...
-    def load(self, key: str) -> Any | None: ...
-    def delete(self, key: str) -> None: ...
-
-
-class ArtifactStore(Protocol):
-    def save(self, key: str, data: Any, metadata: dict | None = None) -> None: ...
-    def load(self, key: str) -> Any | None: ...
-    def delete(self, key: str) -> None: ...
-
-
-class TraceStore(Protocol):
-    def append(self, task_id: str, event: Any) -> None: ...

@@ -1,6 +1,3 @@
-import importlib
-import importlib.util
-
 from src.config import Config
 from src.demo.agent import Agent
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
@@ -126,15 +123,3 @@ def test_from_config_builds_the_default_composition():
 
     assert agent.config is config
     assert agent.llm_gateway is gateway
-
-
-def test_hook_behavior_lives_in_core_with_a_schema_compatibility_export():
-    try:
-        spec = importlib.util.find_spec("src.core.hook")
-    except ModuleNotFoundError:
-        spec = None
-    assert spec is not None
-    core_hook = importlib.import_module("src.core.hook")
-    schema_hook = importlib.import_module("src.schema.hook")
-
-    assert schema_hook.HarnessHook is core_hook.HarnessHook
