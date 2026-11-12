@@ -100,6 +100,7 @@ def _harness(
     hooks=None,
     tools=None,
     executor=None,
+    repository=None,
 ) -> Harness:
     return Harness(
         "Be brief.",
@@ -110,9 +111,23 @@ def _harness(
         harness_hooks=hooks or HarnessHook(),
         harness_guard=guard or NoOpGuard(),
         event_handler=event_handler,
+        task_repository=repository,
         max_steps=max_steps,
         max_seconds=max_seconds,
     )
+
+
+class RecordingRepository:
+    def __init__(self):
+        self.tasks = {}
+        self.states = []
+
+    def save(self, task):
+        self.tasks[task.id] = task
+        self.states.append(task.state)
+
+    def get(self, task_id):
+        return self.tasks.get(task_id)
 
 
 class ScriptedGateway(Gateway):
@@ -160,6 +175,17 @@ def test_run_plans_a_new_task_and_returns_the_answer():
     assert harness.run(task).output == "bought"
 
     assert gateway.planning_calls == [(False, TaskPlan)]
+
+
+def test_run_saves_state_changes_through_the_repository():
+    repository = RecordingRepository()
+    task = _task()
+
+    _harness(Gateway(), repository=repository).run(task)
+
+    assert repository.get(task.id) is task
+    assert repository.states[0] is TaskState.TASK_RUNNING
+    assert repository.states[-1] is TaskState.TASK_COMPLETED
     assert task.state is TaskState.TASK_COMPLETED
     assert task.plan.goal == ["buy a phone"]
     assert task.plan.current == "compare"

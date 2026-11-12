@@ -96,8 +96,6 @@ class Task:
         if state_reason is not None:
             self.state_reason = state_reason
 
-        self.persist()
-
     def transition_to_running(self, reason: TaskRunningReason) -> None:
         """
         Run the task.
@@ -183,7 +181,6 @@ class Task:
             plan: The plan produced for this task.
         """
         self.plan = plan
-        self.persist()
 
     def add_history_messages(self, messages: list[Message]) -> None:
         """
@@ -192,7 +189,6 @@ class Task:
             message: The message to add to the task history.
         """
         self.history.extend(messages)
-        self.persist()
 
     def set_pending_tool_calls(self, pending_tool_calls: list[ToolExecutionResult]) -> None:
         """
@@ -201,7 +197,6 @@ class Task:
             pending_tool_calls: Tool executions that have not finished.
         """
         self.pending_tool_calls = pending_tool_calls
-        self.persist()
 
     def approval_requests(self) -> list[ToolExecutionResult]:
         """
@@ -231,7 +226,6 @@ class Task:
                     if approved
                     else ApprovalDecision.APPROVAL_DECISION_REJECTED
                 )
-                self.persist()
                 return
         raise ValueError(f"no tool call waits for approval with id {tool_id}")
 
@@ -246,7 +240,6 @@ class Task:
             if message.role == ROLE_TOOL and message.tool_call_id in by_call_id:
                 self.history[index] = by_call_id.pop(message.tool_call_id)
         self.history.extend(by_call_id.values())
-        self.persist()
 
     def set_progress(self, step_count: int, elapsed_seconds: float) -> None:
         """
@@ -257,7 +250,6 @@ class Task:
         """
         self.step_count = step_count
         self.elapsed_seconds = elapsed_seconds
-        self.persist()
 
     def set_result(self, result: TaskResult) -> None:
         """
@@ -266,13 +258,6 @@ class Task:
             result: The result produced for this task.
         """
         self.result = result
-        self.persist()
-
-    def persist(self) -> None:
-        """
-        Persist the task.
-        """
-        ...
 
 
 def get_task_status(task: Task) -> dict:

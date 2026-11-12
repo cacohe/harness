@@ -13,6 +13,7 @@ from src.core.context import (
 from src.core.event import EventHandler
 from src.core.guard import GuardError, HarnessGuard, NoOpGuard
 from src.core.llm import LlmCallError, LlmGateway
+from src.core.persistence import NoOpTaskRepository, TaskRepository
 from src.core.task import Task
 from src.core.tool import ToolExecutor
 from src.schema.context import Context
@@ -50,6 +51,7 @@ class Harness:
         harness_hooks: HarnessHook | None = None,
         harness_guard: HarnessGuard | None = None,
         event_handler: EventHandler | None = None,
+        task_repository: TaskRepository | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
         max_seconds: int = DEFAULT_MAX_SECONDS,
     ):
@@ -61,9 +63,15 @@ class Harness:
         self.harness_hooks = harness_hooks if harness_hooks is not None else HarnessHook()
         self.harness_guard = harness_guard if harness_guard is not None else NoOpGuard()
         self.event_handler = event_handler or EventHandler()
+        self.task_repository = (
+            task_repository if task_repository is not None else NoOpTaskRepository()
+        )
         self._max_steps = max_steps
         self._max_seconds = max_seconds
         self._length_continuations = 0
+
+    def _save_task(self, task: Task) -> None:
+        self.task_repository.save(task)
 
     def _available_tools(self) -> list[Tool]:
         return self.tool_executor.get_all_tools()
@@ -364,6 +372,7 @@ class Harness:
         self.harness_hooks.after_think(task=task, output=output)
 
         task.add_history_messages([build_history_message(output)])
+        self._save_task(task)
 
         if not self._requests_tool_calls(output):
             return StepResult(llm_output=output)
@@ -373,6 +382,7 @@ class Harness:
         self.harness_hooks.after_execute_tool_calls(task=task, result=result)
 
         task.add_history_messages(build_tool_messages(result))
+        self._save_task(task)
 
         return StepResult(llm_output=output, tool_call_result=result)
 
@@ -460,6 +470,7 @@ class Harness:
         if blocked_reason == TaskPauseReason.TASK_PAUSED_WAITING_APPROVAL:
             task.set_pending_tool_calls(step_result.tool_call_result.pending_tools)
             task.transition_to_paused(blocked_reason)
+            self._save_task(task)
             self._emit_task_event(
                 EventType.TASK_PAUSED,
                 task,
@@ -481,6 +492,7 @@ class Harness:
             The task result.
         """
         task.transition_to_failed(failed_reason)
+        self._save_task(task)
         self._emit_task_event(
             EventType.TASK_FAILED,
             task,
@@ -506,6 +518,7 @@ class Harness:
 
         task.set_result(result)
         task.transition_to_completed()
+        self._save_task(task)
         self._emit_task_event(
             EventType.TASK_COMPLETED, task, content=result.output, step_id=str(step_count)
         )
@@ -560,10 +573,12 @@ class Harness:
 
             if task.is_created():
                 task.transition_to_running(TaskRunningReason.TASK_RUNNING_CREATE)
+                self._save_task(task)
                 self.guard_input(task)
 
                 self._emit_task_event(EventType.TASK_PLANNING, task)
                 task.set_plan(self.planning(self.build_planning_context(task), task))
+                self._save_task(task)
                 self._emit_task_event(EventType.TASK_PLANNED, task, goal=list(task.plan.goal))
                 question = (task.plan.clarification or "").strip()
                 if question:
@@ -573,6 +588,7 @@ class Harness:
                 self._emit_task_event(EventType.TASK_RESUMED, task)
                 task.transition_to_running(TaskRunningReason.TASK_RUNNING_RESUME)
                 self._finish_pending_tool_calls(task)
+                self._save_task(task)
 
             result = self.turn(task)
             return result
@@ -588,6 +604,7 @@ class Harness:
                 else:
                     reason = TaskFailReason.TASK_FAILED_UNKNOWN
                 task.transition_to_failed(reason)
+                self._save_task(task)
 
             fail_reason = task.state_reason.value if task.state_reason else None
             self._emit_task_event(

@@ -7,6 +7,7 @@ from src.core.loop import Harness
 from src.core.task import Task
 from src.core.tool import ToolExecutor
 from src.llm.litellm import LiteLLMGateway
+from src.persistence.in_memory import InMemoryTaskRepository
 from src.schema.hook import HarnessHook
 from src.schema.tool import ToolExecutionResult
 from src.tool.local_tools import LOCAL_TOOLS
@@ -48,6 +49,7 @@ class Agent:
         self.context_builder = context_builder or DefaultContextBuilder()
         self.pending_task: Task | None = None
         self.pending_message: str | None = None
+        self.task_repository = InMemoryTaskRepository()
         self.harness = Harness(
             SYSTEM_PROMPT,
             self.llm_gateway,
@@ -56,6 +58,7 @@ class Agent:
             self.context_builder,
             harness_hooks=HarnessHook(),
             harness_guard=NoOpGuard(),
+            task_repository=self.task_repository,
             max_steps=self.config.max_steps,
             max_seconds=self.config.max_seconds,
         )
@@ -101,6 +104,7 @@ class Agent:
         if self.pending_task is None:
             raise ValueError("nothing is waiting for approval")
         self.pending_task.decide_tool_call(tool_id, approved)
+        self.task_repository.save(self.pending_task)
 
     def resume(self) -> Task:
         """
