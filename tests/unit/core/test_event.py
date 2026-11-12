@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime
 
 from src.core.event import EventHandler
@@ -85,3 +86,14 @@ def test_emitter_errors_do_not_escape(capsys):
 
     assert "tracing " in capsys.readouterr().out
     assert "client " not in capsys.readouterr().out
+
+
+def test_emitter_errors_are_logged(caplog):
+    def boom(event):
+        raise RuntimeError("down")
+
+    with caplog.at_level(logging.ERROR, logger="harness.core.event"):
+        EventHandler(client_emitter=boom).emit(_event(), EventChannel.CLIENT)
+
+    assert "event emitter failed" in caplog.text
+    assert "RuntimeError: down" in caplog.text

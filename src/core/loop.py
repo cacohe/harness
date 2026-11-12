@@ -12,6 +12,7 @@ from src.core.context import (
 )
 from src.core.event import EventHandler
 from src.core.guard import GuardError, HarnessGuard, NoOpGuard
+from src.core.hook import HarnessHook
 from src.core.llm import LlmCallError, LlmGateway
 from src.core.persistence import NoOpTaskRepository, TaskRepository
 from src.core.task import Task
@@ -19,7 +20,6 @@ from src.core.tool import ToolExecutor
 from src.schema.context import Context
 from src.schema.event import Event, EventType, LlmEventPayload, TaskEventPayload, ToolEventPayload
 from src.schema.harness import StepResult
-from src.schema.hook import HarnessHook
 from src.schema.llm import (
     FinishReason,
     LLMOutput,
