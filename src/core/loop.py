@@ -44,7 +44,6 @@ class Harness:
         self,
         system_prompt: str,
         llm_gateway: LlmGateway,
-        tools: list[Tool],
         skills: list[Skill],
         tool_executor: ToolExecutor,
         context_builder: ContextBuilder,
@@ -56,7 +55,6 @@ class Harness:
     ):
         self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
         self.llm_gateway = llm_gateway
-        self.tools = tools
         self.skills = skills
         self.tool_executor = tool_executor
         self.context_builder = context_builder
@@ -66,6 +64,9 @@ class Harness:
         self._max_steps = max_steps
         self._max_seconds = max_seconds
         self._length_continuations = 0
+
+    def _available_tools(self) -> list[Tool]:
+        return self.tool_executor.get_all_tools()
 
     def _emit_task_event(
         self,
@@ -194,7 +195,7 @@ class Harness:
         """
         try:
             return self.context_builder.build_planning_context(
-                self.system_prompt, task, tools=self.tools
+                self.system_prompt, task, tools=self._available_tools()
             )
         except ContextBuilderError:
             raise
@@ -258,7 +259,7 @@ class Harness:
         """
         try:
             return self.context_builder.build_infer_context(
-                self.system_prompt, task, self.tools, self.skills
+                self.system_prompt, task, self._available_tools(), self.skills
             )
         except ContextBuilderError:
             raise
@@ -335,26 +336,16 @@ class Harness:
             Completed, failed, and pending tool executions.
         """
 
-        pending_tools = []
-        completed_tools = []
-        failed_tools = []
-
-        for call in tool_calls:
+        def before_call(call: LlmToolCall) -> None:
             self._emit_tool_event(EventType.TOOL_EXECUTION_STARTED, task, call)
 
-            result: ToolExecutionResult = self.tool_executor.execute_tool_call(
-                call, hold=bool(pending_tools)
-            )
-            if result.is_completed():
-                completed_tools.append(result)
-            elif result.is_failed():
-                failed_tools.append(result)
-            else:
-                pending_tools.append(result)
+        def after_call(call: LlmToolCall, result: ToolExecutionResult) -> None:
             self._emit_tool_result(task, call, result)
 
-        return ToolCallResult(
-            pending_tools=pending_tools, completed_tools=completed_tools, failed_tools=failed_tools
+        return self.tool_executor.execute_tool_calls(
+            tool_calls,
+            before_call=before_call,
+            after_call=after_call,
         )
 
     def step(self, task: Task) -> StepResult:
@@ -397,7 +388,7 @@ class Harness:
         """
         try:
             return self.context_builder.build_final_context(
-                self.system_prompt, task, tools=self.tools, skills=self.skills
+                self.system_prompt, task, tools=self._available_tools(), skills=self.skills
             )
         except ContextBuilderError:
             raise

@@ -51,7 +51,6 @@ class Agent:
         self.harness = Harness(
             SYSTEM_PROMPT,
             self.llm_gateway,
-            self.tool_registry.get_all_tools(),
             [],
             self.tool_executor,
             self.context_builder,

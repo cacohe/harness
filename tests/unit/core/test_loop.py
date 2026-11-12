@@ -56,31 +56,16 @@ class Gateway:
 
 
 class Executor(ToolExecutor):
-    def is_need_approval(self, tool: Tool) -> bool:
-        return False
+    def __init__(self, tools=None):
+        registry = DefaultToolRegistry()
+        for tool in tools or []:
+            registry.register(tool)
+        super().__init__(registry, LocalRunner())
 
-    def launch_approval(self, tool: Tool) -> bool:
-        return False
 
-    def is_need_sandbox(self, tool: Tool) -> bool:
-        return False
-
-    def get_sandbox(self):
-        raise NotImplementedError
-
-    def find_tool(self, name: str) -> Tool | None:
-        return None
-
-    def execute_without_sandbox(self, tool_id: str, inputs: dict) -> ToolExecutionResult:
-        return ToolExecutionResult(
-            tool_id=tool_id,
-            tool_name=tool_id,
-            state=ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED,
-            output=None,
-        )
-
-    def execute(self, tool: Tool, inputs: dict) -> ToolExecutionResult:
-        return self.execute_without_sandbox(tool.id, inputs)
+class LocalRunner:
+    def run(self, tool, inputs):
+        return tool.executer(inputs)
 
 
 def _task() -> Task:
@@ -99,8 +84,8 @@ class RecordingOutput:
 
 
 def test_harness_default_collaborators_are_isolated():
-    first = Harness("", None, [], [], None, None)
-    second = Harness("", None, [], [], None, None)
+    first = Harness("", None, [], Executor(), None)
+    second = Harness("", None, [], Executor(), None)
 
     assert first.harness_hooks is not second.harness_hooks
     assert first.harness_guard is not second.harness_guard
@@ -119,9 +104,8 @@ def _harness(
     return Harness(
         "Be brief.",
         gateway,
-        [] if tools is None else tools,
         [],
-        executor or Executor(),
+        executor or Executor(tools),
         DefaultContextBuilder(),
         harness_hooks=hooks or HarnessHook(),
         harness_guard=guard or NoOpGuard(),
@@ -145,7 +129,8 @@ class ScriptedGateway(Gateway):
 
 
 class CountingExecutor(Executor):
-    def __init__(self):
+    def __init__(self, tools=None):
+        super().__init__(tools)
         self.batches = 0
 
     def execute_tool_call(self, call, approved=False, hold=False):
@@ -293,9 +278,8 @@ def test_planning_context_names_tools_but_does_not_offer_them():
     harness = Harness(
         "Be brief.",
         Gateway(),
-        [tool],
         [],
-        Executor(),
+        Executor([tool]),
         DefaultContextBuilder(),
         harness_guard=NoOpGuard(),
     )
@@ -303,6 +287,24 @@ def test_planning_context_names_tools_but_does_not_offer_them():
     context = harness.build_planning_context(_task())
 
     assert context.tools == []
+    assert "shell: Run a command." in context.messages[0].content
+
+
+def test_context_reads_tools_from_the_executor_catalog_at_call_time():
+    registry = DefaultToolRegistry()
+    executor = DefaultToolExecutor(registry)
+    harness = Harness(
+        "Be brief.",
+        Gateway(),
+        [],
+        executor,
+        DefaultContextBuilder(),
+        harness_guard=NoOpGuard(),
+    )
+    registry.register(_shell())
+
+    context = harness.build_planning_context(_task())
+
     assert "shell: Run a command." in context.messages[0].content
 
 
@@ -446,7 +448,7 @@ def test_execute_tool_calls_emits_failure():
 
 
 def test_step_limit_asks_for_a_closing_answer_from_unseen_tool_results():
-    executor = CountingExecutor()
+    executor = CountingExecutor([_shell()])
     gateway = ScriptedGateway(
         [
             _model(FinishReason.TOOL_CALLS, None, [LlmToolCall("call_1", "shell", "{}")]),
@@ -456,7 +458,7 @@ def test_step_limit_asks_for_a_closing_answer_from_unseen_tool_results():
     task = _task()
 
     assert (
-        _harness(gateway, tools=[_shell()], executor=executor, max_steps=1).run(task).output
+        _harness(gateway, executor=executor, max_steps=1).run(task).output
         == "based on the tool"
     )
 
