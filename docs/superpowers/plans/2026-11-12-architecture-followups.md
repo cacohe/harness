@@ -183,4 +183,3 @@ Commit: `docs: close architecture follow-up plan`
 - [ ] **Step 5: 创建 PR 并清理旧工作区**
 
 推送 `codex/architecture-followups` 并创建面向 `main` 的 PR。确认旧 C 盘 worktree 干净后，从主工作区删除它；删除本地和远程 `codex/core-architecture-refactor` 分支。保留新的 F 盘 worktree 处理 PR 反馈。
-
