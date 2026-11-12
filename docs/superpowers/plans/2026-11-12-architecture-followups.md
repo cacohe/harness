@@ -43,7 +43,8 @@
 - [x] **Step 1: 运行缺失的类型检查命令并记录预期失败**
 
 Run: `uv run --locked mypy src`
-Expected: FAIL，因为开发依赖尚未包含 `mypy`。
+Observed: FAIL；环境中可发现未锁定的 `mypy`，并报告 14 个项目类型错误。随后把
+`mypy` 加入项目锁定依赖，避免 CI 依赖外部 PATH 状态。
 
 - [x] **Step 2: 添加 mypy 开发依赖和项目配置**
 
@@ -52,7 +53,7 @@ Expected: FAIL，因为开发依赖尚未包含 `mypy`。
 - [x] **Step 3: 更新锁文件并运行全项目检查**
 
 Run: `uv lock && uv run --locked mypy src`
-Expected: 首次检查报告真实类型问题。
+Observed: 锁定版首次检查报告 13 个真实类型问题。
 
 - [x] **Step 4: 最小化修正 mypy 报告的问题**
 
@@ -88,7 +89,7 @@ Commit: `build: add project-wide mypy gate`
 
 - [x] **Step 2: 运行测试并确认按预期失败**
 
-Run: `uv run pytest tests/unit/core/test_ports.py tests/unit/core/test_loop.py -q`
+Run: `uv run --locked python -m pytest tests/unit/core/test_ports.py tests/unit/core/test_loop.py -q`
 Expected: FAIL，因为 `EventSink` 不存在且假值 sink 被替换。
 
 - [x] **Step 3: 实现 EventSink 并修正默认选择**
@@ -97,7 +98,7 @@ Expected: FAIL，因为 `EventSink` 不存在且假值 sink 被替换。
 
 - [x] **Step 4: 运行目标测试、mypy 和完整测试**
 
-Run: `uv run pytest tests/unit/core/test_event.py tests/unit/core/test_ports.py tests/unit/core/test_loop.py -q && uv run mypy src && uv run pytest -q -p no:cacheprovider`
+Run: `uv run --locked python -m pytest tests/unit/core/test_event.py tests/unit/core/test_ports.py tests/unit/core/test_loop.py -q && uv run --locked mypy src && uv run --locked python -m pytest -q -p no:cacheprovider`
 Expected: PASS。
 
 - [x] **Step 5: 提交**
@@ -125,7 +126,7 @@ Commit: `refactor: define event sink port`
 
 - [x] **Step 2: 运行测试并确认按预期失败**
 
-Run: `uv run pytest tests/unit/core/test_legacy_exports.py -q`
+Run: `uv run --locked python -m pytest tests/unit/core/test_legacy_exports.py -q`
 Expected: FAIL，列出当前仍存在的兼容导出。
 
 - [x] **Step 3: 删除兼容导出、模块和未使用协议**
@@ -134,12 +135,12 @@ Expected: FAIL，列出当前仍存在的兼容导出。
 
 - [x] **Step 4: 验证没有旧引用**
 
-Run: `rg -n "ToolRegistry|core\.sandbox|schema\.hook|CheckpointStore|ArtifactStore|TraceStore" src tests README.md docs`
-Expected: 只允许迁移说明和历史计划中明确描述已删除名称的文本。
+Run: `rg -n "\bToolRegistry\b|core\.sandbox|schema\.hook|\bCheckpointStore\b|\bArtifactStore\b|\bTraceStore\b" src tests README.md docs`
+Expected: 只允许删除回归测试、迁移说明和历史计划中明确描述已删除名称的文本。
 
 - [x] **Step 5: 运行目标测试、mypy 和完整测试**
 
-Run: `uv run pytest tests/unit/core/test_legacy_exports.py tests/unit/demo/test_agent.py -q && uv run mypy src && uv run pytest -q -p no:cacheprovider`
+Run: `uv run --locked python -m pytest tests/unit/core/test_legacy_exports.py tests/unit/demo/test_agent.py -q && uv run --locked mypy src && uv run --locked python -m pytest -q -p no:cacheprovider`
 Expected: PASS。
 
 - [x] **Step 6: 提交**

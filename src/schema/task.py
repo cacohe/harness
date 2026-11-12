@@ -78,7 +78,7 @@ class TaskPlan(BaseModel):
 class TaskResult:
     """Task result."""
 
-    def __init__(self, output: str = ""):
+    def __init__(self, output: str | None = ""):
         self.output = output
 
     def to_dict(self) -> dict:

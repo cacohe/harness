@@ -2,7 +2,6 @@
 
 import time
 import uuid
-from typing import cast
 
 from src.core.context import (
     ContextBuilder,
@@ -515,7 +514,7 @@ class Harness:
         Returns:
             The task result.
         """
-        result = TaskResult(output=step_result.llm_output.content or "")
+        result = TaskResult(output=step_result.llm_output.content)
 
         task.set_result(result)
         task.transition_to_completed()
@@ -555,7 +554,7 @@ class Harness:
             if self._completed(step_result):
                 return self._handle_completed_turn(task, step_result, step_count)
 
-    def run(self, task: Task) -> TaskResult:
+    def run(self, task: Task) -> TaskResult | None:
         """
         Plan a new task, then infer and execute tools until the model answers or a limit is hit.
         Args:
@@ -570,7 +569,7 @@ class Harness:
         try:
             if task.is_finished():
                 self._emit_task_event(EventType.TASK_FINISHED, task)
-                return cast(TaskResult, task.result)
+                return task.result
 
             self._emit_task_event(EventType.TASK_STARTED, task)
 
