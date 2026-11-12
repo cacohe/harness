@@ -48,6 +48,15 @@ class ToolExecutionResult:
     state: ToolExecutionState = ToolExecutionState.TOOL_EXECUTION_STATE_PENDING
     output: Any | None = None
     fail_reason: ToolExecutionFailReason | None = None
+    arguments: str | None = None
+    approval: ApprovalDecision | None = None
+    needs_approval: bool = False
+
+    def can_run(self) -> bool:
+        return (
+            not self.needs_approval
+            or self.approval == ApprovalDecision.APPROVAL_DECISION_APPROVED
+        )
 
     def is_completed(self) -> bool:
         return self.state == ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED

@@ -7,6 +7,7 @@ from src.core.context import (
     ContextBuilder,
     ContextBuilderError,
     build_history_message,
+    build_tool_message,
     build_tool_messages,
 )
 from src.core.event import EventHandler
@@ -122,6 +123,15 @@ class Harness:
                 task_id=str(task.id),
             )
         )
+
+    def _emit_tool_result(self, task: Task, call: LlmToolCall, result: ToolExecutionResult) -> None:
+        if result.is_completed():
+            event_type = EventType.TOOL_EXECUTION_COMPLETED
+        elif result.is_failed():
+            event_type = EventType.TOOL_EXECUTION_FAILED
+        else:
+            event_type = EventType.TOOL_EXECUTION_PAUSED
+        self._emit_tool_event(event_type, task, call, result)
 
     def _emit_llm_event(
         self,
@@ -332,15 +342,16 @@ class Harness:
         for call in tool_calls:
             self._emit_tool_event(EventType.TOOL_EXECUTION_STARTED, task, call)
 
-            result: ToolExecutionResult = self.tool_executor.execute_tool_call(call)
+            result: ToolExecutionResult = self.tool_executor.execute_tool_call(
+                call, hold=bool(pending_tools)
+            )
             if result.is_completed():
                 completed_tools.append(result)
-                self._emit_tool_event(EventType.TOOL_EXECUTION_COMPLETED, task, call, result)
             elif result.is_failed():
                 failed_tools.append(result)
-                self._emit_tool_event(EventType.TOOL_EXECUTION_FAILED, task, call, result)
             else:
                 pending_tools.append(result)
+            self._emit_tool_result(task, call, result)
 
         return ToolCallResult(
             pending_tools=pending_tools, completed_tools=completed_tools, failed_tools=failed_tools
@@ -464,9 +475,7 @@ class Harness:
                 reason=TaskPauseReason.TASK_PAUSED_WAITING_APPROVAL.value,
                 step_id=str(step_count),
             )
-
-        final_output = self.finalize(task)
-        return TaskResult(output=final_output)
+        return TaskResult()
 
     def _handle_failed_turn(
         self, task: Task, step_count: int, failed_reason: TaskFailReason
@@ -521,14 +530,15 @@ class Harness:
             The task result. A completed task carries the assistant text. A paused or
             failed task carries the result recorded while closing the turn.
         """
-        start_time = time.monotonic()
-        step_count = 0
+        start_time = time.monotonic() - task.elapsed_seconds
+        step_count = task.step_count
         while True:
             step_result: StepResult = self.step(task)
             step_count += 1
 
             blocked, blocked_reason = self._blocked(step_result)
             if blocked:
+                task.set_progress(step_count, time.monotonic() - start_time)
                 return self._handle_blocked_turn(task, step_result, step_count, blocked_reason)
 
             failed, failed_reason = self._failed(start_time, step_count)
@@ -545,7 +555,11 @@ class Harness:
             task: The task to run.
         Returns:
             The task result. Its output is the assistant text when the task is completed.
+        Raises:
+            ValueError: The task is paused and a tool call still waits for the user's decision.
         """
+        if task.is_paused() and task.approval_requests():
+            raise ValueError("tool calls are waiting for approval")
         try:
             if task.is_finished():
                 self._emit_task_event(EventType.TASK_FINISHED, task)
@@ -560,10 +574,14 @@ class Harness:
                 self._emit_task_event(EventType.TASK_PLANNING, task)
                 task.set_plan(self.planning(self.build_planning_context(task), task))
                 self._emit_task_event(EventType.TASK_PLANNED, task, goal=list(task.plan.goal))
+                question = (task.plan.clarification or "").strip()
+                if question:
+                    return self._ask_clarification(task, question)
 
             if task.is_paused():
                 self._emit_task_event(EventType.TASK_RESUMED, task)
                 task.transition_to_running(TaskRunningReason.TASK_RUNNING_RESUME)
+                self._finish_pending_tool_calls(task)
 
             result = self.turn(task)
             return result
@@ -588,3 +606,23 @@ class Harness:
                 content=str(error),
             )
             return TaskResult(output=f"An unexpected error occurred: {str(error)}")
+
+    def _ask_clarification(self, task: Task, question: str) -> TaskResult:
+        result = TaskResult(output=question)
+        task.set_result(result)
+        task.transition_to_completed()
+        self._emit_llm_event(task, EventType.LLM_DELTA, phase="planning", content=question)
+        self._emit_task_event(EventType.TASK_COMPLETED, task, content=question)
+        return result
+
+    def _finish_pending_tool_calls(self, task: Task) -> None:
+        results = []
+        for item in task.pending_tool_calls:
+            call = LlmToolCall(item.tool_id, item.tool_name, item.arguments or "")
+            if item.can_run():
+                self._emit_tool_event(EventType.TOOL_EXECUTION_RESUMED, task, call)
+            result = self.tool_executor.execute_held_tool_call(item)
+            self._emit_tool_result(task, call, result)
+            results.append(result)
+        task.replace_tool_messages([build_tool_message(result) for result in results])
+        task.set_pending_tool_calls([])

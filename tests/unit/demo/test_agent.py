@@ -1,6 +1,6 @@
 from src.config import Config
 from src.demo.agent import Agent
-from src.schema.llm import FinishReason, LLMOutput
+from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
 from src.schema.task import TaskPlan, TaskState
 
 
@@ -52,3 +52,37 @@ def test_chat_sends_prior_turns_with_the_next_message():
 
     assert task.result.output == "fine"
     assert gateway.plans[1] == "user: hi\nassistant: hello\nuser: and you"
+
+
+def test_failed_resume_clears_the_waiting_task():
+    class FailingAfterPause(ChatGateway):
+        def infer(self, context, stream=True, response_format=None):
+            if not self.answers:
+                raise ValueError("bad request")
+            return self.answers.pop(0)
+
+    gateway = FailingAfterPause(
+        [
+            LLMOutput(
+                FinishReason.TOOL_CALLS,
+                None,
+                [LlmToolCall("call_1", "write_file", '{"path": "x.txt", "content": "x"}')],
+                None,
+                None,
+            )
+        ]
+    )
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=gateway,
+    )
+
+    assert agent.chat("write").state is TaskState.TASK_PAUSED
+
+    [request] = agent.approval_requests()
+    agent.decide_tool_call(request.tool_id, approved=False)
+    task = agent.resume()
+
+    assert task.state is TaskState.TASK_FAILED
+    assert agent.pending_task is None
+    assert agent.approval_requests() == []

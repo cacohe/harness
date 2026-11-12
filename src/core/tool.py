@@ -164,7 +164,7 @@ class ToolExecutor(ABC):
         failed_tools = []
 
         for call in tool_calls:
-            tool_execution_result = self.execute_tool_call(call)
+            tool_execution_result = self.execute_tool_call(call, hold=bool(pending_tools))
             if tool_execution_result.is_completed():
                 completed_tools.append(tool_execution_result)
             elif tool_execution_result.is_failed():
@@ -178,13 +178,18 @@ class ToolExecutor(ABC):
             failed_tools=failed_tools,
         )
 
-    def execute_tool_call(self, call: LlmToolCall) -> ToolExecutionResult:
+    def execute_tool_call(
+        self, call: LlmToolCall, approved: bool = False, hold: bool = False
+    ) -> ToolExecutionResult:
         """
         Run one model tool call.
         Args:
             call: The tool call from the model. It has id, name, and arguments.
+            approved: True when the user already approved this call.
+            hold: True when an earlier call in the same batch waits for approval.
         Returns:
-            The execution result for that call.
+            The execution result for that call. A tool that needs approval, or any call after
+            one, is held as pending with the model arguments, unless the call is approved.
         """
         try:
             parsed = json.loads(call.arguments) if call.arguments else {}
@@ -207,6 +212,43 @@ class ToolExecutor(ABC):
                 output=None,
                 fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_NOT_SUPPORTED,
             )
+        needs_approval = not approved and self.is_need_approval(tool)
+        if needs_approval or hold:
+            return ToolExecutionResult(
+                tool_id=call.id,
+                tool_name=call.name,
+                state=ToolExecutionState.TOOL_EXECUTION_STATE_PENDING,
+                arguments=call.arguments,
+                needs_approval=needs_approval,
+            )
         result = self.execute(tool, parsed)
         result.tool_id = call.id
         return result
+
+    def execute_held_tool_call(self, held: ToolExecutionResult) -> ToolExecutionResult:
+        """
+        Run or reject a held tool call after the user decided.
+        Args:
+            held: The pending result. Its approval is the user's decision when it needs one.
+        Returns:
+            The execution result when the call can run. Otherwise a failed result with the reason.
+        """
+        call = LlmToolCall(held.tool_id, held.tool_name, held.arguments or "")
+        decision = held.approval
+        if held.can_run():
+            return self.execute_tool_call(call, approved=True)
+        if decision == ApprovalDecision.APPROVAL_DECISION_TIMEOUT:
+            reason = ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_TIMEOUT
+            output = "The approval timed out."
+        else:
+            reason = ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_REJECTED
+            output = "The tool call was rejected."
+        return ToolExecutionResult(
+            tool_id=call.id,
+            tool_name=call.name,
+            state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
+            output=output,
+            fail_reason=reason,
+            arguments=call.arguments,
+            approval=decision,
+        )

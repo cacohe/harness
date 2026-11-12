@@ -4,6 +4,7 @@ import uuid
 from typing import FrozenSet, Optional
 
 from src.schema.context import Message
+from src.schema.llm import ROLE_TOOL
 from src.schema.task import (
     TaskFailReason,
     TaskPauseReason,
@@ -13,7 +14,7 @@ from src.schema.task import (
     TaskState,
     TaskStateReason,
 )
-from src.schema.tool import ToolExecutionResult
+from src.schema.tool import ApprovalDecision, ToolExecutionResult
 
 
 class InvalidTransition(Exception):
@@ -55,6 +56,8 @@ class Task:
         self.history = history
         self.pending_tool_calls = pending_tool_calls
         self.result = result
+        self.step_count = 0
+        self.elapsed_seconds = 0.0
 
     def to_dict(self) -> dict:
         """
@@ -71,6 +74,8 @@ class Task:
             "history": self.history,
             "pending_tool_calls": self.pending_tool_calls,
             "result": self.result.to_dict() if self.result else None,
+            "step_count": self.step_count,
+            "elapsed_seconds": self.elapsed_seconds,
         }
 
     def _transition_to(
@@ -194,6 +199,62 @@ class Task:
             pending_tool_calls: Tool executions that have not finished.
         """
         self.pending_tool_calls = pending_tool_calls
+        self.persist()
+
+    def approval_requests(self) -> list[ToolExecutionResult]:
+        """
+        List the pending tool calls that still wait for the user's decision.
+        Returns:
+            Undecided calls that need approval, in call order.
+        """
+        return [
+            item
+            for item in self.pending_tool_calls
+            if item.needs_approval and item.approval is None
+        ]
+
+    def decide_tool_call(self, tool_id: str, approved: bool) -> None:
+        """
+        Record the user's decision on one tool call waiting for approval.
+        Args:
+            tool_id: The id of the pending tool call.
+            approved: True approves the call. False rejects it.
+        Raises:
+            ValueError: No pending tool call needs approval with that id.
+        """
+        for item in self.pending_tool_calls:
+            if item.tool_id == tool_id and item.needs_approval:
+                item.approval = (
+                    ApprovalDecision.APPROVAL_DECISION_APPROVED
+                    if approved
+                    else ApprovalDecision.APPROVAL_DECISION_REJECTED
+                )
+                self.persist()
+                return
+        raise ValueError(f"no tool call waits for approval with id {tool_id}")
+
+    def replace_tool_messages(self, messages: list[Message]) -> None:
+        """
+        Replace history tool messages that answer the same tool calls.
+        Args:
+            messages: Tool messages. A message without a matching tool call is appended.
+        """
+        by_call_id = {message.tool_call_id: message for message in messages}
+        for index, message in enumerate(self.history):
+            if message.role == ROLE_TOOL and message.tool_call_id in by_call_id:
+                self.history[index] = by_call_id.pop(message.tool_call_id)
+        self.history.extend(by_call_id.values())
+        self.persist()
+
+    def set_progress(self, step_count: int, elapsed_seconds: float) -> None:
+        """
+        Record how many steps ran and how long the task ran before it paused.
+        Args:
+            step_count: Steps already taken.
+            elapsed_seconds: Running time already used, excluding paused time.
+        """
+        self.step_count = step_count
+        self.elapsed_seconds = elapsed_seconds
         self.persist()
 
     def set_result(self, result: TaskResult) -> None:

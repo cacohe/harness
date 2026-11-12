@@ -7,6 +7,8 @@ from src.schema.tool import (
     ToolExecutionState,
 )
 
+_NEED_APPROVAL_TOOLS = {"shell", "write_file", "edit_file"}
+
 
 class DefaultToolExecutor(ToolExecutor):
     def __init__(self, tool_registry: ToolRegistry):
@@ -18,9 +20,9 @@ class DefaultToolExecutor(ToolExecutor):
         Args:
             tool: The tool to check.
         Returns:
-            True if the tool needs approval, False otherwise.
+            True when the tool can run commands or change files.
         """
-        return False
+        return tool.name in _NEED_APPROVAL_TOOLS
 
     def launch_approval(self, tool: Tool) -> bool:
         """

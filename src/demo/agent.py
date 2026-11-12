@@ -8,6 +8,7 @@ from src.core.task import Task
 from src.core.tool import ToolExecutor
 from src.llm.litellm import LiteLLMGateway
 from src.schema.hook import HarnessHook
+from src.schema.tool import ToolExecutionResult
 from src.tool.local_tools import LOCAL_TOOLS
 from src.tool.tool_executor import DefaultToolExecutor
 from src.tool.tool_registry import DefaultToolRegistry
@@ -46,6 +47,8 @@ class Agent:
         )
         self.tool_executor = tool_executor or DefaultToolExecutor(self.tool_registry)
         self.context_builder = context_builder or DefaultContextBuilder()
+        self.pending_task: Task | None = None
+        self.pending_message: str | None = None
         self.harness = Harness(
             SYSTEM_PROMPT,
             self.llm_gateway,
@@ -69,10 +72,64 @@ class Agent:
         """
         task = Task(original_input=self._with_transcript(message))
         self.harness.run(task)
+        if task.is_paused():
+            self.pending_task = task
+            self.pending_message = message
+            return task
+        self.pending_task = None
+        self.pending_message = None
+        self._remember(message, task)
+        return task
+
+    def approval_requests(self) -> list[ToolExecutionResult]:
+        """
+        List the tool calls on the paused task that still wait for a decision.
+        Returns:
+            Undecided calls in call order. Empty when no task is paused.
+        """
+        if self.pending_task is None:
+            return []
+        return self.pending_task.approval_requests()
+
+    def decide_tool_call(self, tool_id: str, approved: bool) -> None:
+        """
+        Approve or reject one tool call waiting on the paused task.
+        Args:
+            tool_id: The id of the pending tool call.
+            approved: True runs the call on resume. False records it as rejected.
+        Raises:
+            ValueError: No task is waiting for approval.
+        """
+        if self.pending_task is None:
+            raise ValueError("nothing is waiting for approval")
+        self.pending_task.decide_tool_call(tool_id, approved)
+
+    def resume(self) -> Task:
+        """
+        Continue the paused task after every pending call is decided.
+        Returns:
+            The task after it continues.
+        Raises:
+            ValueError: No task is waiting for approval.
+        """
+        task = self.pending_task
+        if task is None:
+            raise ValueError("nothing is waiting for approval")
+        message = self.pending_message or ""
+        try:
+            self.harness.run(task)
+        finally:
+            if not task.is_paused():
+                self.pending_task = None
+                self.pending_message = None
+        if not task.is_paused():
+            self._remember(message, task)
+        return task
+
+    def _remember(self, message: str, task: Task) -> None:
         if task.is_completed() and task.result is not None:
             self.transcript.append(("user", message))
             self.transcript.append(("assistant", task.result.output))
-        return task
 
     def _with_transcript(self, message: str) -> str:
         if not self.transcript:

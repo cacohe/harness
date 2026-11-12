@@ -3,10 +3,16 @@ from abc import ABC, abstractmethod
 from src.core.task import Task
 from src.schema.context import Context, Message
 from src.schema.llm import ROLE_ASSISTANT, ROLE_TOOL, LLMOutput
-from src.schema.tool import ToolCallResult
+from src.schema.tool import ToolCallResult, ToolExecutionResult
+
+PENDING_TOOL_MESSAGE = "The tool was not executed because it is waiting for approval."
+HELD_TOOL_MESSAGE = (
+    "The tool was not executed because an earlier tool call is waiting for approval."
+)
 
 DEFAULT_SYSTEM_PROMPT_FOR_PLANNING = """
-You are an expert in task management, skilled at converting vague inputs into clear task objectives, and designing reasonable execution steps based on those task objectives.
+You are an expert in task management, skilled at converting inputs into clear task objectives and designing reasonable execution steps based on those objectives.
+You decide whether this input needs a plan. Write the goal and steps when you plan. Use clarification when you need to ask the user something instead.
 """
 DEFAULT_SYSTEM_PROMPT_FOR_INFER = """
 You are an expert in task execution, skilled at executing tasks based on the given task objectives and execution steps.
@@ -87,36 +93,29 @@ def build_tool_messages(result: ToolCallResult) -> list[Message]:
     Returns:
         One tool message per completed or failed execution.
     """
-    messages = []
-    for item in result.completed_tools:
-        messages.append(
-            Message(
-                role=ROLE_TOOL,
-                content="" if item.output is None else str(item.output),
-                tool_call_id=item.tool_id,
-                name=item.tool_name,
-            )
-        )
-    for item in result.failed_tools:
-        if item.output is not None:
-            content = str(item.output)
-        else:
-            content = item.fail_reason.value if item.fail_reason else ""
-        messages.append(
-            Message(
-                role=ROLE_TOOL,
-                content=content,
-                tool_call_id=item.tool_id,
-                name=item.tool_name,
-            )
-        )
-    for item in result.pending_tools:
-        messages.append(
-            Message(
-                role=ROLE_TOOL,
-                content="The tool was not executed because it is waiting for approval.",
-                tool_call_id=item.tool_id,
-                name=item.tool_name,
-            )
-        )
-    return messages
+    items = [*result.completed_tools, *result.failed_tools, *result.pending_tools]
+    return [build_tool_message(item) for item in items]
+
+
+def build_tool_message(item: ToolExecutionResult) -> Message:
+    """
+    Build the tool message for one tool execution.
+    Args:
+        item: A completed, failed, or pending tool execution.
+    Returns:
+        The tool output, the failure text, or a note that the call waits for approval.
+    """
+    if item.is_pending():
+        content = PENDING_TOOL_MESSAGE if item.needs_approval else HELD_TOOL_MESSAGE
+    elif item.output is not None:
+        content = str(item.output)
+    elif item.is_failed() and item.fail_reason is not None:
+        content = item.fail_reason.value
+    else:
+        content = ""
+    return Message(
+        role=ROLE_TOOL,
+        content=content,
+        tool_call_id=item.tool_id,
+        name=item.tool_name,
+    )

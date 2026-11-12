@@ -1,4 +1,6 @@
+import pytest
 from src.context.context_builder import DefaultContextBuilder
+from src.core.context import HELD_TOOL_MESSAGE, PENDING_TOOL_MESSAGE
 from src.core.guard import HarnessGuard
 from src.core.loop import (
     DEFAULT_LLM_ATTEMPT_DELAY_SECONDS,
@@ -26,6 +28,8 @@ from src.schema.tool import (
     ToolExecutionResult,
     ToolExecutionState,
 )
+from src.tool.tool_executor import DefaultToolExecutor
+from src.tool.tool_registry import DefaultToolRegistry
 
 
 class Gateway:
@@ -136,7 +140,7 @@ class CountingExecutor(Executor):
     def __init__(self):
         self.batches = 0
 
-    def execute_tool_call(self, call):
+    def execute_tool_call(self, call, approved=False, hold=False):
         self.batches += 1
         return super().execute_tool_call(call)
 
@@ -373,7 +377,7 @@ def test_length_continues_once_with_tools_then_completes():
 
 def test_execute_tool_calls_emits_start_and_completion():
     class Completing(Executor):
-        def execute_tool_call(self, call):
+        def execute_tool_call(self, call, approved=False, hold=False):
             return ToolExecutionResult(
                 tool_id=call.id,
                 tool_name=call.name,
@@ -407,7 +411,7 @@ def test_execute_tool_calls_emits_start_and_completion():
 
 def test_execute_tool_calls_emits_failure():
     class Failing(Executor):
-        def execute_tool_call(self, call):
+        def execute_tool_call(self, call, approved=False, hold=False):
             return ToolExecutionResult(
                 tool_id=call.id,
                 tool_name=call.name,
@@ -467,3 +471,243 @@ def test_closing_answer_without_text_fails_with_an_empty_result():
 
     assert task.state_reason is TaskFailReason.TASK_FAILED_MAX_STEPS
     assert len(gateway.infer_contexts) == 2
+
+
+def _recording_executor(called: list, *names: str):
+    registry = DefaultToolRegistry()
+    registry.tools = {}
+    for name in names:
+        registry.register(
+            Tool(
+                id=name,
+                name=name,
+                description="A tool.",
+                input_schema={},
+                executer=lambda inputs, name=name: called.append((name, dict(inputs))) or "ran",
+            )
+        )
+    return DefaultToolExecutor(registry)
+
+
+def _shell_call(call_id: str = "call_1") -> LLMOutput:
+    return _model(
+        FinishReason.TOOL_CALLS,
+        None,
+        [LlmToolCall(call_id, "shell", '{"command": "git status"}')],
+    )
+
+
+def _tool_messages(task: Task) -> list:
+    return [message for message in task.history if message.role == "tool"]
+
+
+def test_shell_call_pauses_without_running_or_a_closing_call():
+    called = []
+    output = RecordingOutput()
+    gateway = ScriptedGateway([_shell_call(), _model(FinishReason.STOP, "should not run")])
+    task = _task()
+
+    result = _harness(
+        gateway,
+        event_handler=output,
+        tools=[_shell()],
+        executor=_recording_executor(called, "shell"),
+    ).run(task)
+
+    assert called == []
+    assert result.output == ""
+    assert task.state is TaskState.TASK_PAUSED
+    assert task.state_reason is TaskPauseReason.TASK_PAUSED_WAITING_APPROVAL
+    assert task.pending_tool_calls[0].arguments == '{"command": "git status"}'
+    assert len(gateway.infer_contexts) == 1
+    paused = [e for e in output.events if e.type is EventType.TOOL_EXECUTION_PAUSED]
+    assert [event.payload.tool_call_id for event in paused] == ["call_1"]
+
+
+def test_approved_shell_runs_before_the_next_inference():
+    called = []
+    gateway = ScriptedGateway([_shell_call(), _model(FinishReason.STOP, "status read")])
+    harness = _harness(gateway, executor=_recording_executor(called, "shell"))
+    task = _task()
+    harness.run(task)
+
+    task.decide_tool_call("call_1", approved=True)
+    result = harness.run(task)
+
+    assert called == [("shell", {"command": "git status"})]
+    assert result.output == "status read"
+    assert task.state is TaskState.TASK_COMPLETED
+    assert task.pending_tool_calls == []
+    assert [message.content for message in _tool_messages(task)] == ["ran"]
+
+
+def test_rejected_shell_is_recorded_before_the_next_inference():
+    called = []
+    gateway = ScriptedGateway([_shell_call(), _model(FinishReason.STOP, "skipped")])
+    harness = _harness(gateway, executor=_recording_executor(called, "shell"))
+    task = _task()
+    harness.run(task)
+
+    task.decide_tool_call("call_1", approved=False)
+    result = harness.run(task)
+
+    assert called == []
+    assert result.output == "skipped"
+    assert [message.content for message in _tool_messages(task)] == [
+        "The tool call was rejected."
+    ]
+
+
+def test_calls_after_a_held_call_wait_and_run_in_order():
+    called = []
+    gateway = ScriptedGateway(
+        [
+            _model(
+                FinishReason.TOOL_CALLS,
+                None,
+                [
+                    LlmToolCall("call_1", "read_file", '{"path": "a"}'),
+                    LlmToolCall("call_2", "shell", '{"command": "git status"}'),
+                    LlmToolCall("call_3", "read_file", '{"path": "b"}'),
+                ],
+            ),
+            _model(FinishReason.STOP, "done"),
+        ]
+    )
+    harness = _harness(gateway, executor=_recording_executor(called, "shell", "read_file"))
+    task = _task()
+    harness.run(task)
+
+    assert called == [("read_file", {"path": "a"})]
+    assert [item.tool_id for item in task.approval_requests()] == ["call_2"]
+    messages = {message.tool_call_id: message.content for message in _tool_messages(task)}
+    assert messages == {
+        "call_1": "ran",
+        "call_2": PENDING_TOOL_MESSAGE,
+        "call_3": HELD_TOOL_MESSAGE,
+    }
+
+    task.decide_tool_call("call_2", approved=True)
+    harness.run(task)
+
+    assert called == [
+        ("read_file", {"path": "a"}),
+        ("shell", {"command": "git status"}),
+        ("read_file", {"path": "b"}),
+    ]
+    assert task.state is TaskState.TASK_COMPLETED
+
+
+def test_each_held_call_follows_its_own_decision():
+    called = []
+    gateway = ScriptedGateway(
+        [
+            _model(
+                FinishReason.TOOL_CALLS,
+                None,
+                [
+                    LlmToolCall("call_1", "shell", '{"command": "git status"}'),
+                    LlmToolCall("call_2", "write_file", '{"path": "x.txt"}'),
+                ],
+            ),
+            _model(FinishReason.STOP, "done"),
+        ]
+    )
+    harness = _harness(gateway, executor=_recording_executor(called, "shell", "write_file"))
+    task = _task()
+    harness.run(task)
+
+    assert [item.tool_id for item in task.approval_requests()] == ["call_1", "call_2"]
+
+    task.decide_tool_call("call_1", approved=True)
+    with pytest.raises(ValueError):
+        harness.run(task)
+
+    task.decide_tool_call("call_2", approved=False)
+    harness.run(task)
+
+    assert called == [("shell", {"command": "git status"})]
+    assert [message.content for message in _tool_messages(task)] == [
+        "ran",
+        "The tool call was rejected.",
+    ]
+
+
+def test_paused_task_with_undecided_calls_does_not_run():
+    gateway = ScriptedGateway([_shell_call()])
+    harness = _harness(gateway, executor=_recording_executor([], "shell"))
+    task = _task()
+    harness.run(task)
+
+    with pytest.raises(ValueError):
+        harness.run(task)
+
+    assert task.state is TaskState.TASK_PAUSED
+    assert len(task.pending_tool_calls) == 1
+
+
+def test_failure_after_approval_fails_the_task():
+    class Failing(ScriptedGateway):
+        def infer(self, context, stream=True, response_format=None):
+            if len(self.infer_contexts) == 1:
+                self.infer_contexts.append(context)
+                raise ValueError("bad request")
+            return super().infer(context, stream, response_format)
+
+    gateway = Failing([_shell_call()])
+    harness = _harness(gateway, executor=_recording_executor([], "shell"))
+    task = _task()
+    harness.run(task)
+
+    task.decide_tool_call("call_1", approved=False)
+    harness.run(task)
+
+    assert task.state is TaskState.TASK_FAILED
+    assert task.state_reason is TaskFailReason.TASK_FAILED_LLM_ERROR
+    assert task.pending_tool_calls == []
+
+
+def test_step_limit_counts_steps_taken_before_the_approval():
+    gateway = ScriptedGateway(
+        [
+            _shell_call(),
+            _model(FinishReason.LENGTH, "part"),
+            _model(FinishReason.STOP, "closing"),
+        ]
+    )
+    harness = _harness(gateway, executor=_recording_executor([], "shell"), max_steps=2)
+    task = _task()
+    harness.run(task)
+
+    task.decide_tool_call("call_1", approved=True)
+    result = harness.run(task)
+
+    assert task.state_reason is TaskFailReason.TASK_FAILED_MAX_STEPS
+    assert result.output == "closing"
+
+
+def test_clarification_completes_without_inference():
+    class Clarifying(Gateway):
+        def planning(self, context, stream=True, response_format=None):
+            self.planning_calls.append((stream, response_format))
+            return LLMOutput(
+                FinishReason.STOP,
+                None,
+                [],
+                None,
+                None,
+                structured=TaskPlan(goal=[], clarification="What should I do with 12?"),
+            )
+
+        def infer(self, context, stream=True, response_format=None):
+            raise AssertionError("infer should not run")
+
+    task = _task()
+    output = RecordingOutput()
+
+    result = _harness(Clarifying(), event_handler=output).run(task)
+
+    assert result.output == "What should I do with 12?"
+    assert task.state is TaskState.TASK_COMPLETED
+    deltas = [e.payload.content for e in output.events if e.type is EventType.LLM_DELTA]
+    assert deltas == ["What should I do with 12?"]
