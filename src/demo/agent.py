@@ -39,7 +39,7 @@ class Agent:
             context_builder: Builder to use. When omitted, the default builder is created.
         """
         self.config = config if config is not None else Config.load()
-        self.transcript: list[tuple[str, str | None]] = []
+        self.transcript: list[tuple[str, str]] = []
         self.tool_registry = tool_catalog if tool_catalog is not None else DefaultToolRegistry()
         if tool_catalog is None:
             for tool in LOCAL_TOOLS:

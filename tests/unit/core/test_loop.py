@@ -13,6 +13,7 @@ from src.core.loop import (
 )
 from src.core.task import Task
 from src.core.tool import ToolExecutor
+from src.persistence.in_memory import InMemoryTaskRepository
 from src.schema.context import Context
 from src.schema.event import EventType
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
@@ -208,6 +209,22 @@ def test_run_saves_state_changes_through_the_repository():
     assert task.plan.current == "compare"
 
 
+def test_completed_turn_persists_result_and_progress_snapshot():
+    repository = InMemoryTaskRepository()
+    task = _task()
+
+    result = _harness(Gateway(), repository=repository).run(task)
+    restored = repository.get(task.id)
+
+    assert result is task.result
+    assert task.step_count == 1
+    assert task.elapsed_seconds >= 0
+    assert restored is not None
+    assert restored.state is TaskState.TASK_COMPLETED
+    assert restored.result == result
+    assert restored.step_count == 1
+
+
 def test_planning_run_emits_task_events():
     output = RecordingOutput()
 
@@ -391,8 +408,8 @@ def test_paused_task_returns_to_running_without_planning():
     assert task.result.output == "bought"
 
 
-def test_run_declares_that_finished_tasks_may_have_no_result():
-    assert get_type_hints(Harness.run)["return"] == TaskResult | None
+def test_run_declares_a_non_nullable_result():
+    assert get_type_hints(Harness.run)["return"] is TaskResult
 
 
 def test_completed_turn_normalizes_missing_model_content():
@@ -514,10 +531,18 @@ def test_step_limit_asks_for_a_closing_answer_from_unseen_tool_results():
         ]
     )
     task = _task()
+    repository = InMemoryTaskRepository()
 
-    assert _harness(gateway, executor=executor, max_steps=1).run(task).output == "based on the tool"
+    result = _harness(gateway, executor=executor, max_steps=1, repository=repository).run(task)
 
+    restored = repository.get(task.id)
+    assert result.output == "based on the tool"
+    assert result is task.result
     assert task.state_reason is TaskFailReason.TASK_FAILED_MAX_STEPS
+    assert task.step_count == 1
+    assert restored is not None
+    assert restored.result == result
+    assert restored.step_count == 1
     assert executor.batches == 1
     assert gateway.infer_contexts[1].tools == []
     assert task.history[-1].role == "tool"
@@ -767,10 +792,57 @@ def test_clarification_completes_without_inference():
 
     task = _task()
     output = RecordingOutput()
+    repository = InMemoryTaskRepository()
 
-    result = _harness(Clarifying(), event_handler=output).run(task)
+    result = _harness(Clarifying(), event_handler=output, repository=repository).run(task)
 
     assert result.output == "What should I do with 12?"
     assert task.state is TaskState.TASK_COMPLETED
+    restored = repository.get(task.id)
+    assert restored is not None
+    assert restored.state is TaskState.TASK_COMPLETED
+    assert restored.result == result
     deltas = [e.payload.content for e in output.events if e.type is EventType.LLM_DELTA]
     assert deltas == ["What should I do with 12?"]
+
+
+def test_unexpected_error_persists_the_returned_result():
+    class BrokenPlanning(Gateway):
+        def planning(self, context, stream=True, response_format=None):
+            raise ValueError("bad request")
+
+    repository = InMemoryTaskRepository()
+    task = _task()
+
+    result = _harness(BrokenPlanning(), repository=repository).run(task)
+    restored = repository.get(task.id)
+
+    assert result is task.result
+    assert result.output == "An unexpected error occurred: bad request"
+    assert restored is not None
+    assert restored.result == result
+
+
+def test_finalization_error_replaces_the_empty_failed_result():
+    class FinalizationFails(Gateway):
+        def __init__(self):
+            super().__init__()
+            self.infer_calls = 0
+
+        def infer(self, context, stream=True, response_format=None):
+            self.infer_calls += 1
+            if self.infer_calls == 1:
+                return _model(FinishReason.LENGTH, "partial")
+            raise ValueError("closing failed")
+
+    repository = InMemoryTaskRepository()
+    task = _task()
+
+    result = _harness(FinalizationFails(), max_steps=1, repository=repository).run(task)
+    restored = repository.get(task.id)
+
+    assert result is task.result
+    assert result.output == "An unexpected error occurred: closing failed"
+    assert task.state is TaskState.TASK_FAILED
+    assert restored is not None
+    assert restored.result == result

@@ -500,7 +500,10 @@ class Harness:
             step_id=str(step_count),
         )
         final_output = self.finalize(task)
-        return TaskResult(output=final_output)
+        result = TaskResult(output=final_output)
+        task.set_result(result)
+        self._save_task(task)
+        return result
 
     def _handle_completed_turn(
         self, task: Task, step_result: StepResult, step_count: int
@@ -539,11 +542,11 @@ class Harness:
         while True:
             step_result: StepResult = self.step(task)
             step_count += 1
+            task.set_progress(step_count, time.monotonic() - start_time)
 
             blocked, blocked_reason = self._blocked(step_result)
             if blocked:
                 assert blocked_reason is not None
-                task.set_progress(step_count, time.monotonic() - start_time)
                 return self._handle_blocked_turn(task, step_result, step_count, blocked_reason)
 
             failed, failed_reason = self._failed(start_time, step_count)
@@ -554,7 +557,7 @@ class Harness:
             if self._completed(step_result):
                 return self._handle_completed_turn(task, step_result, step_count)
 
-    def run(self, task: Task) -> TaskResult | None:
+    def run(self, task: Task) -> TaskResult:
         """
         Plan a new task, then infer and execute tools until the model answers or a limit is hit.
         Args:
@@ -569,6 +572,7 @@ class Harness:
         try:
             if task.is_finished():
                 self._emit_task_event(EventType.TASK_FINISHED, task)
+                assert task.result is not None
                 return task.result
 
             self._emit_task_event(EventType.TASK_STARTED, task)
@@ -597,6 +601,7 @@ class Harness:
             return result
 
         except Exception as error:
+            result = TaskResult(output=f"An unexpected error occurred: {str(error)}")
             if not task.is_failed():
                 if isinstance(error, GuardError):
                     reason = TaskFailReason.TASK_FAILED_GUARD_ERROR
@@ -606,8 +611,11 @@ class Harness:
                     reason = TaskFailReason.TASK_FAILED_LLM_ERROR
                 else:
                     reason = TaskFailReason.TASK_FAILED_UNKNOWN
+                task.set_result(result)
                 task.transition_to_failed(reason)
-                self._save_task(task)
+            else:
+                task.set_result(result)
+            self._save_task(task)
 
             fail_reason = task.state_reason.value if task.state_reason else None
             self._emit_task_event(
@@ -616,12 +624,13 @@ class Harness:
                 reason=fail_reason,
                 content=str(error),
             )
-            return TaskResult(output=f"An unexpected error occurred: {str(error)}")
+            return result
 
     def _ask_clarification(self, task: Task, question: str) -> TaskResult:
         result = TaskResult(output=question)
         task.set_result(result)
         task.transition_to_completed()
+        self._save_task(task)
         self._emit_llm_event(task, EventType.LLM_DELTA, phase="planning", content=question)
         self._emit_task_event(EventType.TASK_COMPLETED, task, content=question)
         return result
