@@ -98,6 +98,14 @@ class RecordingOutput:
         self.events.append(event)
 
 
+def test_harness_default_collaborators_are_isolated():
+    first = Harness("", None, [], [], None, None)
+    second = Harness("", None, [], [], None, None)
+
+    assert first.harness_hooks is not second.harness_hooks
+    assert first.harness_guard is not second.harness_guard
+
+
 def _harness(
     gateway,
     guard=None,

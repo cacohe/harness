@@ -37,7 +37,6 @@ class Agent:
         self.config = config or Config.load()
         self.transcript: list[tuple[str, str]] = []
         self.tool_registry = DefaultToolRegistry()
-        self.tool_registry.tools = {}
         for tool in LOCAL_TOOLS:
             self.tool_registry.register(tool)
         self.llm_gateway = llm_gateway or LiteLLMGateway(

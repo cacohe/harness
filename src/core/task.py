@@ -40,21 +40,23 @@ class Task:
     def __init__(
         self,
         original_input: str,
-        id: str = uuid.uuid4(),
+        id: str | None = None,
         state: TaskState = TaskState.TASK_CREATED,
         state_reason: TaskStateReason = None,
-        plan: TaskPlan = None,
-        history: list[Message] = [],
-        pending_tool_calls: list[ToolExecutionResult] = [],
-        result: TaskResult = None,
+        plan: TaskPlan | None = None,
+        history: list[Message] | None = None,
+        pending_tool_calls: list[ToolExecutionResult] | None = None,
+        result: TaskResult | None = None,
     ):
-        self.id = id
+        self.id = id if id is not None else str(uuid.uuid4())
         self.original_input = original_input
         self.state = state
         self.state_reason = state_reason
         self.plan = plan
-        self.history = history
-        self.pending_tool_calls = pending_tool_calls
+        self.history = list(history) if history is not None else []
+        self.pending_tool_calls = (
+            list(pending_tool_calls) if pending_tool_calls is not None else []
+        )
         self.result = result
         self.step_count = 0
         self.elapsed_seconds = 0.0
@@ -70,7 +72,7 @@ class Task:
             "original_input": self.original_input,
             "state": self.state.value,
             "state_reason": self.state_reason.value if self.state_reason else None,
-            "plan": self.plan.to_dict(),
+            "plan": self.plan.to_dict() if self.plan else None,
             "history": self.history,
             "pending_tool_calls": self.pending_tool_calls,
             "result": self.result.to_dict() if self.result else None,

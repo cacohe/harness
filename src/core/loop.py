@@ -48,8 +48,8 @@ class Harness:
         skills: list[Skill],
         tool_executor: ToolExecutor,
         context_builder: ContextBuilder,
-        harness_hooks: HarnessHook = HarnessHook(),
-        harness_guard: HarnessGuard = HarnessGuard(),
+        harness_hooks: HarnessHook | None = None,
+        harness_guard: HarnessGuard | None = None,
         event_handler: EventHandler | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
         max_seconds: int = DEFAULT_MAX_SECONDS,
@@ -60,8 +60,8 @@ class Harness:
         self.skills = skills
         self.tool_executor = tool_executor
         self.context_builder = context_builder
-        self.harness_hooks = harness_hooks
-        self.harness_guard = harness_guard
+        self.harness_hooks = harness_hooks if harness_hooks is not None else HarnessHook()
+        self.harness_guard = harness_guard if harness_guard is not None else HarnessGuard()
         self.event_handler = event_handler or EventHandler()
         self._max_steps = max_steps
         self._max_seconds = max_seconds
