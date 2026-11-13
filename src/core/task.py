@@ -39,7 +39,7 @@ class Task(BaseModel):
         TaskState.TASK_RUNNING: frozenset(
             [TaskState.TASK_PAUSED, TaskState.TASK_FAILED, TaskState.TASK_COMPLETED]
         ),
-        TaskState.TASK_PAUSED: frozenset([TaskState.TASK_RUNNING]),
+        TaskState.TASK_PAUSED: frozenset([TaskState.TASK_RUNNING, TaskState.TASK_FAILED]),
         TaskState.TASK_FAILED: frozenset([]),
         TaskState.TASK_COMPLETED: frozenset([]),
     }

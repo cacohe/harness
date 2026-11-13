@@ -2,6 +2,7 @@ from typing import get_type_hints
 
 import pytest
 from src.context.context_builder import DefaultContextBuilder
+from src.core.cancellation import CancellationToken
 from src.core.context import HELD_TOOL_MESSAGE, PENDING_TOOL_MESSAGE
 from src.core.guard import NoOpGuard
 from src.core.hook import HarnessHook
@@ -254,7 +255,7 @@ def test_planning_run_emits_task_events():
 
 
 def test_planning_retry_emits_an_llm_retry_event(monkeypatch):
-    monkeypatch.setattr("src.core.loop.time.sleep", lambda seconds: None)
+    monkeypatch.setattr(CancellationToken, "wait", lambda _self, _seconds: False)
     gateway = Gateway()
     gateway.failures = 1
     output = RecordingOutput()
@@ -383,14 +384,19 @@ def test_later_steps_keep_the_goal_and_drop_stale_plan_steps():
 
 
 def test_transient_planning_errors_are_retried(monkeypatch):
-    sleeps = []
-    monkeypatch.setattr("src.core.loop.time.sleep", lambda seconds: sleeps.append(seconds))
+    waits = []
+
+    def record_wait(_token, seconds):
+        waits.append(seconds)
+        return False
+
+    monkeypatch.setattr(CancellationToken, "wait", record_wait)
     gateway = Gateway()
     gateway.failures = 1
 
     assert _harness(gateway).run(_task()).output == "bought"
 
-    assert sleeps == [DEFAULT_LLM_ATTEMPT_DELAY_SECONDS]
+    assert waits == [DEFAULT_LLM_ATTEMPT_DELAY_SECONDS]
     assert len(gateway.planning_calls) == 2
 
 
@@ -612,6 +618,247 @@ def test_shell_call_pauses_without_running_or_a_closing_call():
     assert len(gateway.infer_contexts) == 1
     paused = [e for e in output.events if e.type is EventType.TOOL_EXECUTION_PAUSED]
     assert [event.payload.tool_call_id for event in paused] == ["call_1"]
+
+
+def test_precancelled_created_task_does_no_gateway_work():
+    gateway = Gateway()
+    repository = InMemoryTaskRepository()
+    token = CancellationToken()
+    token.cancel()
+    task = _task()
+
+    result = _harness(gateway, repository=repository).run(task, cancellation_token=token)
+
+    assert result == TaskResult(output="Task cancelled.")
+    assert task.state is TaskState.TASK_FAILED
+    assert task.state_reason is TaskFailReason.TASK_FAILED_CANCEL
+    assert gateway.planning_calls == []
+    assert repository.get(task.id) == task
+
+
+def test_precancelled_paused_task_cancels_held_calls_in_order():
+    called = []
+    sink = RecordingOutput()
+    repository = InMemoryTaskRepository()
+    gateway = ScriptedGateway([_shell_call()])
+    harness = _harness(
+        gateway,
+        event_handler=sink,
+        executor=_recording_executor(called, "shell"),
+        repository=repository,
+    )
+    task = _task()
+    harness.run(task)
+    token = CancellationToken()
+    token.cancel()
+    sink.events.clear()
+
+    result = harness.run(task, cancellation_token=token)
+
+    assert result == TaskResult(output="Task cancelled.")
+    assert task.state is TaskState.TASK_FAILED
+    assert task.state_reason is TaskFailReason.TASK_FAILED_CANCEL
+    assert task.pending_tool_calls == []
+    assert called == []
+    assert [message.content for message in _tool_messages(task)] == ["Tool call cancelled."]
+    assert [event.type for event in sink.events] == [
+        EventType.TOOL_EXECUTION_FAILED,
+        EventType.TASK_FAILED,
+    ]
+    assert repository.get(task.id) == task
+
+
+def test_cancel_between_held_calls_stops_the_remaining_calls():
+    token = CancellationToken()
+    called = []
+
+    def run(inputs):
+        called.append(inputs)
+        token.cancel()
+        return "ran"
+
+    registry = DefaultToolRegistry()
+    registry.register(Tool("shell", "shell", "Run.", {}, run))
+    harness = _harness(
+        ScriptedGateway(
+            [
+                _model(
+                    FinishReason.TOOL_CALLS,
+                    None,
+                    [
+                        LlmToolCall("call-1", "shell", '{"command":"first"}'),
+                        LlmToolCall("call-2", "shell", '{"command":"second"}'),
+                    ],
+                )
+            ]
+        ),
+        executor=DefaultToolExecutor(registry),
+    )
+    task = _task()
+    harness.run(task)
+    task.decide_tool_call("call-1", approved=True)
+    task.decide_tool_call("call-2", approved=True)
+
+    result = harness.run(task, cancellation_token=token)
+
+    assert result == TaskResult(output="Task cancelled.")
+    assert called == [{"command": "first"}]
+    assert [message.content for message in _tool_messages(task)] == [
+        "ran",
+        "Tool call cancelled.",
+    ]
+
+
+def test_cancel_during_planning_return_wins_before_plan_is_saved():
+    token = CancellationToken()
+    sink = RecordingOutput()
+
+    class CancellingPlanning(Gateway):
+        def planning(self, context, stream=True, response_format=None):
+            token.cancel()
+            return super().planning(context, stream, response_format)
+
+    task = _task()
+    result = _harness(CancellingPlanning(), event_handler=sink).run(task, cancellation_token=token)
+
+    assert result == TaskResult(output="Task cancelled.")
+    assert task.state_reason is TaskFailReason.TASK_FAILED_CANCEL
+    assert task.plan is None
+    assert [
+        (event.type, event.payload.reason)
+        for event in sink.events
+        if event.type in {EventType.LLM_COMPLETED, EventType.LLM_FAILED}
+    ] == [(EventType.LLM_FAILED, "cancel")]
+
+
+def test_cancel_during_gateway_error_wins_over_llm_error():
+    token = CancellationToken()
+
+    class CancellingError(Gateway):
+        def planning(self, context, stream=True, response_format=None):
+            token.cancel()
+            raise ValueError("gateway failed")
+
+    task = _task()
+    result = _harness(CancellingError()).run(task, cancellation_token=token)
+
+    assert result == TaskResult(output="Task cancelled.")
+    assert task.state_reason is TaskFailReason.TASK_FAILED_CANCEL
+
+
+def test_cancel_interrupts_retry_backoff_without_another_attempt():
+    class CancellingWaitToken(CancellationToken):
+        def __init__(self):
+            super().__init__()
+            self.waits = []
+
+        def wait(self, timeout):
+            self.waits.append(timeout)
+            self.cancel()
+            return True
+
+    token = CancellingWaitToken()
+    gateway = Gateway()
+    gateway.failures = 1
+    task = _task()
+
+    result = _harness(gateway).run(task, cancellation_token=token)
+
+    assert result == TaskResult(output="Task cancelled.")
+    assert token.waits == [DEFAULT_LLM_ATTEMPT_DELAY_SECONDS]
+    assert len(gateway.planning_calls) == 1
+
+
+def test_cancel_during_inference_prevents_tool_execution_and_completion():
+    token = CancellationToken()
+    called = []
+
+    class CancellingInference(Gateway):
+        def infer(self, context, stream=True, response_format=None):
+            token.cancel()
+            return _shell_call()
+
+    task = _task()
+    result = _harness(CancellingInference(), executor=_recording_executor(called, "shell")).run(
+        task, cancellation_token=token
+    )
+
+    assert result == TaskResult(output="Task cancelled.")
+    assert task.state_reason is TaskFailReason.TASK_FAILED_CANCEL
+    assert called == []
+    assert task.pending_tool_calls == []
+
+
+def test_cancel_during_limit_finalization_emits_only_cancel_failure():
+    token = CancellationToken()
+    sink = RecordingOutput()
+
+    class CancellingFinalization(Gateway):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def infer(self, context, stream=True, response_format=None):
+            self.calls += 1
+            if self.calls == 1:
+                return _model(FinishReason.LENGTH, "partial")
+            token.cancel()
+            return _model(FinishReason.STOP, "closing")
+
+    task = _task()
+    result = _harness(CancellingFinalization(), event_handler=sink, max_steps=1).run(
+        task, cancellation_token=token
+    )
+
+    assert result == TaskResult(output="Task cancelled.")
+    assert task.state_reason is TaskFailReason.TASK_FAILED_CANCEL
+    failed = [event for event in sink.events if event.type is EventType.TASK_FAILED]
+    assert [event.payload.reason for event in failed] == ["cancel"]
+
+
+def test_repository_failure_while_cancelling_still_propagates():
+    class FailingRepository(InMemoryTaskRepository):
+        def save(self, task):
+            if task.is_failed():
+                raise OSError("cancel snapshot failed")
+            super().save(task)
+
+    token = CancellationToken()
+    token.cancel()
+
+    with pytest.raises(OSError, match="cancel snapshot failed"):
+        _harness(Gateway(), repository=FailingRepository()).run(_task(), cancellation_token=token)
+
+
+def test_event_failure_while_cancelling_still_propagates():
+    class FailingSink(RecordingOutput):
+        def emit(self, event):
+            super().emit(event)
+            if event.type is EventType.TASK_FAILED:
+                raise RuntimeError("cancel observer failed")
+
+    token = CancellationToken()
+    token.cancel()
+
+    with pytest.raises(RuntimeError, match="cancel observer failed"):
+        _harness(Gateway(), event_handler=FailingSink()).run(_task(), cancellation_token=token)
+
+
+def test_finished_task_ignores_a_cancelled_token():
+    task = Task(
+        "finished",
+        state=TaskState.TASK_COMPLETED,
+        result=TaskResult(output="done"),
+    )
+    token = CancellationToken()
+    token.cancel()
+    gateway = Gateway()
+
+    result = _harness(gateway).run(task, cancellation_token=token)
+
+    assert result == TaskResult(output="done")
+    assert task.state is TaskState.TASK_COMPLETED
+    assert gateway.planning_calls == []
 
 
 def test_approved_shell_runs_before_the_next_inference():
@@ -975,7 +1222,7 @@ def test_failed_event_never_exposes_an_empty_terminal_snapshot():
         repository=repository,
     ).run(task)
 
-    assert sink.observed == (TaskState.TASK_RUNNING, None)
+    assert sink.observed == (TaskState.TASK_FAILED, TaskResult(output="closing"))
     assert result.output == "closing"
     stored = repository.get(task.id)
     assert stored is not None

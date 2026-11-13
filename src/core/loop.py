@@ -4,6 +4,7 @@ import time
 import uuid
 from typing import NoReturn
 
+from src.core.cancellation import CancellationToken
 from src.core.context import (
     ContextBuilder,
     ContextBuilderError,
@@ -30,7 +31,14 @@ from src.schema.llm import (
 )
 from src.schema.skills import Skill
 from src.schema.task import TaskFailReason, TaskPauseReason, TaskPlan, TaskResult, TaskRunningReason
-from src.schema.tool import Tool, ToolCallResult, ToolExecutionResult
+from src.schema.tool import (
+    TOOL_CALL_CANCELLED_OUTPUT,
+    Tool,
+    ToolCallResult,
+    ToolExecutionFailReason,
+    ToolExecutionResult,
+    ToolExecutionState,
+)
 
 DEFAULT_MAX_STEPS = 10
 DEFAULT_MAX_SECONDS = 60 * 30
@@ -45,6 +53,10 @@ class _TaskPersistenceError(Exception):
 
 class _EventSinkError(Exception):
     """Keep observer failures outside task execution error handling."""
+
+
+class _CancellationRequested(Exception):
+    """Move cooperative cancellation to the run-level terminal handler."""
 
 
 class Harness:
@@ -302,7 +314,12 @@ class Harness:
         except Exception as error:
             raise ContextBuilderError(str(error)) from error
 
-    def planning(self, context: Context, task: Task) -> TaskPlan:
+    def planning(
+        self,
+        context: Context,
+        task: Task,
+        cancellation_token: CancellationToken | None = None,
+    ) -> TaskPlan:
         """
         Ask the model for one structured task plan.
         Args:
@@ -314,10 +331,15 @@ class Harness:
             LlmCallError: The model call failed with a permanent error, the plan is missing,
                 or the retries ran out. Invalid structured output is retried.
         """
+        token = cancellation_token if cancellation_token is not None else CancellationToken()
         for attempt in range(1, DEFAULT_MAX_LLM_ATTEMPTS + 1):
+            if token.is_cancelled():
+                raise _CancellationRequested
             self._emit_llm_event(task, EventType.LLM_STARTED, phase="planning")
             try:
                 output = self.llm_gateway.planning(context, stream=False, response_format=TaskPlan)
+                if token.is_cancelled():
+                    self._cancel_llm_attempt(task, "planning")
                 if not isinstance(output, LLMOutput):
                     raise LlmCallError("planning did not return a complete model output")
 
@@ -335,10 +357,17 @@ class Harness:
             except (_TaskPersistenceError, _EventSinkError):
                 raise
 
+            except _CancellationRequested:
+                raise
+
             except LlmCallError:
+                if token.is_cancelled():
+                    self._cancel_llm_attempt(task, "planning")
                 raise
 
             except Exception as error:
+                if token.is_cancelled():
+                    self._cancel_llm_attempt(task, "planning")
                 if attempt == DEFAULT_MAX_LLM_ATTEMPTS or not is_transient_llm_error(error):
                     raise LlmCallError(str(error)) from error
                 self._emit_llm_event(
@@ -348,7 +377,8 @@ class Harness:
                     reason=type(error).__name__,
                     attempt=attempt,
                 )
-                time.sleep(DEFAULT_LLM_ATTEMPT_DELAY_SECONDS)
+                if token.wait(DEFAULT_LLM_ATTEMPT_DELAY_SECONDS):
+                    self._cancel_llm_attempt(task, "planning")
         raise LlmCallError("planning retries exhausted")
 
     def _ask_clarification(self, task: Task, question: str, start_time: float) -> TaskResult:
@@ -361,17 +391,60 @@ class Harness:
         self._emit_task_event(EventType.TASK_COMPLETED, task, content=question)
         return result
 
-    def _finish_pending_tool_calls(self, task: Task) -> None:
+    @staticmethod
+    def _cancelled_tool_result(item: ToolExecutionResult) -> ToolExecutionResult:
+        return ToolExecutionResult(
+            tool_id=item.tool_id,
+            tool_name=item.tool_name,
+            state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
+            output=TOOL_CALL_CANCELLED_OUTPUT,
+            fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_CANCELLED,
+        )
+
+    def _finish_pending_tool_calls(
+        self,
+        task: Task,
+        cancellation_token: CancellationToken | None = None,
+    ) -> None:
         results = []
         for item in task.pending_tool_calls:
             call = LlmToolCall(item.tool_id, item.tool_name, item.arguments or "")
-            if item.can_run():
-                self._emit_tool_event(EventType.TOOL_EXECUTION_RESUMED, task, call)
-            result = self.tool_executor.execute_held_tool_call(item)
+            if cancellation_token is not None and cancellation_token.is_cancelled():
+                result = self._cancelled_tool_result(item)
+            else:
+                if item.can_run():
+                    self._emit_tool_event(EventType.TOOL_EXECUTION_RESUMED, task, call)
+                result = self.tool_executor.execute_held_tool_call(item)
             self._emit_tool_result(task, call, result)
             results.append(result)
         task.replace_tool_messages([build_tool_message(result) for result in results])
         task.set_pending_tool_calls([])
+
+    def _cancel_pending_tool_calls(self, task: Task) -> None:
+        results = []
+        for item in task.pending_tool_calls:
+            call = LlmToolCall(item.tool_id, item.tool_name, item.arguments or "")
+            result = self._cancelled_tool_result(item)
+            self._emit_tool_result(task, call, result)
+            results.append(result)
+        task.replace_tool_messages([build_tool_message(result) for result in results])
+        task.set_pending_tool_calls([])
+
+    def _handle_cancelled(self, task: Task, start_time: float) -> TaskResult:
+        if task.is_paused():
+            self._cancel_pending_tool_calls(task)
+        result = TaskResult(output="Task cancelled.")
+        task.set_progress(task.step_count, time.monotonic() - start_time)
+        task.set_result(result)
+        task.transition_to_failed(TaskFailReason.TASK_FAILED_CANCEL)
+        self._save_task(task)
+        self._emit_task_event(
+            EventType.TASK_FAILED,
+            task,
+            reason=TaskFailReason.TASK_FAILED_CANCEL.value,
+            content=result.output,
+        )
+        return result
 
     def build_infer_context(self, task: Task) -> Context:
         """
@@ -392,7 +465,12 @@ class Harness:
         except Exception as error:
             raise ContextBuilderError(str(error)) from error
 
-    def infer(self, context: Context, task: Task) -> LLMOutput:
+    def infer(
+        self,
+        context: Context,
+        task: Task,
+        cancellation_token: CancellationToken | None = None,
+    ) -> LLMOutput:
         """
         Run one model call for the execution loop.
         Args:
@@ -403,20 +481,32 @@ class Harness:
         Raises:
             LlmCallError: The model call failed with a permanent error, or the retries ran out.
         """
+        token = cancellation_token if cancellation_token is not None else CancellationToken()
         for attempt in range(1, DEFAULT_MAX_LLM_ATTEMPTS + 1):
+            if token.is_cancelled():
+                raise _CancellationRequested
             self._emit_llm_event(task, EventType.LLM_STARTED, phase="infer")
             try:
                 produced = self.llm_gateway.infer(context, stream=True)
                 output = self._read_inference(task, produced)
+                if token.is_cancelled():
+                    self._cancel_llm_attempt(task, "infer")
                 break
 
             except (_TaskPersistenceError, _EventSinkError):
                 raise
 
+            except _CancellationRequested:
+                raise
+
             except LlmCallError:
+                if token.is_cancelled():
+                    self._cancel_llm_attempt(task, "infer")
                 raise
 
             except Exception as error:
+                if token.is_cancelled():
+                    self._cancel_llm_attempt(task, "infer")
                 if attempt == DEFAULT_MAX_LLM_ATTEMPTS or not is_transient_llm_error(error):
                     raise LlmCallError(str(error)) from error
                 self._emit_llm_event(
@@ -426,13 +516,23 @@ class Harness:
                     reason=type(error).__name__,
                     attempt=attempt,
                 )
-                time.sleep(DEFAULT_LLM_ATTEMPT_DELAY_SECONDS)
+                if token.wait(DEFAULT_LLM_ATTEMPT_DELAY_SECONDS):
+                    self._cancel_llm_attempt(task, "infer")
 
         if not isinstance(output, LLMOutput):
             raise LlmCallError("infer did not return a complete model output")
 
         self._emit_llm_event(task, EventType.LLM_COMPLETED, phase="infer", usage=output.usage)
         return output
+
+    def _cancel_llm_attempt(self, task: Task, phase: str) -> NoReturn:
+        self._emit_llm_event(
+            task,
+            EventType.LLM_FAILED,
+            phase=phase,
+            reason=TaskFailReason.TASK_FAILED_CANCEL.value,
+        )
+        raise _CancellationRequested
 
     def _read_inference(self, task: Task, produced) -> LLMOutput:
         if isinstance(produced, LLMOutput):
@@ -455,7 +555,12 @@ class Harness:
         """
         return llm_output.requests_tool_calls()
 
-    def execute_tool_calls(self, tool_calls: list[LlmToolCall], task: Task) -> ToolCallResult:
+    def execute_tool_calls(
+        self,
+        tool_calls: list[LlmToolCall],
+        task: Task,
+        cancellation_token: CancellationToken | None = None,
+    ) -> ToolCallResult:
         """
         Execute tool calls.
         Args:
@@ -475,9 +580,12 @@ class Harness:
             tool_calls,
             before_call=before_call,
             after_call=after_call,
+            should_cancel=(
+                cancellation_token.is_cancelled if cancellation_token is not None else None
+            ),
         )
 
-    def step(self, task: Task) -> StepResult:
+    def step(self, task: Task, cancellation_token: CancellationToken | None = None) -> StepResult:
         """
         Build the context, run one inference, and execute any requested tool calls.
         Args:
@@ -489,7 +597,7 @@ class Harness:
         context = self.build_infer_context(task)
 
         self.harness_hooks.before_think(task=task, context=context)
-        output: LLMOutput = self.infer(context, task)
+        output: LLMOutput = self.infer(context, task, cancellation_token)
         self.harness_hooks.after_think(task=task, output=output)
 
         task.add_history_messages([build_history_message(output)])
@@ -499,7 +607,9 @@ class Harness:
             return StepResult(llm_output=output)
 
         self.harness_hooks.before_execute_tool_calls(task=task, output=output)
-        result: ToolCallResult = self.execute_tool_calls(output.tool_calls, task)
+        result: ToolCallResult = self.execute_tool_calls(
+            output.tool_calls, task, cancellation_token
+        )
         self.harness_hooks.after_execute_tool_calls(task=task, result=result)
 
         task.add_history_messages(build_tool_messages(result))
@@ -526,7 +636,7 @@ class Harness:
         except Exception as error:
             raise ContextBuilderError(str(error)) from error
 
-    def finalize(self, task: Task) -> str:
+    def finalize(self, task: Task, cancellation_token: CancellationToken | None = None) -> str:
         """
         Close a turn that stopped before a normal answer.
         Args:
@@ -535,7 +645,7 @@ class Harness:
             The final result.
         """
         final_context = self.build_final_context(task)
-        output = self.infer(final_context, task)
+        output = self.infer(final_context, task, cancellation_token)
         return output.content or ""
 
     def _blocked(self, step_result: StepResult) -> tuple[bool, TaskPauseReason | None]:
@@ -606,6 +716,7 @@ class Harness:
         step_count: int,
         failed_reason: TaskFailReason,
         start_time: float,
+        cancellation_token: CancellationToken | None = None,
     ) -> TaskResult:
         """
         Handle a failed turn.
@@ -616,15 +727,11 @@ class Harness:
         Returns:
             The task result.
         """
-        self._emit_task_event(
-            EventType.TASK_FAILED,
-            task,
-            reason=failed_reason.value,
-            step_id=str(step_count),
-        )
         try:
-            final_output = self.finalize(task)
+            final_output = self.finalize(task, cancellation_token)
         except (_TaskPersistenceError, _EventSinkError):
+            raise
+        except _CancellationRequested:
             raise
         except Exception as error:
             task.set_progress(step_count, time.monotonic() - start_time)
@@ -645,6 +752,12 @@ class Harness:
         task.set_result(result)
         task.transition_to_failed(failed_reason)
         self._save_task(task)
+        self._emit_task_event(
+            EventType.TASK_FAILED,
+            task,
+            reason=failed_reason.value,
+            step_id=str(step_count),
+        )
         return result
 
     def _handle_completed_turn(
@@ -670,7 +783,12 @@ class Harness:
 
         return result
 
-    def turn(self, task: Task, start_time: float | None = None) -> TaskResult:
+    def turn(
+        self,
+        task: Task,
+        start_time: float | None = None,
+        cancellation_token: CancellationToken | None = None,
+    ) -> TaskResult:
         """
         Infer and execute tools until the model answers or a limit is hit.
         Args:
@@ -681,9 +799,14 @@ class Harness:
         """
         if start_time is None:
             start_time = time.monotonic() - task.elapsed_seconds
+        token = cancellation_token if cancellation_token is not None else CancellationToken()
         step_count = task.step_count
         while True:
-            step_result: StepResult = self.step(task)
+            if token.is_cancelled():
+                raise _CancellationRequested
+            step_result: StepResult = self.step(task, token)
+            if token.is_cancelled():
+                raise _CancellationRequested
             step_count += 1
             task.set_progress(step_count, time.monotonic() - start_time)
 
@@ -695,12 +818,12 @@ class Harness:
             failed, failed_reason = self._failed(start_time, step_count)
             if failed:
                 assert failed_reason is not None
-                return self._handle_failed_turn(task, step_count, failed_reason, start_time)
+                return self._handle_failed_turn(task, step_count, failed_reason, start_time, token)
 
             if self._completed(step_result):
                 return self._handle_completed_turn(task, step_result, step_count)
 
-    def run(self, task: Task) -> TaskResult:
+    def run(self, task: Task, cancellation_token: CancellationToken | None = None) -> TaskResult:
         """
         Plan a new task, then infer and execute tools until the model answers or a limit is hit.
         Args:
@@ -710,14 +833,19 @@ class Harness:
         Raises:
             ValueError: The task is paused and a tool call still waits for the user's decision.
         """
-        if task.is_paused() and task.approval_requests():
-            raise ValueError("tool calls are waiting for approval")
+        token = cancellation_token if cancellation_token is not None else CancellationToken()
         start_time = time.monotonic() - task.elapsed_seconds
         try:
             if task.is_finished():
                 self._emit_task_event(EventType.TASK_FINISHED, task)
                 assert task.result is not None
                 return task.result
+
+            if token.is_cancelled():
+                return self._handle_cancelled(task, start_time)
+
+            if task.is_paused() and task.approval_requests():
+                raise ValueError("tool calls are waiting for approval")
 
             self._emit_task_event(EventType.TASK_STARTED, task)
 
@@ -727,7 +855,7 @@ class Harness:
                 self.guard_input(task)
 
                 self._emit_task_event(EventType.TASK_PLANNING, task)
-                plan = self.planning(self.build_planning_context(task), task)
+                plan = self.planning(self.build_planning_context(task), task, token)
                 task.set_plan(plan)
                 self._save_task(task)
                 self._emit_task_event(EventType.TASK_PLANNED, task, goal=list(plan.goal))
@@ -738,14 +866,16 @@ class Harness:
             if task.is_paused():
                 self._emit_task_event(EventType.TASK_RESUMED, task)
                 task.transition_to_running(TaskRunningReason.TASK_RUNNING_RESUME)
-                self._finish_pending_tool_calls(task)
+                self._finish_pending_tool_calls(task, token)
                 self._save_task(task)
 
-            result = self.turn(task, start_time)
+            result = self.turn(task, start_time, token)
             return result
 
         except (_TaskPersistenceError, _EventSinkError) as boundary_error:
             self._raise_boundary_cause(boundary_error)
+        except _CancellationRequested:
+            return self._handle_cancelled(task, start_time)
         except Exception as error:
             if task.is_finished() or task.is_paused():
                 raise
