@@ -40,7 +40,7 @@
 - Consumes: `pathlib.Path`; no project runtime dependencies.
 - Produces: `WorkspaceViolation(ValueError)` and `Workspace(root: str | Path)` with `root: Path`, `identity: str`, `resolve(path: str | Path = ".") -> Path`, and `relative(path: Path) -> str`.
 
-- [ ] **Step 1: Write failing construction and containment tests**
+- [x] **Step 1: Write failing construction and containment tests**
 
 Add tests named:
 
@@ -54,17 +54,17 @@ def test_workspace_relative_never_returns_a_host_absolute_path(tmp_path): ...
 
 Assert `WorkspaceViolation`, not a raw `ValueError`/`OSError`, for boundary inputs. Use literal expected relative paths and verify two distinct roots have distinct identities.
 
-- [ ] **Step 2: Run Task 1 tests and confirm RED**
+- [x] **Step 2: Run Task 1 tests and confirm RED**
 
 Run: `python -m pytest tests/unit/core/test_workspace.py -q -p no:cacheprovider`
 
 Expected: collection fails because `src.core.workspace` does not exist.
 
-- [ ] **Step 3: Implement `Workspace` canonical resolution**
+- [x] **Step 3: Implement `Workspace` canonical resolution**
 
 Implement the exact interfaces above. Normalize the root once; compute identity with SHA-256 over `os.path.normcase(str(root))`; reject absolute syntax using both host `Path` and `PureWindowsPath`; reject `..` components before joining; resolve with `strict=False`; use `Path.is_relative_to` for canonical containment. Boundary errors must mention the user input, not an outside canonical host path.
 
-- [ ] **Step 4: Add and run symlink escape tests**
+- [x] **Step 4: Add and run symlink escape tests**
 
 Add:
 
@@ -75,7 +75,7 @@ def test_workspace_rejects_missing_leaf_under_outside_symlink(tmp_path): ...
 
 Create an outside directory beside the root. Skip only when `os.symlink` itself raises an OS privilege/capability error. Run the Task 1 test file and expect all tests to pass.
 
-- [ ] **Step 5: Run focused quality checks**
+- [x] **Step 5: Run focused quality checks**
 
 Run:
 
@@ -86,7 +86,7 @@ python -m mypy src/core/workspace.py
 
 Expected: both exit 0.
 
-- [ ] **Step 6: Commit Task 1**
+- [x] **Step 6: Commit Task 1**
 
 ```bash
 git add src/core/workspace.py tests/unit/core/test_workspace.py
@@ -104,7 +104,7 @@ git commit -m "feat: add canonical workspace boundary"
 - Consumes: `Workspace`, `WorkspaceViolation` from Task 1.
 - Produces: `Tool.requires_sandbox: bool`, `Tool.input_validator: Callable[[dict], dict] | None`, `Tool.workspace: Workspace | None`, and `LocalToolSuite(workspace: Workspace)` with `tools(include_shell: bool = False) -> list[Tool]` plus bound file/search methods.
 
-- [ ] **Step 1: Write failing bound-tool behavior tests**
+- [x] **Step 1: Write failing bound-tool behavior tests**
 
 Replace ambient-`cwd` tests with `tmp_path`-backed tests that instantiate `LocalToolSuite(Workspace(root))`. Add tests:
 
@@ -118,21 +118,21 @@ def test_glob_rejects_absolute_and_parent_patterns(tmp_path): ...
 
 Assert grep/glob output contains workspace-relative paths and never `str(root)` or the outside path.
 
-- [ ] **Step 2: Run Task 2 tests and confirm RED**
+- [x] **Step 2: Run Task 2 tests and confirm RED**
 
 Run: `python -m pytest tests/unit/tool/test_local_tools.py -q -p no:cacheprovider`
 
 Expected: import/constructor failures because `LocalToolSuite` is absent.
 
-- [ ] **Step 3: Extend `Tool` metadata with safe defaults**
+- [x] **Step 3: Extend `Tool` metadata with safe defaults**
 
 Add the three fields from Interfaces after `executer`, preserving existing `Tool(...)` call sites. Use `TYPE_CHECKING` for the `Workspace` type to avoid a runtime schema-to-core import cycle.
 
-- [ ] **Step 4: Implement bound file and search methods**
+- [x] **Step 4: Implement bound file and search methods**
 
 Replace `_resolve`, ambient functions, and `LOCAL_TOOLS` with `LocalToolSuite`. Every path-bearing definition gets an input validator that returns a copied dictionary with canonical workspace-relative path fields. Bound methods resolve again immediately before I/O. Search validates every candidate before reading/reporting and skips an outside symlink; glob validates pattern syntax separately.
 
-- [ ] **Step 5: Add the sandbox-only shell definition**
+- [x] **Step 5: Add the sandbox-only shell definition**
 
 Add tests and implementation for:
 
@@ -144,7 +144,7 @@ def test_shell_callable_never_executes_a_host_process(tmp_path): ...
 
 `tools(include_shell=True)` adds one shell tool with `requires_sandbox=True`, the bound workspace, and an input validator that always supplies `cwd`. Its callable raises a clear sandbox-required exception and contains no `subprocess` call.
 
-- [ ] **Step 6: Run local-tool and existing schema tests**
+- [x] **Step 6: Run local-tool and existing schema tests**
 
 Run:
 
@@ -156,7 +156,7 @@ python -m mypy src/schema/tool.py src/tool/local_tools.py
 
 Expected: all commands exit 0.
 
-- [ ] **Step 7: Commit Task 2**
+- [x] **Step 7: Commit Task 2**
 
 ```bash
 git add src/schema/tool.py src/tool/local_tools.py tests/unit/tool/test_local_tools.py
@@ -175,7 +175,7 @@ git commit -m "feat: bind local tools to workspace"
 - Consumes: bound `Tool` metadata and `Workspace` from Tasks 1-2.
 - Produces: `SandboxRunner.run(tool: Tool, inputs: dict, workspace: Workspace) -> Any`; fail reasons `workspace_violation` and `sandbox_required`; `ToolExecutionResult.workspace_id: str | None`; normalized pending arguments and workspace-bound resume enforcement.
 
-- [ ] **Step 1: Write failing input-validation and classification tests**
+- [x] **Step 1: Write failing input-validation and classification tests**
 
 Add tests that assert:
 
@@ -188,17 +188,17 @@ def test_resumed_call_revalidates_normalized_arguments(): ...
 
 Use real `Workspace` objects and literal normalized JSON. Mutation counters must prove policy/runner were not called after a boundary violation.
 
-- [ ] **Step 2: Run the new Task 3 tests and confirm RED**
+- [x] **Step 2: Run the new Task 3 tests and confirm RED**
 
 Run the four exact tests with `python -m pytest ... -q -p no:cacheprovider`.
 
 Expected: missing metadata/result fields and current raw-argument behavior fail assertions.
 
-- [ ] **Step 3: Implement one validation path for direct, held, and resumed calls**
+- [x] **Step 3: Implement one validation path for direct, held, and resumed calls**
 
 Add a private helper that copies inputs, invokes `tool.input_validator` when present, and maps `WorkspaceViolation` to a failed result. Store normalized JSON with stable separators/sorted keys in pending results. Store `tool.workspace.identity` as `workspace_id`.
 
-- [ ] **Step 4: Write failing sandbox-routing tests**
+- [x] **Step 4: Write failing sandbox-routing tests**
 
 Replace the old “any supported tool runs in sandbox” assumption with:
 
@@ -211,11 +211,11 @@ def test_falsey_sandbox_is_preserved(): ...
 def test_resume_rejects_approval_from_another_workspace(): ...
 ```
 
-- [ ] **Step 5: Implement fail-closed sandbox routing**
+- [x] **Step 5: Implement fail-closed sandbox routing**
 
 Change the protocol signature and test doubles. Route to sandbox only when `tool.requires_sandbox`; require a non-null `tool.workspace`; otherwise return the exact new fail reason. Ordinary tools always use `ToolRunner`. On resume, compare the stored/current workspace identities before execution and return `workspace_violation` on mismatch.
 
-- [ ] **Step 6: Run executor, loop, and demo regression tests**
+- [x] **Step 6: Run executor, loop, and demo regression tests**
 
 Run:
 
@@ -227,7 +227,7 @@ python -m mypy src/core/tool.py src/schema/tool.py src/tool/tool_executor.py
 
 Expected: all commands exit 0. Update existing sandbox doubles to the three-argument `run` signature without weakening assertions.
 
-- [ ] **Step 7: Commit Task 3**
+- [x] **Step 7: Commit Task 3**
 
 ```bash
 git add src/core/tool.py src/schema/tool.py src/tool/tool_executor.py tests/unit/tool/test_tool_executor.py
@@ -246,7 +246,7 @@ git commit -m "feat: enforce fail-closed sandbox routing"
 - Consumes: `Workspace`, `LocalToolSuite`, `SandboxRunner`, and `DefaultToolExecutor` from Tasks 1-3.
 - Produces: `Agent(..., workspace: Workspace | str | Path | None = None, sandbox_runner: SandboxRunner | None = None)` and a default catalog that excludes shell unless the sandbox is supplied.
 
-- [ ] **Step 1: Write failing default-composition tests**
+- [x] **Step 1: Write failing default-composition tests**
 
 Add:
 
@@ -259,21 +259,21 @@ def test_agent_preserves_falsey_workspace_and_sandbox_dependencies(tmp_path): ..
 
 Use the existing fake LLM gateway; do not invoke a real model or process. Assert catalog names and object identity, not implementation internals.
 
-- [ ] **Step 2: Run Task 4 tests and confirm RED**
+- [x] **Step 2: Run Task 4 tests and confirm RED**
 
 Run: `python -m pytest tests/unit/demo/test_agent.py -q -p no:cacheprovider`
 
 Expected: constructor rejects the new keyword arguments or still advertises ambient shell.
 
-- [ ] **Step 3: Implement the secure composition root**
+- [x] **Step 3: Implement the secure composition root**
 
 Capture `Path.cwd()` only during `Agent` construction. Normalize supplied roots to `Workspace`. When the catalog is defaulted, register `LocalToolSuite(workspace).tools(include_shell=sandbox_runner is not None)`. Pass the exact sandbox object to `DefaultToolExecutor`. Preserve explicitly injected catalog/executor behavior.
 
-- [ ] **Step 4: Update README composition and security contract**
+- [x] **Step 4: Update README composition and security contract**
 
 Document explicit workspace construction, the six default tools, shell omission by default, the `SandboxRunner.run(tool, inputs, workspace)` contract, and the distinction between approval and isolation. Do not claim hard-link, mount, network, or process isolation.
 
-- [ ] **Step 5: Run the full verification gate**
+- [x] **Step 5: Run the full verification gate**
 
 Run:
 
@@ -287,7 +287,7 @@ git diff --check
 
 Expected: 0 failures/errors and no diff whitespace errors.
 
-- [ ] **Step 6: Mark this plan complete and commit**
+- [x] **Step 6: Mark this plan complete and commit**
 
 Change every completed checkbox in this plan to `[x]`, then:
 

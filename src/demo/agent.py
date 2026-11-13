@@ -9,7 +9,7 @@ from src.core.llm import LlmGateway
 from src.core.loop import Harness
 from src.core.persistence import TaskRepository
 from src.core.task import Task
-from src.core.tool import ToolCatalog, ToolExecutor
+from src.core.tool import SandboxRunner, ToolCatalog, ToolExecutor
 from src.core.workspace import Workspace
 from src.llm.litellm import LiteLLMGateway
 from src.persistence.in_memory import InMemoryTaskRepository
@@ -32,6 +32,8 @@ class Agent:
         context_builder: ContextBuilder | None = None,
         tool_catalog: ToolCatalog | None = None,
         task_repository: TaskRepository | None = None,
+        workspace: Workspace | str | Path | None = None,
+        sandbox_runner: SandboxRunner | None = None,
     ):
         """
         Create an agent with a model gateway, a context builder, and the local tools.
@@ -40,13 +42,21 @@ class Agent:
             llm_gateway: Gateway to use. When omitted, a LiteLLM gateway is created from config.
             tool_executor: Executor to use. When omitted, the local tools are registered.
             context_builder: Builder to use. When omitted, the default builder is created.
+            workspace: Filesystem authority for default local tools. Defaults to the current directory.
+            sandbox_runner: Isolation backend. Shell is registered only when this is supplied.
         """
         self.config = config if config is not None else Config.load()
         self.transcript: list[tuple[str, str]] = []
+        self.workspace = (
+            workspace
+            if isinstance(workspace, Workspace)
+            else Workspace(Path.cwd() if workspace is None else workspace)
+        )
         self.tool_registry = tool_catalog if tool_catalog is not None else DefaultToolRegistry()
         if tool_catalog is None:
-            self.workspace = Workspace(Path.cwd())
-            for tool in LocalToolSuite(self.workspace).tools():
+            for tool in LocalToolSuite(self.workspace).tools(
+                include_shell=sandbox_runner is not None
+            ):
                 self.tool_registry.register(tool)
         self.llm_gateway = (
             llm_gateway
@@ -58,7 +68,9 @@ class Agent:
             )
         )
         self.tool_executor = (
-            tool_executor if tool_executor is not None else DefaultToolExecutor(self.tool_registry)
+            tool_executor
+            if tool_executor is not None
+            else DefaultToolExecutor(self.tool_registry, sandbox_runner=sandbox_runner)
         )
         self.context_builder = (
             context_builder if context_builder is not None else DefaultContextBuilder()
