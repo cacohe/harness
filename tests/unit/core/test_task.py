@@ -8,6 +8,7 @@ from src.schema.context import Message
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall, LlmUsage
 from src.schema.task import (
     TaskFailReason,
+    TaskPauseReason,
     TaskPlan,
     TaskResult,
     TaskRunningReason,
@@ -142,6 +143,18 @@ def test_failed_transition_does_not_partially_mutate_task():
 
     assert task.state is TaskState.TASK_RUNNING
     assert task.state_reason is TaskRunningReason.TASK_RUNNING_CREATE
+
+
+def test_paused_task_can_transition_directly_to_cancelled_failure():
+    task = Task("cancel")
+    task.transition_to_running(TaskRunningReason.TASK_RUNNING_CREATE)
+    task.transition_to_paused(TaskPauseReason.TASK_PAUSED_WAITING_APPROVAL)
+    task.set_result(TaskResult(output="Task cancelled."))
+
+    task.transition_to_failed(TaskFailReason.TASK_FAILED_CANCEL)
+
+    assert task.state is TaskState.TASK_FAILED
+    assert task.state_reason is TaskFailReason.TASK_FAILED_CANCEL
 
 
 def test_invalid_terminal_result_assignment_preserves_previous_result():

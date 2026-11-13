@@ -89,7 +89,11 @@ def build_tool_messages(result: ToolCallResult) -> list[Message]:
     Returns:
         One tool message per completed or failed execution.
     """
-    items = [*result.completed_tools, *result.failed_tools, *result.pending_tools]
+    items = result.ordered_tools or [
+        *result.completed_tools,
+        *result.failed_tools,
+        *result.pending_tools,
+    ]
     return [build_tool_message(item) for item in items]
 
 

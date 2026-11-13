@@ -1,4 +1,7 @@
 from src.config import Config
+from src.core.cancellation import CancellationToken
+from src.core.loop import Harness
+from src.core.task import Task
 from src.core.workspace import Workspace
 from src.demo.agent import Agent
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
@@ -56,6 +59,11 @@ class FalseySandbox:
 
     def run(self, tool, inputs, workspace):
         return "sandboxed"
+
+
+class FalseyCancellationToken(CancellationToken):
+    def __bool__(self):
+        return False
 
 
 def test_chat_plans_then_returns_the_answer():
@@ -230,3 +238,56 @@ def test_agent_preserves_falsey_workspace_and_sandbox_dependencies(tmp_path):
     assert agent.workspace is workspace
     assert agent.tool_executor.sandbox_runner is sandbox
     assert agent.tool_registry.find_tool("shell") is not None
+
+
+def test_chat_passes_the_exact_falsey_cancellation_token(monkeypatch):
+    observed = []
+
+    def record_run(_harness, task, cancellation_token=None):
+        observed.append(cancellation_token)
+        return task.result
+
+    monkeypatch.setattr(Harness, "run", record_run)
+    token = FalseyCancellationToken()
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["hello"]),
+    )
+
+    agent.chat("cancel me", cancellation_token=token)
+
+    assert observed == [token]
+
+
+def test_resume_passes_the_exact_falsey_cancellation_token(monkeypatch):
+    observed = []
+
+    def record_run(_harness, task, cancellation_token=None):
+        observed.append(cancellation_token)
+        return task.result
+
+    monkeypatch.setattr(Harness, "run", record_run)
+    token = FalseyCancellationToken()
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["hello"]),
+    )
+    agent.pending_task = Task("pending")
+
+    agent.resume(cancellation_token=token)
+
+    assert observed == [token]
+
+
+def test_cancelled_agent_turn_is_not_added_to_transcript():
+    token = CancellationToken()
+    token.cancel()
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["unused"]),
+    )
+
+    task = agent.chat("cancel me", cancellation_token=token)
+
+    assert task.state is TaskState.TASK_FAILED
+    assert agent.transcript == []

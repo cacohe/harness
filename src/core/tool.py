@@ -5,6 +5,7 @@ from typing import Any, Protocol, runtime_checkable
 from src.core.workspace import Workspace, WorkspaceViolation
 from src.schema.llm import LlmToolCall
 from src.schema.tool import (
+    TOOL_CALL_CANCELLED_OUTPUT,
     ApprovalDecision,
     Tool,
     ToolCallResult,
@@ -155,12 +156,27 @@ class ToolExecutor:
         *,
         before_call: Callable[[LlmToolCall], None] | None = None,
         after_call: Callable[[LlmToolCall, ToolExecutionResult], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> ToolCallResult:
         pending_tools: list[ToolExecutionResult] = []
         completed_tools: list[ToolExecutionResult] = []
         failed_tools: list[ToolExecutionResult] = []
+        ordered_tools: list[ToolExecutionResult] = []
 
         for call in tool_calls:
+            if should_cancel is not None and should_cancel():
+                result = ToolExecutionResult(
+                    tool_id=call.id,
+                    tool_name=call.name,
+                    state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
+                    output=TOOL_CALL_CANCELLED_OUTPUT,
+                    fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_CANCELLED,
+                )
+                if after_call is not None:
+                    after_call(call, result)
+                failed_tools.append(result)
+                ordered_tools.append(result)
+                continue
             if before_call is not None:
                 before_call(call)
             result = self.execute_tool_call(call, hold=bool(pending_tools))
@@ -172,11 +188,13 @@ class ToolExecutor:
                 failed_tools.append(result)
             else:
                 pending_tools.append(result)
+            ordered_tools.append(result)
 
         return ToolCallResult(
             pending_tools=pending_tools,
             completed_tools=completed_tools,
             failed_tools=failed_tools,
+            ordered_tools=ordered_tools,
         )
 
     def execute_tool_call(
