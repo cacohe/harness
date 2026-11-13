@@ -138,3 +138,20 @@ def test_from_config_builds_the_default_composition():
 
     assert agent.config is config
     assert agent.llm_gateway is gateway
+
+
+def test_default_agent_registers_workspace_file_tools_without_shell(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["hello"]),
+    )
+
+    assert {tool.name for tool in agent.tool_registry.get_all_tools()} == {
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_dir",
+        "grep",
+        "glob",
+    }

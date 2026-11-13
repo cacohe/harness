@@ -1,8 +1,13 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from src.core.workspace import Workspace
 
 
 @dataclass
@@ -12,6 +17,9 @@ class Tool:
     description: str
     input_schema: dict
     executer: Callable
+    requires_sandbox: bool = False
+    input_validator: Callable[[dict], dict] | None = None
+    workspace: Workspace | None = None
 
 
 class ToolExecution(BaseModel):

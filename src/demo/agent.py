@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from src.config import Config
 from src.context.context_builder import DefaultContextBuilder
 from src.core.context import ContextBuilder
@@ -8,10 +10,11 @@ from src.core.loop import Harness
 from src.core.persistence import TaskRepository
 from src.core.task import Task
 from src.core.tool import ToolCatalog, ToolExecutor
+from src.core.workspace import Workspace
 from src.llm.litellm import LiteLLMGateway
 from src.persistence.in_memory import InMemoryTaskRepository
 from src.schema.tool import ToolExecutionResult
-from src.tool.local_tools import LOCAL_TOOLS
+from src.tool.local_tools import LocalToolSuite
 from src.tool.tool_executor import DefaultToolExecutor
 from src.tool.tool_registry import DefaultToolRegistry
 
@@ -42,7 +45,8 @@ class Agent:
         self.transcript: list[tuple[str, str]] = []
         self.tool_registry = tool_catalog if tool_catalog is not None else DefaultToolRegistry()
         if tool_catalog is None:
-            for tool in LOCAL_TOOLS:
+            self.workspace = Workspace(Path.cwd())
+            for tool in LocalToolSuite(self.workspace).tools():
                 self.tool_registry.register(tool)
         self.llm_gateway = (
             llm_gateway
