@@ -1,6 +1,6 @@
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class TaskState(Enum):
@@ -75,11 +75,20 @@ class TaskPlan(BaseModel):
         ...
 
 
-class TaskResult:
+class TaskResult(BaseModel):
     """Task result."""
 
+    model_config = ConfigDict(validate_assignment=True)
+
+    output: str = ""
+
     def __init__(self, output: str | None = ""):
-        self.output = output
+        super().__init__(output=output)
+
+    @field_validator("output", mode="before")
+    @classmethod
+    def normalize_missing_output(cls, value):
+        return "" if value is None else value
 
     def to_dict(self) -> dict:
         """
@@ -87,4 +96,4 @@ class TaskResult:
         Returns:
             The result text.
         """
-        return {"output": self.output}
+        return self.model_dump(mode="json")

@@ -2,6 +2,7 @@
 
 import time
 import uuid
+from typing import NoReturn
 
 from src.core.context import (
     ContextBuilder,
@@ -38,6 +39,14 @@ DEFAULT_LLM_ATTEMPT_DELAY_SECONDS = 10
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 
 
+class _TaskPersistenceError(Exception):
+    """Keep repository failures outside task execution error handling."""
+
+
+class _EventSinkError(Exception):
+    """Keep observer failures outside task execution error handling."""
+
+
 class Harness:
     """Run one task from planning through tool use until the model answers or a limit is hit."""
 
@@ -70,7 +79,22 @@ class Harness:
         self._max_seconds = max_seconds
 
     def _save_task(self, task: Task) -> None:
-        self.task_repository.save(task)
+        try:
+            self.task_repository.save(task)
+        except Exception as error:
+            raise _TaskPersistenceError from error
+
+    def _emit(self, event: Event) -> None:
+        try:
+            self.event_handler.emit(event)
+        except Exception as error:
+            raise _EventSinkError from error
+
+    @staticmethod
+    def _raise_boundary_cause(error: _TaskPersistenceError | _EventSinkError) -> NoReturn:
+        if error.__cause__ is not None:
+            raise error.__cause__
+        raise error
 
     def _available_tools(self) -> list[Tool]:
         return self.tool_executor.get_all_tools()
@@ -86,7 +110,7 @@ class Harness:
         step_id: str | None = None,
     ) -> None:
         task_id = str(task.id)
-        self.event_handler.emit(
+        self._emit(
             Event(
                 id=str(uuid.uuid4()),
                 type=event_type,
@@ -117,7 +141,7 @@ class Harness:
             tool_call_id = result.tool_id or call.id
             reason = result.fail_reason.value if result.fail_reason else None
             content = None if result.output is None else str(result.output)
-        self.event_handler.emit(
+        self._emit(
             Event(
                 id=str(uuid.uuid4()),
                 type=event_type,
@@ -152,7 +176,7 @@ class Harness:
         content: str | None = None,
         usage=None,
     ) -> None:
-        self.event_handler.emit(
+        self._emit(
             Event(
                 id=str(uuid.uuid4()),
                 type=event_type,
@@ -239,6 +263,9 @@ class Harness:
                 )
                 return output.structured
 
+            except (_TaskPersistenceError, _EventSinkError):
+                raise
+
             except LlmCallError:
                 raise
 
@@ -291,6 +318,9 @@ class Harness:
                 produced = self.llm_gateway.infer(context, stream=True)
                 output = self._read_inference(task, produced)
                 break
+
+            except (_TaskPersistenceError, _EventSinkError):
+                raise
 
             except LlmCallError:
                 raise
@@ -480,7 +510,11 @@ class Harness:
         return TaskResult()
 
     def _handle_failed_turn(
-        self, task: Task, step_count: int, failed_reason: TaskFailReason
+        self,
+        task: Task,
+        step_count: int,
+        failed_reason: TaskFailReason,
+        start_time: float,
     ) -> TaskResult:
         """
         Handle a failed turn.
@@ -491,16 +525,36 @@ class Harness:
         Returns:
             The task result.
         """
-        task.transition_to_failed(failed_reason)
-        self._save_task(task)
         self._emit_task_event(
             EventType.TASK_FAILED,
             task,
             reason=failed_reason.value,
             step_id=str(step_count),
         )
-        final_output = self.finalize(task)
-        return TaskResult(output=final_output)
+        try:
+            final_output = self.finalize(task)
+        except (_TaskPersistenceError, _EventSinkError):
+            raise
+        except Exception as error:
+            task.set_progress(step_count, time.monotonic() - start_time)
+            result = TaskResult(output=f"An unexpected error occurred: {str(error)}")
+            task.set_result(result)
+            task.transition_to_failed(failed_reason)
+            self._save_task(task)
+            self._emit_task_event(
+                EventType.TASK_FAILED,
+                task,
+                reason=failed_reason.value,
+                content=str(error),
+                step_id=str(step_count),
+            )
+            return result
+        result = TaskResult(output=final_output)
+        task.set_progress(step_count, time.monotonic() - start_time)
+        task.set_result(result)
+        task.transition_to_failed(failed_reason)
+        self._save_task(task)
+        return result
 
     def _handle_completed_turn(
         self, task: Task, step_result: StepResult, step_count: int
@@ -525,7 +579,7 @@ class Harness:
 
         return result
 
-    def turn(self, task: Task) -> TaskResult:
+    def turn(self, task: Task, start_time: float | None = None) -> TaskResult:
         """
         Infer and execute tools until the model answers or a limit is hit.
         Args:
@@ -534,27 +588,28 @@ class Harness:
             The task result. A completed task carries the assistant text. A paused or
             failed task carries the result recorded while closing the turn.
         """
-        start_time = time.monotonic() - task.elapsed_seconds
+        if start_time is None:
+            start_time = time.monotonic() - task.elapsed_seconds
         step_count = task.step_count
         while True:
             step_result: StepResult = self.step(task)
             step_count += 1
+            task.set_progress(step_count, time.monotonic() - start_time)
 
             blocked, blocked_reason = self._blocked(step_result)
             if blocked:
                 assert blocked_reason is not None
-                task.set_progress(step_count, time.monotonic() - start_time)
                 return self._handle_blocked_turn(task, step_result, step_count, blocked_reason)
 
             failed, failed_reason = self._failed(start_time, step_count)
             if failed:
                 assert failed_reason is not None
-                return self._handle_failed_turn(task, step_count, failed_reason)
+                return self._handle_failed_turn(task, step_count, failed_reason, start_time)
 
             if self._completed(step_result):
                 return self._handle_completed_turn(task, step_result, step_count)
 
-    def run(self, task: Task) -> TaskResult | None:
+    def run(self, task: Task) -> TaskResult:
         """
         Plan a new task, then infer and execute tools until the model answers or a limit is hit.
         Args:
@@ -566,9 +621,11 @@ class Harness:
         """
         if task.is_paused() and task.approval_requests():
             raise ValueError("tool calls are waiting for approval")
+        start_time = time.monotonic() - task.elapsed_seconds
         try:
             if task.is_finished():
                 self._emit_task_event(EventType.TASK_FINISHED, task)
+                assert task.result is not None
                 return task.result
 
             self._emit_task_event(EventType.TASK_STARTED, task)
@@ -585,7 +642,7 @@ class Harness:
                 self._emit_task_event(EventType.TASK_PLANNED, task, goal=list(plan.goal))
                 question = (plan.clarification or "").strip()
                 if question:
-                    return self._ask_clarification(task, question)
+                    return self._ask_clarification(task, question, start_time)
 
             if task.is_paused():
                 self._emit_task_event(EventType.TASK_RESUMED, task)
@@ -593,35 +650,46 @@ class Harness:
                 self._finish_pending_tool_calls(task)
                 self._save_task(task)
 
-            result = self.turn(task)
+            result = self.turn(task, start_time)
             return result
 
+        except (_TaskPersistenceError, _EventSinkError) as boundary_error:
+            self._raise_boundary_cause(boundary_error)
         except Exception as error:
-            if not task.is_failed():
-                if isinstance(error, GuardError):
-                    reason = TaskFailReason.TASK_FAILED_GUARD_ERROR
-                elif isinstance(error, ContextBuilderError):
-                    reason = TaskFailReason.TASK_FAILED_CONTEXT_BUILD_ERROR
-                elif isinstance(error, LlmCallError):
-                    reason = TaskFailReason.TASK_FAILED_LLM_ERROR
-                else:
-                    reason = TaskFailReason.TASK_FAILED_UNKNOWN
-                task.transition_to_failed(reason)
+            if task.is_finished() or task.is_paused():
+                raise
+            result = TaskResult(output=f"An unexpected error occurred: {str(error)}")
+            task.set_progress(task.step_count, time.monotonic() - start_time)
+            if isinstance(error, GuardError):
+                reason = TaskFailReason.TASK_FAILED_GUARD_ERROR
+            elif isinstance(error, ContextBuilderError):
+                reason = TaskFailReason.TASK_FAILED_CONTEXT_BUILD_ERROR
+            elif isinstance(error, LlmCallError):
+                reason = TaskFailReason.TASK_FAILED_LLM_ERROR
+            else:
+                reason = TaskFailReason.TASK_FAILED_UNKNOWN
+            task.set_result(result)
+            task.transition_to_failed(reason)
+            try:
                 self._save_task(task)
 
-            fail_reason = task.state_reason.value if task.state_reason else None
-            self._emit_task_event(
-                EventType.TASK_FAILED,
-                task,
-                reason=fail_reason,
-                content=str(error),
-            )
-            return TaskResult(output=f"An unexpected error occurred: {str(error)}")
+                fail_reason = task.state_reason.value if task.state_reason else None
+                self._emit_task_event(
+                    EventType.TASK_FAILED,
+                    task,
+                    reason=fail_reason,
+                    content=str(error),
+                )
+            except (_TaskPersistenceError, _EventSinkError) as boundary_error:
+                self._raise_boundary_cause(boundary_error)
+            return result
 
-    def _ask_clarification(self, task: Task, question: str) -> TaskResult:
+    def _ask_clarification(self, task: Task, question: str, start_time: float) -> TaskResult:
         result = TaskResult(output=question)
+        task.set_progress(task.step_count, time.monotonic() - start_time)
         task.set_result(result)
         task.transition_to_completed()
+        self._save_task(task)
         self._emit_llm_event(task, EventType.LLM_DELTA, phase="planning", content=question)
         self._emit_task_event(EventType.TASK_COMPLETED, task, content=question)
         return result

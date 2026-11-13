@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import math
 import uuid
-from typing import FrozenSet, Optional
+from collections.abc import Mapping
+from enum import Enum
+from typing import Any, ClassVar, FrozenSet
+
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from src.schema.context import Message
 from src.schema.llm import ROLE_TOOL
@@ -24,10 +29,12 @@ class InvalidTransition(Exception):
         super().__init__(f"Invalid transition: {current_state} -> {new_state}")
 
 
-class Task:
+class Task(BaseModel):
     """A task to be executed by the harness."""
 
-    TRANSITIONS: dict[TaskState, FrozenSet[TaskState]] = {
+    model_config = ConfigDict(validate_assignment=False)
+
+    TRANSITIONS: ClassVar[dict[TaskState, FrozenSet[TaskState]]] = {
         TaskState.TASK_CREATED: frozenset([TaskState.TASK_RUNNING, TaskState.TASK_FAILED]),
         TaskState.TASK_RUNNING: frozenset(
             [TaskState.TASK_PAUSED, TaskState.TASK_FAILED, TaskState.TASK_COMPLETED]
@@ -37,50 +44,120 @@ class Task:
         TaskState.TASK_COMPLETED: frozenset([]),
     }
 
-    def __init__(
-        self,
-        original_input: str,
-        id: str | None = None,
-        state: TaskState = TaskState.TASK_CREATED,
-        state_reason: TaskStateReason | None = None,
-        plan: TaskPlan | None = None,
-        history: list[Message] | None = None,
-        pending_tool_calls: list[ToolExecutionResult] | None = None,
-        result: TaskResult | None = None,
-    ):
-        self.id = id if id is not None else str(uuid.uuid4())
-        self.original_input = original_input
-        self.state = state
-        self.state_reason = state_reason
-        self.plan = plan
-        self.history = list(history) if history is not None else []
-        self.pending_tool_calls = list(pending_tool_calls) if pending_tool_calls is not None else []
-        self.result = result
-        self.step_count = 0
-        self.elapsed_seconds = 0.0
+    schema_version: int = 1
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    original_input: str
+    state: TaskState = TaskState.TASK_CREATED
+    state_reason: TaskStateReason | None = None
+    plan: TaskPlan | None = None
+    history: list[Message] = Field(default_factory=list)
+    pending_tool_calls: list[ToolExecutionResult] = Field(default_factory=list)
+    result: TaskResult | None = None
+    step_count: int = Field(default=0, ge=0)
+    elapsed_seconds: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
 
-    def to_dict(self) -> dict:
+    def __init__(self, original_input: str, id: str | None = None, **data: Any):
+        if id is not None:
+            data["id"] = id
+        if data.get("history") is None:
+            data.pop("history", None)
+        if data.get("pending_tool_calls") is None:
+            data.pop("pending_tool_calls", None)
+        super().__init__(original_input=original_input, **data)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name not in type(self).model_fields or not hasattr(self, "__pydantic_fields_set__"):
+            super().__setattr__(name, value)
+            return
+        self._apply_updates(**{name: value})
+
+    @model_validator(mode="before")
+    @classmethod
+    def parse_state_reason(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        data = dict(value)
+        raw_state = data.get("state", TaskState.TASK_CREATED)
+        state = raw_state if isinstance(raw_state, TaskState) else TaskState(raw_state)
+        reason = data.get("state_reason")
+        if isinstance(reason, str):
+            reason_type = {
+                TaskState.TASK_RUNNING: TaskRunningReason,
+                TaskState.TASK_PAUSED: TaskPauseReason,
+                TaskState.TASK_FAILED: TaskFailReason,
+            }.get(state)
+            if reason_type is not None:
+                data["state_reason"] = reason_type(reason)
+        return data
+
+    @model_validator(mode="after")
+    def validate_state_invariants(self) -> "Task":
+        expected_reason_type = {
+            TaskState.TASK_RUNNING: TaskRunningReason,
+            TaskState.TASK_PAUSED: TaskPauseReason,
+            TaskState.TASK_FAILED: TaskFailReason,
+        }.get(self.state)
+        if self.state_reason is not None and (
+            expected_reason_type is None or not isinstance(self.state_reason, expected_reason_type)
+        ):
+            raise ValueError(f"state reason {self.state_reason} does not match {self.state.value}")
+        if self.is_finished() and self.result is None:
+            raise ValueError(f"{self.state.value} task requires a result")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
         """
         Convert the task to a dictionary.
         Returns:
             A dictionary representation of the task.
         """
-        return {
-            "id": self.id,
-            "original_input": self.original_input,
-            "state": self.state.value,
-            "state_reason": self.state_reason.value if self.state_reason else None,
-            "plan": self.plan.to_dict() if self.plan else None,
-            "history": self.history,
-            "pending_tool_calls": self.pending_tool_calls,
-            "result": self.result.to_dict() if self.result else None,
-            "step_count": self.step_count,
-            "elapsed_seconds": self.elapsed_seconds,
-        }
+        for message in self.history:
+            _strict_json_value(message.thinking_blocks)
+        for pending_call in self.pending_tool_calls:
+            _strict_json_value(pending_call.output)
+        snapshot = _strict_json_value(self.model_dump(mode="python"))
+        assert isinstance(snapshot, dict)
+        return snapshot
 
-    def _transition_to(
-        self, state: TaskState, state_reason: Optional[TaskStateReason] = None
-    ) -> None:
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "Task":
+        """Restore one task from serialized snapshot data."""
+        snapshot = dict(data)
+        if snapshot.get("history") is None:
+            snapshot["history"] = []
+        if snapshot.get("pending_tool_calls") is None:
+            snapshot["pending_tool_calls"] = []
+        if "schema_version" not in snapshot:
+            snapshot["schema_version"] = 1
+            if snapshot.get("state") in {
+                TaskState.TASK_COMPLETED,
+                TaskState.TASK_COMPLETED.value,
+                TaskState.TASK_FAILED,
+                TaskState.TASK_FAILED.value,
+            } and snapshot.get("state_reason") in {
+                TaskRunningReason.TASK_RUNNING_CREATE,
+                TaskRunningReason.TASK_RUNNING_CREATE.value,
+                TaskRunningReason.TASK_RUNNING_RESUME,
+                TaskRunningReason.TASK_RUNNING_RESUME.value,
+            }:
+                snapshot["state_reason"] = None
+        return cls.model_validate(snapshot)
+
+    def _apply_updates(self, **updates: Any) -> None:
+        """Validate a complete candidate before committing any field updates."""
+        validated_updates = dict(updates)
+        for name in {"id", "history", "pending_tool_calls"}.intersection(updates):
+            field = type(self).model_fields[name]
+            validated_updates[name] = TypeAdapter(field.rebuild_annotation()).validate_python(
+                updates[name]
+            )
+        candidate_data = self.model_dump(mode="python")
+        candidate_data.update(validated_updates)
+        candidate = type(self).model_validate(candidate_data)
+        for name in updates:
+            super().__setattr__(name, getattr(candidate, name))
+
+    def _transition_to(self, state: TaskState, state_reason: TaskStateReason | None = None) -> None:
         """
         Transition the task to a new state.
         Args:
@@ -90,9 +167,7 @@ class Task:
         if state not in self.TRANSITIONS[self.state]:
             raise InvalidTransition(self.state, state)
 
-        self.state = state
-        if state_reason is not None:
-            self.state_reason = state_reason
+        self._apply_updates(state=state, state_reason=state_reason)
 
     def transition_to_running(self, reason: TaskRunningReason) -> None:
         """
@@ -114,9 +189,13 @@ class Task:
         Args:
             reason: The reason for the task failure.
         """
-        if self.result is None:
-            self.result = TaskResult()
-        self._transition_to(TaskState.TASK_FAILED, reason)
+        if TaskState.TASK_FAILED not in self.TRANSITIONS[self.state]:
+            raise InvalidTransition(self.state, TaskState.TASK_FAILED)
+        self._apply_updates(
+            state=TaskState.TASK_FAILED,
+            state_reason=reason,
+            result=self.result if self.result is not None else TaskResult(),
+        )
 
     def transition_to_completed(self) -> None:
         """
@@ -246,8 +325,7 @@ class Task:
             step_count: Steps already taken.
             elapsed_seconds: Running time already used, excluding paused time.
         """
-        self.step_count = step_count
-        self.elapsed_seconds = elapsed_seconds
+        self._apply_updates(step_count=step_count, elapsed_seconds=elapsed_seconds)
 
     def set_result(self, result: TaskResult) -> None:
         """
@@ -256,6 +334,25 @@ class Task:
             result: The result produced for this task.
         """
         self.result = result
+
+
+def _strict_json_value(value: Any) -> Any:
+    """Return an exact JSON value or reject values JSON would coerce or lose."""
+    if isinstance(value, Enum):
+        return _strict_json_value(value.value)
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("task snapshots require finite numbers")
+        return value
+    if isinstance(value, list):
+        return [_strict_json_value(item) for item in value]
+    if isinstance(value, dict):
+        if not all(isinstance(key, str) for key in value):
+            raise ValueError("task snapshot object keys must be strings")
+        return {key: _strict_json_value(item) for key, item in value.items()}
+    raise ValueError(f"task snapshot value is not JSON-safe: {type(value).__name__}")
 
 
 def get_task_status(task: Task) -> dict:

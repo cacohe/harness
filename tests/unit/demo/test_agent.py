@@ -70,6 +70,21 @@ def test_chat_sends_prior_turns_with_the_next_message():
     assert gateway.plans[1] == "user: hi\nassistant: hello\nuser: and you"
 
 
+def test_chat_records_missing_model_content_as_an_empty_string():
+    gateway = ChatGateway([None, "next"])
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=gateway,
+    )
+
+    first = agent.chat("empty")
+    agent.chat("continue")
+
+    assert first.result.output == ""
+    assert agent.transcript[:2] == [("user", "empty"), ("assistant", "")]
+    assert gateway.plans[1] == "user: empty\nassistant: \nuser: continue"
+
+
 def test_failed_resume_clears_the_waiting_task():
     class FailingAfterPause(ChatGateway):
         def infer(self, context, stream=True, response_format=None):

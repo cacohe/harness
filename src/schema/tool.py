@@ -41,8 +41,7 @@ class ToolExecutionFailReason(Enum):
     TOOL_EXECUTION_FAIL_REASON_NOT_AUTHENTICATED = "not_authenticated"
 
 
-@dataclass
-class ToolExecutionResult:
+class ToolExecutionResult(BaseModel):
     tool_id: str
     tool_name: str
     state: ToolExecutionState = ToolExecutionState.TOOL_EXECUTION_STATE_PENDING

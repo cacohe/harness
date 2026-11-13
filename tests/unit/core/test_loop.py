@@ -13,6 +13,7 @@ from src.core.loop import (
 )
 from src.core.task import Task
 from src.core.tool import ToolExecutor
+from src.persistence.in_memory import InMemoryTaskRepository
 from src.schema.context import Context
 from src.schema.event import EventType
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
@@ -208,6 +209,22 @@ def test_run_saves_state_changes_through_the_repository():
     assert task.plan.current == "compare"
 
 
+def test_completed_turn_persists_result_and_progress_snapshot():
+    repository = InMemoryTaskRepository()
+    task = _task()
+
+    result = _harness(Gateway(), repository=repository).run(task)
+    restored = repository.get(task.id)
+
+    assert result is task.result
+    assert task.step_count == 1
+    assert task.elapsed_seconds >= 0
+    assert restored is not None
+    assert restored.state is TaskState.TASK_COMPLETED
+    assert restored.result == result
+    assert restored.step_count == 1
+
+
 def test_planning_run_emits_task_events():
     output = RecordingOutput()
 
@@ -391,18 +408,18 @@ def test_paused_task_returns_to_running_without_planning():
     assert task.result.output == "bought"
 
 
-def test_run_declares_that_finished_tasks_may_have_no_result():
-    assert get_type_hints(Harness.run)["return"] == TaskResult | None
+def test_run_declares_a_non_nullable_result():
+    assert get_type_hints(Harness.run)["return"] is TaskResult
 
 
-def test_completed_turn_preserves_missing_model_content():
+def test_completed_turn_normalizes_missing_model_content():
     gateway = ScriptedGateway([_model(FinishReason.STOP)])
     task = _task()
 
     result = _harness(gateway).run(task)
 
     assert result is not None
-    assert result.output is None
+    assert result.output == ""
     assert task.result is result
 
 
@@ -514,10 +531,18 @@ def test_step_limit_asks_for_a_closing_answer_from_unseen_tool_results():
         ]
     )
     task = _task()
+    repository = InMemoryTaskRepository()
 
-    assert _harness(gateway, executor=executor, max_steps=1).run(task).output == "based on the tool"
+    result = _harness(gateway, executor=executor, max_steps=1, repository=repository).run(task)
 
+    restored = repository.get(task.id)
+    assert result.output == "based on the tool"
+    assert result is task.result
     assert task.state_reason is TaskFailReason.TASK_FAILED_MAX_STEPS
+    assert task.step_count == 1
+    assert restored is not None
+    assert restored.result == result
+    assert restored.step_count == 1
     assert executor.batches == 1
     assert gateway.infer_contexts[1].tools == []
     assert task.history[-1].role == "tool"
@@ -767,10 +792,296 @@ def test_clarification_completes_without_inference():
 
     task = _task()
     output = RecordingOutput()
+    repository = InMemoryTaskRepository()
 
-    result = _harness(Clarifying(), event_handler=output).run(task)
+    result = _harness(Clarifying(), event_handler=output, repository=repository).run(task)
 
     assert result.output == "What should I do with 12?"
     assert task.state is TaskState.TASK_COMPLETED
+    restored = repository.get(task.id)
+    assert restored is not None
+    assert restored.state is TaskState.TASK_COMPLETED
+    assert restored.result == result
     deltas = [e.payload.content for e in output.events if e.type is EventType.LLM_DELTA]
     assert deltas == ["What should I do with 12?"]
+
+
+def test_unexpected_error_persists_the_returned_result():
+    class BrokenPlanning(Gateway):
+        def planning(self, context, stream=True, response_format=None):
+            raise ValueError("bad request")
+
+    repository = InMemoryTaskRepository()
+    task = _task()
+
+    result = _harness(BrokenPlanning(), repository=repository).run(task)
+    restored = repository.get(task.id)
+
+    assert result is task.result
+    assert result.output == "An unexpected error occurred: bad request"
+    assert restored is not None
+    assert restored.result == result
+
+
+def test_finalization_error_replaces_the_empty_failed_result():
+    class FinalizationFails(Gateway):
+        def __init__(self):
+            super().__init__()
+            self.infer_calls = 0
+
+        def infer(self, context, stream=True, response_format=None):
+            self.infer_calls += 1
+            if self.infer_calls == 1:
+                return _model(FinishReason.LENGTH, "partial")
+            raise ValueError("closing failed")
+
+    repository = InMemoryTaskRepository()
+    task = _task()
+
+    result = _harness(FinalizationFails(), max_steps=1, repository=repository).run(task)
+    restored = repository.get(task.id)
+
+    assert result is task.result
+    assert result.output == "An unexpected error occurred: closing failed"
+    assert task.state is TaskState.TASK_FAILED
+    assert task.state_reason is TaskFailReason.TASK_FAILED_MAX_STEPS
+    assert restored is not None
+    assert restored.result == result
+    assert restored.state_reason is TaskFailReason.TASK_FAILED_MAX_STEPS
+
+
+def test_terminal_save_error_is_not_rewritten_as_a_task_failure():
+    class FailingTerminalRepository:
+        def __init__(self):
+            self.inner = InMemoryTaskRepository()
+
+        def save(self, task):
+            if task.is_finished():
+                raise OSError("terminal storage unavailable")
+            self.inner.save(task)
+
+        def get(self, task_id):
+            return self.inner.get(task_id)
+
+    repository = FailingTerminalRepository()
+    task = _task()
+
+    with pytest.raises(OSError, match="terminal storage unavailable"):
+        _harness(Gateway(), repository=repository).run(task)
+
+    assert task.state is TaskState.TASK_COMPLETED
+    assert task.result == TaskResult(output="bought")
+    stored = repository.get(task.id)
+    assert stored is not None
+    assert stored.state is TaskState.TASK_RUNNING
+
+
+def test_terminal_event_error_preserves_the_committed_result():
+    class FailingCompletedSink(RecordingOutput):
+        def emit(self, event):
+            super().emit(event)
+            if event.type is EventType.TASK_COMPLETED:
+                raise RuntimeError("completed observer failed")
+
+    repository = InMemoryTaskRepository()
+    task = _task()
+
+    with pytest.raises(RuntimeError, match="completed observer failed"):
+        _harness(Gateway(), event_handler=FailingCompletedSink(), repository=repository).run(task)
+
+    stored = repository.get(task.id)
+    assert task.state is TaskState.TASK_COMPLETED
+    assert task.result == TaskResult(output="bought")
+    assert stored is not None
+    assert stored.state is TaskState.TASK_COMPLETED
+    assert stored.result == TaskResult(output="bought")
+
+
+def test_planning_completion_event_error_escapes_retry_handling():
+    class FailingPlanningSink(RecordingOutput):
+        def emit(self, event):
+            super().emit(event)
+            if event.type is EventType.LLM_COMPLETED and event.payload.phase == "planning":
+                raise RuntimeError("planning observer failed")
+
+    task = _task()
+
+    with pytest.raises(RuntimeError, match="planning observer failed"):
+        _harness(Gateway(), event_handler=FailingPlanningSink()).run(task)
+
+    assert task.state is TaskState.TASK_RUNNING
+    assert task.result is None
+
+
+def test_inference_delta_event_error_escapes_retry_handling():
+    class FailingDeltaSink(RecordingOutput):
+        def emit(self, event):
+            super().emit(event)
+            if event.type is EventType.LLM_DELTA and event.payload.phase == "infer":
+                raise RuntimeError("delta observer failed")
+
+    task = _task()
+
+    with pytest.raises(RuntimeError, match="delta observer failed"):
+        _harness(Gateway(), event_handler=FailingDeltaSink()).run(task)
+
+    assert task.state is TaskState.TASK_RUNNING
+    assert task.result is None
+
+
+def test_error_snapshot_failure_preserves_the_repository_exception():
+    class FailingFailureRepository(InMemoryTaskRepository):
+        def save(self, task):
+            if task.is_failed():
+                raise OSError("failure snapshot unavailable")
+            super().save(task)
+
+    class BrokenPlanning(Gateway):
+        def planning(self, context, stream=True, response_format=None):
+            raise ValueError("bad request")
+
+    task = _task()
+
+    with pytest.raises(OSError, match="failure snapshot unavailable"):
+        _harness(BrokenPlanning(), repository=FailingFailureRepository()).run(task)
+
+    assert task.state is TaskState.TASK_FAILED
+    assert task.result == TaskResult(output="An unexpected error occurred: bad request")
+
+
+def test_failed_event_never_exposes_an_empty_terminal_snapshot():
+    repository = InMemoryTaskRepository()
+
+    class InspectingFailureSink(RecordingOutput):
+        observed = None
+
+        def emit(self, event):
+            super().emit(event)
+            if event.type is EventType.TASK_FAILED:
+                stored = repository.get(event.task_id)
+                assert stored is not None
+                self.observed = (stored.state, stored.result)
+
+    sink = InspectingFailureSink()
+    gateway = ScriptedGateway(
+        [_model(FinishReason.LENGTH, "partial"), _model(FinishReason.STOP, "closing")]
+    )
+    task = _task()
+
+    result = _harness(
+        gateway,
+        event_handler=sink,
+        max_steps=1,
+        repository=repository,
+    ).run(task)
+
+    assert sink.observed == (TaskState.TASK_RUNNING, None)
+    assert result.output == "closing"
+    stored = repository.get(task.id)
+    assert stored is not None
+    assert stored.state is TaskState.TASK_FAILED
+    assert stored.result == result
+
+
+class FakeClock:
+    def __init__(self, value=100.0):
+        self.value = value
+
+    def monotonic(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
+
+
+def test_clarification_elapsed_time_includes_planning(monkeypatch):
+    clock = FakeClock()
+
+    class Clarifying(Gateway):
+        def planning(self, context, stream=True, response_format=None):
+            clock.advance(4)
+            return LLMOutput(
+                FinishReason.STOP,
+                None,
+                [],
+                None,
+                None,
+                structured=TaskPlan(goal=[], clarification="Which target?"),
+            )
+
+    monkeypatch.setattr("src.core.loop.time.monotonic", clock.monotonic)
+    task = _task()
+
+    _harness(Clarifying()).run(task)
+
+    assert task.elapsed_seconds == 4.0
+
+
+def test_failed_inference_elapsed_time_includes_planning_and_error(monkeypatch):
+    clock = FakeClock()
+
+    class FailingInference(Gateway):
+        def planning(self, context, stream=True, response_format=None):
+            clock.advance(2)
+            return super().planning(context, stream, response_format)
+
+        def infer(self, context, stream=True, response_format=None):
+            clock.advance(3)
+            raise ValueError("bad request")
+
+    monkeypatch.setattr("src.core.loop.time.monotonic", clock.monotonic)
+    task = _task()
+
+    _harness(FailingInference()).run(task)
+
+    assert task.elapsed_seconds == 5.0
+
+
+def test_failed_turn_elapsed_time_includes_successful_finalization(monkeypatch):
+    clock = FakeClock()
+
+    class TimedFinalization(ScriptedGateway):
+        def planning(self, context, stream=True, response_format=None):
+            clock.advance(2)
+            return super().planning(context, stream, response_format)
+
+        def infer(self, context, stream=True, response_format=None):
+            clock.advance(3 if not self.infer_contexts else 4)
+            return super().infer(context, stream, response_format)
+
+    gateway = TimedFinalization(
+        [_model(FinishReason.LENGTH, "partial"), _model(FinishReason.STOP, "closing")]
+    )
+    monkeypatch.setattr("src.core.loop.time.monotonic", clock.monotonic)
+    task = _task()
+
+    _harness(gateway, max_steps=1).run(task)
+
+    assert task.elapsed_seconds == 9.0
+
+
+def test_failed_turn_elapsed_time_includes_finalization_error(monkeypatch):
+    clock = FakeClock()
+
+    class TimedFinalizationFailure(Gateway):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def planning(self, context, stream=True, response_format=None):
+            clock.advance(2)
+            return super().planning(context, stream, response_format)
+
+        def infer(self, context, stream=True, response_format=None):
+            self.calls += 1
+            clock.advance(3 if self.calls == 1 else 4)
+            if self.calls == 1:
+                return _model(FinishReason.LENGTH, "partial")
+            raise ValueError("closing failed")
+
+    monkeypatch.setattr("src.core.loop.time.monotonic", clock.monotonic)
+    task = _task()
+
+    _harness(TimedFinalizationFailure(), max_steps=1).run(task)
+
+    assert task.elapsed_seconds == 9.0

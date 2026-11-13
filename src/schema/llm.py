@@ -1,7 +1,8 @@
 from collections.abc import Iterable
-from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+
+from pydantic import BaseModel, Field
 
 ROLE_SYSTEM = "system"
 ROLE_USER = "user"
@@ -159,35 +160,62 @@ class FinishReason(str, Enum):
         return self in {FinishReason.TOOL_CALLS, FinishReason.FUNCTION_CALL}
 
 
-@dataclass
-class LlmToolCall:
+class LlmToolCall(BaseModel):
     """One tool call requested by the model."""
 
     id: str
     name: str
     arguments: str
 
+    def __init__(self, id: str, name: str, arguments: str):
+        super().__init__(id=id, name=name, arguments=arguments)
 
-@dataclass
-class LlmUsage:
+
+class LlmUsage(BaseModel):
     """Token counts for one model call."""
 
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
 
+    def __init__(self, prompt_tokens: int, completion_tokens: int, total_tokens: int):
+        super().__init__(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        )
 
-@dataclass
-class LLMOutput:
+
+class LLMOutput(BaseModel):
     """Model output used by the agent loop."""
 
     finish_reason: FinishReason | None
     content: str | None
-    tool_calls: list[LlmToolCall]
+    tool_calls: list[LlmToolCall] = Field(default_factory=list)
     reasoning_content: str | None
     thinking_blocks: list[dict[str, Any]] | None
     usage: LlmUsage | None = None
     structured: Any | None = None
+
+    def __init__(
+        self,
+        finish_reason: FinishReason | None,
+        content: str | None,
+        tool_calls: list[LlmToolCall],
+        reasoning_content: str | None,
+        thinking_blocks: list[dict[str, Any]] | None,
+        usage: LlmUsage | None = None,
+        structured: Any | None = None,
+    ):
+        super().__init__(
+            finish_reason=finish_reason,
+            content=content,
+            tool_calls=tool_calls,
+            reasoning_content=reasoning_content,
+            thinking_blocks=thinking_blocks,
+            usage=usage,
+            structured=structured,
+        )
 
     def requests_tool_calls(self) -> bool:
         """
