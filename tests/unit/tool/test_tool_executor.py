@@ -2,6 +2,7 @@ import pytest
 from src.core import tool as core_tool
 from src.core.context import build_tool_messages
 from src.core.tool import ToolExecutor
+from src.core.workspace import Workspace, WorkspaceViolation
 from src.schema.llm import LlmToolCall
 from src.schema.tool import (
     ApprovalDecision,
@@ -46,6 +47,16 @@ class Policy:
         return self.decision
 
 
+class CapturingPolicy(Policy):
+    def __init__(self, decision=ApprovalDecision.APPROVAL_DECISION_APPROVED):
+        super().__init__(decision)
+        self.calls = []
+
+    def decide(self, tool, inputs):
+        self.calls.append((tool, inputs))
+        return self.decision
+
+
 class FalseyPolicy(Policy):
     def __bool__(self):
         return False
@@ -71,9 +82,14 @@ class Sandbox:
     def supports(self, tool):
         return self.supported
 
-    def run(self, tool, inputs):
-        self.calls.append((tool, inputs))
+    def run(self, tool, inputs, workspace):
+        self.calls.append((tool, inputs, workspace))
         return self.output
+
+
+class FalseySandbox(Sandbox):
+    def __bool__(self):
+        return False
 
 
 def _core_executor(*, runner=None, policy=None, sandbox=None):
@@ -93,6 +109,266 @@ def _core_executor(*, runner=None, policy=None, sandbox=None):
         approval_policy=policy if policy is not None else Policy(),
         sandbox_runner=sandbox,
     )
+
+
+def _executor_for_tool(tool, *, runner=None, policy=None, sandbox=None):
+    registry = DefaultToolRegistry()
+    registry.register(tool)
+    return ToolExecutor(
+        registry,
+        runner if runner is not None else Runner(),
+        approval_policy=policy if policy is not None else Policy(),
+        sandbox_runner=sandbox,
+    )
+
+
+def _sandbox_tool(workspace):
+    return Tool(
+        id="shell",
+        name="shell",
+        description="Run a command.",
+        input_schema={},
+        executer=lambda inputs: "host fallback",
+        requires_sandbox=True,
+        input_validator=lambda inputs: {**inputs, "cwd": inputs.get("cwd") or "."},
+        workspace=workspace,
+    )
+
+
+def test_validator_output_is_used_for_approval_and_execution():
+    runner = Runner()
+    policy = CapturingPolicy()
+    tool = Tool(
+        id="read_file",
+        name="read_file",
+        description="Read a file.",
+        input_schema={},
+        executer=lambda inputs: "legacy",
+        input_validator=lambda inputs: {**inputs, "path": "normalized.txt"},
+    )
+    executor = _executor_for_tool(tool, runner=runner, policy=policy)
+
+    result = executor.execute_tool_call(
+        LlmToolCall(id="call-1", name="read_file", arguments='{"path":"alias.txt"}')
+    )
+
+    assert result.is_completed()
+    assert policy.calls == [(tool, {"path": "normalized.txt"})]
+    assert runner.calls == [(tool, {"path": "normalized.txt"})]
+
+
+def test_workspace_violation_fails_before_policy_or_runner():
+    runner = Runner()
+    policy = CapturingPolicy()
+
+    def reject(_inputs):
+        raise WorkspaceViolation("blocked")
+
+    tool = Tool(
+        id="read_file",
+        name="read_file",
+        description="Read a file.",
+        input_schema={},
+        executer=lambda inputs: "legacy",
+        input_validator=reject,
+    )
+    executor = _executor_for_tool(tool, runner=runner, policy=policy)
+
+    result = executor.execute_tool_call(
+        LlmToolCall(id="call-1", name="read_file", arguments='{"path":"../outside"}')
+    )
+
+    assert (
+        result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_WORKSPACE_VIOLATION
+    )
+    assert result.output == "WorkspaceViolation: blocked"
+    assert policy.calls == []
+    assert runner.calls == []
+
+
+def test_held_call_persists_normalized_arguments_and_workspace_identity(tmp_path):
+    workspace = Workspace(tmp_path)
+    tool = Tool(
+        id="write_file",
+        name="write_file",
+        description="Write a file.",
+        input_schema={},
+        executer=lambda inputs: "legacy",
+        input_validator=lambda inputs: {**inputs, "path": "nested/file.txt"},
+        workspace=workspace,
+    )
+    executor = _executor_for_tool(tool, policy=Policy(None))
+
+    result = executor.execute_tool_call(
+        LlmToolCall(
+            id="call-1",
+            name="write_file",
+            arguments='{"path": "alias.txt", "content": "hello"}',
+        )
+    )
+
+    assert result.is_pending()
+    assert result.arguments == '{"content":"hello","path":"nested/file.txt"}'
+    assert result.workspace_id == workspace.identity
+
+
+def test_resumed_call_revalidates_normalized_arguments(tmp_path):
+    workspace = Workspace(tmp_path)
+    validations = []
+    runner = Runner()
+
+    def validate(inputs):
+        validations.append(dict(inputs))
+        if len(validations) == 2:
+            raise WorkspaceViolation("policy changed")
+        return dict(inputs)
+
+    tool = Tool(
+        id="write_file",
+        name="write_file",
+        description="Write a file.",
+        input_schema={},
+        executer=lambda inputs: "legacy",
+        input_validator=validate,
+        workspace=workspace,
+    )
+    executor = _executor_for_tool(tool, runner=runner, policy=Policy(None))
+    held = executor.execute_tool_call(
+        LlmToolCall(id="call-1", name="write_file", arguments='{"path":"file.txt"}')
+    )
+    held.approval = ApprovalDecision.APPROVAL_DECISION_APPROVED
+
+    result = executor.execute_held_tool_call(held)
+
+    assert (
+        result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_WORKSPACE_VIOLATION
+    )
+    assert validations == [{"path": "file.txt"}, {"path": "file.txt"}]
+    assert runner.calls == []
+
+
+def test_sandbox_required_tool_fails_without_sandbox_and_never_uses_runner(tmp_path):
+    runner = Runner()
+    tool = _sandbox_tool(Workspace(tmp_path))
+
+    result = _executor_for_tool(tool, runner=runner).execute_tool_call(
+        LlmToolCall(id="call-1", name="shell", arguments='{"command":"dir"}')
+    )
+
+    assert result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_SANDBOX_REQUIRED
+    assert runner.calls == []
+
+
+def test_sandbox_required_tool_fails_when_sandbox_does_not_support_it(tmp_path):
+    runner = Runner()
+    sandbox = Sandbox(supported=False)
+    tool = _sandbox_tool(Workspace(tmp_path))
+
+    result = _executor_for_tool(tool, runner=runner, sandbox=sandbox).execute_tool_call(
+        LlmToolCall(id="call-1", name="shell", arguments='{"command":"dir"}')
+    )
+
+    assert result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_SANDBOX_REQUIRED
+    assert sandbox.calls == []
+    assert runner.calls == []
+
+
+def test_sandbox_capability_error_fails_closed(tmp_path):
+    class BrokenSandbox(Sandbox):
+        def supports(self, tool):
+            raise RuntimeError("sandbox offline")
+
+    runner = Runner()
+    tool = _sandbox_tool(Workspace(tmp_path))
+
+    result = _executor_for_tool(tool, runner=runner, sandbox=BrokenSandbox()).execute_tool_call(
+        LlmToolCall(id="call-1", name="shell", arguments='{"command":"dir"}')
+    )
+
+    assert result.is_failed()
+    assert result.output == "RuntimeError: sandbox offline"
+    assert runner.calls == []
+
+
+def test_sandbox_required_tool_without_workspace_fails_before_sandbox():
+    runner = Runner()
+    sandbox = Sandbox()
+    tool = _sandbox_tool(None)
+
+    result = _executor_for_tool(tool, runner=runner, sandbox=sandbox).execute_tool_call(
+        LlmToolCall(id="call-1", name="shell", arguments='{"command":"dir"}')
+    )
+
+    assert (
+        result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_WORKSPACE_VIOLATION
+    )
+    assert result.output == "WorkspaceViolation: sandbox-required tool has no bound workspace"
+    assert sandbox.calls == []
+    assert runner.calls == []
+
+
+def test_sandbox_receives_tool_inputs_and_bound_workspace(tmp_path):
+    workspace = Workspace(tmp_path)
+    runner = Runner()
+    sandbox = Sandbox()
+    tool = _sandbox_tool(workspace)
+
+    result = _executor_for_tool(tool, runner=runner, sandbox=sandbox).execute_tool_call(
+        LlmToolCall(id="call-1", name="shell", arguments='{"command":"dir"}')
+    )
+
+    assert result.output == "sandboxed"
+    assert sandbox.calls == [(tool, {"command": "dir", "cwd": "."}, workspace)]
+    assert runner.calls == []
+
+
+def test_regular_tool_uses_bound_runner_even_when_sandbox_supports_it():
+    runner = Runner()
+    sandbox = Sandbox()
+    tool = Tool("read_file", "read_file", "Read.", {}, lambda inputs: "legacy")
+
+    result = _executor_for_tool(tool, runner=runner, sandbox=sandbox).execute_tool_call(
+        LlmToolCall(id="call-1", name="read_file", arguments='{"path":"a.txt"}')
+    )
+
+    assert result.output == "ran"
+    assert runner.calls == [(tool, {"path": "a.txt"})]
+    assert sandbox.calls == []
+
+
+def test_falsey_sandbox_is_preserved(tmp_path):
+    workspace = Workspace(tmp_path)
+    sandbox = FalseySandbox()
+    tool = _sandbox_tool(workspace)
+
+    result = _executor_for_tool(tool, sandbox=sandbox).execute_tool_call(
+        LlmToolCall(id="call-1", name="shell", arguments='{"command":"dir"}')
+    )
+
+    assert result.output == "sandboxed"
+    assert sandbox.calls == [(tool, {"command": "dir", "cwd": "."}, workspace)]
+
+
+def test_resume_rejects_approval_from_another_workspace(tmp_path):
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first_tool = _sandbox_tool(Workspace(first_root))
+    second_tool = _sandbox_tool(Workspace(second_root))
+    executor = _executor_for_tool(first_tool, policy=Policy(None), sandbox=Sandbox())
+    held = executor.execute_tool_call(
+        LlmToolCall(id="call-1", name="shell", arguments='{"command":"dir"}')
+    )
+    held.approval = ApprovalDecision.APPROVAL_DECISION_APPROVED
+    executor.catalog.register(second_tool)
+
+    result = executor.execute_held_tool_call(held)
+
+    assert (
+        result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_WORKSPACE_VIOLATION
+    )
+    assert result.output == "WorkspaceViolation: approval belongs to a different workspace"
 
 
 def test_unknown_tool_returns_not_supported():
@@ -141,20 +417,7 @@ def test_undecided_tool_is_pending_with_its_arguments():
     )
 
     assert result.state is ToolExecutionState.TOOL_EXECUTION_STATE_PENDING
-    assert result.arguments == '{"command": "dir"}'
-    assert runner.calls == []
-
-
-def test_supported_tool_runs_only_inside_sandbox():
-    runner = Runner()
-    sandbox = Sandbox()
-    result = _core_executor(runner=runner, sandbox=sandbox).execute_tool_call(
-        LlmToolCall(id="call-1", name="shell", arguments='{"command": "dir"}')
-    )
-
-    assert result.state is ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED
-    assert result.output == "sandboxed"
-    assert len(sandbox.calls) == 1
+    assert result.arguments == '{"command":"dir"}'
     assert runner.calls == []
 
 
@@ -289,7 +552,7 @@ def test_mutating_tools_wait_for_approval_without_running(name):
     assert result.completed_tools == []
     assert result.pending_tools[0].state is ToolExecutionState.TOOL_EXECUTION_STATE_PENDING
     assert result.pending_tools[0].tool_id == "call_1"
-    assert result.pending_tools[0].arguments == '{"command": "git status"}'
+    assert result.pending_tools[0].arguments == '{"command":"git status"}'
 
 
 def test_calls_after_a_held_call_wait_in_order():

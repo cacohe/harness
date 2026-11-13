@@ -47,6 +47,8 @@ class ToolExecutionFailReason(Enum):
     TOOL_EXECUTION_FAIL_REASON_UNKNOWN = "unknown"
     TOOL_EXECUTION_FAIL_REASON_NOT_SUPPORTED = "not_supported"
     TOOL_EXECUTION_FAIL_REASON_NOT_AUTHENTICATED = "not_authenticated"
+    TOOL_EXECUTION_FAIL_REASON_WORKSPACE_VIOLATION = "workspace_violation"
+    TOOL_EXECUTION_FAIL_REASON_SANDBOX_REQUIRED = "sandbox_required"
 
 
 class ToolExecutionResult(BaseModel):
@@ -58,6 +60,7 @@ class ToolExecutionResult(BaseModel):
     arguments: str | None = None
     approval: ApprovalDecision | None = None
     needs_approval: bool = False
+    workspace_id: str | None = None
 
     def can_run(self) -> bool:
         return (

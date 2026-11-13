@@ -608,7 +608,7 @@ def test_shell_call_pauses_without_running_or_a_closing_call():
     assert result.output == ""
     assert task.state is TaskState.TASK_PAUSED
     assert task.state_reason is TaskPauseReason.TASK_PAUSED_WAITING_APPROVAL
-    assert task.pending_tool_calls[0].arguments == '{"command": "git status"}'
+    assert task.pending_tool_calls[0].arguments == '{"command":"git status"}'
     assert len(gateway.infer_contexts) == 1
     paused = [e for e in output.events if e.type is EventType.TOOL_EXECUTION_PAUSED]
     assert [event.payload.tool_call_id for event in paused] == ["call_1"]
