@@ -2,6 +2,7 @@ from pathlib import Path
 
 from src.config import Config
 from src.context.context_builder import DefaultContextBuilder
+from src.core.cancellation import CancellationToken
 from src.core.context import ContextBuilder
 from src.core.guard import NoOpGuard
 from src.core.hook import HarnessHook
@@ -98,16 +99,21 @@ class Agent:
         """Build the default composition from an explicit runtime config."""
         return cls(config=config, **dependencies)
 
-    def chat(self, message: str) -> Task:
+    def chat(
+        self,
+        message: str,
+        cancellation_token: CancellationToken | None = None,
+    ) -> Task:
         """
         Plan one message, run it to an answer, and remember the turn.
         Args:
             message: The user's next line.
+            cancellation_token: Per-turn cooperative cancellation signal.
         Returns:
             The task after planning and execution. A failed turn is not remembered.
         """
         task = Task(original_input=self._with_transcript(message))
-        self.harness.run(task)
+        self.harness.run(task, cancellation_token=cancellation_token)
         if task.is_paused():
             self.pending_task = task
             self.pending_message = message
@@ -141,9 +147,11 @@ class Agent:
         self.pending_task.decide_tool_call(tool_id, approved)
         self.task_repository.save(self.pending_task)
 
-    def resume(self) -> Task:
+    def resume(self, cancellation_token: CancellationToken | None = None) -> Task:
         """
         Continue the paused task after every pending call is decided.
+        Args:
+            cancellation_token: Per-resume cooperative cancellation signal.
         Returns:
             The task after it continues.
         Raises:
@@ -154,7 +162,7 @@ class Agent:
             raise ValueError("nothing is waiting for approval")
         message = self.pending_message or ""
         try:
-            self.harness.run(task)
+            self.harness.run(task, cancellation_token=cancellation_token)
         finally:
             if not task.is_paused():
                 self.pending_task = None

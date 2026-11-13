@@ -74,6 +74,32 @@ agent = Agent.from_config(
 审批只表示用户允许某次调用，不提供隔离，也不能绕过 workspace 或 sandbox 检查。
 注入的 runner 是受信任的隔离边界；当前框架本身不声明提供硬链接、挂载、网络或进程隔离。
 
+## 外部取消
+
+同步 Harness 支持每次运行独立的协作式取消。控制线程创建 `CancellationToken`，将它传给
+`Agent.chat` 或 `Agent.resume`，再从其他线程调用 `cancel()`：
+
+```python
+from threading import Thread
+
+from src.core.cancellation import CancellationToken
+
+token = CancellationToken()
+worker = Thread(
+    target=lambda: agent.chat("分析这个项目", cancellation_token=token),
+)
+worker.start()
+
+# 控制器决定停止本次运行。
+token.cancel()
+worker.join()
+```
+
+取消是线程安全、幂等且按单次运行隔离的。Harness 会立即唤醒模型重试等待，并在规划、
+推理和工具调用边界停止后续工作；任务最终保存为 `failed/cancel`。取消不会强制终止已经
+进入第三方模型、工具、线程、进程或 sandbox 的阻塞调用，而会在该调用返回后丢弃其结果并
+停止下一步。一个已经取消的 token 不会自动重置，重复用于其他运行会立即取消该运行。
+
 需要替换模型、工具执行或持久化时，构造函数接收的是 `core` 中定义的端口，运行时注入
 相应实现：
 
@@ -140,5 +166,3 @@ agent-harness. Enter a message, or /exit to quit.
 ```
 
 `/help` 查看命令。`/exit`、`/quit`、`exit`、`quit` 或 Ctrl+C 退出。空行会被忽略。同一会话里，后面的输入会带上之前的问答。
-## TODO
-1、harness增加外部取消机制

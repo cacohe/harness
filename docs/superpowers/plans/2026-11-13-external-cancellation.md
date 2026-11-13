@@ -40,7 +40,7 @@
 - Consumes: Python `threading.Event`.
 - Produces: `CancellationToken.cancel() -> None`, `CancellationToken.is_cancelled() -> bool`, and `CancellationToken.wait(timeout: float) -> bool`.
 
-- [ ] **Step 1: Write failing token lifecycle tests**
+- [x] **Step 1: Write failing token lifecycle tests**
 
 Add tests named:
 
@@ -52,17 +52,17 @@ def test_reusing_a_cancelled_token_remains_cancelled(): ...
 
 Use a real helper thread plus bounded `threading.Event` coordination; do not use sleeps as synchronization. Assert both calls to `cancel()` are harmless and `wait()` returns `True` after cancellation.
 
-- [ ] **Step 2: Run Task 1 tests and confirm RED**
+- [x] **Step 2: Run Task 1 tests and confirm RED**
 
 Run: `python -m pytest tests/unit/core/test_cancellation.py -q -p no:cacheprovider`
 
 Expected: collection fails because `src.core.cancellation` does not exist.
 
-- [ ] **Step 3: Implement `CancellationToken`**
+- [x] **Step 3: Implement `CancellationToken`**
 
 Create the exact interface above with one private `threading.Event`. `is_cancelled` delegates to `is_set`; `wait` preserves `Event.wait` return semantics; no reset API is added.
 
-- [ ] **Step 4: Verify and commit Task 1**
+- [x] **Step 4: Verify and commit Task 1**
 
 Run:
 
@@ -92,7 +92,7 @@ git commit -m "feat: add cancellation token"
 - Consumes: optional `should_cancel: Callable[[], bool] | None`.
 - Produces: `ToolCallResult.ordered_tools: list[ToolExecutionResult]`; `ToolExecutor.execute_tool_calls(..., should_cancel=None)`; stable cancelled results with fail reason `TOOL_EXECUTION_FAIL_REASON_CANCELLED` and output `"Tool call cancelled."`.
 
-- [ ] **Step 1: Write failing ordered-result tests**
+- [x] **Step 1: Write failing ordered-result tests**
 
 Add tests proving:
 
@@ -104,17 +104,17 @@ def test_build_tool_messages_falls_back_for_legacy_results(): ...
 
 Use three calls whose category order differs from input order. Assert `ordered_tools` and built tool messages match the model call IDs exactly.
 
-- [ ] **Step 2: Run ordered-result tests and confirm RED**
+- [x] **Step 2: Run ordered-result tests and confirm RED**
 
 Run the three exact tests with `python -m pytest ... -q -p no:cacheprovider`.
 
 Expected: missing `ordered_tools` and current category concatenation fail.
 
-- [ ] **Step 3: Implement the ordered result contract**
+- [x] **Step 3: Implement the ordered result contract**
 
 Add `ordered_tools` with a default factory. Populate it for every executor batch result. Change `build_tool_messages` to use it when non-empty and retain the existing completed/failed/pending fallback.
 
-- [ ] **Step 4: Write failing cancellation-between-tools tests**
+- [x] **Step 4: Write failing cancellation-between-tools tests**
 
 Add:
 
@@ -126,11 +126,11 @@ def test_precancelled_batch_never_invokes_policy_validator_or_runner(): ...
 
 Cancel from the first runner after it completes. Assert every later call is failed/cancelled in order, has the stable output, and no later mutation hook ran.
 
-- [ ] **Step 5: Implement cancellable batch routing**
+- [x] **Step 5: Implement cancellable batch routing**
 
 Before each call, check `should_cancel` when supplied. For cancellation, create the failed result directly, call only `after_call`, append to `failed_tools` and `ordered_tools`, and continue so every model call receives a result.
 
-- [ ] **Step 6: Verify and commit Task 2**
+- [x] **Step 6: Verify and commit Task 2**
 
 Run:
 
@@ -159,7 +159,7 @@ git commit -m "feat: cancel ordered tool batches"
 - Consumes: `CancellationToken` from Task 1 and `ToolExecutor.execute_tool_calls(..., should_cancel=...)` plus `ordered_tools` from Task 2.
 - Produces: `Harness.run(task: Task, cancellation_token: CancellationToken | None = None) -> TaskResult`; direct `TASK_PAUSED -> TASK_FAILED`; internal cancellation handling with exact task output `"Task cancelled."`.
 
-- [ ] **Step 1: Write failing state and pre-cancel tests**
+- [x] **Step 1: Write failing state and pre-cancel tests**
 
 Add tests named:
 
@@ -171,15 +171,15 @@ def test_precancelled_paused_task_cancels_held_calls_in_order(): ...
 
 For the paused case assert cancelled tool messages replace held messages, pending calls clear, failed tool events keep order, no `TASK_RESUMED` is emitted, repository snapshot reason is `cancel`, and no runner/gateway/finalizer is called.
 
-- [ ] **Step 2: Run Step 1 tests and confirm RED**
+- [x] **Step 2: Run Step 1 tests and confirm RED**
 
 Run the three exact tests. Expected: constructor/signature/state-transition failures and current approval guard behavior.
 
-- [ ] **Step 3: Implement the dedicated cancellation terminal path**
+- [x] **Step 3: Implement the dedicated cancellation terminal path**
 
 Add paused→failed to `Task.TRANSITIONS`. Add private Harness helpers to check/raise cancellation, close held calls, and persist/emit the deterministic cancelled task result. In `run`, terminal tasks win; otherwise pre-cancellation is checked before the approval guard.
 
-- [ ] **Step 4: Write failing gateway and retry race tests**
+- [x] **Step 4: Write failing gateway and retry race tests**
 
 Add tests proving:
 
@@ -192,11 +192,11 @@ def test_cancel_during_inference_prevents_tool_execution_and_completion(): ...
 
 Use deterministic fake gateways and token callbacks; patch no sleeps. Assert abandoned LLM attempts emit `LLM_FAILED` reason `cancel` and never emit their `LLM_COMPLETED`.
 
-- [ ] **Step 5: Propagate cancellation through model attempts and steps**
+- [x] **Step 5: Propagate cancellation through model attempts and steps**
 
 Pass the exact token through planning, inference, step, turn, and tool execution. Check before every attempt and after returns/exceptions. Replace retry `time.sleep` with `token.wait`; an interrupted wait enters the dedicated cancel path.
 
-- [ ] **Step 6: Write failing finalization and boundary tests**
+- [x] **Step 6: Write failing finalization and boundary tests**
 
 Add:
 
@@ -209,11 +209,11 @@ def test_finished_task_ignores_a_cancelled_token(): ...
 
 Assert timeout/max-step `TASK_FAILED` is not emitted before finalization resolves and persisted/event reasons never disagree.
 
-- [ ] **Step 7: Implement consistent failure-event ordering**
+- [x] **Step 7: Implement consistent failure-event ordering**
 
 Delay the normal limit-failure event until finalization and the post-call cancellation check finish. Let internal cancellation escape normal LLM/failure classification but never catch `_TaskPersistenceError` or `_EventSinkError` as cancellation.
 
-- [ ] **Step 8: Verify and commit Task 3**
+- [x] **Step 8: Verify and commit Task 3**
 
 Run:
 
@@ -242,7 +242,7 @@ git commit -m "feat: cancel harness runs cooperatively"
 - Consumes: `CancellationToken` and the new `Harness.run` signature.
 - Produces: `Agent.chat(message: str, cancellation_token: CancellationToken | None = None) -> Task` and `Agent.resume(cancellation_token: CancellationToken | None = None) -> Task`.
 
-- [ ] **Step 1: Write failing Agent propagation tests**
+- [x] **Step 1: Write failing Agent propagation tests**
 
 Add:
 
@@ -254,17 +254,17 @@ def test_cancelled_agent_turn_is_not_added_to_transcript(): ...
 
 Use a recording Harness double or patched `run`; object identity is required and truthiness must not replace the injected token.
 
-- [ ] **Step 2: Run Agent tests and confirm RED**
+- [x] **Step 2: Run Agent tests and confirm RED**
 
 Run: `python -m pytest tests/unit/demo/test_agent.py -q -p no:cacheprovider`
 
 Expected: `chat`/`resume` reject the keyword or do not forward it.
 
-- [ ] **Step 3: Implement Agent propagation and README contract**
+- [x] **Step 3: Implement Agent propagation and README contract**
 
 Add optional keyword parameters and pass them unchanged to `Harness.run`. Replace the README TODO with a controller-thread example and the explicit cooperative/non-preemptive limitation.
 
-- [ ] **Step 4: Run the full verification gate**
+- [x] **Step 4: Run the full verification gate**
 
 Run:
 
@@ -278,7 +278,7 @@ git diff --check
 
 Expected: all exit 0.
 
-- [ ] **Step 5: Mark the plan complete and commit**
+- [x] **Step 5: Mark the plan complete and commit**
 
 Change every completed checkbox in this plan to `[x]`, then:
 
