@@ -1,4 +1,6 @@
+import inspect
 import re
+from functools import wraps
 from pathlib import Path
 
 from src.core.workspace import Workspace, WorkspaceViolation
@@ -9,11 +11,43 @@ _MAX_MATCHES = 200
 _MAX_OUTPUT_CHARS = 20000
 
 
+class LocalToolIOError(RuntimeError):
+    """A local I/O failure whose message contains only workspace-relative context."""
+
+
+def _sanitize_io_errors(function):
+    function_signature = inspect.signature(function)
+
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except OSError as error:
+            arguments = function_signature.bind_partial(*args, **kwargs).arguments
+            path = arguments.get("path", ".")
+            detail = error.strerror or type(error).__name__
+            raise LocalToolIOError(
+                f"{function.__name__} failed for workspace path {path}: {detail}"
+            ) from None
+
+    return guarded
+
+
 class LocalToolSuite:
     """Create local tools whose filesystem authority is one explicit workspace."""
 
+    __slots__ = ("_workspace",)
+    _workspace: Workspace
+
     def __init__(self, workspace: Workspace) -> None:
-        self.workspace = workspace
+        object.__setattr__(self, "_workspace", workspace)
+
+    @property
+    def workspace(self) -> Workspace:
+        return self._workspace
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("LocalToolSuite workspace bindings are immutable")
 
     def tools(self, *, include_shell: bool = False) -> list[Tool]:
         tools = [
@@ -108,6 +142,7 @@ class LocalToolSuite:
             tools.append(self._shell_tool())
         return tools
 
+    @_sanitize_io_errors
     def read_file(self, path: str, offset: int = 1, limit: int | None = None) -> str:
         file_path = self.workspace.resolve(path)
         if not file_path.is_file():
@@ -121,6 +156,7 @@ class LocalToolSuite:
             body += f"\n...[{len(lines) - (start + window)} more lines]"
         return body
 
+    @_sanitize_io_errors
     def write_file(self, path: str, content: str) -> str:
         file_path = self.workspace.resolve(path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -128,6 +164,7 @@ class LocalToolSuite:
         display = self.workspace.relative(file_path)
         return f"Wrote {display} ({len(content.encode('utf-8'))} bytes)"
 
+    @_sanitize_io_errors
     def edit_file(self, path: str, old_string: str, new_string: str) -> str:
         file_path = self.workspace.resolve(path)
         if not old_string:
@@ -143,6 +180,7 @@ class LocalToolSuite:
         file_path.write_text(text.replace(old_string, new_string, 1), encoding="utf-8")
         return f"Edited {self.workspace.relative(file_path)}"
 
+    @_sanitize_io_errors
     def list_dir(self, path: str = ".") -> str:
         directory = self.workspace.resolve(path)
         if not directory.is_dir():
@@ -157,6 +195,7 @@ class LocalToolSuite:
             entries.append(name)
         return "\n".join(entries) if entries else "(empty)"
 
+    @_sanitize_io_errors
     def grep(self, pattern: str, path: str = ".", glob: str | None = None) -> str:
         try:
             expression = re.compile(pattern)
@@ -187,6 +226,7 @@ class LocalToolSuite:
                         return _truncate("\n".join(matches) + "\n...[match limit reached]")
         return "\n".join(matches) if matches else "(no matches)"
 
+    @_sanitize_io_errors
     def glob_files(self, pattern: str, path: str = ".") -> str:
         self._validate_pattern(pattern)
         root = self.workspace.resolve(path)

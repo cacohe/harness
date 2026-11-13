@@ -10,7 +10,8 @@ from src.schema.tool import (
     ToolExecutionFailReason,
     ToolExecutionState,
 )
-from src.tool.tool_executor import DefaultToolExecutor
+from src.tool.local_tools import LocalToolSuite
+from src.tool.tool_executor import DefaultToolExecutor, LocalToolRunner
 from src.tool.tool_registry import DefaultToolRegistry
 
 
@@ -184,6 +185,21 @@ def test_workspace_violation_fails_before_policy_or_runner():
     assert result.output == "WorkspaceViolation: blocked"
     assert policy.calls == []
     assert runner.calls == []
+
+
+def test_local_io_failure_does_not_expose_the_host_workspace_path(tmp_path):
+    workspace = Workspace(tmp_path)
+    [tool] = [item for item in LocalToolSuite(workspace).tools() if item.name == "write_file"]
+    executor = _executor_for_tool(tool, runner=LocalToolRunner())
+
+    result = executor.execute_tool_call(
+        LlmToolCall(id="call-1", name="write_file", arguments='{"path":".","content":"x"}'),
+        approved=True,
+    )
+
+    assert result.is_failed()
+    assert str(workspace.root) not in str(result.output).replace("\\\\", "\\")
+    assert "workspace path ." in str(result.output)
 
 
 def test_held_call_persists_normalized_arguments_and_workspace_identity(tmp_path):
@@ -369,6 +385,40 @@ def test_resume_rejects_approval_from_another_workspace(tmp_path):
         result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_WORKSPACE_VIOLATION
     )
     assert result.output == "WorkspaceViolation: approval belongs to a different workspace"
+
+
+def test_resumed_write_uses_normalized_target_after_symlink_alias_retarget(tmp_path):
+    root = tmp_path / "workspace"
+    inside = root / "inside"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    inside.mkdir()
+    outside.mkdir()
+    alias = root / "alias"
+    try:
+        alias.symlink_to(inside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlinks are unavailable: {error}")
+
+    workspace = Workspace(root)
+    [tool] = [item for item in LocalToolSuite(workspace).tools() if item.name == "write_file"]
+    executor = _executor_for_tool(tool, runner=LocalToolRunner(), policy=Policy(None))
+    held = executor.execute_tool_call(
+        LlmToolCall(
+            id="call-1",
+            name="write_file",
+            arguments='{"path":"alias/file.txt","content":"safe"}',
+        )
+    )
+    held.approval = ApprovalDecision.APPROVAL_DECISION_APPROVED
+    alias.unlink()
+    alias.symlink_to(outside, target_is_directory=True)
+
+    result = executor.execute_held_tool_call(held)
+
+    assert result.is_completed()
+    assert (inside / "file.txt").read_text(encoding="utf-8") == "safe"
+    assert not (outside / "file.txt").exists()
 
 
 def test_unknown_tool_returns_not_supported():
@@ -613,6 +663,25 @@ def test_call_held_behind_another_runs_without_a_decision():
 
     assert result.is_completed()
     assert called == [{"path": "b"}]
+
+
+def test_call_held_behind_another_honors_a_policy_rejection():
+    runner = Runner()
+    tool = Tool("read_file", "read_file", "Read.", {}, lambda inputs: "legacy")
+    executor = _executor_for_tool(
+        tool,
+        runner=runner,
+        policy=Policy(ApprovalDecision.APPROVAL_DECISION_REJECTED),
+    )
+    held = executor.execute_tool_call(
+        LlmToolCall(id="call_2", name="read_file", arguments='{"path":"b"}'),
+        hold=True,
+    )
+
+    result = executor.execute_held_tool_call(held)
+
+    assert result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_REJECTED
+    assert runner.calls == []
 
 
 @pytest.mark.parametrize("name", ["read_file", "list_dir", "grep", "glob"])

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, InstanceOf
 
 if TYPE_CHECKING:
     from src.core.workspace import Workspace
@@ -23,7 +23,7 @@ class Tool:
 
 
 class ToolExecution(BaseModel):
-    tool: Tool
+    tool: InstanceOf[Tool]
     inputs: dict
 
 
@@ -63,6 +63,11 @@ class ToolExecutionResult(BaseModel):
     workspace_id: str | None = None
 
     def can_run(self) -> bool:
+        if self.approval in {
+            ApprovalDecision.APPROVAL_DECISION_REJECTED,
+            ApprovalDecision.APPROVAL_DECISION_TIMEOUT,
+        }:
+            return False
         return (
             not self.needs_approval or self.approval == ApprovalDecision.APPROVAL_DECISION_APPROVED
         )

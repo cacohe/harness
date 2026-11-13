@@ -51,7 +51,8 @@ task = agent.chat("帮我比较两款手机")
 `workspace` 是本地工具唯一的文件系统权限边界，可传入现有目录路径或 `Workspace` 对象；
 未提供时，`Agent` 只在构造时捕获当时的当前目录。默认目录包含 `read_file`、
 `write_file`、`edit_file`、`list_dir`、`grep` 和 `glob` 六个绑定到该 workspace 的工具。
-工具参数只接受 workspace 相对路径；绝对路径、父目录穿越以及解析后越界的符号链接会被拒绝。
+工具参数只接受 workspace 相对路径；绝对路径、父目录穿越、Windows 设备名/数据流以及解析后
+越界的符号链接会被拒绝。本地 I/O 错误只报告相对路径，不暴露宿主 workspace 前缀。
 
 默认不会注册 shell。要启用 shell，调用方必须注入真正提供隔离能力的 `SandboxRunner`：
 

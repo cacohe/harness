@@ -28,6 +28,16 @@ def test_local_suite_exposes_six_file_tools_without_shell(tmp_path):
     assert all(not tool.requires_sandbox for tool in tools)
 
 
+@pytest.mark.parametrize("attribute", ["workspace", "_workspace"])
+def test_local_suite_workspace_binding_is_immutable(tmp_path, attribute):
+    _, suite = _suite(tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+
+    with pytest.raises(AttributeError, match="immutable"):
+        setattr(suite, attribute, Workspace(other))
+
+
 def test_bound_write_read_edit_list_grep_and_glob_stay_relative(tmp_path):
     root, suite = _suite(tmp_path)
 

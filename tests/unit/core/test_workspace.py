@@ -30,6 +30,14 @@ def test_workspace_resolves_relative_paths_and_has_stable_identity(tmp_path):
     assert first.identity != Workspace(other).identity
 
 
+@pytest.mark.parametrize("attribute", ["root", "identity", "_root", "_identity"])
+def test_workspace_capability_is_immutable(tmp_path, attribute):
+    workspace = Workspace(tmp_path)
+
+    with pytest.raises(AttributeError, match="immutable"):
+        setattr(workspace, attribute, tmp_path)
+
+
 @pytest.mark.parametrize(
     "path",
     [
@@ -46,6 +54,15 @@ def test_workspace_rejects_absolute_and_parent_paths(tmp_path, path):
 
     with pytest.raises(WorkspaceViolation):
         Workspace(root).resolve(path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["NUL", "nul.txt", "nested/COM1.log", "AUX ", "file:stream"],
+)
+def test_workspace_rejects_windows_reserved_components(tmp_path, path):
+    with pytest.raises(WorkspaceViolation, match="reserved Windows path"):
+        Workspace(tmp_path).resolve(path)
 
 
 def test_workspace_relative_never_returns_a_host_absolute_path(tmp_path):

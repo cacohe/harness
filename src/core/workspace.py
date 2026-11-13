@@ -12,6 +12,20 @@ class WorkspaceViolation(ValueError):
 class Workspace:
     """Resolve relative paths inside one immutable canonical workspace root."""
 
+    __slots__ = ("_root", "_identity")
+    _root: Path
+    _identity: str
+    _WINDOWS_DEVICES = {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CONIN$",
+        "CONOUT$",
+        *(f"COM{suffix}" for suffix in "123456789¹²³"),
+        *(f"LPT{suffix}" for suffix in "123456789¹²³"),
+    }
+
     def __init__(self, root: str | Path) -> None:
         try:
             resolved = Path(root).resolve(strict=True)
@@ -21,9 +35,20 @@ class Workspace:
             ) from error
         if not resolved.is_dir():
             raise WorkspaceViolation(f"workspace root is not an existing directory: {root}")
-        self.root = resolved
+        object.__setattr__(self, "_root", resolved)
         normalized = os.path.normcase(str(resolved)).encode("utf-8")
-        self.identity = hashlib.sha256(normalized).hexdigest()
+        object.__setattr__(self, "_identity", hashlib.sha256(normalized).hexdigest())
+
+    @property
+    def root(self) -> Path:
+        return self._root
+
+    @property
+    def identity(self) -> str:
+        return self._identity
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("Workspace capabilities are immutable")
 
     def resolve(self, path: str | Path = ".") -> Path:
         """Resolve one relative input and reject every path that escapes the root."""
@@ -40,6 +65,8 @@ class Workspace:
             raise WorkspaceViolation(f"absolute workspace path is not allowed: {raw}")
         if ".." in host_path.parts or ".." in windows_path.parts:
             raise WorkspaceViolation(f"parent traversal is not allowed: {raw}")
+        if any(self._is_reserved_windows_component(part) for part in windows_path.parts):
+            raise WorkspaceViolation(f"reserved Windows path is not allowed: {raw}")
         try:
             resolved = (self.root / host_path).resolve(strict=False)
         except (OSError, RuntimeError, ValueError) as error:
@@ -47,6 +74,14 @@ class Workspace:
         if not resolved.is_relative_to(self.root):
             raise WorkspaceViolation(f"workspace path escapes the root: {raw}")
         return resolved
+
+    @classmethod
+    def _is_reserved_windows_component(cls, component: str) -> bool:
+        trimmed = component.rstrip(" .")
+        if not trimmed or trimmed != component or ":" in component:
+            return True
+        stem = trimmed.split(".", 1)[0].upper()
+        return stem in cls._WINDOWS_DEVICES
 
     def relative(self, path: Path) -> str:
         """Render a canonical path without exposing the host workspace prefix."""
