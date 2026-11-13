@@ -350,7 +350,7 @@ class Harness:
                 )
                 time.sleep(DEFAULT_LLM_ATTEMPT_DELAY_SECONDS)
         raise LlmCallError("planning retries exhausted")
-    
+
     def _ask_clarification(self, task: Task, question: str, start_time: float) -> TaskResult:
         result = TaskResult(output=question)
         task.set_progress(task.step_count, time.monotonic() - start_time)
@@ -360,7 +360,7 @@ class Harness:
         self._emit_llm_event(task, EventType.LLM_DELTA, phase="planning", content=question)
         self._emit_task_event(EventType.TASK_COMPLETED, task, content=question)
         return result
-    
+
     def _finish_pending_tool_calls(self, task: Task) -> None:
         results = []
         for item in task.pending_tool_calls:

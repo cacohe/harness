@@ -87,7 +87,7 @@ class ToolExecutor:
         if decision is not ApprovalDecision.APPROVAL_DECISION_APPROVED:
             return self._failed(tool)
         return self.execute_approved(tool, inputs)
-    
+
     def _needs_sandbox(self, tool: Tool) -> bool:
         """
         Determine if a tool needs to be run in a sandbox.
@@ -96,9 +96,9 @@ class ToolExecutor:
         Returns:
             True if the tool needs to be run in a sandbox, False otherwise.
         """
-        ... 
+        ...
         # TODO: Implement this.
-    
+
     def _run_in_sandbox(self, tool: Tool, inputs: dict) -> Any:
         """
         Run a tool in a sandbox.

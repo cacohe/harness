@@ -16,6 +16,7 @@ class Tool:
         input_schema: The input schema of the tool.
         executer: The executer of the tool.
     """
+
     id: str
     name: str
     description: str
@@ -30,6 +31,7 @@ class ToolExecution(BaseModel):
         tool: The tool to execute.
         inputs: The inputs to the tool.
     """
+
     tool: Tool
     inputs: dict
 
