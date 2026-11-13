@@ -1,11 +1,18 @@
 import json
+import math
 
 import pytest
 from pydantic import ValidationError
 from src.core.task import Task
 from src.schema.context import Message
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall, LlmUsage
-from src.schema.task import TaskFailReason, TaskPlan, TaskResult, TaskState
+from src.schema.task import (
+    TaskFailReason,
+    TaskPlan,
+    TaskResult,
+    TaskRunningReason,
+    TaskState,
+)
 from src.schema.tool import (
     ApprovalDecision,
     ToolExecutionResult,
@@ -116,6 +123,103 @@ def test_task_accepts_positional_and_keyword_original_input():
     assert Task(original_input="keyword").original_input == "keyword"
 
 
+def test_task_accepts_legacy_id_and_none_collections():
+    task = Task("legacy", "known-id", history=None, pending_tool_calls=None)
+    generated = Task("generated", id=None)
+
+    assert task.id == "known-id"
+    assert task.history == []
+    assert task.pending_tool_calls == []
+    assert generated.id
+
+
+def test_failed_transition_does_not_partially_mutate_task():
+    task = Task("atomic")
+    task.transition_to_running(TaskRunningReason.TASK_RUNNING_CREATE)
+
+    with pytest.raises(ValidationError):
+        task.transition_to_completed()
+
+    assert task.state is TaskState.TASK_RUNNING
+    assert task.state_reason is TaskRunningReason.TASK_RUNNING_CREATE
+
+
+def test_invalid_terminal_result_assignment_preserves_previous_result():
+    result = TaskResult(output="done")
+    task = Task("atomic", state=TaskState.TASK_COMPLETED, result=result)
+
+    with pytest.raises(ValidationError):
+        task.result = None
+
+    assert task.result == result
+
+
+def test_invalid_task_result_assignment_preserves_previous_output():
+    result = TaskResult(output="done")
+
+    with pytest.raises(ValidationError):
+        result.output = 123
+
+    assert result.output == "done"
+
+
+@pytest.mark.parametrize("field", ["id", "history", "pending_tool_calls"])
+def test_none_assignment_does_not_apply_constructor_compatibility(field):
+    task = Task(
+        "atomic",
+        id="known-id",
+        history=[Message(role="user", content="keep")],
+        pending_tool_calls=[
+            ToolExecutionResult(
+                tool_id="call-1",
+                tool_name="keep",
+                state=ToolExecutionState.TOOL_EXECUTION_STATE_PENDING,
+            )
+        ],
+    )
+    previous = getattr(task, field)
+
+    with pytest.raises(ValidationError):
+        setattr(task, field, None)
+
+    assert getattr(task, field) == previous
+
+
+@pytest.mark.parametrize(
+    ("field", "item"),
+    [
+        ("history", Message(role="user", content="keep")),
+        (
+            "pending_tool_calls",
+            ToolExecutionResult(
+                tool_id="call-1",
+                tool_name="keep",
+                state=ToolExecutionState.TOOL_EXECUTION_STATE_PENDING,
+            ),
+        ),
+    ],
+)
+def test_iterable_assignment_commits_the_validated_items(field, item):
+    task = Task("atomic")
+
+    setattr(task, field, iter([item]))
+
+    assert getattr(task, field) == [item]
+
+
+def test_state_reason_assignment_uses_the_current_task_state():
+    task = Task(
+        "failed",
+        state=TaskState.TASK_FAILED,
+        state_reason=TaskFailReason.TASK_FAILED_CANCEL,
+        result=TaskResult(output="cancelled"),
+    )
+
+    task.state_reason = "unknown"
+
+    assert task.state_reason is TaskFailReason.TASK_FAILED_UNKNOWN
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("step_count", -1), ("elapsed_seconds", -0.01)],
@@ -123,6 +227,29 @@ def test_task_accepts_positional_and_keyword_original_input():
 def test_task_rejects_negative_progress(field, value):
     with pytest.raises(ValidationError):
         Task(original_input="invalid", **{field: value})
+
+
+def test_task_rejects_non_finite_elapsed_time():
+    with pytest.raises(ValidationError):
+        Task(original_input="invalid", elapsed_seconds=math.inf)
+
+
+@pytest.mark.parametrize("output", [math.nan, math.inf, {1: "integer", "1": "string"}])
+def test_task_snapshot_export_rejects_lossy_json_values(output):
+    task = Task(
+        "invalid snapshot",
+        pending_tool_calls=[
+            ToolExecutionResult(
+                tool_id="call-1",
+                tool_name="lossy",
+                state=ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED,
+                output=output,
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError):
+        task.to_dict()
 
 
 @pytest.mark.parametrize("state", [TaskState.TASK_COMPLETED, TaskState.TASK_FAILED])
@@ -142,3 +269,23 @@ def test_failed_unknown_reason_restores_as_fail_reason():
     )
 
     assert task.state_reason is TaskFailReason.TASK_FAILED_UNKNOWN
+
+
+def test_legacy_terminal_snapshot_discards_stale_running_reason():
+    task = Task.from_dict(
+        {
+            "id": "legacy-id",
+            "original_input": "done",
+            "state": "completed",
+            "state_reason": "create",
+            "result": {"output": "done"},
+            "history": None,
+            "pending_tool_calls": None,
+        }
+    )
+
+    assert task.schema_version == 1
+    assert task.state is TaskState.TASK_COMPLETED
+    assert task.state_reason is None
+    assert task.history == []
+    assert task.pending_tool_calls == []

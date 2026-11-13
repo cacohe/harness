@@ -20,5 +20,5 @@ class Message(BaseModel):
 class Context(BaseModel):
     """One LiteLLM call: ordered messages with unified roles, and the tool catalog."""
 
-    messages: list[Message] = Field(default_factory=list)
+    messages: list[dict[str, Any] | Message] = Field(default_factory=list)
     tools: list[Any] = Field(default_factory=list)

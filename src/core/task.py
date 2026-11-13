@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import math
 import uuid
 from collections.abc import Mapping
+from enum import Enum
 from typing import Any, ClassVar, FrozenSet
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from src.schema.context import Message
 from src.schema.llm import ROLE_TOOL
@@ -30,7 +32,7 @@ class InvalidTransition(Exception):
 class Task(BaseModel):
     """A task to be executed by the harness."""
 
-    model_config = ConfigDict(validate_assignment=True)
+    model_config = ConfigDict(validate_assignment=False)
 
     TRANSITIONS: ClassVar[dict[TaskState, FrozenSet[TaskState]]] = {
         TaskState.TASK_CREATED: frozenset([TaskState.TASK_RUNNING, TaskState.TASK_FAILED]),
@@ -52,10 +54,22 @@ class Task(BaseModel):
     pending_tool_calls: list[ToolExecutionResult] = Field(default_factory=list)
     result: TaskResult | None = None
     step_count: int = Field(default=0, ge=0)
-    elapsed_seconds: float = Field(default=0.0, ge=0.0)
+    elapsed_seconds: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
 
-    def __init__(self, original_input: str, **data: Any):
+    def __init__(self, original_input: str, id: str | None = None, **data: Any):
+        if id is not None:
+            data["id"] = id
+        if data.get("history") is None:
+            data.pop("history", None)
+        if data.get("pending_tool_calls") is None:
+            data.pop("pending_tool_calls", None)
         super().__init__(original_input=original_input, **data)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name not in type(self).model_fields or not hasattr(self, "__pydantic_fields_set__"):
+            super().__setattr__(name, value)
+            return
+        self._apply_updates(**{name: value})
 
     @model_validator(mode="before")
     @classmethod
@@ -97,12 +111,51 @@ class Task(BaseModel):
         Returns:
             A dictionary representation of the task.
         """
-        return self.model_dump(mode="json")
+        for message in self.history:
+            _strict_json_value(message.thinking_blocks)
+        for pending_call in self.pending_tool_calls:
+            _strict_json_value(pending_call.output)
+        snapshot = _strict_json_value(self.model_dump(mode="python"))
+        assert isinstance(snapshot, dict)
+        return snapshot
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Task":
         """Restore one task from serialized snapshot data."""
-        return cls.model_validate(dict(data))
+        snapshot = dict(data)
+        if snapshot.get("history") is None:
+            snapshot["history"] = []
+        if snapshot.get("pending_tool_calls") is None:
+            snapshot["pending_tool_calls"] = []
+        if "schema_version" not in snapshot:
+            snapshot["schema_version"] = 1
+            if snapshot.get("state") in {
+                TaskState.TASK_COMPLETED,
+                TaskState.TASK_COMPLETED.value,
+                TaskState.TASK_FAILED,
+                TaskState.TASK_FAILED.value,
+            } and snapshot.get("state_reason") in {
+                TaskRunningReason.TASK_RUNNING_CREATE,
+                TaskRunningReason.TASK_RUNNING_CREATE.value,
+                TaskRunningReason.TASK_RUNNING_RESUME,
+                TaskRunningReason.TASK_RUNNING_RESUME.value,
+            }:
+                snapshot["state_reason"] = None
+        return cls.model_validate(snapshot)
+
+    def _apply_updates(self, **updates: Any) -> None:
+        """Validate a complete candidate before committing any field updates."""
+        validated_updates = dict(updates)
+        for name in {"id", "history", "pending_tool_calls"}.intersection(updates):
+            field = type(self).model_fields[name]
+            validated_updates[name] = TypeAdapter(field.rebuild_annotation()).validate_python(
+                updates[name]
+            )
+        candidate_data = self.model_dump(mode="python")
+        candidate_data.update(validated_updates)
+        candidate = type(self).model_validate(candidate_data)
+        for name in updates:
+            super().__setattr__(name, getattr(candidate, name))
 
     def _transition_to(self, state: TaskState, state_reason: TaskStateReason | None = None) -> None:
         """
@@ -114,10 +167,7 @@ class Task(BaseModel):
         if state not in self.TRANSITIONS[self.state]:
             raise InvalidTransition(self.state, state)
 
-        self.state_reason = None
-        self.state = state
-        if state_reason is not None:
-            self.state_reason = state_reason
+        self._apply_updates(state=state, state_reason=state_reason)
 
     def transition_to_running(self, reason: TaskRunningReason) -> None:
         """
@@ -139,9 +189,13 @@ class Task(BaseModel):
         Args:
             reason: The reason for the task failure.
         """
-        if self.result is None:
-            self.result = TaskResult()
-        self._transition_to(TaskState.TASK_FAILED, reason)
+        if TaskState.TASK_FAILED not in self.TRANSITIONS[self.state]:
+            raise InvalidTransition(self.state, TaskState.TASK_FAILED)
+        self._apply_updates(
+            state=TaskState.TASK_FAILED,
+            state_reason=reason,
+            result=self.result if self.result is not None else TaskResult(),
+        )
 
     def transition_to_completed(self) -> None:
         """
@@ -271,8 +325,7 @@ class Task(BaseModel):
             step_count: Steps already taken.
             elapsed_seconds: Running time already used, excluding paused time.
         """
-        self.step_count = step_count
-        self.elapsed_seconds = elapsed_seconds
+        self._apply_updates(step_count=step_count, elapsed_seconds=elapsed_seconds)
 
     def set_result(self, result: TaskResult) -> None:
         """
@@ -281,6 +334,25 @@ class Task(BaseModel):
             result: The result produced for this task.
         """
         self.result = result
+
+
+def _strict_json_value(value: Any) -> Any:
+    """Return an exact JSON value or reject values JSON would coerce or lose."""
+    if isinstance(value, Enum):
+        return _strict_json_value(value.value)
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("task snapshots require finite numbers")
+        return value
+    if isinstance(value, list):
+        return [_strict_json_value(item) for item in value]
+    if isinstance(value, dict):
+        if not all(isinstance(key, str) for key in value):
+            raise ValueError("task snapshot object keys must be strings")
+        return {key: _strict_json_value(item) for key, item in value.items()}
+    raise ValueError(f"task snapshot value is not JSON-safe: {type(value).__name__}")
 
 
 def get_task_status(task: Task) -> dict:

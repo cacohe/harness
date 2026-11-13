@@ -1,6 +1,6 @@
 from enum import Enum
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class TaskState(Enum):
@@ -77,6 +77,8 @@ class TaskPlan(BaseModel):
 
 class TaskResult(BaseModel):
     """Task result."""
+
+    model_config = ConfigDict(validate_assignment=True)
 
     output: str = ""
 

@@ -1,3 +1,5 @@
+from typing import Any
+
 from src.core.context import (
     DEFAULT_SYSTEM_PROMPT_FOR_FINAL,
     DEFAULT_SYSTEM_PROMPT_FOR_INFER,
@@ -63,7 +65,7 @@ class DefaultContextBuilder:
             and the tools for this call.
         """
         try:
-            messages = [
+            messages: list[dict[str, Any] | Message] = [
                 Message(role="system", content=_infer_system_prompt(system_prompt, skills)),
                 Message(role="user", content=task.original_input),
                 *list(task.history or []),

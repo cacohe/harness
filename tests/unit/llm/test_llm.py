@@ -226,3 +226,38 @@ def test_infer_replays_tool_calls_and_reasoning(monkeypatch):
     assert assistant["thinking_blocks"][0]["signature"] == "sig"
     assert seen["messages"][2]["tool_call_id"] == "call_1"
     assert seen["messages"][2]["content"] == "sunny"
+
+
+def test_infer_preserves_raw_provider_message_fields(monkeypatch):
+    seen = {}
+
+    def fake_completion(**kwargs):
+        seen["messages"] = kwargs["messages"]
+
+        class MessageOut:
+            content = "done"
+            tool_calls = None
+            reasoning_content = None
+            thinking_blocks = None
+
+        class Choice:
+            message = MessageOut()
+            finish_reason = "stop"
+
+        class Response:
+            choices = [Choice()]
+            usage = None
+
+        return Response()
+
+    monkeypatch.setattr("src.llm.litellm.litellm.completion", fake_completion)
+    raw_message = {
+        "role": "user",
+        "content": [{"type": "text", "text": "Inspect this"}],
+        "cache_control": {"type": "ephemeral"},
+        "provider_extension": {"trace": "keep-me"},
+    }
+
+    LiteLLMGateway("m").infer(Context(messages=[raw_message]), stream=False)
+
+    assert seen["messages"] == [raw_message]
