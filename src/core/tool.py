@@ -88,11 +88,32 @@ class ToolExecutor:
             return self._failed(tool)
         return self.execute_approved(tool, inputs)
 
+    def _needs_sandbox(self, tool: Tool) -> bool:
+        """
+        Determine if a tool needs to be run in a sandbox.
+        Args:
+            tool: The tool to check.
+        Returns:
+            True if the tool needs to be run in a sandbox, False otherwise.
+        """
+        return False
+
+    def _run_in_sandbox(self, tool: Tool, inputs: dict) -> Any:
+        """
+        Run a tool in a sandbox.
+        Args:
+            tool: The tool to run.
+            inputs: The inputs to the tool.
+        Returns:
+            The output of the tool.
+        """
+        raise NotImplementedError
+
     def execute_approved(self, tool: Tool, inputs: dict) -> ToolExecutionResult:
         """Run a tool after authorization has already been established."""
         try:
-            if self.sandbox_runner is not None and self.sandbox_runner.supports(tool):
-                output = self.sandbox_runner.run(tool, inputs)
+            if self._needs_sandbox(tool):
+                output = self._run_in_sandbox(tool, inputs)
             else:
                 output = self.runner.run(tool, inputs)
         except Exception as error:

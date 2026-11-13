@@ -1,4 +1,11 @@
 def decode_output(data: bytes | str | None) -> str:
+    """
+    Decode the data to a string.
+    Args:
+        data: The data to decode.
+    Returns:
+        The decoded data.
+    """
     if not data:
         return ""
     if isinstance(data, str):

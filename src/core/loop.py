@@ -79,12 +79,26 @@ class Harness:
         self._max_seconds = max_seconds
 
     def _save_task(self, task: Task) -> None:
+        """
+        Save the task to the repository.
+        Args:
+            task: The task to save.
+        Raises:
+            _TaskPersistenceError: The task could not be saved.
+        """
         try:
             self.task_repository.save(task)
         except Exception as error:
             raise _TaskPersistenceError from error
 
     def _emit(self, event: Event) -> None:
+        """
+        Emit an event.
+        Args:
+            event: The event to emit.
+        Raises:
+            _EventSinkError: The event could not be emitted.
+        """
         try:
             self.event_handler.emit(event)
         except Exception as error:
@@ -92,11 +106,23 @@ class Harness:
 
     @staticmethod
     def _raise_boundary_cause(error: _TaskPersistenceError | _EventSinkError) -> NoReturn:
+        """
+        Raise the cause of the error.
+        Args:
+            error: The error to raise.
+        Raises:
+            The cause of the error.
+        """
         if error.__cause__ is not None:
             raise error.__cause__
         raise error
 
     def _available_tools(self) -> list[Tool]:
+        """
+        Get all available tools.
+        Returns:
+            The available tools.
+        """
         return self.tool_executor.get_all_tools()
 
     def _emit_task_event(
@@ -109,6 +135,16 @@ class Harness:
         goal: list[str] | None = None,
         step_id: str | None = None,
     ) -> None:
+        """
+        Emit a task event.
+        Args:
+            event_type: The type of event.
+            task: The task to emit the event for.
+            reason: The reason for the event.
+            content: The content of the event.
+            goal: The goal of the event.
+            step_id: The step id of the event.
+        """
         task_id = str(task.id)
         self._emit(
             Event(
@@ -132,6 +168,14 @@ class Harness:
         call: LlmToolCall,
         result=None,
     ) -> None:
+        """
+        Emit a tool event.
+        Args:
+            event_type: The type of event.
+            task: The task to emit the event for.
+            call: The tool call to emit the event for.
+            result: The result of the tool call.
+        """
         reason = None
         content = None
         name = call.name
@@ -157,6 +201,13 @@ class Harness:
         )
 
     def _emit_tool_result(self, task: Task, call: LlmToolCall, result: ToolExecutionResult) -> None:
+        """
+        Emit a tool result event.
+        Args:
+            task: The task to emit the event for.
+            call: The tool call to emit the event for.
+            result: The result of the tool call.
+        """
         if result.is_completed():
             event_type = EventType.TOOL_EXECUTION_COMPLETED
         elif result.is_failed():
@@ -176,6 +227,17 @@ class Harness:
         content: str | None = None,
         usage=None,
     ) -> None:
+        """
+        Emit an LLM event.
+        Args:
+            task: The task to emit the event for.
+            event_type: The type of event.
+            phase: The phase of the event.
+            reason: The reason for the event.
+            attempt: The attempt of the event.
+            content: The content of the event.
+            usage: The usage of the event.
+        """
         self._emit(
             Event(
                 id=str(uuid.uuid4()),
@@ -192,6 +254,13 @@ class Harness:
         )
 
     def _emit_answer(self, task: Task, output: LLMOutput, parts: list[str]) -> None:
+        """
+        Emit an answer event.
+        Args:
+            task: The task to emit the event for.
+            output: The output to emit the event for.
+            parts: The parts of the output.
+        """
         if output.requests_tool_calls():
             return
         for part in parts:
@@ -205,7 +274,7 @@ class Harness:
 
     def guard_input(self, task: Task) -> None:
         """
-        Reject input that tries to override the harness or disable its controls.
+        Guard the input.
         Args:
             task: The task whose original input is checked.
         Raises:
@@ -281,6 +350,28 @@ class Harness:
                 )
                 time.sleep(DEFAULT_LLM_ATTEMPT_DELAY_SECONDS)
         raise LlmCallError("planning retries exhausted")
+
+    def _ask_clarification(self, task: Task, question: str, start_time: float) -> TaskResult:
+        result = TaskResult(output=question)
+        task.set_progress(task.step_count, time.monotonic() - start_time)
+        task.set_result(result)
+        task.transition_to_completed()
+        self._save_task(task)
+        self._emit_llm_event(task, EventType.LLM_DELTA, phase="planning", content=question)
+        self._emit_task_event(EventType.TASK_COMPLETED, task, content=question)
+        return result
+
+    def _finish_pending_tool_calls(self, task: Task) -> None:
+        results = []
+        for item in task.pending_tool_calls:
+            call = LlmToolCall(item.tool_id, item.tool_name, item.arguments or "")
+            if item.can_run():
+                self._emit_tool_event(EventType.TOOL_EXECUTION_RESUMED, task, call)
+            result = self.tool_executor.execute_held_tool_call(item)
+            self._emit_tool_result(task, call, result)
+            results.append(result)
+        task.replace_tool_messages([build_tool_message(result) for result in results])
+        task.set_pending_tool_calls([])
 
     def build_infer_context(self, task: Task) -> Context:
         """
@@ -683,25 +774,3 @@ class Harness:
             except (_TaskPersistenceError, _EventSinkError) as boundary_error:
                 self._raise_boundary_cause(boundary_error)
             return result
-
-    def _ask_clarification(self, task: Task, question: str, start_time: float) -> TaskResult:
-        result = TaskResult(output=question)
-        task.set_progress(task.step_count, time.monotonic() - start_time)
-        task.set_result(result)
-        task.transition_to_completed()
-        self._save_task(task)
-        self._emit_llm_event(task, EventType.LLM_DELTA, phase="planning", content=question)
-        self._emit_task_event(EventType.TASK_COMPLETED, task, content=question)
-        return result
-
-    def _finish_pending_tool_calls(self, task: Task) -> None:
-        results = []
-        for item in task.pending_tool_calls:
-            call = LlmToolCall(item.tool_id, item.tool_name, item.arguments or "")
-            if item.can_run():
-                self._emit_tool_event(EventType.TOOL_EXECUTION_RESUMED, task, call)
-            result = self.tool_executor.execute_held_tool_call(item)
-            self._emit_tool_result(task, call, result)
-            results.append(result)
-        task.replace_tool_messages([build_tool_message(result) for result in results])
-        task.set_pending_tool_calls([])
