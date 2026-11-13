@@ -80,7 +80,7 @@ class Workspace:
         trimmed = component.rstrip(" .")
         if not trimmed or trimmed != component or ":" in component:
             return True
-        stem = trimmed.split(".", 1)[0].upper()
+        stem = trimmed.split(".", 1)[0].rstrip(" ").upper()
         return stem in cls._WINDOWS_DEVICES
 
     def relative(self, path: Path) -> str:

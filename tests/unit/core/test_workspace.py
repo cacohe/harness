@@ -58,7 +58,16 @@ def test_workspace_rejects_absolute_and_parent_paths(tmp_path, path):
 
 @pytest.mark.parametrize(
     "path",
-    ["NUL", "nul.txt", "nested/COM1.log", "AUX ", "file:stream"],
+    [
+        "NUL",
+        "nul.txt",
+        "NUL .txt",
+        "nul  .log",
+        "nested/COM1.log",
+        "nested/COM1 .log",
+        "AUX ",
+        "file:stream",
+    ],
 )
 def test_workspace_rejects_windows_reserved_components(tmp_path, path):
     with pytest.raises(WorkspaceViolation, match="reserved Windows path"):
