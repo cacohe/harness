@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field, InstanceOf
 if TYPE_CHECKING:
     from src.core.workspace import Workspace
 
+TOOL_CALL_CANCELLED_OUTPUT = "Tool call cancelled."
+
 
 @dataclass
 class Tool:
@@ -103,3 +105,4 @@ class ToolCallResult(BaseModel):
     pending_tools: list[ToolExecutionResult] = Field(default_factory=list)
     completed_tools: list[ToolExecutionResult] = Field(default_factory=list)
     failed_tools: list[ToolExecutionResult] = Field(default_factory=list)
+    ordered_tools: list[ToolExecutionResult] = Field(default_factory=list)

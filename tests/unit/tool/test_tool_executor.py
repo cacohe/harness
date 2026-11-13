@@ -520,6 +520,96 @@ def test_approval_exception_fails_only_that_call_and_batch_continues():
     assert len(runner.calls) == 1
 
 
+def test_tool_call_result_keeps_original_mixed_call_order():
+    executor = _executor(lambda inputs: "ran", "shell", "read_file")
+
+    result = executor.execute_tool_calls(
+        [
+            LlmToolCall(id="call-1", name="shell", arguments='{"command":"status"}'),
+            LlmToolCall(id="call-2", name="missing", arguments="{}"),
+            LlmToolCall(id="call-3", name="read_file", arguments='{"path":"a"}'),
+        ]
+    )
+
+    assert [item.tool_id for item in result.ordered_tools] == ["call-1", "call-2", "call-3"]
+
+
+def test_cancellation_stops_later_tools_and_preserves_order():
+    cancelled = False
+    calls = []
+
+    def run(inputs):
+        nonlocal cancelled
+        calls.append(inputs)
+        cancelled = True
+        return "ran"
+
+    executor = _executor(run, "first", "second", "third")
+    result = executor.execute_tool_calls(
+        [
+            LlmToolCall(id="call-1", name="first", arguments='{"value":1}'),
+            LlmToolCall(id="call-2", name="second", arguments='{"value":2}'),
+            LlmToolCall(id="call-3", name="third", arguments='{"value":3}'),
+        ],
+        should_cancel=lambda: cancelled,
+    )
+
+    assert calls == [{"value": 1}]
+    assert [item.tool_id for item in result.ordered_tools] == ["call-1", "call-2", "call-3"]
+    assert [item.tool_id for item in result.completed_tools] == ["call-1"]
+    assert [item.tool_id for item in result.failed_tools] == ["call-2", "call-3"]
+    assert all(
+        item.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_CANCELLED
+        and item.output == "Tool call cancelled."
+        for item in result.failed_tools
+    )
+
+
+def test_cancelled_tools_skip_before_call_but_reach_after_call():
+    executor = _executor(lambda inputs: "ran", "first", "second")
+    before = []
+    after = []
+
+    result = executor.execute_tool_calls(
+        [
+            LlmToolCall(id="call-1", name="first", arguments="{}"),
+            LlmToolCall(id="call-2", name="second", arguments="{}"),
+        ],
+        before_call=lambda call: before.append(call.id),
+        after_call=lambda call, item: after.append((call.id, item.fail_reason)),
+        should_cancel=lambda: True,
+    )
+
+    assert before == []
+    assert [call_id for call_id, _ in after] == ["call-1", "call-2"]
+    assert result.completed_tools == []
+
+
+def test_precancelled_batch_never_invokes_policy_validator_or_runner():
+    runner = Runner()
+    policy = CapturingPolicy()
+    validations = []
+
+    def validate(inputs):
+        validations.append(inputs)
+        return inputs
+
+    tool = Tool("read", "read", "Read.", {}, lambda inputs: "legacy", input_validator=validate)
+    executor = _executor_for_tool(tool, runner=runner, policy=policy)
+
+    result = executor.execute_tool_calls(
+        [LlmToolCall(id="call-1", name="read", arguments='{"path":"a"}')],
+        should_cancel=lambda: True,
+    )
+
+    assert validations == []
+    assert policy.calls == []
+    assert runner.calls == []
+    assert result.failed_tools[0].fail_reason is (
+        ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_CANCELLED
+    )
+
+
 def _executor(executer, *names: str) -> DefaultToolExecutor:
     registry = DefaultToolRegistry()
     registry.tools = {}
