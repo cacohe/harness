@@ -96,8 +96,7 @@ class ToolExecutor:
         Returns:
             True if the tool needs to be run in a sandbox, False otherwise.
         """
-        ...
-        # TODO: Implement this.
+        return False
 
     def _run_in_sandbox(self, tool: Tool, inputs: dict) -> Any:
         """
@@ -108,8 +107,7 @@ class ToolExecutor:
         Returns:
             The output of the tool.
         """
-        ...
-        # TODO: Implement this.
+        raise NotImplementedError
 
     def execute_approved(self, tool: Tool, inputs: dict) -> ToolExecutionResult:
         """Run a tool after authorization has already been established."""

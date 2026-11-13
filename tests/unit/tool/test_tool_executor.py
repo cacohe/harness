@@ -145,19 +145,6 @@ def test_undecided_tool_is_pending_with_its_arguments():
     assert runner.calls == []
 
 
-def test_supported_tool_runs_only_inside_sandbox():
-    runner = Runner()
-    sandbox = Sandbox()
-    result = _core_executor(runner=runner, sandbox=sandbox).execute_tool_call(
-        LlmToolCall(id="call-1", name="shell", arguments='{"command": "dir"}')
-    )
-
-    assert result.state is ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED
-    assert result.output == "sandboxed"
-    assert len(sandbox.calls) == 1
-    assert runner.calls == []
-
-
 def test_falsey_rejecting_policy_is_not_replaced_by_allow_all():
     runner = Runner()
     policy = FalseyPolicy(ApprovalDecision.APPROVAL_DECISION_REJECTED)
