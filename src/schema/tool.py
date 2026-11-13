@@ -12,6 +12,16 @@ if TYPE_CHECKING:
 
 @dataclass
 class Tool:
+    """
+    A tool in the harness.
+    Args:
+        id: The unique identifier of the tool.
+        name: The name of the tool.
+        description: The description of the tool.
+        input_schema: The input schema of the tool.
+        executer: The executer of the tool.
+    """
+
     id: str
     name: str
     description: str
@@ -23,6 +33,13 @@ class Tool:
 
 
 class ToolExecution(BaseModel):
+    """
+    A tool execution.
+    Args:
+        tool: The tool to execute.
+        inputs: The inputs to the tool.
+    """
+
     tool: InstanceOf[Tool]
     inputs: dict
 
