@@ -1,8 +1,13 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, InstanceOf
+
+if TYPE_CHECKING:
+    from src.core.workspace import Workspace
 
 
 @dataclass
@@ -22,6 +27,9 @@ class Tool:
     description: str
     input_schema: dict
     executer: Callable
+    requires_sandbox: bool = False
+    input_validator: Callable[[dict], dict] | None = None
+    workspace: Workspace | None = None
 
 
 class ToolExecution(BaseModel):
@@ -32,7 +40,7 @@ class ToolExecution(BaseModel):
         inputs: The inputs to the tool.
     """
 
-    tool: Tool
+    tool: InstanceOf[Tool]
     inputs: dict
 
 
@@ -56,6 +64,8 @@ class ToolExecutionFailReason(Enum):
     TOOL_EXECUTION_FAIL_REASON_UNKNOWN = "unknown"
     TOOL_EXECUTION_FAIL_REASON_NOT_SUPPORTED = "not_supported"
     TOOL_EXECUTION_FAIL_REASON_NOT_AUTHENTICATED = "not_authenticated"
+    TOOL_EXECUTION_FAIL_REASON_WORKSPACE_VIOLATION = "workspace_violation"
+    TOOL_EXECUTION_FAIL_REASON_SANDBOX_REQUIRED = "sandbox_required"
 
 
 class ToolExecutionResult(BaseModel):
@@ -67,8 +77,14 @@ class ToolExecutionResult(BaseModel):
     arguments: str | None = None
     approval: ApprovalDecision | None = None
     needs_approval: bool = False
+    workspace_id: str | None = None
 
     def can_run(self) -> bool:
+        if self.approval in {
+            ApprovalDecision.APPROVAL_DECISION_REJECTED,
+            ApprovalDecision.APPROVAL_DECISION_TIMEOUT,
+        }:
+            return False
         return (
             not self.needs_approval or self.approval == ApprovalDecision.APPROVAL_DECISION_APPROVED
         )

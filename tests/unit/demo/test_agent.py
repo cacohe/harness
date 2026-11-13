@@ -1,4 +1,5 @@
 from src.config import Config
+from src.core.workspace import Workspace
 from src.demo.agent import Agent
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
 from src.schema.task import TaskPlan, TaskState
@@ -39,6 +40,22 @@ class FalseyConfig:
 class FalseyGateway(ChatGateway):
     def __bool__(self):
         return False
+
+
+class FalseyWorkspace(Workspace):
+    def __bool__(self):
+        return False
+
+
+class FalseySandbox:
+    def __bool__(self):
+        return False
+
+    def supports(self, tool):
+        return True
+
+    def run(self, tool, inputs, workspace):
+        return "sandboxed"
 
 
 def test_chat_plans_then_returns_the_answer():
@@ -138,3 +155,78 @@ def test_from_config_builds_the_default_composition():
 
     assert agent.config is config
     assert agent.llm_gateway is gateway
+
+
+def test_default_agent_registers_workspace_file_tools_without_shell(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["hello"]),
+    )
+
+    assert {tool.name for tool in agent.tool_registry.get_all_tools()} == {
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_dir",
+        "grep",
+        "glob",
+    }
+
+
+def test_default_agent_binds_file_tools_to_explicit_workspace(tmp_path):
+    workspace = Workspace(tmp_path)
+
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["hello"]),
+        workspace=workspace,
+    )
+
+    tools = agent.tool_registry.get_all_tools()
+    assert agent.workspace is workspace
+    assert tools
+    assert all(tool.workspace is workspace for tool in tools)
+
+
+def test_default_agent_does_not_advertise_shell_without_sandbox(tmp_path):
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["hello"]),
+        workspace=tmp_path,
+    )
+
+    assert "shell" not in {tool.name for tool in agent.tool_registry.get_all_tools()}
+
+
+def test_default_agent_registers_shell_and_passes_workspace_to_sandbox(tmp_path):
+    workspace = Workspace(tmp_path)
+    sandbox = FalseySandbox()
+
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["hello"]),
+        workspace=workspace,
+        sandbox_runner=sandbox,
+    )
+
+    shell = agent.tool_registry.find_tool("shell")
+    assert shell is not None
+    assert shell.workspace is workspace
+    assert agent.tool_executor.sandbox_runner is sandbox
+
+
+def test_agent_preserves_falsey_workspace_and_sandbox_dependencies(tmp_path):
+    workspace = FalseyWorkspace(tmp_path)
+    sandbox = FalseySandbox()
+
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["hello"]),
+        workspace=workspace,
+        sandbox_runner=sandbox,
+    )
+
+    assert agent.workspace is workspace
+    assert agent.tool_executor.sandbox_runner is sandbox
+    assert agent.tool_registry.find_tool("shell") is not None

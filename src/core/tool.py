@@ -2,6 +2,7 @@ import json
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
+from src.core.workspace import Workspace, WorkspaceViolation
 from src.schema.llm import LlmToolCall
 from src.schema.tool import (
     ApprovalDecision,
@@ -35,7 +36,7 @@ class ApprovalPolicy(Protocol):
 @runtime_checkable
 class SandboxRunner(Protocol):
     def supports(self, tool: Tool) -> bool: ...
-    def run(self, tool: Tool, inputs: dict) -> Any: ...
+    def run(self, tool: Tool, inputs: dict, workspace: Workspace) -> Any: ...
 
 
 class AllowAllApprovalPolicy:
@@ -70,6 +71,13 @@ class ToolExecutor:
         return self.catalog.find_tool(name)
 
     def execute(self, tool: Tool, inputs: dict) -> ToolExecutionResult:
+        validated, failure = self._validate_inputs(tool, inputs)
+        if failure is not None:
+            return failure
+        assert validated is not None
+        return self._execute(tool, validated)
+
+    def _execute(self, tool: Tool, inputs: dict) -> ToolExecutionResult:
         try:
             decision = self.approval_policy.decide(tool, inputs)
         except Exception as error:
@@ -86,34 +94,35 @@ class ToolExecutor:
             return self._failed(tool, ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_TIMEOUT)
         if decision is not ApprovalDecision.APPROVAL_DECISION_APPROVED:
             return self._failed(tool)
-        return self.execute_approved(tool, inputs)
-
-    def _needs_sandbox(self, tool: Tool) -> bool:
-        """
-        Determine if a tool needs to be run in a sandbox.
-        Args:
-            tool: The tool to check.
-        Returns:
-            True if the tool needs to be run in a sandbox, False otherwise.
-        """
-        return False
-
-    def _run_in_sandbox(self, tool: Tool, inputs: dict) -> Any:
-        """
-        Run a tool in a sandbox.
-        Args:
-            tool: The tool to run.
-            inputs: The inputs to the tool.
-        Returns:
-            The output of the tool.
-        """
-        raise NotImplementedError
+        return self._run_approved(tool, inputs)
 
     def execute_approved(self, tool: Tool, inputs: dict) -> ToolExecutionResult:
         """Run a tool after authorization has already been established."""
+        validated, failure = self._validate_inputs(tool, inputs)
+        if failure is not None:
+            return failure
+        assert validated is not None
+        return self._run_approved(tool, validated)
+
+    def _run_approved(self, tool: Tool, inputs: dict) -> ToolExecutionResult:
+        if tool.requires_sandbox:
+            if tool.workspace is None:
+                return self._failed(
+                    tool,
+                    ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_WORKSPACE_VIOLATION,
+                    output="WorkspaceViolation: sandbox-required tool has no bound workspace",
+                )
         try:
-            if self._needs_sandbox(tool):
-                output = self._run_in_sandbox(tool, inputs)
+            if tool.requires_sandbox:
+                if self.sandbox_runner is None or not self.sandbox_runner.supports(tool):
+                    return self._failed(
+                        tool,
+                        ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_SANDBOX_REQUIRED,
+                        output="SandboxRequired: no compatible sandbox runner is available",
+                    )
+                assert self.sandbox_runner is not None
+                assert tool.workspace is not None
+                output = self.sandbox_runner.run(tool, inputs, tool.workspace)
             else:
                 output = self.runner.run(tool, inputs)
         except Exception as error:
@@ -194,9 +203,14 @@ class ToolExecutor:
                 state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
                 fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_NOT_SUPPORTED,
             )
+        validated, failure = self._validate_inputs(tool, parsed)
+        if failure is not None:
+            failure.tool_id = call.id
+            return failure
+        assert validated is not None
         if hold:
             try:
-                decision = self.approval_policy.decide(tool, parsed)
+                decision = self.approval_policy.decide(tool, validated)
             except Exception as error:
                 result = self._failed(tool, output=f"{type(error).__name__}: {error}")
                 result.tool_id = call.id
@@ -205,15 +219,17 @@ class ToolExecutor:
                 tool_id=call.id,
                 tool_name=call.name,
                 state=ToolExecutionState.TOOL_EXECUTION_STATE_PENDING,
-                arguments=call.arguments,
+                arguments=self._encoded_arguments(validated),
                 approval=decision if decision is not None else None,
                 needs_approval=decision is None,
+                workspace_id=self._workspace_id(tool),
             )
-        result = self.execute_approved(tool, parsed) if approved else self.execute(tool, parsed)
+        result = self._run_approved(tool, validated) if approved else self._execute(tool, validated)
         result.tool_id = call.id
         if result.is_pending():
-            result.arguments = call.arguments
+            result.arguments = self._encoded_arguments(validated)
             result.needs_approval = True
+            result.workspace_id = self._workspace_id(tool)
         return result
 
     def execute_held_tool_call(self, held: ToolExecutionResult) -> ToolExecutionResult:
@@ -221,6 +237,15 @@ class ToolExecutor:
         call = LlmToolCall(held.tool_id, held.tool_name, held.arguments or "")
         decision = held.approval
         if held.can_run():
+            tool = self.find_tool(call.name)
+            if tool is not None and held.workspace_id != self._workspace_id(tool):
+                result = self._failed(
+                    tool,
+                    ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_WORKSPACE_VIOLATION,
+                    output="WorkspaceViolation: approval belongs to a different workspace",
+                )
+                result.tool_id = call.id
+                return result
             return self.execute_tool_call(call, approved=True)
         if decision == ApprovalDecision.APPROVAL_DECISION_TIMEOUT:
             reason = ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_TIMEOUT
@@ -237,3 +262,28 @@ class ToolExecutor:
             arguments=call.arguments,
             approval=decision,
         )
+
+    def _validate_inputs(
+        self, tool: Tool, inputs: dict
+    ) -> tuple[dict | None, ToolExecutionResult | None]:
+        try:
+            validated = dict(inputs)
+            if tool.input_validator is not None:
+                validated = tool.input_validator(validated)
+            return validated, None
+        except WorkspaceViolation as error:
+            return None, self._failed(
+                tool,
+                ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_WORKSPACE_VIOLATION,
+                output=f"WorkspaceViolation: {error}",
+            )
+        except Exception as error:
+            return None, self._failed(tool, output=f"{type(error).__name__}: {error}")
+
+    @staticmethod
+    def _workspace_id(tool: Tool) -> str | None:
+        return tool.workspace.identity if tool.workspace is not None else None
+
+    @staticmethod
+    def _encoded_arguments(inputs: dict) -> str:
+        return json.dumps(inputs, ensure_ascii=False, separators=(",", ":"), sort_keys=True)

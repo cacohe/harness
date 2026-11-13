@@ -44,9 +44,35 @@ MAX_SECONDS=1800
 from src.config import Config
 from src.demo.agent import Agent
 
-agent = Agent.from_config(Config.load())
+agent = Agent.from_config(Config.load(), workspace="./my-project")
 task = agent.chat("帮我比较两款手机")
 ```
+
+`workspace` 是本地工具唯一的文件系统权限边界，可传入现有目录路径或 `Workspace` 对象；
+未提供时，`Agent` 只在构造时捕获当时的当前目录。默认目录包含 `read_file`、
+`write_file`、`edit_file`、`list_dir`、`grep` 和 `glob` 六个绑定到该 workspace 的工具。
+工具参数只接受 workspace 相对路径；绝对路径、父目录穿越、Windows 设备名/数据流以及解析后
+越界的符号链接会被拒绝。本地 I/O 错误只报告相对路径，不暴露宿主 workspace 前缀。
+
+默认不会注册 shell。要启用 shell，调用方必须注入真正提供隔离能力的 `SandboxRunner`：
+
+```python
+from src.config import Config
+from src.core.workspace import Workspace
+from src.demo.agent import Agent
+
+workspace = Workspace("./my-project")
+agent = Agent.from_config(
+    Config.load(),
+    workspace=workspace,
+    sandbox_runner=my_sandbox_runner,
+)
+```
+
+`SandboxRunner` 实现 `supports(tool)` 与 `run(tool, inputs, workspace)`。标记为
+`requires_sandbox` 的工具在未配置兼容 runner 时失败关闭，绝不回退到宿主进程执行。
+审批只表示用户允许某次调用，不提供隔离，也不能绕过 workspace 或 sandbox 检查。
+注入的 runner 是受信任的隔离边界；当前框架本身不声明提供硬链接、挂载、网络或进程隔离。
 
 需要替换模型、工具执行或持久化时，构造函数接收的是 `core` 中定义的端口，运行时注入
 相应实现：
