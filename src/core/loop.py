@@ -1,5 +1,6 @@
 """Run a task by planning once, then alternating model calls and tool calls."""
 
+import inspect
 import time
 import uuid
 from typing import NoReturn
@@ -336,6 +337,8 @@ class Harness:
             if token.is_cancelled():
                 raise _CancellationRequested
             self._emit_llm_event(task, EventType.LLM_STARTED, phase="planning")
+            if token.is_cancelled():
+                self._cancel_llm_attempt(task, "planning")
             try:
                 output = self.llm_gateway.planning(context, stream=False, response_format=TaskPlan)
                 if token.is_cancelled():
@@ -352,6 +355,8 @@ class Harness:
                     phase="planning",
                     usage=output.usage,
                 )
+                if token.is_cancelled():
+                    raise _CancellationRequested
                 return output.structured
 
             except (_TaskPersistenceError, _EventSinkError):
@@ -381,7 +386,15 @@ class Harness:
                     self._cancel_llm_attempt(task, "planning")
         raise LlmCallError("planning retries exhausted")
 
-    def _ask_clarification(self, task: Task, question: str, start_time: float) -> TaskResult:
+    def _ask_clarification(
+        self,
+        task: Task,
+        question: str,
+        start_time: float,
+        cancellation_token: CancellationToken | None = None,
+    ) -> TaskResult:
+        if cancellation_token is not None and cancellation_token.is_cancelled():
+            raise _CancellationRequested
         result = TaskResult(output=question)
         task.set_progress(task.step_count, time.monotonic() - start_time)
         task.set_result(result)
@@ -486,9 +499,14 @@ class Harness:
             if token.is_cancelled():
                 raise _CancellationRequested
             self._emit_llm_event(task, EventType.LLM_STARTED, phase="infer")
+            if token.is_cancelled():
+                self._cancel_llm_attempt(task, "infer")
             try:
                 produced = self.llm_gateway.infer(context, stream=True)
-                output = self._read_inference(task, produced)
+                output, parts = self._read_inference(produced)
+                if token.is_cancelled():
+                    self._cancel_llm_attempt(task, "infer")
+                self._emit_answer(task, output, parts)
                 if token.is_cancelled():
                     self._cancel_llm_attempt(task, "infer")
                 break
@@ -523,6 +541,8 @@ class Harness:
             raise LlmCallError("infer did not return a complete model output")
 
         self._emit_llm_event(task, EventType.LLM_COMPLETED, phase="infer", usage=output.usage)
+        if token.is_cancelled():
+            raise _CancellationRequested
         return output
 
     def _cancel_llm_attempt(self, task: Task, phase: str) -> NoReturn:
@@ -534,16 +554,14 @@ class Harness:
         )
         raise _CancellationRequested
 
-    def _read_inference(self, task: Task, produced) -> LLMOutput:
+    def _read_inference(self, produced) -> tuple[LLMOutput, list[str]]:
         if isinstance(produced, LLMOutput):
-            self._emit_answer(task, produced, [produced.content] if produced.content else [])
-            return produced
+            return produced, [produced.content] if produced.content else []
         try:
             output, parts = assemble_llm_stream(produced)
         except TypeError as error:
             raise LlmCallError(str(error)) from error
-        self._emit_answer(task, output, parts)
-        return output
+        return output, parts
 
     def _requests_tool_calls(self, llm_output: LLMOutput) -> bool:
         """
@@ -576,13 +594,22 @@ class Harness:
         def after_call(call: LlmToolCall, result: ToolExecutionResult) -> None:
             self._emit_tool_result(task, call, result)
 
+        parameters = inspect.signature(self.tool_executor.execute_tool_calls).parameters.values()
+        supports_cancellation = any(
+            parameter.name == "should_cancel" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        if cancellation_token is not None and supports_cancellation:
+            return self.tool_executor.execute_tool_calls(
+                tool_calls,
+                before_call=before_call,
+                after_call=after_call,
+                should_cancel=cancellation_token.is_cancelled,
+            )
         return self.tool_executor.execute_tool_calls(
             tool_calls,
             before_call=before_call,
             after_call=after_call,
-            should_cancel=(
-                cancellation_token.is_cancelled if cancellation_token is not None else None
-            ),
         )
 
     def step(self, task: Task, cancellation_token: CancellationToken | None = None) -> StepResult:
@@ -729,6 +756,8 @@ class Harness:
         """
         try:
             final_output = self.finalize(task, cancellation_token)
+            if cancellation_token is not None and cancellation_token.is_cancelled():
+                raise _CancellationRequested
         except (_TaskPersistenceError, _EventSinkError):
             raise
         except _CancellationRequested:
@@ -856,12 +885,14 @@ class Harness:
 
                 self._emit_task_event(EventType.TASK_PLANNING, task)
                 plan = self.planning(self.build_planning_context(task), task, token)
+                if token.is_cancelled():
+                    raise _CancellationRequested
                 task.set_plan(plan)
                 self._save_task(task)
                 self._emit_task_event(EventType.TASK_PLANNED, task, goal=list(plan.goal))
                 question = (plan.clarification or "").strip()
                 if question:
-                    return self._ask_clarification(task, question, start_time)
+                    return self._ask_clarification(task, question, start_time, token)
 
             if task.is_paused():
                 self._emit_task_event(EventType.TASK_RESUMED, task)

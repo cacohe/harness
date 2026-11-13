@@ -816,6 +816,131 @@ def test_cancel_during_limit_finalization_emits_only_cancel_failure():
     assert [event.payload.reason for event in failed] == ["cancel"]
 
 
+def test_cancel_from_finalization_completed_callback_wins_over_limit_failure():
+    token = CancellationToken()
+
+    class CancelSecondCompletion(RecordingOutput):
+        def __init__(self):
+            super().__init__()
+            self.completions = 0
+
+        def emit(self, event):
+            super().emit(event)
+            if event.type is EventType.LLM_COMPLETED and event.payload.phase == "infer":
+                self.completions += 1
+                if self.completions == 2:
+                    token.cancel()
+
+    task = _task()
+    sink = CancelSecondCompletion()
+    result = _harness(
+        ScriptedGateway(
+            [_model(FinishReason.LENGTH, "partial"), _model(FinishReason.STOP, "closing")]
+        ),
+        event_handler=sink,
+        max_steps=1,
+    ).run(task, cancellation_token=token)
+
+    assert result == TaskResult(output="Task cancelled.")
+    assert task.state_reason is TaskFailReason.TASK_FAILED_CANCEL
+    assert [
+        event.payload.reason for event in sink.events if event.type is EventType.TASK_FAILED
+    ] == ["cancel"]
+
+
+def test_cancel_from_planning_completed_callback_prevents_clarification_completion():
+    token = CancellationToken()
+
+    class ClarifyingGateway(Gateway):
+        def planning(self, context, stream=True, response_format=None):
+            return LLMOutput(
+                FinishReason.STOP,
+                None,
+                [],
+                None,
+                None,
+                structured=TaskPlan(goal=[], clarification="Which target?"),
+            )
+
+    class CancelPlanningCompletion(RecordingOutput):
+        def emit(self, event):
+            super().emit(event)
+            if event.type is EventType.LLM_COMPLETED and event.payload.phase == "planning":
+                token.cancel()
+
+    task = _task()
+    result = _harness(ClarifyingGateway(), event_handler=CancelPlanningCompletion()).run(
+        task, cancellation_token=token
+    )
+
+    assert result == TaskResult(output="Task cancelled.")
+    assert task.state_reason is TaskFailReason.TASK_FAILED_CANCEL
+
+
+def test_cancelled_inference_does_not_publish_abandoned_answer_delta():
+    token = CancellationToken()
+    sink = RecordingOutput()
+
+    class CancellingAnswer(Gateway):
+        def infer(self, context, stream=True, response_format=None):
+            token.cancel()
+            return _model(FinishReason.STOP, "should-not-publish")
+
+    task = _task()
+    _harness(CancellingAnswer(), event_handler=sink).run(task, cancellation_token=token)
+
+    assert all(
+        not (event.type is EventType.LLM_DELTA and event.payload.content == "should-not-publish")
+        for event in sink.events
+    )
+
+
+def test_uncancelled_run_supports_legacy_tool_executor_batch_signature():
+    class LegacyExecutor(Executor):
+        def execute_tool_calls(self, tool_calls, *, before_call=None, after_call=None):
+            return super().execute_tool_calls(
+                tool_calls,
+                before_call=before_call,
+                after_call=after_call,
+            )
+
+    tool = Tool("read_file", "read_file", "Read.", {}, lambda inputs: "read")
+    gateway = ScriptedGateway(
+        [
+            _model(
+                FinishReason.TOOL_CALLS,
+                None,
+                [LlmToolCall("call-1", "read_file", '{"path":"a"}')],
+            ),
+            _model(FinishReason.STOP, "done"),
+        ]
+    )
+    task = _task()
+
+    result = _harness(gateway, executor=LegacyExecutor([tool])).run(task)
+
+    assert result == TaskResult(output="done")
+    assert task.state is TaskState.TASK_COMPLETED
+
+
+def test_cancel_from_llm_started_callback_prevents_gateway_call():
+    token = CancellationToken()
+
+    class CancelOnStart(RecordingOutput):
+        def emit(self, event):
+            super().emit(event)
+            if event.type is EventType.LLM_STARTED and event.payload.phase == "planning":
+                token.cancel()
+
+    gateway = Gateway()
+    task = _task()
+
+    result = _harness(gateway, event_handler=CancelOnStart()).run(task, cancellation_token=token)
+
+    assert result == TaskResult(output="Task cancelled.")
+    assert gateway.planning_calls == []
+
+
 def test_repository_failure_while_cancelling_still_propagates():
     class FailingRepository(InMemoryTaskRepository):
         def save(self, task):
