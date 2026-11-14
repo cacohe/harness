@@ -16,6 +16,7 @@ dependencies = [
     { name = "fastmcp" },
     { name = "litellm" },
     { name = "pydantic" },
+    { name = "pyyaml" },
 ]
 
 [package.dev-dependencies]
@@ -30,6 +31,7 @@ requires-dist = [
     { name = "fastmcp", specifier = ">=2.4" },
     { name = "litellm" },
     { name = "pydantic", specifier = ">=2" },
+    { name = "pyyaml", specifier = ">=6" },
 ]
 
 [package.metadata.requires-dev]

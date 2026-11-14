@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Sketch of an agent harness: interfaces and call order only."
 requires-python = ">=3.11"
 readme = "README.md"
-dependencies = ["fastmcp>=2.4", "litellm", "pydantic>=2"]
+dependencies = ["fastmcp>=2.4", "litellm", "pydantic>=2", "pyyaml>=6"]
 
 [dependency-groups]
 dev = ["mypy>=1.15", "pytest>=8", "ruff>=0.8"]

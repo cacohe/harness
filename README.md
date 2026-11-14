@@ -74,6 +74,49 @@ agent = Agent.from_config(
 审批只表示用户允许某次调用，不提供隔离，也不能绕过 workspace 或 sandbox 检查。
 注入的 runner 是受信任的隔离边界；当前框架本身不声明提供硬链接、挂载、网络或进程隔离。
 
+## Skill 目录
+
+`Agent` 可以从一个或多个目录加载 Skill。每个目录必须包含带 YAML frontmatter 的
+`SKILL.md`，其中 `name` 和 `description` 是非空字符串；frontmatter 后的正文会进入模型的
+系统上下文：
+
+```markdown
+---
+name: research
+description: Research a topic from local reference material.
+---
+Read `references/sources.md` before writing the answer.
+```
+
+```python
+agent = Agent.from_config(
+    Config.load(),
+    workspace="./my-project",
+    skill_directories=["./skills/research"],
+)
+```
+
+Skill 目录拥有独立于 Agent 工作目录的只读资源工具，名称形如
+`skill__research__read_file`。路径仍只接受 Skill 目录内的相对路径；绝对路径、父目录穿越、
+Windows 保留名和解析后越界的符号链接都会被 `Workspace` 拒绝。
+
+仅当调用方注入 `SandboxRunner` 时，Agent 才会为 Skill 注册形如
+`skill__research__shell` 的命令工具：
+
+```python
+agent = Agent.from_config(
+    Config.load(),
+    workspace="./my-project",
+    sandbox_runner=my_sandbox_runner,
+    skill_directories=["./skills/research"],
+)
+```
+
+该工具继续使用 Skill 目录作为独立 workspace，并由同一个 `ToolExecutor` 进行审批、参数
+验证和 sandbox 路由。Skill 加载器本身不会调用 `subprocess`，未注入 sandbox 时也不会注册
+Skill shell，因此脚本永远不会回退到宿主进程执行。重复 Skill 名、规范化后的工具名冲突或
+注册中途失败都会在构造阶段报错，并回滚本批已注册的 Skill 工具。
+
 ## 外部取消
 
 同步 Harness 支持每次运行独立的协作式取消。控制线程创建 `CancellationToken`，将它传给
