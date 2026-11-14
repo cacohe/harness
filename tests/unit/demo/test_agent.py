@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,7 @@ from src.core.workspace import Workspace
 from src.demo.agent import Agent
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
 from src.schema.task import TaskPlan, TaskState
-from src.schema.tool import Tool
+from src.schema.tool import ApprovalDecision, Tool
 from src.tool.tool_executor import DefaultToolExecutor
 from src.tool.tool_registry import DefaultToolRegistry
 
@@ -261,13 +262,19 @@ def test_agent_routes_skill_shell_through_sandbox_with_skill_workspace(tmp_path)
         skill_directories=[skill_dir],
     )
 
-    result = agent.tool_executor.execute_tool_call(
+    held = agent.tool_executor.execute_tool_call(
         LlmToolCall(
             "call-1",
             "skill__script_runner__shell",
             '{"command":"bash scripts/check.sh"}',
         )
     )
+
+    assert held.is_pending()
+    assert held.needs_approval is True
+    assert sandbox.calls == []
+    held.approval = ApprovalDecision.APPROVAL_DECISION_APPROVED
+    result = agent.tool_executor.execute_held_tool_call(held)
 
     assert result.is_completed()
     assert result.output == "sandboxed"
@@ -330,6 +337,60 @@ def test_agent_rolls_back_skill_tools_when_catalog_registration_fails(tmp_path):
 
     skill_dir = _write_skill(tmp_path, "scripts", "script runner")
     catalog = FailingCatalog()
+
+    with pytest.raises(RuntimeError, match="catalog offline"):
+        Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=ChatGateway(["unused"]),
+            tool_catalog=catalog,
+            sandbox_runner=RecordingSandbox(),
+            skill_directories=[skill_dir],
+        )
+
+    assert catalog.get_all_tools() == []
+
+
+def test_agent_rolls_back_skill_tools_from_a_catalog_that_stores_copies(tmp_path):
+    class CopyingCatalog(DefaultToolRegistry):
+        def __init__(self):
+            super().__init__()
+            self.register_calls = 0
+
+        def register(self, tool):
+            self.register_calls += 1
+            if self.register_calls == 2:
+                raise RuntimeError("catalog offline")
+            return super().register(replace(tool))
+
+    skill_dir = _write_skill(tmp_path, "scripts", "script runner")
+    catalog = CopyingCatalog()
+
+    with pytest.raises(RuntimeError, match="catalog offline"):
+        Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=ChatGateway(["unused"]),
+            tool_catalog=catalog,
+            sandbox_runner=RecordingSandbox(),
+            skill_directories=[skill_dir],
+        )
+
+    assert catalog.get_all_tools() == []
+
+
+def test_agent_rolls_back_a_skill_tool_inserted_before_registration_raises(tmp_path):
+    class InsertThenFailCatalog(DefaultToolRegistry):
+        def __init__(self):
+            super().__init__()
+            self.register_calls = 0
+
+        def register(self, tool):
+            self.register_calls += 1
+            super().register(tool)
+            if self.register_calls == 2:
+                raise RuntimeError("catalog offline")
+
+    skill_dir = _write_skill(tmp_path, "scripts", "script runner")
+    catalog = InsertThenFailCatalog()
 
     with pytest.raises(RuntimeError, match="catalog offline"):
         Agent(

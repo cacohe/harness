@@ -66,7 +66,15 @@ class SkillDirectory:
                 continue
             name = provider_tool_name("skill", skill_name, tool.name)
             description = f"[{skill_name}] {tool.description}"
-            tools.append(replace(tool, id=name, name=name, description=description))
+            tools.append(
+                replace(
+                    tool,
+                    id=name,
+                    name=name,
+                    description=description,
+                    requires_approval=tool.requires_approval or tool.name == "shell",
+                )
+            )
         return tools
 
     def _read_document(self) -> str:
@@ -83,7 +91,7 @@ class SkillDirectory:
     def _load_metadata(source: str) -> dict[str, Any]:
         try:
             metadata = yaml.safe_load(source)
-        except yaml.YAMLError as error:
+        except (yaml.YAMLError, ValueError, TypeError, OverflowError) as error:
             raise SkillDocumentError("SKILL.md contains invalid YAML frontmatter") from error
         if not isinstance(metadata, dict):
             raise SkillDocumentError("SKILL.md frontmatter must be a mapping")

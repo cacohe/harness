@@ -298,7 +298,6 @@ def _register_tools_atomically(catalog: ToolCatalog, tools: list[Tool]) -> None:
             catalog.register(tool)
     except BaseException:
         for tool in tools:
-            registered = catalog.find_tool(tool.id)
-            if registered is tool:
+            if catalog.find_tool(tool.id) is not None:
                 catalog.unregister(tool.id)
         raise

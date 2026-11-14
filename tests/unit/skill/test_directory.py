@@ -45,6 +45,8 @@ def test_load_parses_frontmatter_and_unicode_body(tmp_path, newline):
     [
         ("---\nname: demo\ndescription: ok\n", "closing frontmatter"),
         ("---\nname: [\ndescription: ok\n---\nbody", "invalid YAML"),
+        ("---\nname: demo\ndescription: 2026-99-99\n---\nbody", "invalid YAML"),
+        ("---\nname: demo\ndescription: !!int invalid\n---\nbody", "invalid YAML"),
         ("---\n- name\n- description\n---\nbody", "mapping"),
         ("---\ndescription: ok\n---\nbody", "name"),
         ("---\nname: '  '\ndescription: ok\n---\nbody", "name"),
