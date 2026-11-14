@@ -7,7 +7,7 @@ from src.core.cancellation import CancellationToken
 from src.core.context import ContextBuilder
 from src.core.guard import NoOpGuard
 from src.core.hook import HarnessHook
-from src.core.llm import LlmGateway
+from src.core.llm import AsyncLlmGateway, LlmGateway
 from src.core.loop import Harness
 from src.core.persistence import TaskRepository
 from src.core.task import Task
@@ -29,7 +29,7 @@ class Agent:
     def __init__(
         self,
         config: Config | None = None,
-        llm_gateway: LlmGateway | None = None,
+        llm_gateway: LlmGateway | AsyncLlmGateway | None = None,
         tool_executor: ToolExecutor | None = None,
         context_builder: ContextBuilder | None = None,
         tool_catalog: ToolCatalog | None = None,

@@ -928,6 +928,29 @@ def test_async_held_tool_call_resumes_after_approval():
     assert result.output == "ran"
 
 
+def test_async_held_call_honors_a_legacy_execute_tool_call_override():
+    class LegacyOverrideExecutor(DefaultToolExecutor):
+        def __init__(self, registry):
+            super().__init__(registry)
+            self.legacy_calls = 0
+
+        def execute_tool_call(self, call, approved=False, hold=False):
+            self.legacy_calls += 1
+            return super().execute_tool_call(call, approved=approved, hold=hold)
+
+    registry = DefaultToolRegistry()
+    registry.register(Tool("shell", "shell", "Run.", {}, lambda inputs: "ran"))
+    executor = LegacyOverrideExecutor(registry)
+    held = executor.execute_tool_call(LlmToolCall("call-1", "shell", "{}"))
+    executor.legacy_calls = 0
+    held.approval = ApprovalDecision.APPROVAL_DECISION_APPROVED
+
+    result = asyncio.run(executor.aexecute_held_tool_call(held))
+
+    assert result.output == "ran"
+    assert executor.legacy_calls == 1
+
+
 def test_sync_tool_wrapper_rejects_an_active_event_loop_before_execution():
     called = False
 

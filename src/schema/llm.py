@@ -240,47 +240,62 @@ def assemble_llm_stream(pieces: Iterable[LLMOutput]) -> tuple[LLMOutput, list[st
     Raises:
         TypeError: A fragment is not an LLMOutput.
     """
-    text: list[str] = []
-    calls: list[LlmToolCall] = []
-    finish_reason = None
-    usage = None
-    reasoning = None
-    thinking = None
-    structured = None
+    accumulator = _LlmStreamAccumulator()
     for piece in pieces:
-        if not isinstance(piece, LLMOutput):
-            raise TypeError("infer did not return a model output")
-        if piece.content:
-            text.append(piece.content)
-        _merge_tool_calls(calls, piece.tool_calls)
-        if piece.finish_reason is not None:
-            finish_reason = piece.finish_reason
-        if piece.usage is not None:
-            usage = piece.usage
-        if piece.reasoning_content:
-            reasoning = piece.reasoning_content
-        if piece.thinking_blocks:
-            thinking = piece.thinking_blocks
-        if piece.structured is not None:
-            structured = piece.structured
-    output = LLMOutput(
-        finish_reason,
-        "".join(text) or None,
-        calls,
-        reasoning,
-        thinking,
-        usage,
-        structured,
-    )
-    return output, text
+        accumulator.add(piece)
+    return accumulator.finish()
 
 
 async def assemble_llm_async_stream(
     pieces: AsyncIterator[LLMOutput] | Iterator[LLMOutput],
 ) -> tuple[LLMOutput, list[str]]:
     """Fold synchronous or asynchronous streamed model pieces into one output."""
-    collected = [piece async for piece in iterate_maybe_async(pieces)]
-    return assemble_llm_stream(collected)
+    accumulator = _LlmStreamAccumulator()
+    async for piece in iterate_maybe_async(pieces):
+        accumulator.add(piece)
+    return accumulator.finish()
+
+
+class _LlmStreamAccumulator:
+    def __init__(self) -> None:
+        self.text: list[str] = []
+        self.calls: list[LlmToolCall] = []
+        self.finish_reason: FinishReason | None = None
+        self.usage: LlmUsage | None = None
+        self.reasoning: str | None = None
+        self.thinking: list[dict[str, Any]] | None = None
+        self.structured: Any | None = None
+
+    def add(self, piece: LLMOutput) -> None:
+        if not isinstance(piece, LLMOutput):
+            raise TypeError("infer did not return a model output")
+        if piece.content:
+            self.text.append(piece.content)
+        _merge_tool_calls(self.calls, piece.tool_calls)
+        if piece.finish_reason is not None:
+            self.finish_reason = piece.finish_reason
+        if piece.usage is not None:
+            self.usage = piece.usage
+        if piece.reasoning_content:
+            self.reasoning = piece.reasoning_content
+        if piece.thinking_blocks:
+            self.thinking = piece.thinking_blocks
+        if piece.structured is not None:
+            self.structured = piece.structured
+
+    def finish(self) -> tuple[LLMOutput, list[str]]:
+        return (
+            LLMOutput(
+                self.finish_reason,
+                "".join(self.text) or None,
+                self.calls,
+                self.reasoning,
+                self.thinking,
+                self.usage,
+                self.structured,
+            ),
+            self.text,
+        )
 
 
 def _merge_tool_calls(calls: list[LlmToolCall], deltas: list[LlmToolCall]) -> None:

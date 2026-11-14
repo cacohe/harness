@@ -71,3 +71,15 @@ def test_async_wait_on_an_already_cancelled_token_returns_immediately():
         assert await token.await_cancelled() is True
 
     asyncio.run(scenario())
+
+
+def test_cancel_tolerates_a_waiter_whose_event_loop_has_closed():
+    token = CancellationToken()
+    loop = asyncio.new_event_loop()
+    waiter = loop.create_future()
+    loop.close()
+    token._async_waiters.append((loop, waiter))
+
+    token.cancel()
+
+    assert token.is_cancelled() is True

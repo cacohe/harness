@@ -2,8 +2,11 @@ from src.core import event as core_event
 from src.core.context import ContextBuilder
 from src.core.guard import HarnessGuard
 from src.core.llm import AsyncLlmGateway, LlmGateway
+from src.core.loop import Harness
 from src.core.memory import MemoryRetriever, MemoryStore
-from src.core.tool import AsyncToolRunner
+from src.core.tool import AsyncToolRunner, ToolExecutor
+from src.demo.agent import Agent
+from src.tool.tool_executor import DefaultToolExecutor
 
 
 class DuckContextBuilder:
@@ -66,3 +69,19 @@ def test_guard_module_provides_an_explicit_noop_default():
 
     assert hasattr(guard, "NoOpGuard")
     guard.NoOpGuard().guard_input(object())
+
+
+def test_public_composition_annotations_accept_native_async_ports():
+    from types import UnionType
+    from typing import get_args, get_type_hints
+
+    harness_gateway = get_type_hints(Harness.__init__)["llm_gateway"]
+    agent_gateway = get_type_hints(Agent.__init__)["llm_gateway"]
+    core_runner = get_type_hints(ToolExecutor.__init__)["runner"]
+    default_runner = get_type_hints(DefaultToolExecutor.__init__)["runner"]
+
+    assert isinstance(harness_gateway, UnionType)
+    assert AsyncLlmGateway in get_args(harness_gateway)
+    assert AsyncLlmGateway in get_args(agent_gateway)
+    assert AsyncToolRunner in get_args(core_runner)
+    assert AsyncToolRunner in get_args(default_runner)

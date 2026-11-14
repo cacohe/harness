@@ -18,7 +18,11 @@ class CancellationToken:
             waiters = self._async_waiters
             self._async_waiters = []
         for loop, waiter in waiters:
-            loop.call_soon_threadsafe(self._complete_waiter, waiter)
+            try:
+                loop.call_soon_threadsafe(self._complete_waiter, waiter)
+            except RuntimeError:
+                if not loop.is_closed():
+                    raise
 
     def is_cancelled(self) -> bool:
         return self._event.is_set()

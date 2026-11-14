@@ -3,6 +3,7 @@ import inspect
 from src.core.async_utils import call_maybe_async
 from src.core.tool import (
     ApprovalPolicy,
+    AsyncToolRunner,
     SandboxRunner,
     ToolCatalog,
     ToolExecutor,
@@ -40,7 +41,7 @@ class DefaultToolExecutor(ToolExecutor):
         self,
         tool_registry: ToolCatalog,
         *,
-        runner: ToolRunner | None = None,
+        runner: ToolRunner | AsyncToolRunner | None = None,
         approval_policy: ApprovalPolicy | None = None,
         sandbox_runner: SandboxRunner | None = None,
     ) -> None:

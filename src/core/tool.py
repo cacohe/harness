@@ -60,7 +60,7 @@ class ToolExecutor:
     def __init__(
         self,
         catalog: ToolCatalog,
-        runner: ToolRunner,
+        runner: ToolRunner | AsyncToolRunner,
         *,
         approval_policy: ApprovalPolicy | None = None,
         sandbox_runner: SandboxRunner | None = None,
@@ -342,7 +342,7 @@ class ToolExecutor:
                 )
                 result.tool_id = call.id
                 return result
-            return await self.aexecute_tool_call(call, approved=True)
+            return await self._aexecute_tool_call_compat(call, approved=True)
         if decision == ApprovalDecision.APPROVAL_DECISION_TIMEOUT:
             reason = ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_TIMEOUT
             output = "The approval timed out."

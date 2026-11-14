@@ -136,3 +136,17 @@ def test_async_stream_assembly_accepts_a_sync_iterator_without_blocking_contract
 
     assert output.content == "done"
     assert parts == ["done"]
+
+
+def test_async_stream_assembly_folds_a_reused_mutable_chunk_on_arrival():
+    def reused_chunks():
+        piece = _piece("hello ")
+        yield piece
+        piece.content = "world"
+        piece.finish_reason = FinishReason.STOP
+        yield piece
+
+    output, parts = asyncio.run(assemble_llm_async_stream(reused_chunks()))
+
+    assert output.content == "hello world"
+    assert parts == ["hello ", "world"]

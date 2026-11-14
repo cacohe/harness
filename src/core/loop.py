@@ -18,7 +18,7 @@ from src.core.context import (
 from src.core.event import EventHandler, EventSink
 from src.core.guard import GuardError, HarnessGuard, NoOpGuard
 from src.core.hook import HarnessHook
-from src.core.llm import LlmCallError, LlmGateway
+from src.core.llm import AsyncLlmGateway, LlmCallError, LlmGateway
 from src.core.persistence import NoOpTaskRepository, TaskRepository
 from src.core.task import Task
 from src.core.tool import ToolExecutor
@@ -68,7 +68,7 @@ class Harness:
     def __init__(
         self,
         system_prompt: str,
-        llm_gateway: LlmGateway,
+        llm_gateway: LlmGateway | AsyncLlmGateway,
         skills: list[Skill],
         tool_executor: ToolExecutor,
         context_builder: ContextBuilder,
@@ -650,12 +650,24 @@ class Harness:
         """
 
         def before_call(call: LlmToolCall) -> None:
+            if cancellation_token is not None and cancellation_token.is_cancelled():
+                return
             self._emit_tool_event(EventType.TOOL_EXECUTION_STARTED, task, call)
 
         def after_call(call: LlmToolCall, result: ToolExecutionResult) -> None:
+            if cancellation_token is not None and cancellation_token.is_cancelled():
+                return
             self._emit_tool_result(task, call, result)
 
         async_batch = getattr(self.tool_executor, "aexecute_tool_calls", None)
+        sync_override = (
+            type(self.tool_executor).execute_tool_calls is not ToolExecutor.execute_tool_calls
+        )
+        async_override = (
+            type(self.tool_executor).aexecute_tool_calls is not ToolExecutor.aexecute_tool_calls
+        )
+        if sync_override and not async_override:
+            async_batch = None
         batch = async_batch if async_batch is not None else self.tool_executor.execute_tool_calls
         parameters = inspect.signature(batch).parameters.values()
         supports_cancellation = any(
@@ -999,11 +1011,13 @@ class Harness:
             result = await self.aturn(task, start_time, token)
             return result
 
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
+            token.cancel()
             try:
                 self._handle_cancelled(task, start_time)
             except (_TaskPersistenceError, _EventSinkError) as boundary_error:
-                self._raise_boundary_cause(boundary_error)
+                cause = boundary_error.__cause__ or boundary_error
+                raise cause from cancellation
             raise
         except (_TaskPersistenceError, _EventSinkError) as boundary_error:
             self._raise_boundary_cause(boundary_error)

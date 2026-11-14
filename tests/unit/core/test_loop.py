@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from typing import get_type_hints
 
 import pytest
@@ -29,6 +30,7 @@ from src.schema.task import (
 )
 from src.schema.tool import (
     Tool,
+    ToolCallResult,
     ToolExecutionFailReason,
     ToolExecutionResult,
     ToolExecutionState,
@@ -901,7 +903,12 @@ def test_cancelled_inference_does_not_publish_abandoned_answer_delta():
 
 def test_uncancelled_run_supports_legacy_tool_executor_batch_signature():
     class LegacyExecutor(Executor):
+        def __init__(self, tools=None):
+            super().__init__(tools)
+            self.legacy_batches = 0
+
         def execute_tool_calls(self, tool_calls, *, before_call=None, after_call=None):
+            self.legacy_batches += 1
             return super().execute_tool_calls(
                 tool_calls,
                 before_call=before_call,
@@ -921,10 +928,12 @@ def test_uncancelled_run_supports_legacy_tool_executor_batch_signature():
     )
     task = _task()
 
-    result = _harness(gateway, executor=LegacyExecutor([tool])).run(task)
+    executor = LegacyExecutor([tool])
+    result = _harness(gateway, executor=executor).run(task)
 
     assert result == TaskResult(output="done")
     assert task.state is TaskState.TASK_COMPLETED
+    assert executor.legacy_batches == 1
 
 
 def test_cancel_from_llm_started_callback_prevents_gateway_call():
@@ -1647,3 +1656,114 @@ def test_cancellation_cleanup_repository_failure_wins_over_cancelled_error():
             await running
 
     asyncio.run(scenario())
+
+
+def test_cancellation_cleanup_error_keeps_cancelled_error_as_its_cause():
+    class WaitingGateway(NativeAsyncGateway):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+
+        async def ainfer(self, context, stream=True, response_format=None):
+            self.started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    class FailCancelledSave(RecordingRepository):
+        def save(self, task):
+            if task.state_reason is TaskFailReason.TASK_FAILED_CANCEL:
+                raise RuntimeError("cancel save failed")
+            super().save(task)
+
+    async def scenario():
+        gateway = WaitingGateway()
+        running = asyncio.create_task(
+            _harness(gateway, repository=FailCancelledSave()).arun(_task())
+        )
+        await gateway.started.wait()
+        running.cancel()
+        with pytest.raises(RuntimeError) as caught:
+            await running
+        return caught.value
+
+    error = asyncio.run(scenario())
+
+    assert isinstance(error.__cause__, asyncio.CancelledError)
+
+
+def test_cancelled_legacy_batch_cannot_run_later_tools_or_publish_late_events():
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    executed = []
+    sink = RecordingOutput()
+
+    class BlockingLegacyExecutor(Executor):
+        def execute_tool_calls(
+            self,
+            tool_calls,
+            *,
+            before_call=None,
+            after_call=None,
+            should_cancel=None,
+        ):
+            ordered = []
+            try:
+                for call in tool_calls:
+                    if should_cancel is not None and should_cancel():
+                        break
+                    if before_call is not None:
+                        before_call(call)
+                    executed.append(call.id)
+                    if len(executed) == 1:
+                        started.set()
+                        release.wait(1)
+                    result = ToolExecutionResult(
+                        tool_id=call.id,
+                        tool_name=call.name,
+                        state=ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED,
+                        output="done",
+                    )
+                    ordered.append(result)
+                    if after_call is not None:
+                        after_call(call, result)
+            finally:
+                finished.set()
+            return ToolCallResult(completed_tools=ordered, ordered_tools=ordered)
+
+    gateway = NativeAsyncGateway(
+        [
+            _model(
+                FinishReason.TOOL_CALLS,
+                calls=[
+                    LlmToolCall("call-1", "first", "{}"),
+                    LlmToolCall("call-2", "second", "{}"),
+                ],
+            )
+        ]
+    )
+    tools = [
+        Tool("first", "first", "First.", {}, lambda inputs: "first"),
+        Tool("second", "second", "Second.", {}, lambda inputs: "second"),
+    ]
+    harness = _harness(
+        gateway,
+        executor=BlockingLegacyExecutor(tools),
+        event_handler=sink,
+    )
+
+    async def scenario():
+        running = asyncio.create_task(harness.arun(_task()))
+        await asyncio.to_thread(started.wait, 1)
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        terminal_event_count = len(sink.events)
+        release.set()
+        await asyncio.to_thread(finished.wait, 1)
+        return terminal_event_count
+
+    terminal_event_count = asyncio.run(scenario())
+
+    assert executed == ["call-1"]
+    assert len(sink.events) == terminal_event_count
