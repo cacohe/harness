@@ -58,6 +58,7 @@ class Agent:
             else Workspace(Path.cwd() if workspace is None else workspace)
         )
         executor_catalog = tool_executor.catalog if tool_executor is not None else None
+        owns_catalog = tool_catalog is None and executor_catalog is None
         self.tool_registry = (
             tool_catalog
             if tool_catalog is not None
@@ -67,7 +68,7 @@ class Agent:
             raise ValueError("tool executor catalog must match the Agent catalog")
         if mcp_manager is not None and mcp_manager.catalog is not self.tool_registry:
             raise ValueError("MCP manager catalog must match the Agent catalog")
-        if tool_catalog is None:
+        if owns_catalog:
             for tool in LocalToolSuite(self.workspace).tools(
                 include_shell=sandbox_runner is not None
             ):

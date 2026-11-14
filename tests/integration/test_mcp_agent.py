@@ -1,8 +1,11 @@
 import ast
 import asyncio
 
+import pytest
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from src.config import Config
+from src.core.tool import RemoteToolError
 from src.demo.agent import Agent
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
 from src.schema.task import TaskPlan, TaskState
@@ -74,5 +77,32 @@ def test_agent_runs_real_mcp_tool_through_approval_and_resume():
             assert envelope["is_error"] is False
 
         assert catalog.find_tool("mcp__math__add") is None
+
+    asyncio.run(scenario())
+
+
+def test_real_mcp_error_preserves_the_remote_result_envelope():
+    async def scenario():
+        server = FastMCP("failing")
+
+        @server.tool
+        def reject() -> None:
+            raise ToolError("rejected by server")
+
+        async with Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=MCPGateway(),
+        ) as agent:
+            await agent.add_mcp_server("failure", server)
+            tool = agent.tool_registry.find_tool("mcp__failure__reject")
+            assert tool is not None
+
+            with pytest.raises(RemoteToolError) as caught:
+                await tool.executer({})
+
+            assert caught.value.output["is_error"] is True
+            assert caught.value.output["content"]
+            assert "rejected by server" in str(caught.value.output["content"])
+            assert "MCP transport error" not in str(caught.value.output)
 
     asyncio.run(scenario())

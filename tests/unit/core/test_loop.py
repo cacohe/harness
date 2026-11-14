@@ -1767,3 +1767,105 @@ def test_cancelled_legacy_batch_cannot_run_later_tools_or_publish_late_events():
 
     assert executed == ["call-1"]
     assert len(sink.events) == terminal_event_count
+
+
+def test_resume_honors_a_legacy_held_call_override():
+    called = []
+
+    class LegacyHeldExecutor(DefaultToolExecutor):
+        def execute_held_tool_call(self, held):
+            return ToolExecutionResult(
+                tool_id=held.tool_id,
+                tool_name=held.tool_name,
+                state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
+                output="legacy denied",
+                fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_REJECTED,
+            )
+
+    registry = DefaultToolRegistry()
+    registry.register(Tool("shell", "shell", "Shell.", {}, lambda inputs: called.append(inputs)))
+    harness = _harness(
+        ScriptedGateway([_shell_call(), _model(FinishReason.STOP, "done")]),
+        executor=LegacyHeldExecutor(registry),
+    )
+    task = _task()
+    harness.run(task)
+    task.decide_tool_call("call_1", approved=True)
+
+    harness.run(task)
+
+    assert called == []
+    assert [message.content for message in _tool_messages(task)] == ["legacy denied"]
+
+
+def test_caller_cancellation_during_resume_keeps_completed_and_settles_remaining_calls():
+    async def scenario():
+        first_completed = asyncio.Event()
+        second_started = asyncio.Event()
+
+        async def first(_inputs):
+            first_completed.set()
+            return "first completed"
+
+        async def second(_inputs):
+            second_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        registry = DefaultToolRegistry()
+        registry.register(
+            Tool(
+                "first",
+                "first",
+                "First.",
+                {},
+                first,
+                requires_approval=True,
+            )
+        )
+        registry.register(
+            Tool(
+                "second",
+                "second",
+                "Second.",
+                {},
+                second,
+                requires_approval=True,
+            )
+        )
+        harness = _harness(
+            NativeAsyncGateway(
+                [
+                    _model(
+                        FinishReason.TOOL_CALLS,
+                        calls=[
+                            LlmToolCall("call-1", "first", "{}"),
+                            LlmToolCall("call-2", "second", "{}"),
+                        ],
+                    )
+                ]
+            ),
+            executor=DefaultToolExecutor(registry),
+        )
+        task = _task()
+        await harness.arun(task)
+        task.decide_tool_call("call-1", approved=True)
+        task.decide_tool_call("call-2", approved=True)
+
+        resumed = asyncio.create_task(harness.arun(task))
+        await first_completed.wait()
+        await second_started.wait()
+        resumed.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await resumed
+        return task
+
+    task = asyncio.run(scenario())
+
+    assert task.state is TaskState.TASK_FAILED
+    assert task.state_reason is TaskFailReason.TASK_FAILED_CANCEL
+    assert task.pending_tool_calls == []
+    assert [message.content for message in _tool_messages(task)] == [
+        "first completed",
+        "Tool call cancelled.",
+    ]

@@ -10,6 +10,7 @@ class DefaultToolRegistry:
 
     def register_many_strict(self, tools: list[Tool]) -> None:
         """Register a batch only when every id and name is unique."""
+        snapshot = dict(self._tools)
         batch_ids: set[str] = set()
         batch_names: set[str] = set()
         existing_names = {tool.name for tool in self._tools.values()}
@@ -23,8 +24,12 @@ class DefaultToolRegistry:
                 raise ValueError(f"tool collision for id {tool.id!r} or name {tool.name!r}")
             batch_ids.add(tool.id)
             batch_names.add(tool.name)
-        for tool in tools:
-            self.register(tool)
+        try:
+            for tool in tools:
+                self.register(tool)
+        except BaseException:
+            self._tools = snapshot
+            raise
 
     def unregister(self, tool_id: str):
         self._tools.pop(tool_id)

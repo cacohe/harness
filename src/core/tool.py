@@ -1,4 +1,3 @@
-import asyncio
 import json
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
@@ -267,8 +266,8 @@ class ToolExecutor:
         sync_override = type(self).execute_tool_call is not ToolExecutor.execute_tool_call
         async_override = type(self).aexecute_tool_call is not ToolExecutor.aexecute_tool_call
         if sync_override and not async_override:
-            return await asyncio.to_thread(
-                self.execute_tool_call, call, approved=approved, hold=hold
+            return await call_maybe_async(
+                None, self.execute_tool_call, call, approved=approved, hold=hold
             )
         return await self.aexecute_tool_call(call, approved=approved, hold=hold)
 
@@ -324,6 +323,7 @@ class ToolExecutor:
                 approval=decision if decision is not None else None,
                 needs_approval=decision is None,
                 workspace_id=self._workspace_id(tool),
+                approval_scope=tool.approval_scope,
             )
         result = (
             await self._arun_approved(tool, validated)
@@ -335,6 +335,7 @@ class ToolExecutor:
             result.arguments = self._encoded_arguments(validated)
             result.needs_approval = True
             result.workspace_id = self._workspace_id(tool)
+            result.approval_scope = tool.approval_scope
         return result
 
     def execute_held_tool_call(self, held: ToolExecutionResult) -> ToolExecutionResult:
@@ -348,6 +349,14 @@ class ToolExecutor:
         decision = held.approval
         if held.can_run():
             tool = self.find_tool(call.name)
+            if tool is not None and held.approval_scope != tool.approval_scope:
+                result = self._failed(
+                    tool,
+                    ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_APPROVAL_STALE,
+                    output="ApprovalStale: approval belongs to a different tool generation",
+                )
+                result.tool_id = call.id
+                return result
             if tool is not None and held.workspace_id != self._workspace_id(tool):
                 result = self._failed(
                     tool,

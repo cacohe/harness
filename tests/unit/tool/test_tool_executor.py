@@ -1030,3 +1030,65 @@ def test_remote_tool_error_becomes_a_remote_failure_with_structured_output():
     assert result.is_failed()
     assert result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_REMOTE_ERROR
     assert result.output == output
+
+
+def test_approved_remote_call_rejects_a_replacement_tool_generation():
+    called = []
+    registry = DefaultToolRegistry()
+    registry.register(
+        Tool(
+            "remote",
+            "remote",
+            "Remote.",
+            {},
+            lambda inputs: "old",
+            requires_approval=True,
+            approval_scope="generation-old",
+        )
+    )
+    executor = DefaultToolExecutor(registry)
+    held = asyncio.run(executor.aexecute_tool_call(LlmToolCall("call-1", "remote", "{}")))
+    held.approval = ApprovalDecision.APPROVAL_DECISION_APPROVED
+    registry.unregister("remote")
+    registry.register(
+        Tool(
+            "remote",
+            "remote",
+            "Replacement.",
+            {},
+            lambda inputs: called.append(inputs),
+            requires_approval=True,
+            approval_scope="generation-new",
+        )
+    )
+
+    result = asyncio.run(executor.aexecute_held_tool_call(held))
+
+    assert result.is_failed()
+    assert result.fail_reason is (ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_APPROVAL_STALE)
+    assert called == []
+
+
+def test_legacy_super_override_keeps_native_async_tool_on_the_owner_loop():
+    class LegacyExecutor(DefaultToolExecutor):
+        def execute_tool_call(self, call, approved=False, hold=False):
+            return super().execute_tool_call(call, approved=approved, hold=hold)
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        owner_future = loop.create_future()
+        loop.call_later(0.01, owner_future.set_result, "owner-loop")
+
+        async def execute(_inputs):
+            return await owner_future
+
+        registry = DefaultToolRegistry()
+        registry.register(Tool("native", "native", "Native.", {}, execute))
+        executor = LegacyExecutor(registry)
+        result = await executor.aexecute_tool_calls([LlmToolCall("call-1", "native", "{}")])
+        return result.ordered_tools[0]
+
+    result = asyncio.run(scenario())
+
+    assert result.is_completed()
+    assert result.output == "owner-loop"

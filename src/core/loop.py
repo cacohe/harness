@@ -448,8 +448,8 @@ class Harness:
         task: Task,
         cancellation_token: CancellationToken | None = None,
     ) -> None:
-        results = []
-        for item in task.pending_tool_calls:
+        pending = list(task.pending_tool_calls)
+        for index, item in enumerate(pending):
             call = LlmToolCall(item.tool_id, item.tool_name, item.arguments or "")
             if cancellation_token is not None and cancellation_token.is_cancelled():
                 result = self._cancelled_tool_result(item)
@@ -457,15 +457,24 @@ class Harness:
                 if item.can_run():
                     self._emit_tool_event(EventType.TOOL_EXECUTION_RESUMED, task, call)
                 async_method = getattr(self.tool_executor, "aexecute_held_tool_call", None)
+                sync_override = (
+                    type(self.tool_executor).execute_held_tool_call
+                    is not ToolExecutor.execute_held_tool_call
+                )
+                async_override = (
+                    type(self.tool_executor).aexecute_held_tool_call
+                    is not ToolExecutor.aexecute_held_tool_call
+                )
+                if sync_override and not async_override:
+                    async_method = None
                 result = await call_maybe_async(
                     async_method,
                     self.tool_executor.execute_held_tool_call,
                     item,
                 )
             self._emit_tool_result(task, call, result)
-            results.append(result)
-        task.replace_tool_messages([build_tool_message(result) for result in results])
-        task.set_pending_tool_calls([])
+            task.replace_tool_messages([build_tool_message(result)])
+            task.set_pending_tool_calls(pending[index + 1 :])
 
     def _cancel_pending_tool_calls(self, task: Task) -> None:
         results = []
@@ -478,7 +487,7 @@ class Harness:
         task.set_pending_tool_calls([])
 
     def _handle_cancelled(self, task: Task, start_time: float) -> TaskResult:
-        if task.is_paused():
+        if task.pending_tool_calls:
             self._cancel_pending_tool_calls(task)
         result = TaskResult(output="Task cancelled.")
         task.set_progress(task.step_count, time.monotonic() - start_time)

@@ -25,6 +25,7 @@ class FakeClient:
         self.close_error = close_error
         self.entered = False
         self.closed = False
+        self.transport_closed = False
         self.calls = []
         self.result = CallToolResult(content=[TextContent(text="ok")])
         self.call_started = asyncio.Event()
@@ -47,7 +48,10 @@ class FakeClient:
             raise self.list_error
         return list(self.tools)
 
-    async def call_tool(self, name, arguments):
+    async def close(self):
+        self.transport_closed = True
+
+    async def call_tool(self, name, arguments, **_options):
         self.calls.append((name, arguments))
         self.call_started.set()
         if self.block_calls:
@@ -68,6 +72,18 @@ class ClientFactory:
 class FailingRegistrationCatalog(DefaultToolRegistry):
     def register_many_strict(self, tools):
         raise RuntimeError("registration failed")
+
+
+class PartialWriteCatalog(DefaultToolRegistry):
+    def __init__(self):
+        super().__init__()
+        self.fail_registration = False
+
+    def register_many_strict(self, tools):
+        if not self.fail_registration:
+            return super().register_many_strict(tools)
+        self.register(tools[0])
+        raise RuntimeError("registration failed after write")
 
 
 def test_add_server_atomically_registers_and_calls_remote_tools():
@@ -153,6 +169,7 @@ def test_failed_connect_or_list_leaves_no_server_or_tools(client, message):
             await manager.add_server("server", "source")
 
         assert catalog.get_all_tools() == []
+        assert client.transport_closed is True
         with pytest.raises(KeyError):
             await manager.remove_server("server")
 
@@ -172,6 +189,22 @@ def test_failed_registration_closes_candidate_and_leaves_no_server_or_tools():
         assert client.closed is True
         with pytest.raises(KeyError, match="not connected"):
             await manager.remove_server("server")
+
+    asyncio.run(scenario())
+
+
+def test_failed_registration_rolls_back_a_catalog_that_wrote_before_raising():
+    async def scenario():
+        client = FakeClient([_remote("one"), _remote("two")])
+        catalog = PartialWriteCatalog()
+        catalog.fail_registration = True
+        manager = MCPManager(catalog, client_factory=ClientFactory(client))
+
+        with pytest.raises(RuntimeError, match="after write"):
+            await manager.add_server("server", "source")
+
+        assert catalog.get_all_tools() == []
+        assert client.transport_closed is True
 
     asyncio.run(scenario())
 
@@ -209,6 +242,23 @@ def test_refresh_collision_rolls_back_to_the_previous_tools():
 
         assert catalog.find_tool("mcp__server__old") is not None
         assert catalog.find_tool("mcp__server__new").id == "taken"
+
+    asyncio.run(scenario())
+
+
+def test_failed_refresh_registration_removes_partial_new_tools_and_restores_old():
+    async def scenario():
+        client = FakeClient([_remote("old")])
+        catalog = PartialWriteCatalog()
+        manager = MCPManager(catalog, client_factory=ClientFactory(client))
+        await manager.add_server("server", "source")
+        client.tools = [_remote("new-one"), _remote("new-two")]
+        catalog.fail_registration = True
+
+        with pytest.raises(RuntimeError, match="after write"):
+            await manager.refresh_server("server")
+
+        assert [tool.name for tool in catalog.get_all_tools()] == ["mcp__server__old"]
 
     asyncio.run(scenario())
 
@@ -264,9 +314,40 @@ def test_aclose_is_idempotent_and_closes_every_server():
         await manager.aclose()
 
         assert first.closed is second.closed is True
+        assert first.transport_closed is second.transport_closed is True
         assert catalog.get_all_tools() == []
         with pytest.raises(RuntimeError, match="closed"):
             await manager.add_server("third", "three")
+
+    asyncio.run(scenario())
+
+
+def test_aclose_unpublishes_every_server_before_waiting_for_active_calls():
+    async def scenario():
+        first = FakeClient([_remote("one")])
+        first.block_calls = True
+        second = FakeClient([_remote("two")])
+        catalog = DefaultToolRegistry()
+        manager = MCPManager(catalog, client_factory=ClientFactory(first, second))
+        await manager.add_server("first", "one")
+        await manager.add_server("second", "two")
+        first_tool = catalog.find_tool("mcp__first__one")
+        second_tool = catalog.find_tool("mcp__second__two")
+        running = asyncio.create_task(first_tool.executer({}))
+        await first.call_started.wait()
+
+        closing = asyncio.create_task(manager.aclose())
+        await asyncio.sleep(0)
+
+        assert catalog.find_tool("mcp__first__one") is None
+        assert catalog.find_tool("mcp__second__two") is None
+        with pytest.raises(KeyError, match="not connected"):
+            await second_tool.executer({})
+        assert closing.done() is False
+
+        first.call_release.set()
+        await running
+        await closing
 
     asyncio.run(scenario())
 
@@ -298,11 +379,41 @@ def test_remove_waits_for_an_inflight_call_but_rejects_new_calls_immediately():
     asyncio.run(scenario())
 
 
+def test_cancelled_remove_keeps_cleanup_owned_and_aclose_waits_for_it():
+    async def scenario():
+        client = FakeClient([_remote("one")])
+        client.block_calls = True
+        catalog = DefaultToolRegistry()
+        manager = MCPManager(catalog, client_factory=ClientFactory(client))
+        await manager.add_server("server", "source")
+        tool = catalog.find_tool("mcp__server__one")
+        running = asyncio.create_task(tool.executer({}))
+        await client.call_started.wait()
+
+        removing = asyncio.create_task(manager.remove_server("server"))
+        await asyncio.sleep(0)
+        removing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await removing
+
+        closing = asyncio.create_task(manager.aclose())
+        await asyncio.sleep(0)
+        assert closing.done() is False
+        assert client.transport_closed is False
+
+        client.call_release.set()
+        await running
+        await closing
+        assert client.transport_closed is True
+
+    asyncio.run(scenario())
+
+
 def test_transport_failure_becomes_a_safe_remote_error():
     async def scenario():
         client = FakeClient([_remote("one")])
 
-        async def fail(_name, _arguments):
+        async def fail(_name, _arguments, **_options):
             raise RuntimeError("transport offline")
 
         client.call_tool = fail

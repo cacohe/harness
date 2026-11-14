@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -50,7 +51,8 @@ def normalize_mcp_result(result: Any) -> dict[str, Any]:
             "structured_content": structured,
             "is_error": is_error,
         }
-        json.dumps(envelope, ensure_ascii=False)
+        _validate_strict_json(envelope)
+        json.dumps(envelope, ensure_ascii=False, allow_nan=False)
     except Exception as error:
         if isinstance(error, RemoteToolError):
             raise
@@ -58,6 +60,26 @@ def normalize_mcp_result(result: Any) -> dict[str, Any]:
     if is_error:
         raise RemoteToolError(envelope)
     return envelope
+
+
+def _validate_strict_json(value: Any) -> None:
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("MCP results require finite numbers")
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_strict_json(item)
+        return
+    if isinstance(value, dict):
+        if not all(isinstance(key, str) for key in value):
+            raise ValueError("MCP result object keys must be strings")
+        for item in value.values():
+            _validate_strict_json(item)
+        return
+    raise TypeError(f"unsupported MCP JSON value: {type(value).__name__}")
 
 
 def _content_block(block: Any) -> dict[str, Any]:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import uuid
 from collections.abc import Callable, Iterable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -18,7 +20,7 @@ class _ServerState:
     client: Any
     stack: AsyncExitStack
     tools: dict[str, Tool]
-    generation: object
+    generation: str
     active_calls: int = 0
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     closing: bool = False
@@ -37,9 +39,10 @@ class MCPManager:
         self._client_factory = client_factory
         self._servers: dict[str, _ServerState] = {}
         self._closing_names: set[str] = set()
+        self._cleanup_tasks: set[asyncio.Task[None]] = set()
         self._lifecycle_lock = asyncio.Lock()
         self._closed = False
-        self._close_future: asyncio.Future[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
 
     @property
     def catalog(self) -> ToolCatalog:
@@ -56,14 +59,17 @@ class MCPManager:
 
             stack = AsyncExitStack()
             await stack.__aenter__()
-            registered_ids: list[str] = []
+            registration_started = False
+            tools: dict[str, Tool] = {}
             try:
                 candidate = self._client_factory(self._client_source(name, source), **options)
+                stack.push_async_callback(self._close_client, candidate)
                 client = await stack.enter_async_context(candidate)
-                generation = object()
+                generation = uuid.uuid4().hex
                 tools = self._build_tools(name, await client.list_tools(), generation)
                 self._preflight_tools(tools.values())
-                registered_ids = self._register_tools(tools.values())
+                registration_started = True
+                self._register_tools(tools.values())
                 self._servers[name] = _ServerState(
                     client=client,
                     stack=stack,
@@ -71,8 +77,8 @@ class MCPManager:
                     generation=generation,
                 )
             except BaseException:
-                for tool_id in registered_ids:
-                    self._catalog.unregister(tool_id)
+                if registration_started:
+                    self._unregister_tools(tools)
                 await stack.aclose()
                 raise
 
@@ -83,75 +89,52 @@ class MCPManager:
             if state is None or state.closing:
                 raise KeyError(f"MCP server {name!r} is not connected")
 
-            generation = object()
+            generation = uuid.uuid4().hex
             tools = self._build_tools(name, await state.client.list_tools(), generation)
             old_tools = list(state.tools.values())
             old_ids = {tool.id for tool in old_tools}
             self._preflight_tools(tools.values(), ignored_ids=old_ids)
 
-            for tool_id in old_ids:
-                self._catalog.unregister(tool_id)
-            registered_ids: list[str] = []
+            self._unregister_tools(old_ids)
             try:
-                registered_ids = self._register_tools(tools.values())
-            except BaseException:
-                for tool_id in registered_ids:
-                    self._catalog.unregister(tool_id)
-                self._register_tools(old_tools)
+                self._register_tools(tools.values())
+            except BaseException as registration_error:
+                self._unregister_tools(tools)
+                try:
+                    for tool in old_tools:
+                        self._catalog.register(tool)
+                except BaseException as restore_error:
+                    raise BaseExceptionGroup(
+                        "MCP refresh registration and rollback both failed",
+                        [registration_error, restore_error],
+                    ) from registration_error
                 raise
             state.tools = tools
             state.generation = generation
 
     async def remove_server(self, name: str) -> None:
-        """Unpublish a server, drain active calls, and close its transport."""
+        """Unpublish a server and wait for its owned cleanup task."""
         async with self._lifecycle_lock:
             state = self._servers.pop(name, None)
             if state is None:
                 raise KeyError(f"MCP server {name!r} is not connected")
-            state.closing = True
-            self._closing_names.add(name)
-            for tool_id in state.tools:
-                self._catalog.unregister(tool_id)
-
-        try:
-            async with state.condition:
-                await state.condition.wait_for(lambda: state.active_calls == 0)
-            await state.stack.aclose()
-        finally:
-            async with self._lifecycle_lock:
-                self._closing_names.discard(name)
+            cleanup = self._start_cleanup_locked(name, state)
+        await asyncio.shield(cleanup)
 
     async def aclose(self) -> None:
-        """Close every server exactly once, waiting for concurrent close calls."""
-        owner = False
+        """Atomically unpublish all servers, then drain every owned cleanup task."""
         async with self._lifecycle_lock:
-            if self._close_future is None:
+            if self._close_task is None:
                 self._closed = True
-                self._close_future = asyncio.get_running_loop().create_future()
-                server_names = list(self._servers)
-                owner = True
-            else:
-                server_names = []
-            close_future = self._close_future
-
-        if owner:
-            errors: list[BaseException] = []
-            for server_name in server_names:
-                try:
-                    await self.remove_server(server_name)
-                except BaseException as error:
-                    errors.append(error)
-            if errors:
-                failure: BaseException
-                if len(errors) == 1:
-                    failure = errors[0]
-                else:
-                    failure = BaseExceptionGroup("failed to close MCP servers", errors)
-                close_future.set_exception(failure)
-            else:
-                close_future.set_result(None)
-
-        await asyncio.shield(close_future)
+                for name, state in list(self._servers.items()):
+                    self._servers.pop(name)
+                    self._start_cleanup_locked(name, state)
+                cleanups = list(self._cleanup_tasks)
+                self._close_task = asyncio.create_task(
+                    self._finish_close(cleanups), name="mcp-manager-close"
+                )
+            close_task = self._close_task
+        await asyncio.shield(close_task)
 
     async def __aenter__(self) -> MCPManager:
         if self._closed:
@@ -178,20 +161,64 @@ class MCPManager:
         """Call a tool returned by this manager."""
         return await tool.executer(arguments)
 
+    def _start_cleanup_locked(self, name: str, state: _ServerState) -> asyncio.Task[None]:
+        state.closing = True
+        self._closing_names.add(name)
+        self._unregister_tools(state.tools)
+        task = asyncio.create_task(self._drain_and_close(name, state), name=f"mcp-close-{name}")
+        task.add_done_callback(self._consume_cleanup_result)
+        self._cleanup_tasks.add(task)
+        return task
+
+    async def _drain_and_close(self, name: str, state: _ServerState) -> None:
+        try:
+            async with state.condition:
+                await state.condition.wait_for(lambda: state.active_calls == 0)
+            await state.stack.aclose()
+        finally:
+            async with self._lifecycle_lock:
+                self._closing_names.discard(name)
+
+    async def _finish_close(self, cleanups: list[asyncio.Task[None]]) -> None:
+        results = await asyncio.gather(*cleanups, return_exceptions=True)
+        async with self._lifecycle_lock:
+            self._cleanup_tasks.difference_update(cleanups)
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if not errors:
+            return
+        if len(errors) == 1:
+            raise errors[0]
+        raise BaseExceptionGroup("failed to close MCP servers", errors)
+
+    @staticmethod
+    def _consume_cleanup_result(task: asyncio.Task[None]) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    @staticmethod
+    async def _close_client(client: Any) -> None:
+        close = getattr(client, "close", None)
+        if close is None:
+            return
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+
     def _build_tools(
-        self, server_name: str, remote_tools: Iterable[Any], generation: object
+        self, server_name: str, remote_tools: Iterable[Any], generation: str
     ) -> dict[str, Tool]:
         tools: dict[str, Tool] = {}
         invoke = self._make_invoker(server_name, generation)
         for remote_tool in remote_tools:
             tool = make_mcp_tool(server_name, remote_tool, invoke)
+            tool.approval_scope = f"mcp:{generation}:{tool.id}"
             if tool.id in tools or any(existing.name == tool.name for existing in tools.values()):
                 raise ValueError(f"tool collision for id {tool.id!r} or name {tool.name!r}")
             tools[tool.id] = tool
         return tools
 
     def _make_invoker(
-        self, server_name: str, generation: object
+        self, server_name: str, generation: str
     ) -> Callable[[str, dict[str, Any]], Any]:
         async def invoke(remote_name: str, arguments: dict[str, Any]) -> Any:
             return await self._invoke(server_name, generation, remote_name, arguments)
@@ -201,18 +228,18 @@ class MCPManager:
     async def _invoke(
         self,
         server_name: str,
-        generation: object,
+        generation: str,
         remote_name: str,
         arguments: dict[str, Any],
     ) -> Any:
         async with self._lifecycle_lock:
             state = self._servers.get(server_name)
-            if state is None or state.closing or state.generation is not generation:
+            if state is None or state.closing or state.generation != generation:
                 raise KeyError(f"MCP server {server_name!r} is not connected")
             state.active_calls += 1
 
         try:
-            return await state.client.call_tool(remote_name, arguments)
+            return await state.client.call_tool(remote_name, arguments, raise_on_error=False)
         except RemoteToolError:
             raise
         except Exception as error:
@@ -250,22 +277,25 @@ class MCPManager:
             batch_ids.add(tool.id)
             batch_names.add(tool.name)
 
-    def _register_tools(self, tools: Iterable[Tool]) -> list[str]:
+    def _register_tools(self, tools: Iterable[Tool]) -> None:
         batch = list(tools)
         strict_register = getattr(self._catalog, "register_many_strict", None)
-        if strict_register is not None:
-            strict_register(batch)
-            return [tool.id for tool in batch]
-        registered: list[str] = []
         try:
-            for tool in batch:
-                self._catalog.register(tool)
-                registered.append(tool.id)
+            if strict_register is not None:
+                strict_register(batch)
+            else:
+                for tool in batch:
+                    self._catalog.register(tool)
         except BaseException:
-            for tool_id in registered:
-                self._catalog.unregister(tool_id)
+            self._unregister_tools(tool.id for tool in batch)
             raise
-        return registered
+
+    def _unregister_tools(self, tools: Iterable[str] | dict[str, Tool]) -> None:
+        for tool_id in tools:
+            try:
+                self._catalog.unregister(tool_id)
+            except KeyError:
+                pass
 
     @staticmethod
     def _validate_name(name: str) -> None:

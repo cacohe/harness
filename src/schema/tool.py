@@ -40,6 +40,7 @@ class Tool:
     workspace: Workspace | None = None
     origin: ToolOrigin = ToolOrigin.CUSTOM
     requires_approval: bool = False
+    approval_scope: str | None = None
 
 
 class ToolExecution(BaseModel):
@@ -77,6 +78,7 @@ class ToolExecutionFailReason(Enum):
     TOOL_EXECUTION_FAIL_REASON_WORKSPACE_VIOLATION = "workspace_violation"
     TOOL_EXECUTION_FAIL_REASON_SANDBOX_REQUIRED = "sandbox_required"
     TOOL_EXECUTION_FAIL_REASON_REMOTE_ERROR = "remote_error"
+    TOOL_EXECUTION_FAIL_REASON_APPROVAL_STALE = "approval_stale"
 
 
 class ToolExecutionResult(BaseModel):
@@ -89,6 +91,7 @@ class ToolExecutionResult(BaseModel):
     approval: ApprovalDecision | None = None
     needs_approval: bool = False
     workspace_id: str | None = None
+    approval_scope: str | None = None
 
     def can_run(self) -> bool:
         if self.approval in {

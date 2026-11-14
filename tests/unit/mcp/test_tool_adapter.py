@@ -1,4 +1,5 @@
 import asyncio
+import math
 import re
 
 import pytest
@@ -92,6 +93,24 @@ def test_normalize_mcp_result_rejects_non_json_data_with_a_safe_error(result):
     assert caught.value.output["is_error"] is True
     assert caught.value.output["content"] == []
     assert isinstance(caught.value.output["structured_content"]["error"], str)
+
+
+@pytest.mark.parametrize(
+    "structured",
+    [
+        {"value": math.nan},
+        {1: "non-string key"},
+        ("tuple",),
+    ],
+)
+def test_normalize_mcp_result_rejects_values_strict_json_would_change(structured):
+    result = CallToolResult(content=[], structuredContent=structured)
+
+    with pytest.raises(RemoteToolError) as caught:
+        normalize_mcp_result(result)
+
+    assert caught.value.output["is_error"] is True
+    assert "Invalid MCP result" in caught.value.output["structured_content"]["error"]
 
 
 def test_make_mcp_tool_requires_approval_and_normalizes_the_invocation_result():

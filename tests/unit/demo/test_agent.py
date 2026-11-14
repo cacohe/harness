@@ -213,6 +213,7 @@ def test_injected_executor_catalog_becomes_authoritative():
     assert agent.tool_registry is catalog
     assert agent.tool_executor is executor
     assert agent.mcp_manager.catalog is catalog
+    assert catalog.get_all_tools() == []
 
 
 def test_matching_catalog_executor_and_manager_are_reused():
