@@ -1,3 +1,6 @@
+import inspect
+
+from src.core.async_utils import call_maybe_async
 from src.core.tool import (
     ApprovalPolicy,
     SandboxRunner,
@@ -13,6 +16,10 @@ class LocalToolRunner:
 
     def run(self, tool: Tool, inputs: dict):
         return tool.executer(inputs)
+
+    async def arun(self, tool: Tool, inputs: dict):
+        async_callable = tool.executer if inspect.iscoroutinefunction(tool.executer) else None
+        return await call_maybe_async(async_callable, tool.executer, inputs)
 
 
 class DefaultApprovalPolicy:

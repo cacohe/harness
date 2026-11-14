@@ -3,6 +3,7 @@ from src.core.context import ContextBuilder
 from src.core.guard import HarnessGuard
 from src.core.llm import AsyncLlmGateway, LlmGateway
 from src.core.memory import MemoryRetriever, MemoryStore
+from src.core.tool import AsyncToolRunner
 
 
 class DuckContextBuilder:
@@ -41,6 +42,10 @@ class DuckEventSink:
     def emit(self, event, channel=None): ...
 
 
+class DuckAsyncToolRunner:
+    async def arun(self, tool, inputs): ...
+
+
 def test_core_ports_accept_structural_implementations():
     assert isinstance(DuckContextBuilder(), ContextBuilder)
     assert isinstance(DuckLlmGateway(), LlmGateway)
@@ -48,6 +53,7 @@ def test_core_ports_accept_structural_implementations():
     assert isinstance(DuckGuard(), HarnessGuard)
     assert isinstance(DuckMemoryStore(), MemoryStore)
     assert isinstance(DuckMemoryRetriever(), MemoryRetriever)
+    assert isinstance(DuckAsyncToolRunner(), AsyncToolRunner)
 
 
 def test_event_sink_accepts_structural_implementation():

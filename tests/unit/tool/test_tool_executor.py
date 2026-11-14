@@ -1,3 +1,7 @@
+import asyncio
+import threading
+import time
+
 import pytest
 from src.core import tool as core_tool
 from src.core.context import build_tool_messages
@@ -782,3 +786,149 @@ def test_read_only_tools_run_without_approval(name):
 
     assert result.pending_tools == []
     assert result.completed_tools[0].output == "ran"
+
+
+def test_async_executor_awaits_a_native_async_runner():
+    class AsyncRunner:
+        async def arun(self, tool, inputs):
+            await asyncio.sleep(0)
+            return {"tool": tool.name, "inputs": inputs}
+
+        def run(self, tool, inputs):
+            raise AssertionError("native async runner must be preferred")
+
+    tool = Tool("read", "read", "Read.", {}, lambda inputs: "unused")
+    executor = _executor_for_tool(tool, runner=AsyncRunner())
+
+    result = asyncio.run(
+        executor.aexecute_tool_call(
+            LlmToolCall(id="call-1", name="read", arguments='{"path":"a"}')
+        )
+    )
+
+    assert result.is_completed()
+    assert result.output == {"tool": "read", "inputs": {"path": "a"}}
+
+
+def test_async_executor_classifies_a_native_async_runner_error():
+    class AsyncRunner:
+        async def arun(self, tool, inputs):
+            raise RuntimeError("remote failed")
+
+        def run(self, tool, inputs):
+            raise AssertionError("native async runner must be preferred")
+
+    tool = Tool("read", "read", "Read.", {}, lambda inputs: "unused")
+    executor = _executor_for_tool(tool, runner=AsyncRunner())
+
+    result = asyncio.run(
+        executor.aexecute_tool_call(LlmToolCall(id="call-1", name="read", arguments="{}"))
+    )
+
+    assert result.is_failed()
+    assert result.output == "RuntimeError: remote failed"
+
+
+def test_async_executor_offloads_a_legacy_runner_without_blocking_the_loop():
+    caller_thread = threading.get_ident()
+    ticks: list[str] = []
+
+    class BlockingRunner:
+        def run(self, tool, inputs):
+            time.sleep(0.05)
+            return threading.get_ident()
+
+    tool = Tool("read", "read", "Read.", {}, lambda inputs: "unused")
+    executor = _executor_for_tool(tool, runner=BlockingRunner())
+
+    async def scenario():
+        call = asyncio.create_task(
+            executor.aexecute_tool_call(LlmToolCall(id="call-1", name="read", arguments="{}"))
+        )
+        await asyncio.sleep(0.01)
+        ticks.append("tick")
+        return await call
+
+    result = asyncio.run(scenario())
+
+    assert ticks == ["tick"]
+    assert result.output != caller_thread
+
+
+def test_local_tool_runner_awaits_an_async_tool_callable():
+    async def execute(inputs):
+        await asyncio.sleep(0)
+        return inputs["value"] * 2
+
+    executor = _executor(execute, "double")
+
+    result = asyncio.run(
+        executor.aexecute_tool_call(
+            LlmToolCall(id="call-1", name="double", arguments='{"value":3}')
+        )
+    )
+
+    assert result.output == 6
+
+
+def test_async_tool_batch_preserves_order_and_cancels_calls_after_the_boundary():
+    cancelled = False
+    calls: list[str] = []
+
+    async def execute(inputs):
+        nonlocal cancelled
+        calls.append(inputs["name"])
+        cancelled = True
+        return inputs["name"]
+
+    executor = _executor(execute, "first", "second")
+
+    result = asyncio.run(
+        executor.aexecute_tool_calls(
+            [
+                LlmToolCall("call-1", "first", '{"name":"first"}'),
+                LlmToolCall("call-2", "second", '{"name":"second"}'),
+            ],
+            should_cancel=lambda: cancelled,
+        )
+    )
+
+    assert calls == ["first"]
+    assert [item.tool_id for item in result.ordered_tools] == ["call-1", "call-2"]
+    assert result.failed_tools[0].fail_reason is (
+        ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_CANCELLED
+    )
+
+
+def test_async_held_tool_call_resumes_after_approval():
+    executor = _executor(lambda inputs: "ran", "shell")
+    held = asyncio.run(
+        executor.aexecute_tool_call(
+            LlmToolCall("call-1", "shell", '{"command":"status"}')
+        )
+    )
+    held.approval = ApprovalDecision.APPROVAL_DECISION_APPROVED
+
+    result = asyncio.run(executor.aexecute_held_tool_call(held))
+
+    assert result.is_completed()
+    assert result.output == "ran"
+
+
+def test_sync_tool_wrapper_rejects_an_active_event_loop_before_execution():
+    called = False
+
+    def execute(inputs):
+        nonlocal called
+        called = True
+        return "ran"
+
+    executor = _executor(execute)
+
+    async def scenario():
+        with pytest.raises(RuntimeError, match="await aexecute_tool_call"):
+            executor.execute_tool_call(LlmToolCall("call-1", "read_file", "{}"))
+
+    asyncio.run(scenario())
+
+    assert called is False
