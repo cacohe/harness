@@ -1,7 +1,7 @@
 from src.core import event as core_event
 from src.core.context import ContextBuilder
 from src.core.guard import HarnessGuard
-from src.core.llm import LlmGateway
+from src.core.llm import AsyncLlmGateway, LlmGateway
 from src.core.memory import MemoryRetriever, MemoryStore
 
 
@@ -14,6 +14,11 @@ class DuckContextBuilder:
 class DuckLlmGateway:
     def planning(self, context, stream=True, response_format=None): ...
     def infer(self, context, stream=True, response_format=None): ...
+
+
+class DuckAsyncLlmGateway:
+    async def aplanning(self, context, stream=True, response_format=None): ...
+    async def ainfer(self, context, stream=True, response_format=None): ...
 
 
 class DuckGuard:
@@ -39,6 +44,7 @@ class DuckEventSink:
 def test_core_ports_accept_structural_implementations():
     assert isinstance(DuckContextBuilder(), ContextBuilder)
     assert isinstance(DuckLlmGateway(), LlmGateway)
+    assert isinstance(DuckAsyncLlmGateway(), AsyncLlmGateway)
     assert isinstance(DuckGuard(), HarnessGuard)
     assert isinstance(DuckMemoryStore(), MemoryStore)
     assert isinstance(DuckMemoryRetriever(), MemoryRetriever)

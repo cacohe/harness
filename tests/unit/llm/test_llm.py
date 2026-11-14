@@ -1,3 +1,5 @@
+import asyncio
+
 from pydantic import BaseModel
 from src.llm.litellm import LiteLLMGateway
 from src.schema.context import Context, Message
@@ -261,3 +263,123 @@ def test_infer_preserves_raw_provider_message_fields(monkeypatch):
     LiteLLMGateway("m").infer(Context(messages=[raw_message]), stream=False)
 
     assert seen["messages"] == [raw_message]
+
+
+def test_ainfer_uses_native_async_completion_and_preserves_complete_output(monkeypatch):
+    class Function:
+        name = "get_weather"
+        arguments = '{"city": "Beijing"}'
+
+    class Call:
+        id = "call_1"
+        function = Function()
+
+    class Message:
+        content = "Checking."
+        tool_calls = [Call()]
+        reasoning_content = "reason"
+        thinking_blocks = None
+
+    class Choice:
+        message = Message()
+        finish_reason = "tool_calls"
+
+    class Usage:
+        prompt_tokens = 4
+        completion_tokens = 2
+        total_tokens = 6
+
+    class Response:
+        choices = [Choice()]
+        usage = Usage()
+
+    async def fake_acompletion(**kwargs):
+        assert kwargs["stream"] is False
+        return Response()
+
+    def fail_sync_completion(**_kwargs):
+        raise AssertionError("async inference must not call litellm.completion")
+
+    monkeypatch.setattr("src.llm.litellm.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("src.llm.litellm.litellm.completion", fail_sync_completion)
+
+    output = asyncio.run(LiteLLMGateway("m").ainfer(_context(), stream=False))
+
+    assert output.content == "Checking."
+    assert output.finish_reason is FinishReason.TOOL_CALLS
+    assert output.tool_calls == [LlmToolCall("call_1", "get_weather", '{"city": "Beijing"}')]
+    assert output.reasoning_content == "reason"
+    assert output.usage.total_tokens == 6
+
+
+def test_ainfer_stream_yields_deltas_and_usage_from_async_completion(monkeypatch):
+    class Delta:
+        content = "Hi"
+        tool_calls = None
+        reasoning_content = None
+        thinking_blocks = None
+
+    class Choice:
+        delta = Delta()
+        finish_reason = "stop"
+
+    class Usage:
+        prompt_tokens = 1
+        completion_tokens = 1
+        total_tokens = 2
+
+    class Chunk:
+        def __init__(self, choices, usage):
+            self.choices = choices
+            self.usage = usage
+
+    async def response():
+        yield Chunk([Choice()], None)
+        yield Chunk([], Usage())
+
+    async def fake_acompletion(**kwargs):
+        assert kwargs["stream"] is True
+        return response()
+
+    monkeypatch.setattr("src.llm.litellm.litellm.acompletion", fake_acompletion)
+
+    async def scenario():
+        produced = await LiteLLMGateway("m").ainfer(_context(), stream=True)
+        return [piece async for piece in produced]
+
+    pieces = asyncio.run(scenario())
+
+    assert pieces[0].content == "Hi"
+    assert pieces[0].finish_reason is FinishReason.STOP
+    assert pieces[1].usage.total_tokens == 2
+
+
+def test_aplanning_delegates_to_native_async_inference(monkeypatch):
+    class Message:
+        content = '{"city": "Beijing"}'
+        tool_calls = None
+        reasoning_content = None
+        thinking_blocks = None
+
+    class Choice:
+        message = Message()
+        finish_reason = "stop"
+
+    class Response:
+        choices = [Choice()]
+        usage = None
+
+    class Weather(BaseModel):
+        city: str
+
+    async def fake_acompletion(**kwargs):
+        assert kwargs["response_format"] is Weather
+        return Response()
+
+    monkeypatch.setattr("src.llm.litellm.litellm.acompletion", fake_acompletion)
+
+    output = asyncio.run(
+        LiteLLMGateway("m").aplanning(_context(), stream=False, response_format=Weather)
+    )
+
+    assert output.structured == Weather(city="Beijing")

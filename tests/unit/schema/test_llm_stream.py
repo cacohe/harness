@@ -1,5 +1,14 @@
+import asyncio
+
 import pytest
-from src.schema.llm import FinishReason, LLMOutput, LlmToolCall, LlmUsage, assemble_llm_stream
+from src.schema.llm import (
+    FinishReason,
+    LLMOutput,
+    LlmToolCall,
+    LlmUsage,
+    assemble_llm_async_stream,
+    assemble_llm_stream,
+)
 
 
 def _piece(
@@ -99,3 +108,31 @@ def test_assemble_llm_stream_returns_an_empty_output_for_no_pieces():
 def test_assemble_llm_stream_rejects_a_non_output_piece():
     with pytest.raises(TypeError, match="infer did not return a model output"):
         assemble_llm_stream(["hel"])
+
+
+def test_async_stream_assembly_matches_sync_stream_for_text_tools_and_usage():
+    usage = LlmUsage(2, 3, 5)
+    pieces = [
+        _piece("hel", tool_calls=[LlmToolCall("call_1", "", '{"x":')]),
+        _piece("lo", tool_calls=[LlmToolCall("", "shell", "1}")]),
+        _piece(finish_reason=FinishReason.TOOL_CALLS, usage=usage),
+    ]
+
+    async def async_pieces():
+        for piece in pieces:
+            yield piece
+
+    async_output, async_parts = asyncio.run(assemble_llm_async_stream(async_pieces()))
+    sync_output, sync_parts = assemble_llm_stream(pieces)
+
+    assert async_output == sync_output
+    assert async_parts == sync_parts == ["hel", "lo"]
+
+
+def test_async_stream_assembly_accepts_a_sync_iterator_without_blocking_contract_changes():
+    pieces = iter([_piece("done", finish_reason=FinishReason.STOP)])
+
+    output, parts = asyncio.run(assemble_llm_async_stream(pieces))
+
+    assert output.content == "done"
+    assert parts == ["done"]

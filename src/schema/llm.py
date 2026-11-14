@@ -1,8 +1,10 @@
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable, Iterator
 from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+from src.core.async_utils import iterate_maybe_async
 
 ROLE_SYSTEM = "system"
 ROLE_USER = "user"
@@ -271,6 +273,14 @@ def assemble_llm_stream(pieces: Iterable[LLMOutput]) -> tuple[LLMOutput, list[st
         structured,
     )
     return output, text
+
+
+async def assemble_llm_async_stream(
+    pieces: AsyncIterator[LLMOutput] | Iterator[LLMOutput],
+) -> tuple[LLMOutput, list[str]]:
+    """Fold synchronous or asynchronous streamed model pieces into one output."""
+    collected = [piece async for piece in iterate_maybe_async(pieces)]
+    return assemble_llm_stream(collected)
 
 
 def _merge_tool_calls(calls: list[LlmToolCall], deltas: list[LlmToolCall]) -> None:

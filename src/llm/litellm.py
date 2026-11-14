@@ -1,9 +1,11 @@
 import json
-from typing import Any, Iterator
+from collections.abc import AsyncIterator, Iterator
+from typing import Any
 
 import litellm
 from pydantic import BaseModel
 
+from src.core.async_utils import iterate_maybe_async
 from src.schema.context import Context
 from src.schema.llm import ROLE_TOOL, FinishReason, LLMOutput, LlmToolCall, LlmUsage
 from src.schema.tool import Tool
@@ -128,6 +130,33 @@ class LiteLLMGateway:
         """
         return self.infer(context, stream=stream, response_format=response_format)
 
+    async def aplanning(
+        self,
+        context: Context,
+        stream: bool = True,
+        response_format: type[BaseModel] | dict[str, Any] | None = None,
+    ) -> LLMOutput | AsyncIterator[LLMOutput]:
+        """Plan one task through LiteLLM's native asynchronous API."""
+        return await self.ainfer(context, stream=stream, response_format=response_format)
+
+    async def ainfer(
+        self,
+        context: Context,
+        stream: bool = True,
+        response_format: type[BaseModel] | dict[str, Any] | None = None,
+    ) -> LLMOutput | AsyncIterator[LLMOutput]:
+        """Run one LLM call through LiteLLM's native asynchronous API."""
+        messages, options = self._request(context, stream, response_format)
+        response = await litellm.acompletion(
+            model=self.model,
+            messages=messages,
+            stream=stream,
+            **options,
+        )
+        if stream:
+            return self._astream(response, response_format)
+        return self._complete_output(response, response_format)
+
     def infer(
         self,
         context: Context,
@@ -150,6 +179,24 @@ class LiteLLMGateway:
             A stream yields the same fields as each piece arrives. The parsed structure
             arrives on the piece that carries the finish reason.
         """
+        messages, options = self._request(context, stream, response_format)
+
+        response = litellm.completion(
+            model=self.model,
+            messages=messages,
+            stream=stream,
+            **options,
+        )
+        if stream:
+            return self._stream(response, response_format)
+        return self._complete_output(response, response_format)
+
+    def _request(
+        self,
+        context: Context,
+        stream: bool,
+        response_format: type[BaseModel] | dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         messages, wire_format = _completion_request(
             self.model, self.api_base, self._messages(context), response_format
         )
@@ -168,15 +215,13 @@ class LiteLLMGateway:
             stream_options = dict(options.get("stream_options") or {})
             stream_options.setdefault("include_usage", True)
             options["stream_options"] = stream_options
+        return messages, options
 
-        response = litellm.completion(
-            model=self.model,
-            messages=messages,
-            stream=stream,
-            **options,
-        )
-        if stream:
-            return self._stream(response, response_format)
+    def _complete_output(
+        self,
+        response: Any,
+        response_format: type[BaseModel] | dict[str, Any] | None,
+    ) -> LLMOutput:
         choice = response.choices[0]
         output = self._output(
             choice.message,
@@ -291,6 +336,33 @@ class LiteLLMGateway:
         """
         text_parts: list[str] = []
         for chunk in response:
+            usage = self._usage(getattr(chunk, "usage", None))
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                if usage is not None:
+                    yield LLMOutput(None, None, [], None, None, usage=usage)
+                continue
+            choice = choices[0]
+            output = self._output(
+                getattr(choice, "delta", None),
+                self._finish_reason(getattr(choice, "finish_reason", None)),
+                usage,
+            )
+            if output.content:
+                text_parts.append(output.content)
+            if response_format is not None and output.finish_reason is not None:
+                output.structured = self._structured("".join(text_parts), response_format)
+            if self._has_payload(output):
+                yield output
+
+    async def _astream(
+        self,
+        response: Any,
+        response_format: type[BaseModel] | dict[str, Any] | None = None,
+    ) -> AsyncIterator[LLMOutput]:
+        """Yield each streamed piece from a native async LiteLLM response."""
+        text_parts: list[str] = []
+        async for chunk in iterate_maybe_async(response):
             usage = self._usage(getattr(chunk, "usage", None))
             choices = getattr(chunk, "choices", None) or []
             if not choices:
