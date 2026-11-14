@@ -43,15 +43,32 @@ class AgentSession:
         self._ensure_open = ensure_open
         self.transcript: list[tuple[str, str]] = []
         self.pending_run: TaskRun | None = None
+        self._pending_message_hint: str | None = None
         self._operation_lock = threading.Lock()
 
     @property
     def pending_task(self) -> Task | None:
         return self.pending_run.task if self.pending_run is not None else None
 
+    @pending_task.setter
+    def pending_task(self, task: Task | None) -> None:
+        if task is None:
+            self.pending_run = None
+            self._pending_message_hint = None
+            return
+        self.pending_run = TaskRun(task=task, message=self._pending_message_hint or "")
+
     @property
     def pending_message(self) -> str | None:
-        return self.pending_run.message if self.pending_run is not None else None
+        if self.pending_run is not None:
+            return self.pending_run.message
+        return self._pending_message_hint
+
+    @pending_message.setter
+    def pending_message(self, message: str | None) -> None:
+        self._pending_message_hint = message
+        if self.pending_run is not None:
+            self.pending_run.message = message or ""
 
     def chat(
         self,
@@ -76,6 +93,7 @@ class AgentSession:
             await self.harness.arun(task, cancellation_token=cancellation_token)
             if task.is_paused():
                 self.pending_run = TaskRun(task=task, message=message)
+                self._pending_message_hint = None
             else:
                 self._remember(message, task)
             return task
@@ -117,6 +135,7 @@ class AgentSession:
         finally:
             if run is not None and not run.task.is_paused():
                 self.pending_run = None
+                self._pending_message_hint = None
             self._operation_lock.release()
 
     def _begin_operation(self) -> None:

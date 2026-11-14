@@ -3,7 +3,6 @@ from pathlib import Path
 
 from src.config import Config
 from src.context.context_builder import DefaultContextBuilder
-from src.core.async_utils import run_sync
 from src.core.cancellation import CancellationToken
 from src.core.context import ContextBuilder
 from src.core.guard import NoOpGuard
@@ -14,6 +13,7 @@ from src.core.persistence import TaskRepository
 from src.core.task import Task
 from src.core.tool import SandboxRunner, ToolCatalog, ToolExecutor
 from src.core.workspace import Workspace
+from src.demo.session import AgentSession
 from src.llm.litellm import LiteLLMGateway
 from src.mcp import MCPManager
 from src.persistence.in_memory import InMemoryTaskRepository
@@ -55,7 +55,6 @@ class Agent:
             skill_directories: Directories containing SKILL.md and optional resources.
         """
         self.config = config if config is not None else Config.load()
-        self.transcript: list[tuple[str, str]] = []
         self.workspace = (
             workspace
             if isinstance(workspace, Workspace)
@@ -106,8 +105,6 @@ class Agent:
         self.task_repository = (
             task_repository if task_repository is not None else InMemoryTaskRepository()
         )
-        self.pending_task: Task | None = None
-        self.pending_message: str | None = None
         self.harness = Harness(
             SYSTEM_PROMPT,
             self.llm_gateway,
@@ -120,6 +117,7 @@ class Agent:
             max_steps=self.config.max_steps,
             max_seconds=self.config.max_seconds,
         )
+        self._default_session = self.new_session()
 
     @classmethod
     def from_config(cls, config: Config, **dependencies) -> "Agent":
@@ -131,10 +129,7 @@ class Agent:
         message: str,
         cancellation_token: CancellationToken | None = None,
     ) -> Task:
-        return run_sync(
-            lambda: self.achat(message, cancellation_token=cancellation_token),
-            async_name="achat",
-        )
+        return self._default_session.chat(message, cancellation_token=cancellation_token)
 
     async def achat(
         self,
@@ -149,17 +144,7 @@ class Agent:
         Returns:
             The task after planning and execution. A failed turn is not remembered.
         """
-        self._ensure_open()
-        task = Task(original_input=self._with_transcript(message))
-        await self.harness.arun(task, cancellation_token=cancellation_token)
-        if task.is_paused():
-            self.pending_task = task
-            self.pending_message = message
-            return task
-        self.pending_task = None
-        self.pending_message = None
-        self._remember(message, task)
-        return task
+        return await self._default_session.achat(message, cancellation_token=cancellation_token)
 
     def approval_requests(self) -> list[ToolExecutionResult]:
         """
@@ -167,9 +152,7 @@ class Agent:
         Returns:
             Undecided calls in call order. Empty when no task is paused.
         """
-        if self.pending_task is None:
-            return []
-        return self.pending_task.approval_requests()
+        return self._default_session.approval_requests()
 
     def decide_tool_call(self, tool_id: str, approved: bool) -> None:
         """
@@ -180,17 +163,10 @@ class Agent:
         Raises:
             ValueError: No task is waiting for approval.
         """
-        self._ensure_open()
-        if self.pending_task is None:
-            raise ValueError("nothing is waiting for approval")
-        self.pending_task.decide_tool_call(tool_id, approved)
-        self.task_repository.save(self.pending_task)
+        self._default_session.decide_tool_call(tool_id, approved)
 
     def resume(self, cancellation_token: CancellationToken | None = None) -> Task:
-        return run_sync(
-            lambda: self.aresume(cancellation_token=cancellation_token),
-            async_name="aresume",
-        )
+        return self._default_session.resume(cancellation_token=cancellation_token)
 
     async def aresume(self, cancellation_token: CancellationToken | None = None) -> Task:
         """
@@ -202,20 +178,12 @@ class Agent:
         Raises:
             ValueError: No task is waiting for approval.
         """
+        return await self._default_session.aresume(cancellation_token=cancellation_token)
+
+    def new_session(self) -> AgentSession:
+        """Create an isolated conversation sharing this Agent's runtime dependencies."""
         self._ensure_open()
-        task = self.pending_task
-        if task is None:
-            raise ValueError("nothing is waiting for approval")
-        message = self.pending_message or ""
-        try:
-            await self.harness.arun(task, cancellation_token=cancellation_token)
-        finally:
-            if not task.is_paused():
-                self.pending_task = None
-                self.pending_message = None
-        if not task.is_paused():
-            self._remember(message, task)
-        return task
+        return AgentSession(self.harness, self.task_repository, self._ensure_open)
 
     async def add_mcp_server(self, name: str, source, **options) -> None:
         """Connect an MCP server and publish its tools."""
@@ -250,16 +218,25 @@ class Agent:
         if self._closed:
             raise RuntimeError("Agent is closed")
 
-    def _remember(self, message: str, task: Task) -> None:
-        if task.is_completed() and task.result is not None:
-            self.transcript.append(("user", message))
-            self.transcript.append(("assistant", task.result.output))
+    @property
+    def transcript(self) -> list[tuple[str, str]]:
+        return self._default_session.transcript
 
-    def _with_transcript(self, message: str) -> str:
-        if not self.transcript:
-            return message
-        prior = "\n".join(f"{role}: {content}" for role, content in self.transcript)
-        return f"{prior}\nuser: {message}"
+    @property
+    def pending_task(self) -> Task | None:
+        return self._default_session.pending_task
+
+    @pending_task.setter
+    def pending_task(self, task: Task | None) -> None:
+        self._default_session.pending_task = task
+
+    @property
+    def pending_message(self) -> str | None:
+        return self._default_session.pending_message
+
+    @pending_message.setter
+    def pending_message(self, message: str | None) -> None:
+        self._default_session.pending_message = message
 
 
 def _load_skill_directories(

@@ -124,3 +124,84 @@ def test_failed_turn_is_not_committed_to_session_transcript():
     assert task.is_failed()
     assert session.transcript == []
     assert session.pending_run is None
+
+
+def test_same_session_reentry_fails_without_blocking_the_first_turn():
+    class BlockingHarness:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def arun(self, task, cancellation_token=None):
+            self.started.set()
+            await self.release.wait()
+            task.transition_to_running(TaskRunningReason.TASK_RUNNING_CREATE)
+            task.set_result(TaskResult(output="first"))
+            task.transition_to_completed()
+            return task.result
+
+    async def scenario():
+        harness = BlockingHarness()
+        session = AgentSession(harness, RecordingRepository(), lambda: None)
+        first = asyncio.create_task(session.achat("one"))
+        await harness.started.wait()
+
+        with pytest.raises(RuntimeError, match="already in progress"):
+            await session.achat("two")
+
+        harness.release.set()
+        return session, await first
+
+    session, task = asyncio.run(scenario())
+
+    assert task.result.output == "first"
+    assert session.transcript == [("user", "one"), ("assistant", "first")]
+
+
+def test_operation_guard_is_released_after_error():
+    class RaisesOnceHarness(CompletingHarness):
+        async def arun(self, task, cancellation_token=None):
+            if not self.inputs:
+                self.inputs.append(task.original_input)
+                raise RuntimeError("gateway offline")
+            return await super().arun(task, cancellation_token=cancellation_token)
+
+    session = AgentSession(RaisesOnceHarness(), RecordingRepository(), lambda: None)
+
+    with pytest.raises(RuntimeError, match="gateway offline"):
+        session.chat("first")
+    recovered = session.chat("second")
+
+    assert recovered.is_completed()
+
+
+def test_operation_guard_is_released_after_caller_cancellation():
+    class CancellableHarness(CompletingHarness):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def arun(self, task, cancellation_token=None):
+            if not self.inputs:
+                self.inputs.append(task.original_input)
+                self.started.set()
+                await self.release.wait()
+            return await super().arun(task, cancellation_token=cancellation_token)
+
+    async def scenario():
+        harness = CancellableHarness()
+        session = AgentSession(harness, RecordingRepository(), lambda: None)
+        cancelled = asyncio.create_task(session.achat("cancel"))
+        await harness.started.wait()
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        harness.release.set()
+        recovered = await session.achat("recover")
+        return session, recovered
+
+    session, recovered = asyncio.run(scenario())
+
+    assert recovered.is_completed()
+    assert session.transcript == [("user", "recover"), ("assistant", "answer-2")]
