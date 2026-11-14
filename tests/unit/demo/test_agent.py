@@ -9,6 +9,8 @@ from src.core.workspace import Workspace
 from src.demo.agent import Agent
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
 from src.schema.task import TaskPlan, TaskState
+from src.tool.tool_executor import DefaultToolExecutor
+from src.tool.tool_registry import DefaultToolRegistry
 
 
 class ChatGateway:
@@ -67,6 +69,25 @@ class FalseySandbox:
 class FalseyCancellationToken(CancellationToken):
     def __bool__(self):
         return False
+
+
+class RecordingMCPManager:
+    def __init__(self, catalog):
+        self.catalog = catalog
+        self.calls = []
+        self.close_calls = 0
+
+    async def add_server(self, name, source, **options):
+        self.calls.append(("add", name, source, options))
+
+    async def refresh_server(self, name):
+        self.calls.append(("refresh", name))
+
+    async def remove_server(self, name):
+        self.calls.append(("remove", name))
+
+    async def aclose(self):
+        self.close_calls += 1
 
 
 def test_chat_plans_then_returns_the_answer():
@@ -166,6 +187,167 @@ def test_from_config_builds_the_default_composition():
 
     assert agent.config is config
     assert agent.llm_gateway is gateway
+
+
+def test_default_composition_shares_one_new_catalog():
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["hello"]),
+    )
+
+    assert isinstance(agent.tool_registry, DefaultToolRegistry)
+    assert agent.tool_executor.catalog is agent.tool_registry
+    assert agent.mcp_manager.catalog is agent.tool_registry
+
+
+def test_injected_executor_catalog_becomes_authoritative():
+    catalog = DefaultToolRegistry()
+    executor = DefaultToolExecutor(catalog)
+
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["hello"]),
+        tool_executor=executor,
+    )
+
+    assert agent.tool_registry is catalog
+    assert agent.tool_executor is executor
+    assert agent.mcp_manager.catalog is catalog
+
+
+def test_matching_catalog_executor_and_manager_are_reused():
+    catalog = DefaultToolRegistry()
+    executor = DefaultToolExecutor(catalog)
+    manager = RecordingMCPManager(catalog)
+
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["hello"]),
+        tool_catalog=catalog,
+        tool_executor=executor,
+        mcp_manager=manager,
+    )
+
+    assert agent.tool_registry is catalog
+    assert agent.tool_executor is executor
+    assert agent.mcp_manager is manager
+
+
+def test_rejects_catalog_executor_mismatch_before_registering_local_tools():
+    catalog = DefaultToolRegistry()
+    executor_catalog = DefaultToolRegistry()
+
+    with pytest.raises(ValueError, match="catalog"):
+        Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=ChatGateway(["hello"]),
+            tool_catalog=catalog,
+            tool_executor=DefaultToolExecutor(executor_catalog),
+        )
+
+    assert catalog.get_all_tools() == []
+    assert executor_catalog.get_all_tools() == []
+
+
+def test_rejects_catalog_manager_mismatch_before_registering_local_tools():
+    catalog = DefaultToolRegistry()
+    manager_catalog = DefaultToolRegistry()
+
+    with pytest.raises(ValueError, match="catalog"):
+        Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=ChatGateway(["hello"]),
+            tool_catalog=catalog,
+            mcp_manager=RecordingMCPManager(manager_catalog),
+        )
+
+    assert catalog.get_all_tools() == []
+    assert manager_catalog.get_all_tools() == []
+
+
+def test_rejects_executor_manager_catalog_mismatch():
+    executor_catalog = DefaultToolRegistry()
+    manager_catalog = DefaultToolRegistry()
+
+    with pytest.raises(ValueError, match="catalog"):
+        Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=ChatGateway(["hello"]),
+            tool_executor=DefaultToolExecutor(executor_catalog),
+            mcp_manager=RecordingMCPManager(manager_catalog),
+        )
+
+    assert executor_catalog.get_all_tools() == []
+    assert manager_catalog.get_all_tools() == []
+
+
+def test_agent_mcp_methods_delegate_without_sync_loop_creation():
+    async def scenario():
+        catalog = DefaultToolRegistry()
+        manager = RecordingMCPManager(catalog)
+        agent = Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=ChatGateway(["hello"]),
+            tool_catalog=catalog,
+            mcp_manager=manager,
+        )
+
+        await agent.add_mcp_server("weather", "memory://weather", timeout=2)
+        await agent.refresh_mcp_server("weather")
+        await agent.remove_mcp_server("weather")
+
+        assert manager.calls == [
+            ("add", "weather", "memory://weather", {"timeout": 2}),
+            ("refresh", "weather"),
+            ("remove", "weather"),
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_agent_context_exit_closes_manager_once():
+    async def scenario():
+        catalog = DefaultToolRegistry()
+        manager = RecordingMCPManager(catalog)
+        async with Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=ChatGateway(["hello"]),
+            tool_catalog=catalog,
+            mcp_manager=manager,
+        ) as agent:
+            assert agent.mcp_manager is manager
+
+        await agent.aclose()
+        assert manager.close_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_closed_agent_rejects_chat_and_mcp_lifecycle_operations():
+    async def scenario():
+        catalog = DefaultToolRegistry()
+        manager = RecordingMCPManager(catalog)
+        gateway = ChatGateway(["unused"])
+        agent = Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=gateway,
+            tool_catalog=catalog,
+            mcp_manager=manager,
+        )
+        await agent.aclose()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            await agent.achat("hello")
+        with pytest.raises(RuntimeError, match="closed"):
+            await agent.add_mcp_server("server", "source")
+        with pytest.raises(RuntimeError, match="closed"):
+            await agent.refresh_mcp_server("server")
+        with pytest.raises(RuntimeError, match="closed"):
+            await agent.remove_mcp_server("server")
+
+        assert gateway.plans == []
+
+    asyncio.run(scenario())
 
 
 def test_default_agent_registers_workspace_file_tools_without_shell(tmp_path, monkeypatch):
