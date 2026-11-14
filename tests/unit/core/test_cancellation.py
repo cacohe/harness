@@ -1,3 +1,4 @@
+import asyncio
 import threading
 
 from src.core.cancellation import CancellationToken
@@ -40,3 +41,33 @@ def test_reusing_a_cancelled_token_remains_cancelled():
 
     assert token.wait(0) is True
     assert token.is_cancelled() is True
+
+
+def test_cancel_wakes_async_waiters():
+    async def scenario():
+        token = CancellationToken()
+        waiting = asyncio.create_task(token.await_cancelled(1))
+        await asyncio.sleep(0)
+
+        token.cancel()
+
+        assert await waiting is True
+
+    asyncio.run(scenario())
+
+
+def test_async_wait_returns_false_after_timeout():
+    async def scenario():
+        token = CancellationToken()
+        assert await token.await_cancelled(0.01) is False
+
+    asyncio.run(scenario())
+
+
+def test_async_wait_on_an_already_cancelled_token_returns_immediately():
+    async def scenario():
+        token = CancellationToken()
+        token.cancel()
+        assert await token.await_cancelled() is True
+
+    asyncio.run(scenario())
