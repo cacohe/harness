@@ -82,9 +82,10 @@ regular-expression, or process modules.
   context in messages.
 - `SkillDirectory(root)`, which constructs an immutable `Workspace` rooted at an existing
   directory.
-- `load() -> Skill`, which reads `SKILL.md` as UTF-8, accepts LF or CRLF delimiters, parses the
-  leading YAML mapping, validates `name` and `description`, and returns the remaining body as
-  `content` without the delimiters.
+- `load(*, include_shell: bool = False) -> Skill`, which reads `SKILL.md` as UTF-8, accepts LF
+  or CRLF delimiters, parses the leading YAML mapping, validates `name` and `description`, and
+  returns the remaining body as `content` without the delimiters plus the matching resource-tool
+  note.
 - `tools(include_shell: bool = False) -> list[Tool]`, which returns a renamed read-only file
   tool and, when requested, a renamed shell tool. Both remain bound to the same workspace.
 
