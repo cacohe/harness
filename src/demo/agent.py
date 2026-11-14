@@ -2,6 +2,7 @@ from pathlib import Path
 
 from src.config import Config
 from src.context.context_builder import DefaultContextBuilder
+from src.core.async_utils import run_sync
 from src.core.cancellation import CancellationToken
 from src.core.context import ContextBuilder
 from src.core.guard import NoOpGuard
@@ -104,6 +105,16 @@ class Agent:
         message: str,
         cancellation_token: CancellationToken | None = None,
     ) -> Task:
+        return run_sync(
+            lambda: self.achat(message, cancellation_token=cancellation_token),
+            async_name="achat",
+        )
+
+    async def achat(
+        self,
+        message: str,
+        cancellation_token: CancellationToken | None = None,
+    ) -> Task:
         """
         Plan one message, run it to an answer, and remember the turn.
         Args:
@@ -113,7 +124,7 @@ class Agent:
             The task after planning and execution. A failed turn is not remembered.
         """
         task = Task(original_input=self._with_transcript(message))
-        self.harness.run(task, cancellation_token=cancellation_token)
+        await self.harness.arun(task, cancellation_token=cancellation_token)
         if task.is_paused():
             self.pending_task = task
             self.pending_message = message
@@ -148,6 +159,12 @@ class Agent:
         self.task_repository.save(self.pending_task)
 
     def resume(self, cancellation_token: CancellationToken | None = None) -> Task:
+        return run_sync(
+            lambda: self.aresume(cancellation_token=cancellation_token),
+            async_name="aresume",
+        )
+
+    async def aresume(self, cancellation_token: CancellationToken | None = None) -> Task:
         """
         Continue the paused task after every pending call is decided.
         Args:
@@ -162,7 +179,7 @@ class Agent:
             raise ValueError("nothing is waiting for approval")
         message = self.pending_message or ""
         try:
-            self.harness.run(task, cancellation_token=cancellation_token)
+            await self.harness.arun(task, cancellation_token=cancellation_token)
         finally:
             if not task.is_paused():
                 self.pending_task = None

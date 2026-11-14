@@ -100,6 +100,33 @@ worker.join()
 进入第三方模型、工具、线程、进程或 sandbox 的阻塞调用，而会在该调用返回后丢弃其结果并
 停止下一步。一个已经取消的 token 不会自动重置，重复用于其他运行会立即取消该运行。
 
+## 异步运行时
+
+`Harness` 和 `Agent` 以异步实现为主。在已有事件循环的服务、Notebook 或异步测试中，直接
+调用 `arun`、`achat` 和 `aresume`：
+
+```python
+task = await agent.achat("分析这个项目")
+
+if task.is_paused():
+    for request in agent.approval_requests():
+        agent.decide_tool_call(request.tool_id, approved=True)
+    task = await agent.aresume()
+```
+
+同步的 `Harness.run()`、`Agent.chat()` 和 `Agent.resume()` 是兼容入口，只在调用线程没有
+运行中的事件循环时可用；在异步代码里调用会立即抛出 `RuntimeError`，应改为 `await` 对应的
+异步方法。默认 LiteLLM gateway 使用原生异步请求和流式响应；旧的同步 gateway、同步流和本地
+工具会在线程池中运行，避免阻塞事件循环。
+
+多个独立 `Harness.arun()` 或独立 `Agent` 实例可以在同一事件循环并发运行。当前单个 `Agent`
+仍只拥有一个 `pending_task` 和一份 transcript，不应同时启动多个会话；按会话隔离并发所有权属于
+下一阶段。
+
+取消等待中的原生协程会停止后续 Harness 工作并保存 `failed/cancel`。已经进入同步 gateway 或
+同步工具的线程池调用无法被强制终止；其结果会被丢弃，后台线程可能在短时间内继续运行。外部
+`CancellationToken` 仍采用上一节说明的协作式、非抢占语义。
+
 需要替换模型、工具执行或持久化时，构造函数接收的是 `core` 中定义的端口，运行时注入
 相应实现：
 
