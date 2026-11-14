@@ -1,3 +1,5 @@
+import asyncio
+import threading
 from typing import get_type_hints
 
 import pytest
@@ -28,6 +30,7 @@ from src.schema.task import (
 )
 from src.schema.tool import (
     Tool,
+    ToolCallResult,
     ToolExecutionFailReason,
     ToolExecutionResult,
     ToolExecutionState,
@@ -255,7 +258,10 @@ def test_planning_run_emits_task_events():
 
 
 def test_planning_retry_emits_an_llm_retry_event(monkeypatch):
-    monkeypatch.setattr(CancellationToken, "wait", lambda _self, _seconds: False)
+    async def no_cancel(_self, _seconds):
+        return False
+
+    monkeypatch.setattr(CancellationToken, "await_cancelled", no_cancel)
     gateway = Gateway()
     gateway.failures = 1
     output = RecordingOutput()
@@ -386,11 +392,11 @@ def test_later_steps_keep_the_goal_and_drop_stale_plan_steps():
 def test_transient_planning_errors_are_retried(monkeypatch):
     waits = []
 
-    def record_wait(_token, seconds):
+    async def record_wait(_token, seconds):
         waits.append(seconds)
         return False
 
-    monkeypatch.setattr(CancellationToken, "wait", record_wait)
+    monkeypatch.setattr(CancellationToken, "await_cancelled", record_wait)
     gateway = Gateway()
     gateway.failures = 1
 
@@ -752,7 +758,7 @@ def test_cancel_interrupts_retry_backoff_without_another_attempt():
             super().__init__()
             self.waits = []
 
-        def wait(self, timeout):
+        async def await_cancelled(self, timeout=None):
             self.waits.append(timeout)
             self.cancel()
             return True
@@ -897,7 +903,12 @@ def test_cancelled_inference_does_not_publish_abandoned_answer_delta():
 
 def test_uncancelled_run_supports_legacy_tool_executor_batch_signature():
     class LegacyExecutor(Executor):
+        def __init__(self, tools=None):
+            super().__init__(tools)
+            self.legacy_batches = 0
+
         def execute_tool_calls(self, tool_calls, *, before_call=None, after_call=None):
+            self.legacy_batches += 1
             return super().execute_tool_calls(
                 tool_calls,
                 before_call=before_call,
@@ -917,10 +928,12 @@ def test_uncancelled_run_supports_legacy_tool_executor_batch_signature():
     )
     task = _task()
 
-    result = _harness(gateway, executor=LegacyExecutor([tool])).run(task)
+    executor = LegacyExecutor([tool])
+    result = _harness(gateway, executor=executor).run(task)
 
     assert result == TaskResult(output="done")
     assert task.state is TaskState.TASK_COMPLETED
+    assert executor.legacy_batches == 1
 
 
 def test_cancel_from_llm_started_callback_prevents_gateway_call():
@@ -1457,3 +1470,402 @@ def test_failed_turn_elapsed_time_includes_finalization_error(monkeypatch):
     _harness(TimedFinalizationFailure(), max_steps=1).run(task)
 
     assert task.elapsed_seconds == 9.0
+
+
+class NativeAsyncGateway:
+    def __init__(self, answers=None):
+        self.answers = list(answers or [_model(FinishReason.STOP, "async answer")])
+
+    async def aplanning(self, context, stream=True, response_format=None):
+        await asyncio.sleep(0)
+        return LLMOutput(
+            FinishReason.STOP,
+            None,
+            [],
+            None,
+            None,
+            structured=TaskPlan(goal=["async"], current="run", remaining=[]),
+        )
+
+    async def ainfer(self, context, stream=True, response_format=None):
+        await asyncio.sleep(0)
+        return self.answers.pop(0)
+
+    def planning(self, context, stream=True, response_format=None):
+        raise AssertionError("native async planning must be preferred")
+
+    def infer(self, context, stream=True, response_format=None):
+        raise AssertionError("native async inference must be preferred")
+
+
+def test_arun_completes_with_a_native_async_gateway():
+    task = _task()
+
+    result = asyncio.run(_harness(NativeAsyncGateway()).arun(task))
+
+    assert result.output == "async answer"
+    assert task.state is TaskState.TASK_COMPLETED
+    assert task.plan.goal == ["async"]
+
+
+def test_arun_accepts_a_gateway_that_implements_only_the_async_protocol():
+    class AsyncOnlyGateway:
+        async def aplanning(self, context, stream=True, response_format=None):
+            return LLMOutput(
+                FinishReason.STOP,
+                None,
+                [],
+                None,
+                None,
+                structured=TaskPlan(goal=["async only"]),
+            )
+
+        async def ainfer(self, context, stream=True, response_format=None):
+            return _model(FinishReason.STOP, "done")
+
+    result = asyncio.run(_harness(AsyncOnlyGateway()).arun(_task()))
+
+    assert result.output == "done"
+
+
+def test_arun_executes_async_tools_and_preserves_pause_resume_flow():
+    called = []
+
+    async def execute(inputs):
+        called.append(inputs)
+        return "tool output"
+
+    gateway = NativeAsyncGateway(
+        [
+            _model(
+                FinishReason.TOOL_CALLS,
+                calls=[LlmToolCall("call-1", "shell", '{"command":"status"}')],
+            ),
+            _model(FinishReason.STOP, "done"),
+        ]
+    )
+    registry = DefaultToolRegistry()
+    registry.register(Tool("shell", "shell", "Run.", {}, execute))
+    harness = _harness(gateway, executor=DefaultToolExecutor(registry))
+    task = _task()
+
+    asyncio.run(harness.arun(task))
+    assert task.state is TaskState.TASK_PAUSED
+    task.decide_tool_call("call-1", True)
+    result = asyncio.run(harness.arun(task))
+
+    assert result.output == "done"
+    assert called == [{"command": "status"}]
+
+
+def test_two_arun_calls_can_wait_in_the_same_async_gateway_concurrently():
+    class RendezvousGateway(NativeAsyncGateway):
+        def __init__(self):
+            super().__init__()
+            self.infer_count = 0
+            self.both_started = asyncio.Event()
+
+        async def ainfer(self, context, stream=True, response_format=None):
+            self.infer_count += 1
+            if self.infer_count == 2:
+                self.both_started.set()
+            await self.both_started.wait()
+            return _model(FinishReason.STOP, "done")
+
+    async def scenario():
+        gateway = RendezvousGateway()
+        harness = _harness(gateway)
+        return await asyncio.wait_for(
+            asyncio.gather(harness.arun(_task()), harness.arun(_task())), timeout=1
+        )
+
+    results = asyncio.run(scenario())
+
+    assert [result.output for result in results] == ["done", "done"]
+
+
+def test_sync_run_rejects_an_active_loop_before_emitting_or_saving():
+    sink = RecordingOutput()
+    repository = RecordingRepository()
+    harness = _harness(Gateway(), event_handler=sink, repository=repository)
+
+    async def scenario():
+        with pytest.raises(RuntimeError, match="await arun"):
+            harness.run(_task())
+
+    asyncio.run(scenario())
+
+    assert sink.events == []
+    assert repository.states == []
+
+
+def test_cancelling_the_arun_task_persists_cancel_and_reraises():
+    class WaitingGateway(NativeAsyncGateway):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+
+        async def ainfer(self, context, stream=True, response_format=None):
+            self.started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    async def scenario():
+        gateway = WaitingGateway()
+        repository = InMemoryTaskRepository()
+        task = _task()
+        running = asyncio.create_task(_harness(gateway, repository=repository).arun(task))
+        await gateway.started.wait()
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        return task, repository.get(task.id)
+
+    task, restored = asyncio.run(scenario())
+
+    assert task.state is TaskState.TASK_FAILED
+    assert task.state_reason is TaskFailReason.TASK_FAILED_CANCEL
+    assert restored is not None
+    assert restored.state_reason is TaskFailReason.TASK_FAILED_CANCEL
+
+
+def test_cancellation_cleanup_repository_failure_wins_over_cancelled_error():
+    class WaitingGateway(NativeAsyncGateway):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+
+        async def ainfer(self, context, stream=True, response_format=None):
+            self.started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    class FailCancelledSave(RecordingRepository):
+        def save(self, task):
+            if task.state_reason is TaskFailReason.TASK_FAILED_CANCEL:
+                raise RuntimeError("cancel save failed")
+            super().save(task)
+
+    async def scenario():
+        gateway = WaitingGateway()
+        task = _task()
+        running = asyncio.create_task(_harness(gateway, repository=FailCancelledSave()).arun(task))
+        await gateway.started.wait()
+        running.cancel()
+        with pytest.raises(RuntimeError, match="cancel save failed"):
+            await running
+
+    asyncio.run(scenario())
+
+
+def test_cancellation_cleanup_error_keeps_cancelled_error_as_its_cause():
+    class WaitingGateway(NativeAsyncGateway):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+
+        async def ainfer(self, context, stream=True, response_format=None):
+            self.started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    class FailCancelledSave(RecordingRepository):
+        def save(self, task):
+            if task.state_reason is TaskFailReason.TASK_FAILED_CANCEL:
+                raise RuntimeError("cancel save failed")
+            super().save(task)
+
+    async def scenario():
+        gateway = WaitingGateway()
+        running = asyncio.create_task(
+            _harness(gateway, repository=FailCancelledSave()).arun(_task())
+        )
+        await gateway.started.wait()
+        running.cancel()
+        with pytest.raises(RuntimeError) as caught:
+            await running
+        return caught.value
+
+    error = asyncio.run(scenario())
+
+    assert isinstance(error.__cause__, asyncio.CancelledError)
+
+
+def test_cancelled_legacy_batch_cannot_run_later_tools_or_publish_late_events():
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    executed = []
+    sink = RecordingOutput()
+
+    class BlockingLegacyExecutor(Executor):
+        def execute_tool_calls(
+            self,
+            tool_calls,
+            *,
+            before_call=None,
+            after_call=None,
+            should_cancel=None,
+        ):
+            ordered = []
+            try:
+                for call in tool_calls:
+                    if should_cancel is not None and should_cancel():
+                        break
+                    if before_call is not None:
+                        before_call(call)
+                    executed.append(call.id)
+                    if len(executed) == 1:
+                        started.set()
+                        release.wait(1)
+                    result = ToolExecutionResult(
+                        tool_id=call.id,
+                        tool_name=call.name,
+                        state=ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED,
+                        output="done",
+                    )
+                    ordered.append(result)
+                    if after_call is not None:
+                        after_call(call, result)
+            finally:
+                finished.set()
+            return ToolCallResult(completed_tools=ordered, ordered_tools=ordered)
+
+    gateway = NativeAsyncGateway(
+        [
+            _model(
+                FinishReason.TOOL_CALLS,
+                calls=[
+                    LlmToolCall("call-1", "first", "{}"),
+                    LlmToolCall("call-2", "second", "{}"),
+                ],
+            )
+        ]
+    )
+    tools = [
+        Tool("first", "first", "First.", {}, lambda inputs: "first"),
+        Tool("second", "second", "Second.", {}, lambda inputs: "second"),
+    ]
+    harness = _harness(
+        gateway,
+        executor=BlockingLegacyExecutor(tools),
+        event_handler=sink,
+    )
+
+    async def scenario():
+        running = asyncio.create_task(harness.arun(_task()))
+        await asyncio.to_thread(started.wait, 1)
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        terminal_event_count = len(sink.events)
+        release.set()
+        await asyncio.to_thread(finished.wait, 1)
+        return terminal_event_count
+
+    terminal_event_count = asyncio.run(scenario())
+
+    assert executed == ["call-1"]
+    assert len(sink.events) == terminal_event_count
+
+
+def test_resume_honors_a_legacy_held_call_override():
+    called = []
+
+    class LegacyHeldExecutor(DefaultToolExecutor):
+        def execute_held_tool_call(self, held):
+            return ToolExecutionResult(
+                tool_id=held.tool_id,
+                tool_name=held.tool_name,
+                state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
+                output="legacy denied",
+                fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_REJECTED,
+            )
+
+    registry = DefaultToolRegistry()
+    registry.register(Tool("shell", "shell", "Shell.", {}, lambda inputs: called.append(inputs)))
+    harness = _harness(
+        ScriptedGateway([_shell_call(), _model(FinishReason.STOP, "done")]),
+        executor=LegacyHeldExecutor(registry),
+    )
+    task = _task()
+    harness.run(task)
+    task.decide_tool_call("call_1", approved=True)
+
+    harness.run(task)
+
+    assert called == []
+    assert [message.content for message in _tool_messages(task)] == ["legacy denied"]
+
+
+def test_caller_cancellation_during_resume_keeps_completed_and_settles_remaining_calls():
+    async def scenario():
+        first_completed = asyncio.Event()
+        second_started = asyncio.Event()
+
+        async def first(_inputs):
+            first_completed.set()
+            return "first completed"
+
+        async def second(_inputs):
+            second_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        registry = DefaultToolRegistry()
+        registry.register(
+            Tool(
+                "first",
+                "first",
+                "First.",
+                {},
+                first,
+                requires_approval=True,
+            )
+        )
+        registry.register(
+            Tool(
+                "second",
+                "second",
+                "Second.",
+                {},
+                second,
+                requires_approval=True,
+            )
+        )
+        harness = _harness(
+            NativeAsyncGateway(
+                [
+                    _model(
+                        FinishReason.TOOL_CALLS,
+                        calls=[
+                            LlmToolCall("call-1", "first", "{}"),
+                            LlmToolCall("call-2", "second", "{}"),
+                        ],
+                    )
+                ]
+            ),
+            executor=DefaultToolExecutor(registry),
+        )
+        task = _task()
+        await harness.arun(task)
+        task.decide_tool_call("call-1", approved=True)
+        task.decide_tool_call("call-2", approved=True)
+
+        resumed = asyncio.create_task(harness.arun(task))
+        await first_completed.wait()
+        await second_started.wait()
+        resumed.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await resumed
+        return task
+
+    task = asyncio.run(scenario())
+
+    assert task.state is TaskState.TASK_FAILED
+    assert task.state_reason is TaskFailReason.TASK_FAILED_CANCEL
+    assert task.pending_tool_calls == []
+    assert [message.content for message in _tool_messages(task)] == [
+        "first completed",
+        "Tool call cancelled.",
+    ]

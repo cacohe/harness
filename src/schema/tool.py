@@ -12,6 +12,12 @@ if TYPE_CHECKING:
 TOOL_CALL_CANCELLED_OUTPUT = "Tool call cancelled."
 
 
+class ToolOrigin(str, Enum):
+    LOCAL = "local"
+    MCP = "mcp"
+    CUSTOM = "custom"
+
+
 @dataclass
 class Tool:
     """
@@ -32,6 +38,9 @@ class Tool:
     requires_sandbox: bool = False
     input_validator: Callable[[dict], dict] | None = None
     workspace: Workspace | None = None
+    origin: ToolOrigin = ToolOrigin.CUSTOM
+    requires_approval: bool = False
+    approval_scope: str | None = None
 
 
 class ToolExecution(BaseModel):
@@ -68,6 +77,8 @@ class ToolExecutionFailReason(Enum):
     TOOL_EXECUTION_FAIL_REASON_NOT_AUTHENTICATED = "not_authenticated"
     TOOL_EXECUTION_FAIL_REASON_WORKSPACE_VIOLATION = "workspace_violation"
     TOOL_EXECUTION_FAIL_REASON_SANDBOX_REQUIRED = "sandbox_required"
+    TOOL_EXECUTION_FAIL_REASON_REMOTE_ERROR = "remote_error"
+    TOOL_EXECUTION_FAIL_REASON_APPROVAL_STALE = "approval_stale"
 
 
 class ToolExecutionResult(BaseModel):
@@ -80,6 +91,7 @@ class ToolExecutionResult(BaseModel):
     approval: ApprovalDecision | None = None
     needs_approval: bool = False
     workspace_id: str | None = None
+    approval_scope: str | None = None
 
     def can_run(self) -> bool:
         if self.approval in {

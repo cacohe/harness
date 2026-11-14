@@ -1,3 +1,6 @@
+import asyncio
+
+import pytest
 from src.config import Config
 from src.core.cancellation import CancellationToken
 from src.core.loop import Harness
@@ -6,6 +9,8 @@ from src.core.workspace import Workspace
 from src.demo.agent import Agent
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
 from src.schema.task import TaskPlan, TaskState
+from src.tool.tool_executor import DefaultToolExecutor
+from src.tool.tool_registry import DefaultToolRegistry
 
 
 class ChatGateway:
@@ -64,6 +69,25 @@ class FalseySandbox:
 class FalseyCancellationToken(CancellationToken):
     def __bool__(self):
         return False
+
+
+class RecordingMCPManager:
+    def __init__(self, catalog):
+        self.catalog = catalog
+        self.calls = []
+        self.close_calls = 0
+
+    async def add_server(self, name, source, **options):
+        self.calls.append(("add", name, source, options))
+
+    async def refresh_server(self, name):
+        self.calls.append(("refresh", name))
+
+    async def remove_server(self, name):
+        self.calls.append(("remove", name))
+
+    async def aclose(self):
+        self.close_calls += 1
 
 
 def test_chat_plans_then_returns_the_answer():
@@ -165,6 +189,168 @@ def test_from_config_builds_the_default_composition():
     assert agent.llm_gateway is gateway
 
 
+def test_default_composition_shares_one_new_catalog():
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["hello"]),
+    )
+
+    assert isinstance(agent.tool_registry, DefaultToolRegistry)
+    assert agent.tool_executor.catalog is agent.tool_registry
+    assert agent.mcp_manager.catalog is agent.tool_registry
+
+
+def test_injected_executor_catalog_becomes_authoritative():
+    catalog = DefaultToolRegistry()
+    executor = DefaultToolExecutor(catalog)
+
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["hello"]),
+        tool_executor=executor,
+    )
+
+    assert agent.tool_registry is catalog
+    assert agent.tool_executor is executor
+    assert agent.mcp_manager.catalog is catalog
+    assert catalog.get_all_tools() == []
+
+
+def test_matching_catalog_executor_and_manager_are_reused():
+    catalog = DefaultToolRegistry()
+    executor = DefaultToolExecutor(catalog)
+    manager = RecordingMCPManager(catalog)
+
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["hello"]),
+        tool_catalog=catalog,
+        tool_executor=executor,
+        mcp_manager=manager,
+    )
+
+    assert agent.tool_registry is catalog
+    assert agent.tool_executor is executor
+    assert agent.mcp_manager is manager
+
+
+def test_rejects_catalog_executor_mismatch_before_registering_local_tools():
+    catalog = DefaultToolRegistry()
+    executor_catalog = DefaultToolRegistry()
+
+    with pytest.raises(ValueError, match="catalog"):
+        Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=ChatGateway(["hello"]),
+            tool_catalog=catalog,
+            tool_executor=DefaultToolExecutor(executor_catalog),
+        )
+
+    assert catalog.get_all_tools() == []
+    assert executor_catalog.get_all_tools() == []
+
+
+def test_rejects_catalog_manager_mismatch_before_registering_local_tools():
+    catalog = DefaultToolRegistry()
+    manager_catalog = DefaultToolRegistry()
+
+    with pytest.raises(ValueError, match="catalog"):
+        Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=ChatGateway(["hello"]),
+            tool_catalog=catalog,
+            mcp_manager=RecordingMCPManager(manager_catalog),
+        )
+
+    assert catalog.get_all_tools() == []
+    assert manager_catalog.get_all_tools() == []
+
+
+def test_rejects_executor_manager_catalog_mismatch():
+    executor_catalog = DefaultToolRegistry()
+    manager_catalog = DefaultToolRegistry()
+
+    with pytest.raises(ValueError, match="catalog"):
+        Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=ChatGateway(["hello"]),
+            tool_executor=DefaultToolExecutor(executor_catalog),
+            mcp_manager=RecordingMCPManager(manager_catalog),
+        )
+
+    assert executor_catalog.get_all_tools() == []
+    assert manager_catalog.get_all_tools() == []
+
+
+def test_agent_mcp_methods_delegate_without_sync_loop_creation():
+    async def scenario():
+        catalog = DefaultToolRegistry()
+        manager = RecordingMCPManager(catalog)
+        agent = Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=ChatGateway(["hello"]),
+            tool_catalog=catalog,
+            mcp_manager=manager,
+        )
+
+        await agent.add_mcp_server("weather", "memory://weather", timeout=2)
+        await agent.refresh_mcp_server("weather")
+        await agent.remove_mcp_server("weather")
+
+        assert manager.calls == [
+            ("add", "weather", "memory://weather", {"timeout": 2}),
+            ("refresh", "weather"),
+            ("remove", "weather"),
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_agent_context_exit_closes_manager_once():
+    async def scenario():
+        catalog = DefaultToolRegistry()
+        manager = RecordingMCPManager(catalog)
+        async with Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=ChatGateway(["hello"]),
+            tool_catalog=catalog,
+            mcp_manager=manager,
+        ) as agent:
+            assert agent.mcp_manager is manager
+
+        await agent.aclose()
+        assert manager.close_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_closed_agent_rejects_chat_and_mcp_lifecycle_operations():
+    async def scenario():
+        catalog = DefaultToolRegistry()
+        manager = RecordingMCPManager(catalog)
+        gateway = ChatGateway(["unused"])
+        agent = Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=gateway,
+            tool_catalog=catalog,
+            mcp_manager=manager,
+        )
+        await agent.aclose()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            await agent.achat("hello")
+        with pytest.raises(RuntimeError, match="closed"):
+            await agent.add_mcp_server("server", "source")
+        with pytest.raises(RuntimeError, match="closed"):
+            await agent.refresh_mcp_server("server")
+        with pytest.raises(RuntimeError, match="closed"):
+            await agent.remove_mcp_server("server")
+
+        assert gateway.plans == []
+
+    asyncio.run(scenario())
+
+
 def test_default_agent_registers_workspace_file_tools_without_shell(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     agent = Agent(
@@ -243,11 +429,11 @@ def test_agent_preserves_falsey_workspace_and_sandbox_dependencies(tmp_path):
 def test_chat_passes_the_exact_falsey_cancellation_token(monkeypatch):
     observed = []
 
-    def record_run(_harness, task, cancellation_token=None):
+    async def record_run(_harness, task, cancellation_token=None):
         observed.append(cancellation_token)
         return task.result
 
-    monkeypatch.setattr(Harness, "run", record_run)
+    monkeypatch.setattr(Harness, "arun", record_run)
     token = FalseyCancellationToken()
     agent = Agent(
         config=Config(llm="test-model", max_steps=3, max_seconds=30),
@@ -262,11 +448,11 @@ def test_chat_passes_the_exact_falsey_cancellation_token(monkeypatch):
 def test_resume_passes_the_exact_falsey_cancellation_token(monkeypatch):
     observed = []
 
-    def record_run(_harness, task, cancellation_token=None):
+    async def record_run(_harness, task, cancellation_token=None):
         observed.append(cancellation_token)
         return task.result
 
-    monkeypatch.setattr(Harness, "run", record_run)
+    monkeypatch.setattr(Harness, "arun", record_run)
     token = FalseyCancellationToken()
     agent = Agent(
         config=Config(llm="test-model", max_steps=3, max_seconds=30),
@@ -291,3 +477,132 @@ def test_cancelled_agent_turn_is_not_added_to_transcript():
 
     assert task.state is TaskState.TASK_FAILED
     assert agent.transcript == []
+
+
+def test_achat_completes_and_remembers_the_turn():
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["hello"]),
+    )
+
+    task = asyncio.run(agent.achat("hi"))
+
+    assert task.result.output == "hello"
+    assert agent.transcript == [("user", "hi"), ("assistant", "hello")]
+
+
+def test_achat_pauses_and_aresume_finishes_after_a_decision():
+    class ApprovalGateway(ChatGateway):
+        def infer(self, context, stream=True, response_format=None):
+            return self.answers.pop(0)
+
+    gateway = ApprovalGateway(
+        [
+            LLMOutput(
+                FinishReason.TOOL_CALLS,
+                None,
+                [LlmToolCall("call-1", "write_file", '{"path":"x.txt","content":"x"}')],
+                None,
+                None,
+            ),
+            LLMOutput(FinishReason.STOP, "done", [], None, None),
+        ]
+    )
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=gateway,
+    )
+
+    paused = asyncio.run(agent.achat("write"))
+    assert paused.state is TaskState.TASK_PAUSED
+    agent.decide_tool_call("call-1", approved=False)
+    completed = asyncio.run(agent.aresume())
+
+    assert completed.result.output == "done"
+    assert agent.pending_task is None
+    assert agent.transcript == [("user", "write"), ("assistant", "done")]
+
+
+def test_achat_passes_the_exact_falsey_cancellation_token(monkeypatch):
+    observed = []
+
+    async def record_run(_harness, task, cancellation_token=None):
+        observed.append(cancellation_token)
+        return task.result
+
+    monkeypatch.setattr(Harness, "arun", record_run)
+    token = FalseyCancellationToken()
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["hello"]),
+    )
+
+    asyncio.run(agent.achat("cancel me", cancellation_token=token))
+
+    assert observed == [token]
+
+
+def test_failed_achat_is_not_added_to_transcript():
+    token = CancellationToken()
+    token.cancel()
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["unused"]),
+    )
+
+    task = asyncio.run(agent.achat("cancel me", cancellation_token=token))
+
+    assert task.state is TaskState.TASK_FAILED
+    assert agent.transcript == []
+
+
+def test_independent_agents_can_chat_concurrently():
+    class RendezvousGateway:
+        def __init__(self, rendezvous):
+            self.rendezvous = rendezvous
+
+        async def aplanning(self, context, stream=True, response_format=None):
+            return LLMOutput(
+                FinishReason.STOP,
+                None,
+                [],
+                None,
+                None,
+                structured=TaskPlan(goal=["answer"]),
+            )
+
+        async def ainfer(self, context, stream=True, response_format=None):
+            self.rendezvous["count"] += 1
+            if self.rendezvous["count"] == 2:
+                self.rendezvous["ready"].set()
+            await self.rendezvous["ready"].wait()
+            return LLMOutput(FinishReason.STOP, "done", [], None, None)
+
+    async def scenario():
+        rendezvous = {"count": 0, "ready": asyncio.Event()}
+        config = Config(llm="test-model", max_steps=3, max_seconds=30)
+        first = Agent(config=config, llm_gateway=RendezvousGateway(rendezvous))
+        second = Agent(config=config, llm_gateway=RendezvousGateway(rendezvous))
+        return await asyncio.wait_for(
+            asyncio.gather(first.achat("one"), second.achat("two")), timeout=1
+        )
+
+    tasks = asyncio.run(scenario())
+
+    assert [task.result.output for task in tasks] == ["done", "done"]
+
+
+def test_chat_rejects_an_active_event_loop_before_starting_work():
+    gateway = ChatGateway(["unused"])
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=gateway,
+    )
+
+    async def scenario():
+        with pytest.raises(RuntimeError, match="await achat"):
+            agent.chat("hi")
+
+    asyncio.run(scenario())
+
+    assert gateway.plans == []

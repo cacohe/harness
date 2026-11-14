@@ -100,6 +100,75 @@ worker.join()
 进入第三方模型、工具、线程、进程或 sandbox 的阻塞调用，而会在该调用返回后丢弃其结果并
 停止下一步。一个已经取消的 token 不会自动重置，重复用于其他运行会立即取消该运行。
 
+## 异步运行时
+
+`Harness` 和 `Agent` 以异步实现为主。在已有事件循环的服务、Notebook 或异步测试中，直接
+调用 `arun`、`achat` 和 `aresume`：
+
+```python
+task = await agent.achat("分析这个项目")
+
+if task.is_paused():
+    for request in agent.approval_requests():
+        agent.decide_tool_call(request.tool_id, approved=True)
+    task = await agent.aresume()
+```
+
+同步的 `Harness.run()`、`Agent.chat()` 和 `Agent.resume()` 是兼容入口，只在调用线程没有
+运行中的事件循环时可用；在异步代码里调用会立即抛出 `RuntimeError`，应改为 `await` 对应的
+异步方法。默认 LiteLLM gateway 使用原生异步请求和流式响应；旧的同步 gateway、同步流和本地
+工具会在线程池中运行，避免阻塞事件循环。
+
+多个独立 `Harness.arun()` 或独立 `Agent` 实例可以在同一事件循环并发运行。当前单个 `Agent`
+仍只拥有一个 `pending_task` 和一份 transcript，不应同时启动多个会话；按会话隔离并发所有权属于
+下一阶段。
+
+取消等待中的原生协程会停止后续 Harness 工作并保存 `failed/cancel`。已经进入同步 gateway 或
+同步工具的线程池调用无法被强制终止；其结果会被丢弃，后台线程可能在短时间内继续运行。外部
+`CancellationToken` 仍采用上一节说明的协作式、非抢占语义。
+
+
+## MCP 工具
+
+MCP 连接属于持久异步资源，应通过 `Agent` 的异步上下文管理生命周期。连接成功后，远程工具
+进入 Agent 与工具执行器共享的同一目录；MCP 工具默认逐次要求审批：
+
+```python
+import asyncio
+
+from src.config import Config
+from src.demo.agent import Agent
+
+
+async def main() -> None:
+    async with Agent.from_config(Config.load(), workspace="./my-project") as agent:
+        await agent.add_mcp_server("weather", "https://example.com/mcp")
+
+        task = await agent.achat("查询北京天气")
+        if task.is_paused():
+            for request in agent.approval_requests():
+                agent.decide_tool_call(request.tool_id, approved=True)
+            task = await agent.aresume()
+
+        print(task.result.output)
+
+
+asyncio.run(main())
+```
+
+也可以用 `refresh_mcp_server(name)` 原子刷新工具定义，或用 `remove_mcp_server(name)` 主动断开。
+退出 `async with` 会调用幂等的 `aclose()`，立即撤下工具，等待已开始的远程调用结束，再关闭
+传输。关闭后的 Agent 不再接受聊天或新的 MCP 生命周期操作。
+
+模型可见名称采用 `mcp__<server>__<tool>` 格式。非 ASCII 与标点会被规范化，超长名称带稳定
+哈希后缀；规范化后发生冲突时连接或刷新会失败，目录不会留下部分注册结果。调用方应使用
+Agent 目录中实际公布的名称，不应自行拼接未经规范化的远程名称。
+
+连接 MCP 服务不等于授权该服务执行操作，因此默认审批策略会暂停每一次 MCP 工具调用。更重要
+的是，远程 MCP 工具不在本地 `Workspace` 内运行，也不会经过本地 `SandboxRunner`；本地文件和
+进程隔离保证不适用于远程服务。服务身份、网络访问、凭据、数据披露以及远端执行环境必须由部署
+方单独评估和控制。
+
 需要替换模型、工具执行或持久化时，构造函数接收的是 `core` 中定义的端口，运行时注入
 相应实现：
 

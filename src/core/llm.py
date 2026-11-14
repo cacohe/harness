@@ -1,4 +1,4 @@
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any, Protocol, runtime_checkable
 
 from src.schema.context import Context
@@ -46,6 +46,25 @@ class LlmGateway(Protocol):
             The LLM output. When response_format is set, structured holds the parsed value.
         """
         ...
+
+
+@runtime_checkable
+class AsyncLlmGateway(Protocol):
+    """Native asynchronous LLM gateway."""
+
+    async def aplanning(
+        self,
+        context: Context,
+        stream: bool = True,
+        response_format: Any | None = None,
+    ) -> LLMOutput | AsyncIterator[LLMOutput]: ...
+
+    async def ainfer(
+        self,
+        context: Context,
+        stream: bool = True,
+        response_format: Any | None = None,
+    ) -> LLMOutput | AsyncIterator[LLMOutput]: ...
 
 
 def get_finish_reason_value(finish_reason: FinishReason | None) -> str | None:

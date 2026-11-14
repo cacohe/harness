@@ -1,18 +1,21 @@
+import asyncio
 from pathlib import Path
 
 from src.config import Config
 from src.context.context_builder import DefaultContextBuilder
+from src.core.async_utils import run_sync
 from src.core.cancellation import CancellationToken
 from src.core.context import ContextBuilder
 from src.core.guard import NoOpGuard
 from src.core.hook import HarnessHook
-from src.core.llm import LlmGateway
+from src.core.llm import AsyncLlmGateway, LlmGateway
 from src.core.loop import Harness
 from src.core.persistence import TaskRepository
 from src.core.task import Task
 from src.core.tool import SandboxRunner, ToolCatalog, ToolExecutor
 from src.core.workspace import Workspace
 from src.llm.litellm import LiteLLMGateway
+from src.mcp import MCPManager
 from src.persistence.in_memory import InMemoryTaskRepository
 from src.schema.tool import ToolExecutionResult
 from src.tool.local_tools import LocalToolSuite
@@ -28,13 +31,14 @@ class Agent:
     def __init__(
         self,
         config: Config | None = None,
-        llm_gateway: LlmGateway | None = None,
+        llm_gateway: LlmGateway | AsyncLlmGateway | None = None,
         tool_executor: ToolExecutor | None = None,
         context_builder: ContextBuilder | None = None,
         tool_catalog: ToolCatalog | None = None,
         task_repository: TaskRepository | None = None,
         workspace: Workspace | str | Path | None = None,
         sandbox_runner: SandboxRunner | None = None,
+        mcp_manager: MCPManager | None = None,
     ):
         """
         Create an agent with a model gateway, a context builder, and the local tools.
@@ -53,8 +57,18 @@ class Agent:
             if isinstance(workspace, Workspace)
             else Workspace(Path.cwd() if workspace is None else workspace)
         )
-        self.tool_registry = tool_catalog if tool_catalog is not None else DefaultToolRegistry()
-        if tool_catalog is None:
+        executor_catalog = tool_executor.catalog if tool_executor is not None else None
+        owns_catalog = tool_catalog is None and executor_catalog is None
+        self.tool_registry = (
+            tool_catalog
+            if tool_catalog is not None
+            else (executor_catalog if executor_catalog is not None else DefaultToolRegistry())
+        )
+        if executor_catalog is not None and executor_catalog is not self.tool_registry:
+            raise ValueError("tool executor catalog must match the Agent catalog")
+        if mcp_manager is not None and mcp_manager.catalog is not self.tool_registry:
+            raise ValueError("MCP manager catalog must match the Agent catalog")
+        if owns_catalog:
             for tool in LocalToolSuite(self.workspace).tools(
                 include_shell=sandbox_runner is not None
             ):
@@ -73,6 +87,11 @@ class Agent:
             if tool_executor is not None
             else DefaultToolExecutor(self.tool_registry, sandbox_runner=sandbox_runner)
         )
+        self.mcp_manager = (
+            mcp_manager if mcp_manager is not None else MCPManager(self.tool_registry)
+        )
+        self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
         self.context_builder = (
             context_builder if context_builder is not None else DefaultContextBuilder()
         )
@@ -104,6 +123,16 @@ class Agent:
         message: str,
         cancellation_token: CancellationToken | None = None,
     ) -> Task:
+        return run_sync(
+            lambda: self.achat(message, cancellation_token=cancellation_token),
+            async_name="achat",
+        )
+
+    async def achat(
+        self,
+        message: str,
+        cancellation_token: CancellationToken | None = None,
+    ) -> Task:
         """
         Plan one message, run it to an answer, and remember the turn.
         Args:
@@ -112,8 +141,9 @@ class Agent:
         Returns:
             The task after planning and execution. A failed turn is not remembered.
         """
+        self._ensure_open()
         task = Task(original_input=self._with_transcript(message))
-        self.harness.run(task, cancellation_token=cancellation_token)
+        await self.harness.arun(task, cancellation_token=cancellation_token)
         if task.is_paused():
             self.pending_task = task
             self.pending_message = message
@@ -142,12 +172,19 @@ class Agent:
         Raises:
             ValueError: No task is waiting for approval.
         """
+        self._ensure_open()
         if self.pending_task is None:
             raise ValueError("nothing is waiting for approval")
         self.pending_task.decide_tool_call(tool_id, approved)
         self.task_repository.save(self.pending_task)
 
     def resume(self, cancellation_token: CancellationToken | None = None) -> Task:
+        return run_sync(
+            lambda: self.aresume(cancellation_token=cancellation_token),
+            async_name="aresume",
+        )
+
+    async def aresume(self, cancellation_token: CancellationToken | None = None) -> Task:
         """
         Continue the paused task after every pending call is decided.
         Args:
@@ -157,12 +194,13 @@ class Agent:
         Raises:
             ValueError: No task is waiting for approval.
         """
+        self._ensure_open()
         task = self.pending_task
         if task is None:
             raise ValueError("nothing is waiting for approval")
         message = self.pending_message or ""
         try:
-            self.harness.run(task, cancellation_token=cancellation_token)
+            await self.harness.arun(task, cancellation_token=cancellation_token)
         finally:
             if not task.is_paused():
                 self.pending_task = None
@@ -170,6 +208,39 @@ class Agent:
         if not task.is_paused():
             self._remember(message, task)
         return task
+
+    async def add_mcp_server(self, name: str, source, **options) -> None:
+        """Connect an MCP server and publish its tools."""
+        self._ensure_open()
+        await self.mcp_manager.add_server(name, source, **options)
+
+    async def refresh_mcp_server(self, name: str) -> None:
+        """Refresh the tools advertised by one MCP server."""
+        self._ensure_open()
+        await self.mcp_manager.refresh_server(name)
+
+    async def remove_mcp_server(self, name: str) -> None:
+        """Disconnect one MCP server and unpublish its tools."""
+        self._ensure_open()
+        await self.mcp_manager.remove_server(name)
+
+    async def aclose(self) -> None:
+        """Close the Agent and all MCP transports exactly once."""
+        if self._close_task is None:
+            self._closed = True
+            self._close_task = asyncio.create_task(self.mcp_manager.aclose())
+        await asyncio.shield(self._close_task)
+
+    async def __aenter__(self) -> "Agent":
+        self._ensure_open()
+        return self
+
+    async def __aexit__(self, *_args) -> None:
+        await self.aclose()
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("Agent is closed")
 
     def _remember(self, message: str, task: Task) -> None:
         if task.is_completed() and task.result is not None:

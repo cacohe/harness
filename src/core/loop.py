@@ -1,10 +1,12 @@
 """Run a task by planning once, then alternating model calls and tool calls."""
 
+import asyncio
 import inspect
 import time
 import uuid
 from typing import NoReturn
 
+from src.core.async_utils import call_maybe_async, run_sync
 from src.core.cancellation import CancellationToken
 from src.core.context import (
     ContextBuilder,
@@ -16,7 +18,7 @@ from src.core.context import (
 from src.core.event import EventHandler, EventSink
 from src.core.guard import GuardError, HarnessGuard, NoOpGuard
 from src.core.hook import HarnessHook
-from src.core.llm import LlmCallError, LlmGateway
+from src.core.llm import AsyncLlmGateway, LlmCallError, LlmGateway
 from src.core.persistence import NoOpTaskRepository, TaskRepository
 from src.core.task import Task
 from src.core.tool import ToolExecutor
@@ -27,7 +29,7 @@ from src.schema.llm import (
     FinishReason,
     LLMOutput,
     LlmToolCall,
-    assemble_llm_stream,
+    assemble_llm_async_stream,
     is_transient_llm_error,
 )
 from src.schema.skills import Skill
@@ -66,7 +68,7 @@ class Harness:
     def __init__(
         self,
         system_prompt: str,
-        llm_gateway: LlmGateway,
+        llm_gateway: LlmGateway | AsyncLlmGateway,
         skills: list[Skill],
         tool_executor: ToolExecutor,
         context_builder: ContextBuilder,
@@ -321,6 +323,17 @@ class Harness:
         task: Task,
         cancellation_token: CancellationToken | None = None,
     ) -> TaskPlan:
+        return run_sync(
+            lambda: self.aplanning(context, task, cancellation_token),
+            async_name="aplanning",
+        )
+
+    async def aplanning(
+        self,
+        context: Context,
+        task: Task,
+        cancellation_token: CancellationToken | None = None,
+    ) -> TaskPlan:
         """
         Ask the model for one structured task plan.
         Args:
@@ -340,7 +353,13 @@ class Harness:
             if token.is_cancelled():
                 self._cancel_llm_attempt(task, "planning")
             try:
-                output = self.llm_gateway.planning(context, stream=False, response_format=TaskPlan)
+                output = await call_maybe_async(
+                    getattr(self.llm_gateway, "aplanning", None),
+                    getattr(self.llm_gateway, "planning", None),
+                    context,
+                    stream=False,
+                    response_format=TaskPlan,
+                )
                 if token.is_cancelled():
                     self._cancel_llm_attempt(task, "planning")
                 if not isinstance(output, LLMOutput):
@@ -382,7 +401,7 @@ class Harness:
                     reason=type(error).__name__,
                     attempt=attempt,
                 )
-                if token.wait(DEFAULT_LLM_ATTEMPT_DELAY_SECONDS):
+                if await token.await_cancelled(DEFAULT_LLM_ATTEMPT_DELAY_SECONDS):
                     self._cancel_llm_attempt(task, "planning")
         raise LlmCallError("planning retries exhausted")
 
@@ -419,19 +438,43 @@ class Harness:
         task: Task,
         cancellation_token: CancellationToken | None = None,
     ) -> None:
-        results = []
-        for item in task.pending_tool_calls:
+        run_sync(
+            lambda: self._afinish_pending_tool_calls(task, cancellation_token),
+            async_name="arun",
+        )
+
+    async def _afinish_pending_tool_calls(
+        self,
+        task: Task,
+        cancellation_token: CancellationToken | None = None,
+    ) -> None:
+        pending = list(task.pending_tool_calls)
+        for index, item in enumerate(pending):
             call = LlmToolCall(item.tool_id, item.tool_name, item.arguments or "")
             if cancellation_token is not None and cancellation_token.is_cancelled():
                 result = self._cancelled_tool_result(item)
             else:
                 if item.can_run():
                     self._emit_tool_event(EventType.TOOL_EXECUTION_RESUMED, task, call)
-                result = self.tool_executor.execute_held_tool_call(item)
+                async_method = getattr(self.tool_executor, "aexecute_held_tool_call", None)
+                sync_override = (
+                    type(self.tool_executor).execute_held_tool_call
+                    is not ToolExecutor.execute_held_tool_call
+                )
+                async_override = (
+                    type(self.tool_executor).aexecute_held_tool_call
+                    is not ToolExecutor.aexecute_held_tool_call
+                )
+                if sync_override and not async_override:
+                    async_method = None
+                result = await call_maybe_async(
+                    async_method,
+                    self.tool_executor.execute_held_tool_call,
+                    item,
+                )
             self._emit_tool_result(task, call, result)
-            results.append(result)
-        task.replace_tool_messages([build_tool_message(result) for result in results])
-        task.set_pending_tool_calls([])
+            task.replace_tool_messages([build_tool_message(result)])
+            task.set_pending_tool_calls(pending[index + 1 :])
 
     def _cancel_pending_tool_calls(self, task: Task) -> None:
         results = []
@@ -444,7 +487,7 @@ class Harness:
         task.set_pending_tool_calls([])
 
     def _handle_cancelled(self, task: Task, start_time: float) -> TaskResult:
-        if task.is_paused():
+        if task.pending_tool_calls:
             self._cancel_pending_tool_calls(task)
         result = TaskResult(output="Task cancelled.")
         task.set_progress(task.step_count, time.monotonic() - start_time)
@@ -484,6 +527,14 @@ class Harness:
         task: Task,
         cancellation_token: CancellationToken | None = None,
     ) -> LLMOutput:
+        return run_sync(lambda: self.ainfer(context, task, cancellation_token), async_name="ainfer")
+
+    async def ainfer(
+        self,
+        context: Context,
+        task: Task,
+        cancellation_token: CancellationToken | None = None,
+    ) -> LLMOutput:
         """
         Run one model call for the execution loop.
         Args:
@@ -502,8 +553,13 @@ class Harness:
             if token.is_cancelled():
                 self._cancel_llm_attempt(task, "infer")
             try:
-                produced = self.llm_gateway.infer(context, stream=True)
-                output, parts = self._read_inference(produced)
+                produced = await call_maybe_async(
+                    getattr(self.llm_gateway, "ainfer", None),
+                    getattr(self.llm_gateway, "infer", None),
+                    context,
+                    stream=True,
+                )
+                output, parts = await self._aread_inference(produced)
                 if token.is_cancelled():
                     self._cancel_llm_attempt(task, "infer")
                 self._emit_answer(task, output, parts)
@@ -534,7 +590,7 @@ class Harness:
                     reason=type(error).__name__,
                     attempt=attempt,
                 )
-                if token.wait(DEFAULT_LLM_ATTEMPT_DELAY_SECONDS):
+                if await token.await_cancelled(DEFAULT_LLM_ATTEMPT_DELAY_SECONDS):
                     self._cancel_llm_attempt(task, "infer")
 
         if not isinstance(output, LLMOutput):
@@ -555,10 +611,13 @@ class Harness:
         raise _CancellationRequested
 
     def _read_inference(self, produced) -> tuple[LLMOutput, list[str]]:
+        return run_sync(lambda: self._aread_inference(produced), async_name="ainfer")
+
+    async def _aread_inference(self, produced) -> tuple[LLMOutput, list[str]]:
         if isinstance(produced, LLMOutput):
             return produced, [produced.content] if produced.content else []
         try:
-            output, parts = assemble_llm_stream(produced)
+            output, parts = await assemble_llm_async_stream(produced)
         except TypeError as error:
             raise LlmCallError(str(error)) from error
         return output, parts
@@ -579,6 +638,17 @@ class Harness:
         task: Task,
         cancellation_token: CancellationToken | None = None,
     ) -> ToolCallResult:
+        return run_sync(
+            lambda: self.aexecute_tool_calls(tool_calls, task, cancellation_token),
+            async_name="aexecute_tool_calls",
+        )
+
+    async def aexecute_tool_calls(
+        self,
+        tool_calls: list[LlmToolCall],
+        task: Task,
+        cancellation_token: CancellationToken | None = None,
+    ) -> ToolCallResult:
         """
         Execute tool calls.
         Args:
@@ -589,30 +659,53 @@ class Harness:
         """
 
         def before_call(call: LlmToolCall) -> None:
+            if cancellation_token is not None and cancellation_token.is_cancelled():
+                return
             self._emit_tool_event(EventType.TOOL_EXECUTION_STARTED, task, call)
 
         def after_call(call: LlmToolCall, result: ToolExecutionResult) -> None:
+            if cancellation_token is not None and cancellation_token.is_cancelled():
+                return
             self._emit_tool_result(task, call, result)
 
-        parameters = inspect.signature(self.tool_executor.execute_tool_calls).parameters.values()
+        async_batch = getattr(self.tool_executor, "aexecute_tool_calls", None)
+        sync_override = (
+            type(self.tool_executor).execute_tool_calls is not ToolExecutor.execute_tool_calls
+        )
+        async_override = (
+            type(self.tool_executor).aexecute_tool_calls is not ToolExecutor.aexecute_tool_calls
+        )
+        if sync_override and not async_override:
+            async_batch = None
+        batch = async_batch if async_batch is not None else self.tool_executor.execute_tool_calls
+        parameters = inspect.signature(batch).parameters.values()
         supports_cancellation = any(
             parameter.name == "should_cancel" or parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters
         )
         if cancellation_token is not None and supports_cancellation:
-            return self.tool_executor.execute_tool_calls(
+            return await call_maybe_async(
+                async_batch,
+                self.tool_executor.execute_tool_calls,
                 tool_calls,
                 before_call=before_call,
                 after_call=after_call,
                 should_cancel=cancellation_token.is_cancelled,
             )
-        return self.tool_executor.execute_tool_calls(
+        return await call_maybe_async(
+            async_batch,
+            self.tool_executor.execute_tool_calls,
             tool_calls,
             before_call=before_call,
             after_call=after_call,
         )
 
     def step(self, task: Task, cancellation_token: CancellationToken | None = None) -> StepResult:
+        return run_sync(lambda: self.astep(task, cancellation_token), async_name="astep")
+
+    async def astep(
+        self, task: Task, cancellation_token: CancellationToken | None = None
+    ) -> StepResult:
         """
         Build the context, run one inference, and execute any requested tool calls.
         Args:
@@ -624,7 +717,7 @@ class Harness:
         context = self.build_infer_context(task)
 
         self.harness_hooks.before_think(task=task, context=context)
-        output: LLMOutput = self.infer(context, task, cancellation_token)
+        output: LLMOutput = await self.ainfer(context, task, cancellation_token)
         self.harness_hooks.after_think(task=task, output=output)
 
         task.add_history_messages([build_history_message(output)])
@@ -634,7 +727,7 @@ class Harness:
             return StepResult(llm_output=output)
 
         self.harness_hooks.before_execute_tool_calls(task=task, output=output)
-        result: ToolCallResult = self.execute_tool_calls(
+        result: ToolCallResult = await self.aexecute_tool_calls(
             output.tool_calls, task, cancellation_token
         )
         self.harness_hooks.after_execute_tool_calls(task=task, result=result)
@@ -664,6 +757,11 @@ class Harness:
             raise ContextBuilderError(str(error)) from error
 
     def finalize(self, task: Task, cancellation_token: CancellationToken | None = None) -> str:
+        return run_sync(lambda: self.afinalize(task, cancellation_token), async_name="afinalize")
+
+    async def afinalize(
+        self, task: Task, cancellation_token: CancellationToken | None = None
+    ) -> str:
         """
         Close a turn that stopped before a normal answer.
         Args:
@@ -672,7 +770,7 @@ class Harness:
             The final result.
         """
         final_context = self.build_final_context(task)
-        output = self.infer(final_context, task, cancellation_token)
+        output = await self.ainfer(final_context, task, cancellation_token)
         return output.content or ""
 
     def _blocked(self, step_result: StepResult) -> tuple[bool, TaskPauseReason | None]:
@@ -737,7 +835,7 @@ class Harness:
             )
         return TaskResult()
 
-    def _handle_failed_turn(
+    async def _ahandle_failed_turn(
         self,
         task: Task,
         step_count: int,
@@ -755,7 +853,7 @@ class Harness:
             The task result.
         """
         try:
-            final_output = self.finalize(task, cancellation_token)
+            final_output = await self.afinalize(task, cancellation_token)
             if cancellation_token is not None and cancellation_token.is_cancelled():
                 raise _CancellationRequested
         except (_TaskPersistenceError, _EventSinkError):
@@ -818,6 +916,16 @@ class Harness:
         start_time: float | None = None,
         cancellation_token: CancellationToken | None = None,
     ) -> TaskResult:
+        return run_sync(
+            lambda: self.aturn(task, start_time, cancellation_token), async_name="aturn"
+        )
+
+    async def aturn(
+        self,
+        task: Task,
+        start_time: float | None = None,
+        cancellation_token: CancellationToken | None = None,
+    ) -> TaskResult:
         """
         Infer and execute tools until the model answers or a limit is hit.
         Args:
@@ -833,7 +941,7 @@ class Harness:
         while True:
             if token.is_cancelled():
                 raise _CancellationRequested
-            step_result: StepResult = self.step(task, token)
+            step_result: StepResult = await self.astep(task, token)
             if token.is_cancelled():
                 raise _CancellationRequested
             step_count += 1
@@ -847,12 +955,21 @@ class Harness:
             failed, failed_reason = self._failed(start_time, step_count)
             if failed:
                 assert failed_reason is not None
-                return self._handle_failed_turn(task, step_count, failed_reason, start_time, token)
+                return await self._ahandle_failed_turn(
+                    task, step_count, failed_reason, start_time, token
+                )
 
             if self._completed(step_result):
                 return self._handle_completed_turn(task, step_result, step_count)
 
     def run(self, task: Task, cancellation_token: CancellationToken | None = None) -> TaskResult:
+        return run_sync(
+            lambda: self.arun(task, cancellation_token=cancellation_token), async_name="arun"
+        )
+
+    async def arun(
+        self, task: Task, cancellation_token: CancellationToken | None = None
+    ) -> TaskResult:
         """
         Plan a new task, then infer and execute tools until the model answers or a limit is hit.
         Args:
@@ -884,7 +1001,7 @@ class Harness:
                 self.guard_input(task)
 
                 self._emit_task_event(EventType.TASK_PLANNING, task)
-                plan = self.planning(self.build_planning_context(task), task, token)
+                plan = await self.aplanning(self.build_planning_context(task), task, token)
                 if token.is_cancelled():
                     raise _CancellationRequested
                 task.set_plan(plan)
@@ -897,12 +1014,20 @@ class Harness:
             if task.is_paused():
                 self._emit_task_event(EventType.TASK_RESUMED, task)
                 task.transition_to_running(TaskRunningReason.TASK_RUNNING_RESUME)
-                self._finish_pending_tool_calls(task, token)
+                await self._afinish_pending_tool_calls(task, token)
                 self._save_task(task)
 
-            result = self.turn(task, start_time, token)
+            result = await self.aturn(task, start_time, token)
             return result
 
+        except asyncio.CancelledError as cancellation:
+            token.cancel()
+            try:
+                self._handle_cancelled(task, start_time)
+            except (_TaskPersistenceError, _EventSinkError) as boundary_error:
+                cause = boundary_error.__cause__ or boundary_error
+                raise cause from cancellation
+            raise
         except (_TaskPersistenceError, _EventSinkError) as boundary_error:
             self._raise_boundary_cause(boundary_error)
         except _CancellationRequested:

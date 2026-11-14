@@ -1,5 +1,9 @@
+import inspect
+
+from src.core.async_utils import call_maybe_async
 from src.core.tool import (
     ApprovalPolicy,
+    AsyncToolRunner,
     SandboxRunner,
     ToolCatalog,
     ToolExecutor,
@@ -14,6 +18,10 @@ class LocalToolRunner:
     def run(self, tool: Tool, inputs: dict):
         return tool.executer(inputs)
 
+    async def arun(self, tool: Tool, inputs: dict):
+        async_callable = tool.executer if inspect.iscoroutinefunction(tool.executer) else None
+        return await call_maybe_async(async_callable, tool.executer, inputs)
+
 
 class DefaultApprovalPolicy:
     """Pause local tools that can execute commands or mutate files."""
@@ -21,6 +29,8 @@ class DefaultApprovalPolicy:
     _NEED_APPROVAL_TOOLS = {"shell", "write_file", "edit_file"}
 
     def decide(self, tool: Tool, inputs: dict) -> ApprovalDecision | None:
+        if tool.requires_approval:
+            return None
         if tool.name in self._NEED_APPROVAL_TOOLS:
             return None
         return ApprovalDecision.APPROVAL_DECISION_APPROVED
@@ -33,7 +43,7 @@ class DefaultToolExecutor(ToolExecutor):
         self,
         tool_registry: ToolCatalog,
         *,
-        runner: ToolRunner | None = None,
+        runner: ToolRunner | AsyncToolRunner | None = None,
         approval_policy: ApprovalPolicy | None = None,
         sandbox_runner: SandboxRunner | None = None,
     ) -> None:
