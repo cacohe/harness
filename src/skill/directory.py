@@ -24,6 +24,7 @@ class SkillDirectory:
     """Load one skill from a directory bound to an immutable workspace."""
 
     __slots__ = ("_workspace",)
+    _workspace: Workspace
 
     def __init__(self, root: str | Path) -> None:
         object.__setattr__(self, "_workspace", Workspace(root))

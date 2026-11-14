@@ -17,7 +17,9 @@ from src.core.workspace import Workspace
 from src.llm.litellm import LiteLLMGateway
 from src.mcp import MCPManager
 from src.persistence.in_memory import InMemoryTaskRepository
-from src.schema.tool import ToolExecutionResult
+from src.schema.skills import Skill
+from src.schema.tool import Tool, ToolExecutionResult
+from src.skill.directory import SkillDirectory
 from src.tool.local_tools import LocalToolSuite
 from src.tool.tool_executor import DefaultToolExecutor
 from src.tool.tool_registry import DefaultToolRegistry
@@ -39,6 +41,7 @@ class Agent:
         workspace: Workspace | str | Path | None = None,
         sandbox_runner: SandboxRunner | None = None,
         mcp_manager: MCPManager | None = None,
+        skill_directories: list[str | Path] | None = None,
     ):
         """
         Create an agent with a model gateway, a context builder, and the local tools.
@@ -49,6 +52,7 @@ class Agent:
             context_builder: Builder to use. When omitted, the default builder is created.
             workspace: Filesystem authority for default local tools. Defaults to the current directory.
             sandbox_runner: Isolation backend. Shell is registered only when this is supplied.
+            skill_directories: Directories containing SKILL.md and optional resources.
         """
         self.config = config if config is not None else Config.load()
         self.transcript: list[tuple[str, str]] = []
@@ -73,6 +77,10 @@ class Agent:
                 include_shell=sandbox_runner is not None
             ):
                 self.tool_registry.register(tool)
+        self.skills, skill_tools = _load_skill_directories(
+            skill_directories or [], include_shell=sandbox_runner is not None
+        )
+        _register_tools_atomically(self.tool_registry, skill_tools)
         self.llm_gateway = (
             llm_gateway
             if llm_gateway is not None
@@ -103,7 +111,7 @@ class Agent:
         self.harness = Harness(
             SYSTEM_PROMPT,
             self.llm_gateway,
-            [],
+            self.skills,
             self.tool_executor,
             self.context_builder,
             harness_hooks=HarnessHook(),
@@ -252,3 +260,45 @@ class Agent:
             return message
         prior = "\n".join(f"{role}: {content}" for role, content in self.transcript)
         return f"{prior}\nuser: {message}"
+
+
+def _load_skill_directories(
+    roots: list[str | Path], *, include_shell: bool
+) -> tuple[list[Skill], list[Tool]]:
+    skills = []
+    tools = []
+    names: set[str] = set()
+    for root in roots:
+        directory = SkillDirectory(root)
+        skill = directory.load(include_shell=include_shell)
+        if skill.name in names:
+            raise ValueError(f"duplicate skill name: {skill.name!r}")
+        names.add(skill.name)
+        skills.append(skill)
+        tools.extend(directory.tools(include_shell=include_shell))
+    return skills, tools
+
+
+def _register_tools_atomically(catalog: ToolCatalog, tools: list[Tool]) -> None:
+    batch_ids: set[str] = set()
+    batch_names: set[str] = set()
+    for tool in tools:
+        if (
+            tool.id in batch_ids
+            or tool.name in batch_names
+            or catalog.find_tool(tool.id) is not None
+            or catalog.find_tool(tool.name) is not None
+        ):
+            raise ValueError(f"tool collision for id {tool.id!r} or name {tool.name!r}")
+        batch_ids.add(tool.id)
+        batch_names.add(tool.name)
+
+    try:
+        for tool in tools:
+            catalog.register(tool)
+    except BaseException:
+        for tool in tools:
+            registered = catalog.find_tool(tool.id)
+            if registered is tool:
+                catalog.unregister(tool.id)
+        raise

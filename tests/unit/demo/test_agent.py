@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 import pytest
 from src.config import Config
@@ -9,6 +10,7 @@ from src.core.workspace import Workspace
 from src.demo.agent import Agent
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
 from src.schema.task import TaskPlan, TaskState
+from src.schema.tool import Tool
 from src.tool.tool_executor import DefaultToolExecutor
 from src.tool.tool_registry import DefaultToolRegistry
 
@@ -66,6 +68,15 @@ class FalseySandbox:
         return "sandboxed"
 
 
+class RecordingSandbox(FalseySandbox):
+    def __init__(self):
+        self.calls = []
+
+    def run(self, tool, inputs, workspace):
+        self.calls.append((tool, inputs, workspace))
+        return "sandboxed"
+
+
 class FalseyCancellationToken(CancellationToken):
     def __bool__(self):
         return False
@@ -88,6 +99,17 @@ class RecordingMCPManager:
 
     async def aclose(self):
         self.close_calls += 1
+
+
+def _write_skill(root: Path, folder: str, name: str) -> Path:
+    skill_dir = root / folder
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: Helps with research.\n---\nFollow the evidence.\n",
+        encoding="utf-8",
+    )
+    (skill_dir / "reference.md").write_text("trusted", encoding="utf-8")
+    return skill_dir
 
 
 def test_chat_plans_then_returns_the_answer():
@@ -198,6 +220,127 @@ def test_default_composition_shares_one_new_catalog():
     assert isinstance(agent.tool_registry, DefaultToolRegistry)
     assert agent.tool_executor.catalog is agent.tool_registry
     assert agent.mcp_manager.catalog is agent.tool_registry
+
+
+def test_agent_loads_skill_into_prompt_and_registers_read_tool_without_shell(tmp_path):
+    class PromptGateway(ChatGateway):
+        def __init__(self):
+            super().__init__(["done"])
+            self.system_prompts = []
+
+        def infer(self, context, stream=True, response_format=None):
+            self.system_prompts.append(context.messages[0].content)
+            return super().infer(context, stream=stream, response_format=response_format)
+
+    skill_dir = _write_skill(tmp_path, "research", "research helper")
+    gateway = PromptGateway()
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=gateway,
+        workspace=tmp_path,
+        skill_directories=[skill_dir],
+    )
+
+    agent.chat("research this")
+
+    assert [skill.name for skill in agent.harness.skills] == ["research helper"]
+    assert "Follow the evidence." in gateway.system_prompts[0]
+    assert "skill__research_helper__read_file" in gateway.system_prompts[0]
+    assert agent.tool_registry.find_tool("skill__research_helper__read_file") is not None
+    assert agent.tool_registry.find_tool("skill__research_helper__shell") is None
+
+
+def test_agent_routes_skill_shell_through_sandbox_with_skill_workspace(tmp_path):
+    skill_dir = _write_skill(tmp_path, "scripts", "script runner")
+    sandbox = RecordingSandbox()
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["unused"]),
+        workspace=tmp_path,
+        sandbox_runner=sandbox,
+        skill_directories=[skill_dir],
+    )
+
+    result = agent.tool_executor.execute_tool_call(
+        LlmToolCall(
+            "call-1",
+            "skill__script_runner__shell",
+            '{"command":"bash scripts/check.sh"}',
+        )
+    )
+
+    assert result.is_completed()
+    assert result.output == "sandboxed"
+    [(tool, inputs, workspace)] = sandbox.calls
+    assert tool.name == "skill__script_runner__shell"
+    assert inputs == {"command": "bash scripts/check.sh", "cwd": "."}
+    assert workspace.root == skill_dir.resolve()
+
+
+def test_agent_rejects_duplicate_skill_names_before_registering_tools(tmp_path):
+    first = _write_skill(tmp_path, "first", "duplicate")
+    second = _write_skill(tmp_path, "second", "duplicate")
+    catalog = DefaultToolRegistry()
+
+    with pytest.raises(ValueError, match="duplicate skill name"):
+        Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=ChatGateway(["unused"]),
+            tool_catalog=catalog,
+            skill_directories=[first, second],
+        )
+
+    assert catalog.get_all_tools() == []
+
+
+def test_agent_rejects_skill_tool_collision_without_mutating_catalog(tmp_path):
+    skill_dir = _write_skill(tmp_path, "research", "research helper")
+    catalog = DefaultToolRegistry()
+    existing = Tool(
+        id="skill__research_helper__read_file",
+        name="skill__research_helper__read_file",
+        description="existing",
+        input_schema={},
+        executer=lambda _inputs: "existing",
+    )
+    catalog.register(existing)
+
+    with pytest.raises(ValueError, match="tool collision"):
+        Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=ChatGateway(["unused"]),
+            tool_catalog=catalog,
+            skill_directories=[skill_dir],
+        )
+
+    assert catalog.get_all_tools() == [existing]
+
+
+def test_agent_rolls_back_skill_tools_when_catalog_registration_fails(tmp_path):
+    class FailingCatalog(DefaultToolRegistry):
+        def __init__(self):
+            super().__init__()
+            self.register_calls = 0
+
+        def register(self, tool):
+            self.register_calls += 1
+            if self.register_calls == 2:
+                raise RuntimeError("catalog offline")
+            return super().register(tool)
+
+    skill_dir = _write_skill(tmp_path, "scripts", "script runner")
+    catalog = FailingCatalog()
+
+    with pytest.raises(RuntimeError, match="catalog offline"):
+        Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=ChatGateway(["unused"]),
+            tool_catalog=catalog,
+            sandbox_runner=RecordingSandbox(),
+            skill_directories=[skill_dir],
+        )
+
+    assert catalog.get_all_tools() == []
 
 
 def test_injected_executor_catalog_becomes_authoritative():
