@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
-import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -13,31 +11,12 @@ from pydantic import BaseModel
 
 from src.core.tool import RemoteToolError
 from src.schema.tool import Tool, ToolOrigin
-
-_MAX_PROVIDER_NAME = 64
-_HASH_LENGTH = 10
-_UNSAFE_NAME = re.compile(r"[^A-Za-z0-9_-]+")
+from src.utils.tool_names import provider_tool_name as _provider_tool_name
 
 
 def provider_tool_name(server_name: str, remote_name: str) -> str:
     """Build one deterministic provider-safe function name."""
-    server = _normalize_segment(server_name)
-    remote = _normalize_segment(remote_name)
-    full = f"mcp__{server}__{remote}"
-    if len(full) <= _MAX_PROVIDER_NAME:
-        return full
-    digest = hashlib.sha256(full.encode("utf-8")).hexdigest()[:_HASH_LENGTH]
-    prefix_length = _MAX_PROVIDER_NAME - _HASH_LENGTH - 1
-    return f"{full[:prefix_length]}_{digest}"
-
-
-def _normalize_segment(value: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError("MCP names must contain provider-safe ASCII characters")
-    normalized = _UNSAFE_NAME.sub("_", value).strip("_-")
-    if not normalized:
-        raise ValueError(f"MCP name {value!r} has no provider-safe ASCII characters")
-    return normalized
+    return _provider_tool_name("mcp", server_name, remote_name)
 
 
 def normalize_mcp_result(result: Any) -> dict[str, Any]:
