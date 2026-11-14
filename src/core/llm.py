@@ -66,6 +66,7 @@ class AsyncLlmGateway(Protocol):
         response_format: Any | None = None,
     ) -> LLMOutput | AsyncIterator[LLMOutput]: ...
 
+
 def get_finish_reason_value(finish_reason: FinishReason | None) -> str | None:
     """
     Get the value of the finish reason.

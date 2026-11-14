@@ -1,3 +1,4 @@
+import asyncio
 from typing import get_type_hints
 
 import pytest
@@ -255,7 +256,10 @@ def test_planning_run_emits_task_events():
 
 
 def test_planning_retry_emits_an_llm_retry_event(monkeypatch):
-    monkeypatch.setattr(CancellationToken, "wait", lambda _self, _seconds: False)
+    async def no_cancel(_self, _seconds):
+        return False
+
+    monkeypatch.setattr(CancellationToken, "await_cancelled", no_cancel)
     gateway = Gateway()
     gateway.failures = 1
     output = RecordingOutput()
@@ -386,11 +390,11 @@ def test_later_steps_keep_the_goal_and_drop_stale_plan_steps():
 def test_transient_planning_errors_are_retried(monkeypatch):
     waits = []
 
-    def record_wait(_token, seconds):
+    async def record_wait(_token, seconds):
         waits.append(seconds)
         return False
 
-    monkeypatch.setattr(CancellationToken, "wait", record_wait)
+    monkeypatch.setattr(CancellationToken, "await_cancelled", record_wait)
     gateway = Gateway()
     gateway.failures = 1
 
@@ -752,7 +756,7 @@ def test_cancel_interrupts_retry_backoff_without_another_attempt():
             super().__init__()
             self.waits = []
 
-        def wait(self, timeout):
+        async def await_cancelled(self, timeout=None):
             self.waits.append(timeout)
             self.cancel()
             return True
@@ -1457,3 +1461,189 @@ def test_failed_turn_elapsed_time_includes_finalization_error(monkeypatch):
     _harness(TimedFinalizationFailure(), max_steps=1).run(task)
 
     assert task.elapsed_seconds == 9.0
+
+
+class NativeAsyncGateway:
+    def __init__(self, answers=None):
+        self.answers = list(answers or [_model(FinishReason.STOP, "async answer")])
+
+    async def aplanning(self, context, stream=True, response_format=None):
+        await asyncio.sleep(0)
+        return LLMOutput(
+            FinishReason.STOP,
+            None,
+            [],
+            None,
+            None,
+            structured=TaskPlan(goal=["async"], current="run", remaining=[]),
+        )
+
+    async def ainfer(self, context, stream=True, response_format=None):
+        await asyncio.sleep(0)
+        return self.answers.pop(0)
+
+    def planning(self, context, stream=True, response_format=None):
+        raise AssertionError("native async planning must be preferred")
+
+    def infer(self, context, stream=True, response_format=None):
+        raise AssertionError("native async inference must be preferred")
+
+
+def test_arun_completes_with_a_native_async_gateway():
+    task = _task()
+
+    result = asyncio.run(_harness(NativeAsyncGateway()).arun(task))
+
+    assert result.output == "async answer"
+    assert task.state is TaskState.TASK_COMPLETED
+    assert task.plan.goal == ["async"]
+
+
+def test_arun_accepts_a_gateway_that_implements_only_the_async_protocol():
+    class AsyncOnlyGateway:
+        async def aplanning(self, context, stream=True, response_format=None):
+            return LLMOutput(
+                FinishReason.STOP,
+                None,
+                [],
+                None,
+                None,
+                structured=TaskPlan(goal=["async only"]),
+            )
+
+        async def ainfer(self, context, stream=True, response_format=None):
+            return _model(FinishReason.STOP, "done")
+
+    result = asyncio.run(_harness(AsyncOnlyGateway()).arun(_task()))
+
+    assert result.output == "done"
+
+
+def test_arun_executes_async_tools_and_preserves_pause_resume_flow():
+    called = []
+
+    async def execute(inputs):
+        called.append(inputs)
+        return "tool output"
+
+    gateway = NativeAsyncGateway(
+        [
+            _model(
+                FinishReason.TOOL_CALLS,
+                calls=[LlmToolCall("call-1", "shell", '{"command":"status"}')],
+            ),
+            _model(FinishReason.STOP, "done"),
+        ]
+    )
+    registry = DefaultToolRegistry()
+    registry.register(Tool("shell", "shell", "Run.", {}, execute))
+    harness = _harness(gateway, executor=DefaultToolExecutor(registry))
+    task = _task()
+
+    asyncio.run(harness.arun(task))
+    assert task.state is TaskState.TASK_PAUSED
+    task.decide_tool_call("call-1", True)
+    result = asyncio.run(harness.arun(task))
+
+    assert result.output == "done"
+    assert called == [{"command": "status"}]
+
+
+def test_two_arun_calls_can_wait_in_the_same_async_gateway_concurrently():
+    class RendezvousGateway(NativeAsyncGateway):
+        def __init__(self):
+            super().__init__()
+            self.infer_count = 0
+            self.both_started = asyncio.Event()
+
+        async def ainfer(self, context, stream=True, response_format=None):
+            self.infer_count += 1
+            if self.infer_count == 2:
+                self.both_started.set()
+            await self.both_started.wait()
+            return _model(FinishReason.STOP, "done")
+
+    async def scenario():
+        gateway = RendezvousGateway()
+        harness = _harness(gateway)
+        return await asyncio.wait_for(
+            asyncio.gather(harness.arun(_task()), harness.arun(_task())), timeout=1
+        )
+
+    results = asyncio.run(scenario())
+
+    assert [result.output for result in results] == ["done", "done"]
+
+
+def test_sync_run_rejects_an_active_loop_before_emitting_or_saving():
+    sink = RecordingOutput()
+    repository = RecordingRepository()
+    harness = _harness(Gateway(), event_handler=sink, repository=repository)
+
+    async def scenario():
+        with pytest.raises(RuntimeError, match="await arun"):
+            harness.run(_task())
+
+    asyncio.run(scenario())
+
+    assert sink.events == []
+    assert repository.states == []
+
+
+def test_cancelling_the_arun_task_persists_cancel_and_reraises():
+    class WaitingGateway(NativeAsyncGateway):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+
+        async def ainfer(self, context, stream=True, response_format=None):
+            self.started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    async def scenario():
+        gateway = WaitingGateway()
+        repository = InMemoryTaskRepository()
+        task = _task()
+        running = asyncio.create_task(_harness(gateway, repository=repository).arun(task))
+        await gateway.started.wait()
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        return task, repository.get(task.id)
+
+    task, restored = asyncio.run(scenario())
+
+    assert task.state is TaskState.TASK_FAILED
+    assert task.state_reason is TaskFailReason.TASK_FAILED_CANCEL
+    assert restored is not None
+    assert restored.state_reason is TaskFailReason.TASK_FAILED_CANCEL
+
+
+def test_cancellation_cleanup_repository_failure_wins_over_cancelled_error():
+    class WaitingGateway(NativeAsyncGateway):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+
+        async def ainfer(self, context, stream=True, response_format=None):
+            self.started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    class FailCancelledSave(RecordingRepository):
+        def save(self, task):
+            if task.state_reason is TaskFailReason.TASK_FAILED_CANCEL:
+                raise RuntimeError("cancel save failed")
+            super().save(task)
+
+    async def scenario():
+        gateway = WaitingGateway()
+        task = _task()
+        running = asyncio.create_task(_harness(gateway, repository=FailCancelledSave()).arun(task))
+        await gateway.started.wait()
+        running.cancel()
+        with pytest.raises(RuntimeError, match="cancel save failed"):
+            await running
+
+    asyncio.run(scenario())

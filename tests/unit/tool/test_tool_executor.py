@@ -801,13 +801,28 @@ def test_async_executor_awaits_a_native_async_runner():
     executor = _executor_for_tool(tool, runner=AsyncRunner())
 
     result = asyncio.run(
-        executor.aexecute_tool_call(
-            LlmToolCall(id="call-1", name="read", arguments='{"path":"a"}')
-        )
+        executor.aexecute_tool_call(LlmToolCall(id="call-1", name="read", arguments='{"path":"a"}'))
     )
 
     assert result.is_completed()
     assert result.output == {"tool": "read", "inputs": {"path": "a"}}
+
+
+def test_async_executor_accepts_a_runner_that_implements_only_the_async_protocol():
+    class AsyncOnlyRunner:
+        async def arun(self, tool, inputs):
+            return inputs["value"]
+
+    tool = Tool("read", "read", "Read.", {}, lambda inputs: "unused")
+    executor = _executor_for_tool(tool, runner=AsyncOnlyRunner())
+
+    result = asyncio.run(
+        executor.aexecute_tool_call(
+            LlmToolCall(id="call-1", name="read", arguments='{"value":"native"}')
+        )
+    )
+
+    assert result.output == "native"
 
 
 def test_async_executor_classifies_a_native_async_runner_error():
@@ -903,9 +918,7 @@ def test_async_tool_batch_preserves_order_and_cancels_calls_after_the_boundary()
 def test_async_held_tool_call_resumes_after_approval():
     executor = _executor(lambda inputs: "ran", "shell")
     held = asyncio.run(
-        executor.aexecute_tool_call(
-            LlmToolCall("call-1", "shell", '{"command":"status"}')
-        )
+        executor.aexecute_tool_call(LlmToolCall("call-1", "shell", '{"command":"status"}'))
     )
     held.approval = ApprovalDecision.APPROVAL_DECISION_APPROVED
 

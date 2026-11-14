@@ -124,9 +124,7 @@ class ToolExecutor:
         return await self._arun_approved(tool, validated)
 
     def _run_approved(self, tool: Tool, inputs: dict) -> ToolExecutionResult:
-        return run_sync(
-            lambda: self._arun_approved(tool, inputs), async_name="aexecute_approved"
-        )
+        return run_sync(lambda: self._arun_approved(tool, inputs), async_name="aexecute_approved")
 
     async def _arun_approved(self, tool: Tool, inputs: dict) -> ToolExecutionResult:
         if tool.requires_sandbox:
@@ -148,14 +146,17 @@ class ToolExecutor:
                 assert tool.workspace is not None
                 output = await call_maybe_async(
                     getattr(self.sandbox_runner, "arun", None),
-                    self.sandbox_runner.run,
+                    getattr(self.sandbox_runner, "run", None),
                     tool,
                     inputs,
                     tool.workspace,
                 )
             else:
                 output = await call_maybe_async(
-                    getattr(self.runner, "arun", None), self.runner.run, tool, inputs
+                    getattr(self.runner, "arun", None),
+                    getattr(self.runner, "run", None),
+                    tool,
+                    inputs,
                 )
         except Exception as error:
             return self._failed(tool, output=f"{type(error).__name__}: {error}")

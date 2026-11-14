@@ -25,7 +25,7 @@ def run_sync(awaitable_factory: Callable[[], Awaitable[T]], *, async_name: str) 
 
 async def call_maybe_async(
     async_callable: Callable[..., Any] | None,
-    sync_callable: Callable[..., Any],
+    sync_callable: Callable[..., Any] | None,
     /,
     *args: Any,
     **kwargs: Any,
@@ -34,6 +34,8 @@ async def call_maybe_async(
     if async_callable is not None:
         result = async_callable(*args, **kwargs)
     else:
+        if sync_callable is None:
+            raise TypeError("neither an async nor synchronous callable is available")
         result = await asyncio.to_thread(sync_callable, *args, **kwargs)
     if inspect.isawaitable(result):
         return await result
