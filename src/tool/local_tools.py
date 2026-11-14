@@ -4,7 +4,7 @@ from functools import wraps
 from pathlib import Path
 
 from src.core.workspace import Workspace, WorkspaceViolation
-from src.schema.tool import Tool
+from src.schema.tool import Tool, ToolOrigin
 
 _MAX_READ_LINES = 2000
 _MAX_MATCHES = 200
@@ -331,6 +331,7 @@ class LocalToolSuite:
             requires_sandbox=requires_sandbox,
             input_validator=input_validator,
             workspace=self.workspace,
+            origin=ToolOrigin.LOCAL,
         )
 
 

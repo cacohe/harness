@@ -5,7 +5,7 @@ import time
 import pytest
 from src.core import tool as core_tool
 from src.core.context import build_tool_messages
-from src.core.tool import ToolExecutor
+from src.core.tool import RemoteToolError, ToolExecutor
 from src.core.workspace import Workspace, WorkspaceViolation
 from src.schema.llm import LlmToolCall
 from src.schema.tool import (
@@ -13,6 +13,7 @@ from src.schema.tool import (
     Tool,
     ToolExecutionFailReason,
     ToolExecutionState,
+    ToolOrigin,
 )
 from src.tool.local_tools import LocalToolSuite
 from src.tool.tool_executor import DefaultToolExecutor, LocalToolRunner
@@ -968,3 +969,64 @@ def test_sync_tool_wrapper_rejects_an_active_event_loop_before_execution():
     asyncio.run(scenario())
 
     assert called is False
+
+
+def test_local_tool_suite_marks_every_tool_as_local(tmp_path):
+    tools = LocalToolSuite(Workspace(tmp_path)).tools(include_shell=True)
+
+    assert tools
+    assert {tool.origin for tool in tools} == {ToolOrigin.LOCAL}
+
+
+def test_default_policy_pauses_a_tool_marked_as_requiring_approval():
+    registry = DefaultToolRegistry()
+    registry.register(
+        Tool(
+            "remote",
+            "remote",
+            "Remote.",
+            {},
+            lambda inputs: "ran",
+            origin=ToolOrigin.MCP,
+            requires_approval=True,
+        )
+    )
+    executor = DefaultToolExecutor(registry)
+
+    result = executor.execute_tool_call(LlmToolCall("call-1", "remote", "{}"))
+
+    assert result.is_pending()
+    assert result.needs_approval is True
+
+
+def test_injected_policy_can_approve_a_tool_marked_as_requiring_approval():
+    tool = Tool(
+        "remote",
+        "remote",
+        "Remote.",
+        {},
+        lambda inputs: "unused",
+        origin=ToolOrigin.MCP,
+        requires_approval=True,
+    )
+    executor = _executor_for_tool(tool, runner=Runner("approved"), policy=Policy())
+
+    result = executor.execute_tool_call(LlmToolCall("call-1", "remote", "{}"))
+
+    assert result.is_completed()
+    assert result.output == "approved"
+
+
+def test_remote_tool_error_becomes_a_remote_failure_with_structured_output():
+    output = {"content": [], "structured_content": None, "is_error": True}
+
+    async def fail(_inputs):
+        raise RemoteToolError(output)
+
+    executor = _executor(fail, "remote")
+
+    result = asyncio.run(executor.aexecute_tool_call(LlmToolCall("call-1", "remote", "{}")))
+
+    assert result.is_failed()
+    assert result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_REMOTE_ERROR
+    assert result.output == output

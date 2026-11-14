@@ -17,6 +17,14 @@ from src.schema.tool import (
 )
 
 
+class RemoteToolError(Exception):
+    """A remote tool returned a structured failure."""
+
+    def __init__(self, output: Any):
+        self.output = output
+        super().__init__(str(output))
+
+
 @runtime_checkable
 class ToolCatalog(Protocol):
     def register(self, tool: Tool) -> None: ...
@@ -158,6 +166,12 @@ class ToolExecutor:
                     tool,
                     inputs,
                 )
+        except RemoteToolError as error:
+            return self._failed(
+                tool,
+                ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_REMOTE_ERROR,
+                output=error.output,
+            )
         except Exception as error:
             return self._failed(tool, output=f"{type(error).__name__}: {error}")
         return ToolExecutionResult(

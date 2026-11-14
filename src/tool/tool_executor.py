@@ -29,6 +29,8 @@ class DefaultApprovalPolicy:
     _NEED_APPROVAL_TOOLS = {"shell", "write_file", "edit_file"}
 
     def decide(self, tool: Tool, inputs: dict) -> ApprovalDecision | None:
+        if tool.requires_approval:
+            return None
         if tool.name in self._NEED_APPROVAL_TOOLS:
             return None
         return ApprovalDecision.APPROVAL_DECISION_APPROVED
