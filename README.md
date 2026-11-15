@@ -84,7 +84,12 @@ from src.demo.agent import Agent
 from src.sandbox import DockerSandboxRunner
 
 image = "registry.example/agent-runtime@sha256:" + "0123456789abcdef" * 4
-sandbox = DockerSandboxRunner(image, memory_bytes=512 * 1024 * 1024, cpus=1.0)
+sandbox = DockerSandboxRunner(
+    image,
+    docker_executable=r"C:\Program Files\Docker\Docker\resources\bin\docker.exe",
+    memory_bytes=512 * 1024 * 1024,
+    cpus=1.0,
+)
 agent = Agent.from_config(
     Config.load(),
     workspace="./my-project",
@@ -98,7 +103,12 @@ runner 仅在宿主机上以参数数组启动 Docker CLI，模型生成的命�
 Workspace 被以可读写方式挂载到 `/workspace`。工作目录会在 runner 内再次验证。
 
 默认要求 `@sha256:` 镜像引用并传入 `--pull=never`，不会在执行期隐式拉取或更换
-镜像。超时会终止 Docker CLI 并强制删除该次唯一命名的容器；无法确认清理时
+镜像。`docker_executable` 必须是已存在、可执行的绝对本机路径，不从 PATH 或当前目录
+搜索。runner 还会显式覆盖 Docker context/`DOCKER_HOST`，只允许本地 Unix socket 或 Windows
+named pipe；需要 rootless socket 时可用 `docker_host="unix:///absolute/path/docker.sock"` 指定。
+
+每次执行先创建但不启动容器，再单独 attach/start。无论命令成功、失败、CLI 异常或
+超时，都会在返回前强制删除该次唯一命名的容器；无法确认清理时
 失败关闭。stdout/stderr 会持续排空，但只保留配置的有界字节数。
 
 Docker daemon、Docker CLI、宿主内核和指定镜像仍是受信任的部署边界。runner 不会挂载

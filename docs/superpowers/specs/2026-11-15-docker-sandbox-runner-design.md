@@ -7,9 +7,14 @@ model-authored command text in a host shell.
 
 ## Trust boundary
 
-The Docker daemon, selected local image, Docker CLI, and host kernel are trusted deployment
+The local Docker daemon, selected local image, Docker CLI, and host kernel are trusted deployment
 dependencies. The container is the isolation boundary. This runner does not claim to protect a host
 from a compromised Docker daemon or kernel, and it supports Linux containers only.
+
+The Docker CLI must be supplied as an existing absolute native executable. The runner never searches
+the current directory or `PATH`. Every invocation explicitly selects a local Unix socket or Windows
+named pipe, overriding ambient Docker contexts and `DOCKER_HOST`; remote daemon transports are
+rejected because a bind source would refer to the remote host rather than this Workspace.
 
 The image is injected explicitly. By default it must use an immutable `@sha256:<digest>` reference
 and the runner passes `--pull=never`; operators provision the image before starting the Agent.
@@ -22,7 +27,7 @@ command tools, rather than guessing from a mutable tool name.
 
 ## Container policy
 
-Each call creates a uniquely named, one-shot container with:
+Each call creates a uniquely named, initially stopped container with:
 
 - `--network none`, `--read-only`, `--cap-drop ALL`, and `no-new-privileges`;
 - non-root UID/GID, PID, memory, swap, CPU, and file-descriptor limits;
@@ -40,9 +45,12 @@ The synchronous runner is intentionally used through ToolExecutor's worker-threa
 stdout and stderr concurrently, keeps only configured byte limits, and returns a JSON-safe result
 with exit code, decoded streams, and truncation flags.
 
-Timeout kills the Docker CLI and then force-removes the unique container. A force-remove is also
-attempted after unexpected CLI failures. Timeout and cleanup failures cross a sanitized exception
-boundary; host workspace paths and Docker command lines are not included.
+Creation and attached start are separate Docker operations, so command execution begins only after
+container identity is established. Every created container is force-removed before return, including
+normal nonzero exits, timeouts, CLI failures, and output-capture failures. Cleanup happens before
+bounded reader joins; remaining streams are closed at the shared cleanup deadline. Timeout and
+cleanup failures cross a sanitized exception boundary; host paths and Docker command lines are not
+included.
 
 ## Validation
 
