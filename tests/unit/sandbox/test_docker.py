@@ -1,4 +1,5 @@
 import io
+import os
 import subprocess
 import sys
 import threading
@@ -333,6 +334,40 @@ def test_output_setup_failure_cannot_skip_container_cleanup(tmp_path, monkeypatc
         runner.run(shell, {"command": "true"}, workspace)
 
     assert cleanup_calls
+
+
+def test_buffered_reader_lock_cannot_defeat_the_cleanup_deadline(tmp_path, monkeypatch):
+    workspace, shell = _shell(tmp_path)
+    read_fd, write_fd = os.pipe()
+    reader = os.fdopen(read_fd, "rb")
+    writer = os.fdopen(write_fd, "wb")
+    process = _Process()
+    process.stdout = reader
+    monkeypatch.setattr("src.sandbox.docker.subprocess.run", _control_success)
+    monkeypatch.setattr("src.sandbox.docker.subprocess.Popen", lambda *_a, **_k: process)
+    runner = _runner(cleanup_timeout=0.02)
+    finished = threading.Event()
+    errors = []
+
+    def execute():
+        try:
+            runner.run(shell, {"command": "wait for pipe"}, workspace)
+        except Exception as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=execute, daemon=True)
+    worker.start()
+    returned_before_release = finished.wait(0.3)
+    writer.close()
+    worker.join(1)
+    reader.close()
+
+    assert returned_before_release is True
+    assert len(errors) == 1
+    assert isinstance(errors[0], DockerSandboxError)
+    assert "capture" in str(errors[0])
 
 
 def test_cleanup_failure_overrides_a_successful_command_result(tmp_path, monkeypatch):

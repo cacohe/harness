@@ -239,7 +239,6 @@ class DockerSandboxRunner:
             if not self._force_remove(container_name, creationflags, self.cleanup_timeout):
                 raise DockerSandboxError("sandbox container cleanup could not be confirmed")
             raise DockerSandboxError("could not capture Docker sandbox output")
-        output_streams = [process.stdout, process.stderr]
         stdout = _BoundedCapture(self.max_output_bytes)
         stderr = _BoundedCapture(self.max_output_bytes)
         pending_readers = [
@@ -259,7 +258,7 @@ class DockerSandboxRunner:
                 creationflags,
                 max(0.001, deadline - time.monotonic()),
             )
-            self._settle_readers(readers, output_streams, deadline)
+            self._settle_readers(readers, deadline)
             if not cleanup_confirmed:
                 raise DockerSandboxError(
                     "sandbox container cleanup could not be confirmed"
@@ -289,11 +288,7 @@ class DockerSandboxRunner:
                 process.wait(timeout=max(0.001, deadline - time.monotonic()))
             except Exception as error:
                 wait_error = wait_error or error
-        readers_settled = self._settle_readers(
-            readers,
-            output_streams,
-            deadline,
-        )
+        readers_settled = self._settle_readers(readers, deadline)
 
         if not cleanup_confirmed:
             raise DockerSandboxError("sandbox container cleanup could not be confirmed")
@@ -319,18 +314,7 @@ class DockerSandboxRunner:
             return
 
     @staticmethod
-    def _settle_readers(
-        readers: list[threading.Thread], streams: list[IO[bytes]], deadline: float
-    ) -> bool:
-        for reader in readers:
-            reader.join(max(0.0, deadline - time.monotonic()))
-        if all(not reader.is_alive() for reader in readers):
-            return True
-        for stream in streams:
-            try:
-                stream.close()
-            except Exception:
-                pass
+    def _settle_readers(readers: list[threading.Thread], deadline: float) -> bool:
         for reader in readers:
             reader.join(max(0.0, deadline - time.monotonic()))
         return all(not reader.is_alive() for reader in readers)
