@@ -913,6 +913,20 @@ def test_agent_pending_compatibility_properties_delegate_to_default_session():
     assert agent.new_session().pending_task is None
 
 
+def test_agent_transcript_assignment_restores_default_session_history():
+    gateway = ChatGateway(["restored"])
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=gateway,
+    )
+
+    agent.transcript = [("user", "saved"), ("assistant", "history")]
+    task = agent.chat("continue")
+
+    assert gateway.plans == ["user: saved\nassistant: history\nuser: continue"]
+    assert task.result.output == "restored"
+
+
 def test_chat_rejects_an_active_event_loop_before_starting_work():
     gateway = ChatGateway(["unused"])
     agent = Agent(

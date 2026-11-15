@@ -222,6 +222,10 @@ class Agent:
     def transcript(self) -> list[tuple[str, str]]:
         return self._default_session.transcript
 
+    @transcript.setter
+    def transcript(self, transcript: list[tuple[str, str]]) -> None:
+        self._default_session.transcript = transcript
+
     @property
     def pending_task(self) -> Task | None:
         return self._default_session.pending_task

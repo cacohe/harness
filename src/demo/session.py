@@ -56,7 +56,12 @@ class AgentSession:
             self.pending_run = None
             self._pending_message_hint = None
             return
-        self.pending_run = TaskRun(task=task, message=self._pending_message_hint or "")
+        message = (
+            self.pending_run.message
+            if self.pending_run is not None
+            else self._pending_message_hint or ""
+        )
+        self.pending_run = TaskRun(task=task, message=message)
 
     @property
     def pending_message(self) -> str | None:

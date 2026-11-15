@@ -101,6 +101,18 @@ def test_session_owns_paused_run_approval_and_resume():
     assert session.transcript == [("user", "run it"), ("assistant", "resumed")]
 
 
+def test_replacing_paused_task_preserves_its_original_message():
+    session = AgentSession(PausingHarness(), RecordingRepository(), lambda: None)
+    paused = session.chat("run it")
+
+    session.pending_task = paused
+
+    assert session.pending_message == "run it"
+    session.decide_tool_call("call-1", approved=False)
+    session.resume()
+    assert session.transcript == [("user", "run it"), ("assistant", "resumed")]
+
+
 def test_session_rejects_decision_without_own_pending_run():
     session = AgentSession(CompletingHarness(), RecordingRepository(), lambda: None)
 
