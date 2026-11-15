@@ -162,9 +162,31 @@ if task.is_paused():
 异步方法。默认 LiteLLM gateway 使用原生异步请求和流式响应；旧的同步 gateway、同步流和本地
 工具会在线程池中运行，避免阻塞事件循环。
 
-多个独立 `Harness.arun()` 或独立 `Agent` 实例可以在同一事件循环并发运行。当前单个 `Agent`
-仍只拥有一个 `pending_task` 和一份 transcript，不应同时启动多个会话；按会话隔离并发所有权属于
-下一阶段。
+多个独立 `Harness.arun()`、独立 `Agent` 实例，或同一 Agent 创建的不同 `AgentSession` 都可以
+在同一事件循环并发运行。每个 Session 独占 transcript、暂停任务、审批和 resume 所有权，共享
+Agent 已配置的模型、工具、Skill、任务仓库与 MCP 连接：
+
+```python
+async with Agent.from_config(Config.load(), workspace="./my-project") as agent:
+    first = agent.new_session()
+    second = agent.new_session()
+
+    first_task, second_task = await asyncio.gather(
+        first.achat("分析项目 A"),
+        second.achat("分析项目 B"),
+    )
+```
+
+同一个 Session 表示一条有序对话，不能同时执行两个 `achat` / `aresume`；重入会立即抛出
+`RuntimeError("session operation already in progress")`，不会阻塞事件循环或影响已经运行的回合。
+Session 有任务暂停等待审批时，新 `chat` 会被拒绝；必须通过该 Session 自己的
+`approval_requests()`、`decide_tool_call()` 和 `resume()` 继续，其他 Session 即使出现相同的
+tool-call id 也不会被修改。
+
+直接调用 `agent.chat()`、`agent.achat()`、`agent.resume()` 仍使用一个内置默认 Session，因此
+现有单会话调用方保持兼容；`agent.transcript`、`agent.pending_task` 和
+`agent.pending_message` 也是该默认 Session 的兼容视图。`Agent.aclose()` 后，之前创建的所有
+Session 都不能再开始或修改任务，已有 transcript 与审批列表仍可只读检查。
 
 取消等待中的原生协程会停止后续 Harness 工作并保存 `failed/cancel`。已经进入同步 gateway 或
 同步工具的线程池调用无法被强制终止；其结果会被丢弃，后台线程可能在短时间内继续运行。外部

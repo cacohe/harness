@@ -10,8 +10,8 @@ from src.core.task import Task
 from src.core.workspace import Workspace
 from src.demo.agent import Agent
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
-from src.schema.task import TaskPlan, TaskState
-from src.schema.tool import ApprovalDecision, Tool
+from src.schema.task import TaskPauseReason, TaskPlan, TaskResult, TaskRunningReason, TaskState
+from src.schema.tool import ApprovalDecision, Tool, ToolExecutionResult
 from src.tool.tool_executor import DefaultToolExecutor
 from src.tool.tool_registry import DefaultToolRegistry
 
@@ -794,6 +794,137 @@ def test_independent_agents_can_chat_concurrently():
     tasks = asyncio.run(scenario())
 
     assert [task.result.output for task in tasks] == ["done", "done"]
+
+
+def test_sessions_on_one_agent_chat_concurrently_with_isolated_transcripts():
+    class RendezvousGateway:
+        def __init__(self):
+            self.inputs = []
+            self.ready = asyncio.Event()
+
+        async def aplanning(self, context, stream=True, response_format=None):
+            return LLMOutput(
+                FinishReason.STOP,
+                None,
+                [],
+                None,
+                None,
+                structured=TaskPlan(goal=["answer"]),
+            )
+
+        async def ainfer(self, context, stream=True, response_format=None):
+            user_input = context.messages[1].content
+            self.inputs.append(user_input)
+            if len(self.inputs) == 2:
+                self.ready.set()
+            await self.ready.wait()
+            return LLMOutput(FinishReason.STOP, f"answer:{user_input}", [], None, None)
+
+    async def scenario():
+        gateway = RendezvousGateway()
+        agent = Agent(
+            config=Config(llm="test-model", max_steps=3, max_seconds=30),
+            llm_gateway=gateway,
+        )
+        first = agent.new_session()
+        second = agent.new_session()
+        tasks = await asyncio.wait_for(
+            asyncio.gather(first.achat("one"), second.achat("two")), timeout=1
+        )
+        return gateway, first, second, tasks
+
+    gateway, first, second, tasks = asyncio.run(scenario())
+
+    assert set(gateway.inputs) == {"one", "two"}
+    assert [task.result.output for task in tasks] == ["answer:one", "answer:two"]
+    assert first.transcript == [("user", "one"), ("assistant", "answer:one")]
+    assert second.transcript == [("user", "two"), ("assistant", "answer:two")]
+
+
+def test_sessions_keep_same_tool_call_id_approval_and_resume_isolated(monkeypatch):
+    async def pause_or_complete(_harness, task, cancellation_token=None):
+        if task.is_created():
+            task.transition_to_running(TaskRunningReason.TASK_RUNNING_CREATE)
+            task.set_pending_tool_calls(
+                [
+                    ToolExecutionResult(
+                        tool_id="shared-call",
+                        tool_name="shell",
+                        needs_approval=True,
+                    )
+                ]
+            )
+            task.transition_to_paused(TaskPauseReason.TASK_PAUSED_WAITING_APPROVAL)
+        else:
+            task.transition_to_running(TaskRunningReason.TASK_RUNNING_RESUME)
+            task.set_pending_tool_calls([])
+            task.set_result(TaskResult(output="resumed"))
+            task.transition_to_completed()
+        return task.result
+
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["unused"]),
+    )
+    monkeypatch.setattr(Harness, "arun", pause_or_complete)
+    first = agent.new_session()
+    second = agent.new_session()
+    third = agent.new_session()
+
+    first.chat("one")
+    second.chat("two")
+    first.decide_tool_call("shared-call", approved=False)
+    resumed = first.resume()
+
+    assert resumed.result.output == "resumed"
+    assert first.approval_requests() == []
+    assert [item.tool_id for item in second.approval_requests()] == ["shared-call"]
+    with pytest.raises(ValueError, match="nothing is waiting"):
+        third.decide_tool_call("shared-call", approved=True)
+
+
+def test_agent_close_invalidates_existing_sessions():
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["unused"]),
+    )
+    session = agent.new_session()
+
+    asyncio.run(agent.aclose())
+
+    with pytest.raises(RuntimeError, match="closed"):
+        session.chat("after close")
+    assert session.transcript == []
+    assert session.approval_requests() == []
+
+
+def test_agent_pending_compatibility_properties_delegate_to_default_session():
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["unused"]),
+    )
+    task = Task("legacy")
+
+    agent.pending_message = "legacy"
+    agent.pending_task = task
+
+    assert agent.pending_task is task
+    assert agent.pending_message == "legacy"
+    assert agent.new_session().pending_task is None
+
+
+def test_agent_transcript_assignment_restores_default_session_history():
+    gateway = ChatGateway(["restored"])
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=gateway,
+    )
+
+    agent.transcript = [("user", "saved"), ("assistant", "history")]
+    task = agent.chat("continue")
+
+    assert gateway.plans == ["user: saved\nassistant: history\nuser: continue"]
+    assert task.result.output == "restored"
 
 
 def test_chat_rejects_an_active_event_loop_before_starting_work():
