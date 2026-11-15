@@ -56,4 +56,3 @@ mount delimiter characters are rejected rather than ambiguously parsed.
 - Network-enabled commands or arbitrary container configuration from model input.
 - Windows-container support.
 - Treating approval as isolation; approval remains a separate policy layer.
-
