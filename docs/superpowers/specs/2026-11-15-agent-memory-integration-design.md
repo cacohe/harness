@@ -45,4 +45,3 @@ memory outside the manager's update path.
 - Existing `AgentSession(harness, repository, ensure_open)` construction remains valid.
 - Transcript properties and pause/resume ownership are unchanged.
 - No packaging or external dependency is added.
-
