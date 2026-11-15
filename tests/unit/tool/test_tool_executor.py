@@ -343,6 +343,20 @@ def test_sandbox_receives_tool_inputs_and_bound_workspace(tmp_path):
     assert runner.calls == []
 
 
+def test_sandbox_timeout_is_classified_as_a_tool_timeout(tmp_path):
+    class TimedOutSandbox(Sandbox):
+        def run(self, tool, inputs, workspace):
+            raise TimeoutError("sandbox command exceeded its timeout")
+
+    tool = _sandbox_tool(Workspace(tmp_path))
+    result = _executor_for_tool(tool, sandbox=TimedOutSandbox()).execute_tool_call(
+        LlmToolCall(id="call-1", name="shell", arguments='{"command":"sleep 60"}')
+    )
+
+    assert result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_TIMEOUT
+    assert result.output == "TimeoutError: sandbox command exceeded its timeout"
+
+
 def test_regular_tool_uses_bound_runner_even_when_sandbox_supports_it():
     runner = Runner()
     sandbox = Sandbox()

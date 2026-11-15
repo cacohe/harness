@@ -165,6 +165,12 @@ class ToolExecutor:
                     tool,
                     inputs,
                 )
+        except TimeoutError as error:
+            return self._failed(
+                tool,
+                ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_TIMEOUT,
+                output=f"TimeoutError: {error}",
+            )
         except RemoteToolError as error:
             return self._failed(
                 tool,
