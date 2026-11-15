@@ -24,8 +24,23 @@ class HarnessRunner(Protocol):
 
 
 class MemoryRuntime(Protocol):
-    def recall(self, query: str, **options: Any) -> list[MemoryItem]: ...
-    def remember(self, content: str, **options: Any) -> MemoryItem: ...
+    def recall(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        token_budget: int | None = None,
+        exclude_metadata: dict[str, Any] | None = None,
+    ) -> list[MemoryItem]: ...
+
+    def remember(
+        self,
+        content: str,
+        *,
+        type: MemoryType = MemoryType.EPISODIC,
+        importance: float = 0.5,
+        metadata: dict[str, Any] | None = None,
+    ) -> MemoryItem: ...
 
 
 @dataclass(frozen=True)

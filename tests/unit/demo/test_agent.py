@@ -12,6 +12,7 @@ from src.core.workspace import Workspace
 from src.demo.agent import Agent
 from src.memory.retriever import HybridRetriever
 from src.memory.store import InMemoryStore
+from src.observability import MetricsEventSink
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
 from src.schema.task import TaskPauseReason, TaskPlan, TaskResult, TaskRunningReason, TaskState
 from src.schema.tool import ApprovalDecision, Tool, ToolExecutionResult
@@ -696,6 +697,45 @@ def test_achat_completes_and_remembers_the_turn():
 
     assert task.result.output == "hello"
     assert agent.transcript == [("user", "hi"), ("assistant", "hello")]
+
+
+def test_agent_uses_an_explicit_event_sink_for_harness_observability():
+    metrics = MetricsEventSink()
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=ChatGateway(["hello"]),
+        event_sink=metrics,
+    )
+
+    task = agent.chat("hi")
+
+    assert agent.harness.event_handler is metrics
+    assert task.result.output == "hello"
+    snapshot = metrics.snapshot()
+    assert snapshot["events"]["task_started"] == 1
+    assert snapshot["task_outcomes"] == {"completed": 1}
+    assert snapshot["in_flight"] == {"tasks": 0, "llm": 0, "tools": 0}
+
+
+def test_agent_metrics_reconcile_a_permanent_model_failure():
+    class BrokenPlanning(ChatGateway):
+        def planning(self, context, stream=True, response_format=None):
+            raise ValueError("bad request")
+
+    metrics = MetricsEventSink()
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=BrokenPlanning([]),
+        event_sink=metrics,
+    )
+
+    task = agent.chat("hi")
+
+    assert task.state is TaskState.TASK_FAILED
+    snapshot = metrics.snapshot()
+    assert snapshot["events"]["llm_failed"] == 1
+    assert snapshot["task_outcomes"] == {"failed": 1}
+    assert snapshot["in_flight"] == {"tasks": 0, "llm": 0, "tools": 0}
 
 
 def test_agent_shares_injected_long_term_memory_across_isolated_sessions():

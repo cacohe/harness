@@ -5,6 +5,7 @@ from src.config import Config
 from src.context.context_builder import DefaultContextBuilder
 from src.core.cancellation import CancellationToken
 from src.core.context import ContextBuilder
+from src.core.event import EventSink
 from src.core.guard import NoOpGuard
 from src.core.hook import HarnessHook
 from src.core.llm import AsyncLlmGateway, LlmGateway
@@ -48,6 +49,7 @@ class Agent:
         memory_manager: MemoryRuntime | None = None,
         memory_top_k: int = 5,
         memory_token_budget: int | None = None,
+        event_sink: EventSink | None = None,
     ):
         """
         Create an agent with a model gateway, a context builder, and the local tools.
@@ -60,6 +62,7 @@ class Agent:
             sandbox_runner: Isolation backend. Shell is registered only when this is supplied.
             skill_directories: Directories containing SKILL.md and optional resources.
             memory_manager: Optional long-term memory shared by every Agent Session.
+            event_sink: Optional destination for Harness lifecycle events.
         """
         self.config = config if config is not None else Config.load()
         self.workspace = (
@@ -124,6 +127,7 @@ class Agent:
             harness_hooks=HarnessHook(),
             harness_guard=NoOpGuard(),
             task_repository=self.task_repository,
+            event_handler=event_sink,
             max_steps=self.config.max_steps,
             max_seconds=self.config.max_seconds,
         )

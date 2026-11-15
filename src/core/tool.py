@@ -233,7 +233,11 @@ class ToolExecutor:
         ordered_tools: list[ToolExecutionResult] = []
 
         for call in tool_calls:
-            if should_cancel is not None and should_cancel():
+            cancelled = should_cancel is not None and should_cancel()
+            if not cancelled and before_call is not None:
+                before_call(call)
+                cancelled = should_cancel is not None and should_cancel()
+            if cancelled:
                 result = ToolExecutionResult(
                     tool_id=call.id,
                     tool_name=call.name,
@@ -246,8 +250,6 @@ class ToolExecutor:
                 failed_tools.append(result)
                 ordered_tools.append(result)
                 continue
-            if before_call is not None:
-                before_call(call)
             result = await self._aexecute_tool_call_compat(call, hold=bool(pending_tools))
             if after_call is not None:
                 after_call(call, result)

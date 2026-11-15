@@ -275,6 +275,7 @@ def test_planning_retry_emits_an_llm_retry_event(monkeypatch):
     assert retries[0].payload.reason == "TimeoutError"
     assert [event.type for event in output.events if event.type.name.startswith("LLM_")] == [
         EventType.LLM_STARTED,
+        EventType.LLM_FAILED,
         EventType.LLM_RETRYING,
         EventType.LLM_STARTED,
         EventType.LLM_COMPLETED,
@@ -534,6 +535,33 @@ def test_execute_tool_calls_emits_failure():
     assert output.events[1].payload.content == "RuntimeError: nope"
 
 
+def test_executor_error_after_start_emits_a_matching_tool_failure():
+    class RaisesAfterStart(Executor):
+        def execute_tool_calls(
+            self,
+            tool_calls,
+            *,
+            before_call=None,
+            after_call=None,
+            should_cancel=None,
+        ):
+            del after_call, should_cancel
+            before_call(tool_calls[0])
+            raise RuntimeError("executor crashed")
+
+    output = RecordingOutput()
+    harness = _harness(Gateway(), event_handler=output, executor=RaisesAfterStart())
+
+    with pytest.raises(RuntimeError, match="executor crashed"):
+        harness.execute_tool_calls([LlmToolCall("call_1", "shell", "{}")], _task())
+
+    assert [event.type for event in output.events] == [
+        EventType.TOOL_EXECUTION_STARTED,
+        EventType.TOOL_EXECUTION_FAILED,
+    ]
+    assert output.events[-1].payload.reason == "unknown"
+
+
 def test_step_limit_asks_for_a_closing_answer_from_unseen_tool_results():
     executor = CountingExecutor([_shell()])
     gateway = ScriptedGateway(
@@ -644,7 +672,14 @@ def test_precancelled_created_task_does_no_gateway_work():
 
 def test_precancelled_paused_task_cancels_held_calls_in_order():
     called = []
-    sink = RecordingOutput()
+
+    class FailChildCancellation(RecordingOutput):
+        def emit(self, event):
+            super().emit(event)
+            if event.type is EventType.TOOL_EXECUTION_FAILED:
+                raise RuntimeError("child terminal failed")
+
+    sink = FailChildCancellation()
     repository = InMemoryTaskRepository()
     gateway = ScriptedGateway([_shell_call()])
     harness = _harness(
@@ -685,6 +720,13 @@ def test_cancel_between_held_calls_stops_the_remaining_calls():
 
     registry = DefaultToolRegistry()
     registry.register(Tool("shell", "shell", "Run.", {}, run))
+
+    class FailChildCancellation(RecordingOutput):
+        def emit(self, event):
+            super().emit(event)
+            if event.type is EventType.TOOL_EXECUTION_FAILED:
+                raise RuntimeError("child terminal failed")
+
     harness = _harness(
         ScriptedGateway(
             [
@@ -699,6 +741,7 @@ def test_cancel_between_held_calls_stops_the_remaining_calls():
             ]
         ),
         executor=DefaultToolExecutor(registry),
+        event_handler=FailChildCancellation(),
     )
     task = _task()
     harness.run(task)
@@ -717,7 +760,14 @@ def test_cancel_between_held_calls_stops_the_remaining_calls():
 
 def test_cancel_during_planning_return_wins_before_plan_is_saved():
     token = CancellationToken()
-    sink = RecordingOutput()
+
+    class FailChildCancellation(RecordingOutput):
+        def emit(self, event):
+            super().emit(event)
+            if event.type is EventType.LLM_FAILED:
+                raise RuntimeError("child terminal failed")
+
+    sink = FailChildCancellation()
 
     class CancellingPlanning(Gateway):
         def planning(self, context, stream=True, response_format=None):
@@ -767,12 +817,18 @@ def test_cancel_interrupts_retry_backoff_without_another_attempt():
     gateway = Gateway()
     gateway.failures = 1
     task = _task()
+    sink = RecordingOutput()
 
-    result = _harness(gateway).run(task, cancellation_token=token)
+    result = _harness(gateway, event_handler=sink).run(task, cancellation_token=token)
 
     assert result == TaskResult(output="Task cancelled.")
     assert token.waits == [DEFAULT_LLM_ATTEMPT_DELAY_SECONDS]
     assert len(gateway.planning_calls) == 1
+    assert [event.type for event in sink.events if event.type.name.startswith("LLM_")] == [
+        EventType.LLM_STARTED,
+        EventType.LLM_FAILED,
+        EventType.LLM_RETRYING,
+    ]
 
 
 def test_cancel_during_inference_prevents_tool_execution_and_completion():
@@ -952,6 +1008,107 @@ def test_cancel_from_llm_started_callback_prevents_gateway_call():
 
     assert result == TaskResult(output="Task cancelled.")
     assert gateway.planning_calls == []
+
+
+def test_cancel_from_tool_started_callback_prevents_default_tool_execution():
+    token = CancellationToken()
+    called = []
+
+    class CancelOnToolStart(RecordingOutput):
+        def emit(self, event):
+            super().emit(event)
+            if event.type is EventType.TOOL_EXECUTION_STARTED:
+                token.cancel()
+            if event.type is EventType.TOOL_EXECUTION_FAILED:
+                raise RuntimeError("terminal sink failed")
+
+    gateway = ScriptedGateway(
+        [
+            _model(
+                FinishReason.TOOL_CALLS,
+                calls=[LlmToolCall("call-1", "read_file", "{}")],
+            )
+        ]
+    )
+    sink = CancelOnToolStart()
+    task = _task()
+
+    result = _harness(
+        gateway,
+        event_handler=sink,
+        executor=_recording_executor(called, "read_file"),
+    ).run(task, cancellation_token=token)
+
+    assert result == TaskResult(output="Task cancelled.")
+    assert called == []
+    assert [event.type for event in sink.events if event.type.name.startswith("TOOL_")] == [
+        EventType.TOOL_EXECUTION_STARTED,
+        EventType.TOOL_EXECUTION_FAILED,
+    ]
+
+
+def test_public_tool_batch_returns_cancelled_result_when_start_sink_cancels():
+    token = CancellationToken()
+    called = []
+
+    class CancelOnStart(RecordingOutput):
+        def emit(self, event):
+            super().emit(event)
+            if event.type is EventType.TOOL_EXECUTION_STARTED:
+                token.cancel()
+
+    harness = _harness(
+        Gateway(),
+        event_handler=CancelOnStart(),
+        executor=_recording_executor(called, "read_file"),
+    )
+
+    result = harness.execute_tool_calls(
+        [LlmToolCall("call-1", "read_file", "{}")],
+        _task(),
+        cancellation_token=token,
+    )
+
+    assert called == []
+    assert result.completed_tools == []
+    assert [item.tool_id for item in result.failed_tools] == ["call-1"]
+    assert result.failed_tools[0].fail_reason is (
+        ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_CANCELLED
+    )
+
+
+def test_terminal_sink_failure_after_tool_cancels_does_not_skip_task_cleanup():
+    token = CancellationToken()
+
+    def cancel_during_tool(_inputs):
+        token.cancel()
+        return "abandoned"
+
+    class FailCancelledToolTerminal(RecordingOutput):
+        def emit(self, event):
+            super().emit(event)
+            if event.type is EventType.TOOL_EXECUTION_FAILED:
+                raise RuntimeError("terminal sink failed")
+
+    registry = DefaultToolRegistry()
+    registry.register(Tool("read_file", "read_file", "Read.", {}, cancel_during_tool))
+    task = _task()
+
+    result = _harness(
+        ScriptedGateway(
+            [
+                _model(
+                    FinishReason.TOOL_CALLS,
+                    calls=[LlmToolCall("call-1", "read_file", "{}")],
+                )
+            ]
+        ),
+        event_handler=FailCancelledToolTerminal(),
+        executor=DefaultToolExecutor(registry),
+    ).run(task, cancellation_token=token)
+
+    assert result == TaskResult(output="Task cancelled.")
+    assert task.state_reason is TaskFailReason.TASK_FAILED_CANCEL
 
 
 def test_repository_failure_while_cancelling_still_propagates():
@@ -1198,14 +1355,21 @@ def test_unexpected_error_persists_the_returned_result():
 
     repository = InMemoryTaskRepository()
     task = _task()
+    output = RecordingOutput()
 
-    result = _harness(BrokenPlanning(), repository=repository).run(task)
+    result = _harness(BrokenPlanning(), repository=repository, event_handler=output).run(task)
     restored = repository.get(task.id)
 
     assert result is task.result
     assert result.output == "An unexpected error occurred: bad request"
     assert restored is not None
     assert restored.result == result
+    llm_events = [event for event in output.events if event.type.name.startswith("LLM_")]
+    assert [event.type for event in llm_events] == [
+        EventType.LLM_STARTED,
+        EventType.LLM_FAILED,
+    ]
+    assert llm_events[-1].payload.reason == "ValueError"
 
 
 def test_finalization_error_replaces_the_empty_failed_result():
@@ -1629,6 +1793,47 @@ def test_cancelling_the_arun_task_persists_cancel_and_reraises():
     assert restored.state_reason is TaskFailReason.TASK_FAILED_CANCEL
 
 
+def test_child_observer_failure_during_caller_cancel_does_not_skip_task_cleanup():
+    class WaitingGateway(NativeAsyncGateway):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+
+        async def ainfer(self, context, stream=True, response_format=None):
+            self.started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    class FailChildTerminal(RecordingOutput):
+        def emit(self, event):
+            if event.type is EventType.LLM_FAILED:
+                raise RuntimeError("child observer failed")
+            super().emit(event)
+
+    async def scenario():
+        gateway = WaitingGateway()
+        repository = InMemoryTaskRepository()
+        task = _task()
+        running = asyncio.create_task(
+            _harness(
+                gateway,
+                event_handler=FailChildTerminal(),
+                repository=repository,
+            ).arun(task)
+        )
+        await gateway.started.wait()
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        return task, repository.get(task.id)
+
+    task, restored = asyncio.run(scenario())
+
+    assert task.state_reason is TaskFailReason.TASK_FAILED_CANCEL
+    assert restored is not None
+    assert restored.state_reason is TaskFailReason.TASK_FAILED_CANCEL
+
+
 def test_cancellation_cleanup_repository_failure_wins_over_cancelled_error():
     class WaitingGateway(NativeAsyncGateway):
         def __init__(self):
@@ -1696,7 +1901,14 @@ def test_cancelled_legacy_batch_cannot_run_later_tools_or_publish_late_events():
     release = threading.Event()
     finished = threading.Event()
     executed = []
-    sink = RecordingOutput()
+
+    class FailToolTerminal(RecordingOutput):
+        def emit(self, event):
+            super().emit(event)
+            if event.type is EventType.TOOL_EXECUTION_FAILED:
+                raise RuntimeError("tool observer failed")
+
+    sink = FailToolTerminal()
 
     class BlockingLegacyExecutor(Executor):
         def execute_tool_calls(
@@ -1767,6 +1979,135 @@ def test_cancelled_legacy_batch_cannot_run_later_tools_or_publish_late_events():
 
     assert executed == ["call-1"]
     assert len(sink.events) == terminal_event_count
+    tool_events = [event for event in sink.events if event.type.name.startswith("TOOL_EXECUTION_")]
+    assert [event.type for event in tool_events] == [
+        EventType.TOOL_EXECUTION_STARTED,
+        EventType.TOOL_EXECUTION_FAILED,
+    ]
+    assert tool_events[-1].payload.reason == "cancelled"
+
+
+def test_cancelling_worker_sink_does_not_block_the_event_loop_on_callback_lock():
+    sink_waiting = threading.Event()
+    acknowledge = threading.Event()
+    executor_finished = threading.Event()
+    sink_timeouts = []
+    executed = []
+
+    class AcknowledgedSink(RecordingOutput):
+        def emit(self, event):
+            super().emit(event)
+            if event.type is EventType.TOOL_EXECUTION_STARTED:
+                sink_waiting.set()
+                if not acknowledge.wait(1):
+                    sink_timeouts.append(True)
+
+    class SingleLegacyExecutor(Executor):
+        def execute_tool_calls(
+            self,
+            tool_calls,
+            *,
+            before_call=None,
+            after_call=None,
+            should_cancel=None,
+        ):
+            del should_cancel
+            try:
+                call = tool_calls[0]
+                before_call(call)
+                executed.append(call.id)
+                result = ToolExecutionResult(
+                    tool_id=call.id,
+                    tool_name=call.name,
+                    state=ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED,
+                    output="done",
+                )
+                after_call(call, result)
+                return ToolCallResult(completed_tools=[result], ordered_tools=[result])
+            finally:
+                executor_finished.set()
+
+    gateway = NativeAsyncGateway(
+        [_model(FinishReason.TOOL_CALLS, calls=[LlmToolCall("call-1", "first", "{}")])]
+    )
+    harness = _harness(
+        gateway,
+        executor=SingleLegacyExecutor([Tool("first", "first", "First.", {}, lambda _: "")]),
+        event_handler=AcknowledgedSink(),
+    )
+
+    async def scenario():
+        running = asyncio.create_task(harness.arun(_task()))
+        await asyncio.to_thread(sink_waiting.wait, 1)
+        running.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await running
+        finally:
+            acknowledge.set()
+        await asyncio.to_thread(executor_finished.wait, 1)
+
+    asyncio.run(scenario())
+
+    assert sink_timeouts == []
+    assert executed == []
+
+
+def test_cancelled_legacy_batch_cannot_start_after_callback_entry_race():
+    precheck_finished = threading.Event()
+    release_callback = threading.Event()
+    executor_finished = threading.Event()
+    executed = []
+
+    class PrecheckedLegacyExecutor(Executor):
+        def execute_tool_calls(
+            self,
+            tool_calls,
+            *,
+            before_call=None,
+            after_call=None,
+            should_cancel=None,
+        ):
+            try:
+                assert should_cancel is not None
+                assert should_cancel() is False
+                precheck_finished.set()
+                release_callback.wait(1)
+                call = tool_calls[0]
+                before_call(call)
+                executed.append(call.id)
+                result = ToolExecutionResult(
+                    tool_id=call.id,
+                    tool_name=call.name,
+                    state=ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED,
+                )
+                after_call(call, result)
+                return ToolCallResult(completed_tools=[result], ordered_tools=[result])
+            finally:
+                executor_finished.set()
+
+    gateway = NativeAsyncGateway(
+        [_model(FinishReason.TOOL_CALLS, calls=[LlmToolCall("call-1", "first", "{}")])]
+    )
+    harness = _harness(
+        gateway,
+        executor=PrecheckedLegacyExecutor([Tool("first", "first", "First.", {}, lambda _: "")]),
+    )
+
+    async def scenario():
+        task = _task()
+        running = asyncio.create_task(harness.arun(task))
+        await asyncio.to_thread(precheck_finished.wait, 1)
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        assert task.state is TaskState.TASK_FAILED
+        release_callback.set()
+        await asyncio.to_thread(executor_finished.wait, 1)
+
+    asyncio.run(scenario())
+
+    assert executed == []
 
 
 def test_resume_honors_a_legacy_held_call_override():
@@ -1796,6 +2137,34 @@ def test_resume_honors_a_legacy_held_call_override():
 
     assert called == []
     assert [message.content for message in _tool_messages(task)] == ["legacy denied"]
+
+
+def test_resumed_tool_executor_error_emits_a_matching_failure():
+    class BrokenHeldExecutor(DefaultToolExecutor):
+        def execute_held_tool_call(self, held):
+            raise RuntimeError("resume crashed")
+
+    registry = DefaultToolRegistry()
+    registry.register(Tool("shell", "shell", "Shell.", {}, lambda inputs: "unused"))
+    sink = RecordingOutput()
+    harness = _harness(
+        ScriptedGateway([_shell_call()]),
+        executor=BrokenHeldExecutor(registry),
+        event_handler=sink,
+    )
+    task = _task()
+    harness.run(task)
+    task.decide_tool_call("call_1", approved=True)
+
+    result = harness.run(task)
+
+    assert result.output == "An unexpected error occurred: resume crashed"
+    tool_events = [event for event in sink.events if event.type.name.startswith("TOOL_")]
+    assert [event.type for event in tool_events[-2:]] == [
+        EventType.TOOL_EXECUTION_RESUMED,
+        EventType.TOOL_EXECUTION_FAILED,
+    ]
+    assert tool_events[-1].payload.reason == "unknown"
 
 
 def test_caller_cancellation_during_resume_keeps_completed_and_settles_remaining_calls():

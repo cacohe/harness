@@ -274,6 +274,41 @@ Session 都不能再开始或修改任务，已有 transcript 与审批列表仍
 同步工具的线程池调用无法被强制终止；其结果会被丢弃，后台线程可能在短时间内继续运行。外部
 `CancellationToken` 仍采用上一节说明的协作式、非抢占语义。
 
+## 可观测性
+
+`Harness` 会为 Task、模型调用和工具执行产生生命周期事件。`Agent` 默认使用控制台
+`EventHandler`；生产服务可以通过 `event_sink` 显式替换，或将默认输出与进程内指标组合：
+
+```python
+from src.config import Config
+from src.core.event import EventHandler
+from src.demo.agent import Agent
+from src.observability import CompositeEventSink, MetricsEventSink
+
+metrics = MetricsEventSink(max_inflight=10_000)
+events = CompositeEventSink(EventHandler(), metrics)
+agent = Agent.from_config(Config.load(), event_sink=events)
+
+task = agent.chat("分析服务健康状况")
+snapshot = metrics.snapshot()
+```
+
+直接只注入 `MetricsEventSink` 会关闭默认控制台事件输出。`CompositeEventSink` 按声明顺序发送，
+默认隔离单个下游异常并累计 `failure_count`，避免监控故障改变 Agent 任务结果；只有测试或明确
+要求观测失败传播时才使用 `fail_fast=True`。
+
+快照包含各事件类型累计数、Task 终态计数、LLM token 用量、Task/LLM/Tool 当前 in-flight 数、
+被容量限制逐出的 in-flight 条目数，以及已配对操作的耗时次数、总和和最大值。为避免观察器
+自身无界增长，只保留至多 `max_inflight` 个各类别的活动标识；快照是脱离内部状态的 JSON-safe
+副本，`reset()` 可开始新的统计窗口。LLM 重试会先结束失败的本次 attempt，再发布 retry 事件；
+取消路径也会结束已开始的模型/工具操作，Task 终态还会兜底回收其未配对的子操作。该实现仅覆盖
+当前进程生命周期，不负责网络导出、跨进程
+聚合或告警；部署方应周期性读取 `snapshot()` 并交给自己的 metrics/telemetry 后端。
+
+`tests/load/test_shared_agent_load.py` 是确定性的并发回归，不是吞吐量 SLA 或基准测试。它在一个
+Agent 上并发运行 64 个隔离 Session，检查 transcript、任务仓库、共享长期内存与观测计数不会
+串扰。环境容量和性能验收仍应在目标模型、数据库、sandbox 与部署拓扑上单独压测。
+
 
 ## MCP 工具
 
@@ -384,6 +419,12 @@ uv run --locked ruff format --check src tests
 uv run --locked ruff check --no-cache src tests
 uv run --locked mypy src
 uv run --locked python -m pytest -q -p no:cacheprovider
+```
+
+只运行共享 Agent 并发回归：
+
+```powershell
+uv run --locked python -m pytest -q -p no:cacheprovider tests/load
 ```
 
 ## 启动

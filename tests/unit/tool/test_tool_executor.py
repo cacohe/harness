@@ -604,6 +604,30 @@ def test_cancelled_tools_skip_before_call_but_reach_after_call():
     assert result.completed_tools == []
 
 
+def test_cancellation_requested_by_before_call_prevents_tool_execution():
+    cancelled = False
+    calls = []
+    after = []
+
+    def before_call(_call):
+        nonlocal cancelled
+        cancelled = True
+
+    executor = _executor(lambda inputs: calls.append(inputs), "first")
+
+    result = executor.execute_tool_calls(
+        [LlmToolCall(id="call-1", name="first", arguments="{}")],
+        before_call=before_call,
+        after_call=lambda call, item: after.append((call.id, item.fail_reason)),
+        should_cancel=lambda: cancelled,
+    )
+
+    assert calls == []
+    assert after == [("call-1", ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_CANCELLED)]
+    assert result.completed_tools == []
+    assert [item.tool_id for item in result.failed_tools] == ["call-1"]
+
+
 def test_precancelled_batch_never_invokes_policy_validator_or_runner():
     runner = Runner()
     policy = CapturingPolicy()
