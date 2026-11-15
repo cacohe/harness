@@ -4,6 +4,7 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+import src.persistence.sqlite as sqlite_module
 from src.core.task import Task
 from src.persistence import SQLiteTaskRepository, TaskRepositoryError
 from src.schema.context import Message
@@ -86,13 +87,58 @@ def test_constructor_rejects_unsupported_version_without_modifying_database(tmp_
     with sqlite3.connect(path) as connection:
         connection.execute(f"PRAGMA user_version = {version}")
         connection.execute("CREATE TABLE future_data (value TEXT)")
+    before = path.read_bytes()
 
     with pytest.raises(TaskRepositoryError, match="unsupported schema version") as caught:
         SQLiteTaskRepository(path)
 
+    assert path.read_bytes() == before
     assert str(path) not in str(caught.value)
     assert _database_version(path) == version
     assert _table_names(path) == {"future_data"}
+
+
+@pytest.mark.parametrize(
+    "tasks_ddl",
+    [
+        None,
+        "CREATE TABLE tasks (id TEXT, snapshot TEXT NOT NULL, "
+        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, payload TEXT NOT NULL)",
+    ],
+)
+def test_constructor_rejects_version_one_with_an_invalid_tasks_schema(tmp_path, tasks_ddl):
+    path = tmp_path / "invalid-v1.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA user_version = 1")
+        if tasks_ddl is not None:
+            connection.execute(tasks_ddl)
+
+    with pytest.raises(TaskRepositoryError, match="schema") as caught:
+        SQLiteTaskRepository(path)
+
+    assert str(path) not in str(caught.value)
+
+
+def test_failed_connection_configuration_closes_the_opened_connection(tmp_path, monkeypatch):
+    path = tmp_path / "corrupt.db"
+    path.write_bytes(b"not a sqlite database")
+    opened = []
+    real_connect = sqlite3.connect
+
+    def capturing_connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite_module.sqlite3, "connect", capturing_connect)
+
+    with pytest.raises(TaskRepositoryError, match="initialize"):
+        SQLiteTaskRepository(path)
+
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        opened[0].execute("SELECT 1")
 
 
 def test_persistence_package_exports_sqlite_repository():
@@ -172,6 +218,33 @@ def test_get_wraps_corrupt_or_invariant_invalid_snapshots(tmp_path, snapshot):
         repository.get("broken")
 
     assert str(path) not in str(caught.value)
+
+
+def test_get_rejects_nonstandard_nonfinite_json_values(tmp_path):
+    path = tmp_path / "tasks.db"
+    repository = SQLiteTaskRepository(path)
+    task = Task(
+        "broken",
+        id="broken",
+        pending_tool_calls=[
+            ToolExecutionResult(
+                tool_id="call-1",
+                tool_name="tool",
+                state=ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED,
+                output=0,
+            )
+        ],
+    )
+    snapshot = task.to_dict()
+    snapshot["pending_tool_calls"][0]["output"] = math.nan
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO tasks (id, snapshot) VALUES (?, ?)",
+            (task.id, json.dumps(snapshot)),
+        )
+
+    with pytest.raises(TaskRepositoryError, match="stored task snapshot is invalid"):
+        repository.get(task.id)
 
 
 def test_failed_upsert_rolls_back_and_preserves_previous_snapshot(tmp_path):

@@ -17,6 +17,11 @@ CREATE TABLE tasks (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 )
 """
+_TASK_COLUMNS = [
+    ("id", "TEXT", False, None, 1),
+    ("snapshot", "TEXT", True, None, 0),
+    ("updated_at", "TEXT", True, "CURRENT_TIMESTAMP", 0),
+]
 
 
 class TaskRepositoryError(RuntimeError):
@@ -101,15 +106,61 @@ class SQLiteTaskRepository:
             return None
         try:
             decoded = json.loads(row[0])
-            return Task.from_dict(decoded)
+            task = Task.from_dict(decoded)
+            task.to_dict()
+            return task
         except Exception as error:
             raise TaskRepositoryError("stored task snapshot is invalid") from error
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=self.timeout)
-        connection.execute(f"PRAGMA busy_timeout = {max(1, int(self.timeout * 1000))}")
-        connection.execute("PRAGMA synchronous = FULL")
-        return connection
+        try:
+            connection.execute(f"PRAGMA busy_timeout = {max(1, int(self.timeout * 1000))}")
+            connection.execute("PRAGMA synchronous = FULL")
+            return connection
+        except BaseException:
+            connection.close()
+            raise
+
+    @staticmethod
+    def _application_tables(connection: sqlite3.Connection) -> set[str]:
+        return {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+
+    @staticmethod
+    def _validate_schema(connection: sqlite3.Connection) -> None:
+        columns = [
+            (
+                str(row[1]),
+                str(row[2]).upper(),
+                bool(row[3]),
+                row[4],
+                int(row[5]),
+            )
+            for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
+        ]
+        if columns != _TASK_COLUMNS:
+            raise TaskRepositoryError("task repository schema does not match version 1")
+
+    @classmethod
+    def _validate_compatible_database(cls, connection: sqlite3.Connection) -> int:
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version == 0:
+            if cls._application_tables(connection):
+                raise TaskRepositoryError(
+                    "unversioned database already contains application tables"
+                )
+        elif version == _SCHEMA_VERSION:
+            cls._validate_schema(connection)
+        else:
+            raise TaskRepositoryError(
+                f"unsupported schema version {version}; expected {_SCHEMA_VERSION}"
+            )
+        return version
 
     def _enable_wal(self, connection: sqlite3.Connection) -> None:
         deadline = time.monotonic() + self.timeout
@@ -131,27 +182,14 @@ class SQLiteTaskRepository:
         connection: sqlite3.Connection | None = None
         try:
             connection = self._connect()
+            self._validate_compatible_database(connection)
             self._enable_wal(connection)
             connection.execute("BEGIN IMMEDIATE")
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            version = self._validate_compatible_database(connection)
             if version == 0:
-                existing_tables = {
-                    row[0]
-                    for row in connection.execute(
-                        "SELECT name FROM sqlite_master "
-                        "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-                    ).fetchall()
-                }
-                if existing_tables:
-                    raise TaskRepositoryError(
-                        "unversioned database already contains application tables"
-                    )
                 connection.execute(_CREATE_TASKS)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-            elif version != _SCHEMA_VERSION:
-                raise TaskRepositoryError(
-                    f"unsupported schema version {version}; expected {_SCHEMA_VERSION}"
-                )
+                self._validate_schema(connection)
             connection.commit()
         except TaskRepositoryError:
             if connection is not None:
