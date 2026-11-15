@@ -18,6 +18,12 @@ class ToolOrigin(str, Enum):
     CUSTOM = "custom"
 
 
+class SandboxKind(str, Enum):
+    """Isolation capability required to execute a sandboxed tool."""
+
+    COMMAND = "command"
+
+
 @dataclass
 class Tool:
     """
@@ -41,6 +47,7 @@ class Tool:
     origin: ToolOrigin = ToolOrigin.CUSTOM
     requires_approval: bool = False
     approval_scope: str | None = None
+    sandbox_kind: SandboxKind | None = None
 
 
 class ToolExecution(BaseModel):

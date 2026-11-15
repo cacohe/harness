@@ -4,7 +4,7 @@ from functools import wraps
 from pathlib import Path
 
 from src.core.workspace import Workspace, WorkspaceViolation
-from src.schema.tool import Tool, ToolOrigin
+from src.schema.tool import SandboxKind, Tool, ToolOrigin
 
 _MAX_READ_LINES = 2000
 _MAX_MATCHES = 200
@@ -296,6 +296,7 @@ class LocalToolSuite:
             },
             _sandbox_required,
             requires_sandbox=True,
+            sandbox_kind=SandboxKind.COMMAND,
             input_validator=self._shell_validator,
         )
 
@@ -313,6 +314,7 @@ class LocalToolSuite:
         function,
         *,
         requires_sandbox: bool = False,
+        sandbox_kind: SandboxKind | None = None,
         input_validator=None,
     ) -> Tool:
         properties = {}
@@ -329,6 +331,7 @@ class LocalToolSuite:
             input_schema={"type": "object", "properties": properties, "required": required},
             executer=_bind(function),
             requires_sandbox=requires_sandbox,
+            sandbox_kind=sandbox_kind,
             input_validator=input_validator,
             workspace=self.workspace,
             origin=ToolOrigin.LOCAL,

@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 from src.core.workspace import Workspace, WorkspaceViolation
+from src.schema.tool import SandboxKind
 from src.skill.directory import SkillDirectory, SkillDocumentError
 
 
@@ -148,6 +149,7 @@ def test_optional_shell_tool_is_sandbox_required_and_scoped_to_skill(tmp_path):
     shell = tools[1]
     assert shell.workspace is directory.workspace
     assert shell.requires_sandbox is True
+    assert shell.sandbox_kind is SandboxKind.COMMAND
     assert shell.input_validator is not None
     assert shell.input_validator({"command": "bash scripts/check.sh"}) == {
         "command": "bash scripts/check.sh",

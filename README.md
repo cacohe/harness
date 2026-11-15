@@ -72,7 +72,49 @@ agent = Agent.from_config(
 `SandboxRunner` 实现 `supports(tool)` 与 `run(tool, inputs, workspace)`。标记为
 `requires_sandbox` 的工具在未配置兼容 runner 时失败关闭，绝不回退到宿主进程执行。
 审批只表示用户允许某次调用，不提供隔离，也不能绕过 workspace 或 sandbox 检查。
-注入的 runner 是受信任的隔离边界；当前框架本身不声明提供硬链接、挂载、网络或进程隔离。
+注入的 runner 是受信任的隔离边界；具体隔离保证取决于该实现，框架不会将任意
+`SandboxRunner` 自动当作已提供安全的硬链接、挂载、网络或进程隔离。
+
+内置的 `DockerSandboxRunner` 提供一个可用于生产部署的具体实现。部署方先预拉取包含
+`/bin/sh` 和所需命令的 Linux 镜像，然后使用不可变 digest 注入：
+
+```python
+from src.config import Config
+from src.demo.agent import Agent
+from src.sandbox import DockerSandboxRunner
+
+image = "registry.example/agent-runtime@sha256:" + "0123456789abcdef" * 4
+sandbox = DockerSandboxRunner(
+    image,
+    docker_executable=r"C:\Program Files\Docker\Docker\resources\bin\docker.exe",
+    memory_bytes=512 * 1024 * 1024,
+    cpus=1.0,
+)
+agent = Agent.from_config(
+    Config.load(),
+    workspace="./my-project",
+    sandbox_runner=sandbox,
+)
+```
+
+runner 仅在宿主机上以参数数组启动 Docker CLI，模型生成的命令只会传给容器内的
+`/bin/sh -lc`。每次调用使用无网络、只读根文件系统、非 root 用户、丢弃 capabilities、
+`no-new-privileges` 和 PID/内存/CPU/文件描述符限制的一次性容器；只有 Agent
+Workspace 被以可读写方式挂载到 `/workspace`。工作目录会在 runner 内再次验证。
+
+默认要求 `@sha256:` 镜像引用并传入 `--pull=never`，不会在执行期隐式拉取或更换
+镜像。`docker_executable` 必须是已存在、可执行的绝对本机路径，不从 PATH 或当前目录
+搜索。runner 还会显式覆盖 Docker context/`DOCKER_HOST`，只允许本地 Unix socket 或 Windows
+named pipe；需要 rootless socket 时可用 `docker_host="unix:///absolute/path/docker.sock"` 指定。
+
+每次执行先创建但不启动容器，再单独 attach/start。无论命令成功、失败、CLI 异常或
+超时，都会在返回前强制删除该次唯一命名的容器；无法确认清理时
+失败关闭。stdout/stderr 会持续排空，但只保留配置的有界字节数。
+
+Docker daemon、Docker CLI、宿主内核和指定镜像仍是受信任的部署边界。runner 不会挂载
+Docker socket、宿主凭据或其他目录，但 Workspace 是可写挂载；生产环境还应为该文件系统
+配置容量/配额限制。Linux 上如需写入 Workspace，应将 `user` 配置为拥有对应权限的
+非 root UID/GID。该实现不支持 Windows container，也不将审批视为隔离。
 
 ## Skill 目录
 
