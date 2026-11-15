@@ -68,12 +68,6 @@ class TaskPlan(BaseModel):
         """
         return self.model_dump()
 
-    def advance_plan(self, current: str):
-        """
-        Advance the task plan.
-        """
-        ...
-
 
 class TaskResult(BaseModel):
     """Task result."""

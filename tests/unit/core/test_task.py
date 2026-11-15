@@ -21,6 +21,10 @@ from src.schema.tool import (
 )
 
 
+def test_task_plan_does_not_expose_an_unimplemented_advancement_api():
+    assert not hasattr(TaskPlan, "advance_plan")
+
+
 def test_new_tasks_have_independent_identity_and_collections():
     first = Task(original_input="first")
     second = Task(original_input="second")
