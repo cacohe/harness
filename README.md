@@ -225,6 +225,46 @@ Session 有任务暂停等待审批时，新 `chat` 会被拒绝；必须通过�
 `approval_requests()`、`decide_tool_call()` 和 `resume()` 继续，其他 Session 即使出现相同的
 tool-call id 也不会被修改。
 
+## 长期记忆
+
+默认情况下 Agent 只保留每个 Session 自己的短期 transcript，不会创建或写入长期记忆。
+需要跨 Session 召回时，显式注入 `MemoryManager`：
+
+```python
+from src.config import Config
+from src.core.memory import MemoryManager
+from src.demo.agent import Agent
+from src.memory.retriever import HybridRetriever
+from src.memory.store import InMemoryStore
+
+memory = MemoryManager(
+    InMemoryStore(),
+    HybridRetriever(),
+    default_token_budget=1000,
+)
+agent = Agent.from_config(
+    Config.load(),
+    memory_manager=memory,
+    memory_top_k=5,
+    memory_token_budget=1000,
+)
+```
+
+同一 Agent 创建的 Session 共享该 manager。新回合会按当前用户消息召回记忆，但会在
+检索前排除本 Session 自己写入的记忆，因为这些内容已在有序 transcript 中。只有
+成功完成的 Task 会在终态后写入 episodic memory；暂停、失败和取消回合不写入，
+暂停后成功 resume 仅写入一次。
+
+召回内容作为 JSON 历史数据注入，system prompt 明确要求不将其当作指令；长期记忆
+仍可能过时或包含敌意文本，不应被视为可信权限来源。`top_k` 和 token budget 都在
+调用前验证，记忆以完整条目选入，不会在字符中间截断。
+
+Memory 端口是同步的，Session 会在工作线程中调用，不阻塞事件循环。普通 recall/store
+失败不会推翻已完成 Task 或污染 transcript；可通过 `session.memory_failures` 或默认
+Session 的 `agent.memory_failures` 检查最近 100 条，`memory_failure_count` 保留累计数。内置
+`InMemoryStore` 线程安全且使用深拷贝隔离，但不跨
+进程持久化；生产部署可通过 `MemoryStore` 端口注入持久实现。
+
 直接调用 `agent.chat()`、`agent.achat()`、`agent.resume()` 仍使用一个内置默认 Session，因此
 现有单会话调用方保持兼容；`agent.transcript`、`agent.pending_task` 和
 `agent.pending_message` 也是该默认 Session 的兼容视图。`Agent.aclose()` 后，之前创建的所有
