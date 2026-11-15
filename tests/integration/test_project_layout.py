@@ -28,6 +28,18 @@ def test_project_imports_are_qualified_by_src():
     assert violations == []
 
 
+def test_schema_layer_does_not_depend_on_core_runtime():
+    violations = []
+    for path in (ROOT / "src" / "schema").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.level != 0 or not node.module:
+                continue
+            if node.module == "src.core" or node.module.startswith("src.core."):
+                violations.append(f"{path.relative_to(ROOT)}:{node.lineno}:{node.module}")
+    assert violations == []
+
+
 def test_uv_manages_a_non_packaged_project():
     config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert config["tool"]["uv"]["package"] is False

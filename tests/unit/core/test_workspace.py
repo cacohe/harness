@@ -1,7 +1,18 @@
+import importlib
+import importlib.util
 from pathlib import Path
 
 import pytest
 from src.core.workspace import Workspace, WorkspaceViolation
+
+
+def test_workspace_uses_a_layer_neutral_canonical_module():
+    spec = importlib.util.find_spec("src.workspace")
+
+    assert spec is not None
+    module = importlib.import_module("src.workspace")
+    assert Workspace is module.Workspace
+    assert WorkspaceViolation is module.WorkspaceViolation
 
 
 def test_workspace_requires_an_existing_directory(tmp_path):

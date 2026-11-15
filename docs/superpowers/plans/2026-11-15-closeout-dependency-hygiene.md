@@ -6,9 +6,10 @@
 
 **Goal:** Close implemented roadmap documentation and enforce a clean schema dependency direction.
 
-**Architecture:** Move only the layer-neutral async iterator into `src.utils`, re-export it from the
-legacy core module, and add an AST-level dependency test. Treat plan/metadata/ignore changes as
-documentation and repository hygiene with explicit command verification.
+**Architecture:** Move the layer-neutral async iterator into `src.utils` and the workspace boundary
+to `src.workspace`, re-export both from their legacy core modules, and add an AST-level dependency
+test. Treat plan/metadata/ignore changes as documentation and repository hygiene with explicit
+command verification.
 
 **Tech Stack:** Python 3.11, pytest, Ruff, Mypy, uv, Git
 
@@ -35,14 +36,20 @@ documentation and repository hygiene with explicit command verification.
 
 **Files:**
 - Create: `src/utils/async_utils.py`
+- Create: `src/workspace.py`
 - Modify: `src/core/async_utils.py`
+- Modify: `src/core/workspace.py`
 - Modify: `src/schema/llm.py`
+- Modify: `src/schema/tool.py`
 - Modify: `tests/integration/test_project_layout.py`
 - Modify: `tests/unit/core/test_async_utils.py`
+- Modify: `tests/unit/core/test_workspace.py`
 
 **Interfaces:**
 - Produces: `src.utils.async_utils.iterate_maybe_async(value) -> AsyncIterator[T]`.
 - Preserves: `src.core.async_utils.iterate_maybe_async` as the exact same function object.
+- Produces: `src.workspace.Workspace` and `WorkspaceViolation`.
+- Preserves: legacy core workspace imports as the exact same class objects.
 
 - [ ] **Step 1: Add a failing schema-layer dependency test and canonical utility import tests**
 - [ ] **Step 2: Run the focused tests and verify RED on the existing `schema -> core` import**

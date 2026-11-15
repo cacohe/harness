@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from pydantic import BaseModel, Field, InstanceOf
 
 if TYPE_CHECKING:
-    from src.core.workspace import Workspace
+    from src.workspace import Workspace
 
 TOOL_CALL_CANCELLED_OUTPUT = "Tool call cancelled."
 

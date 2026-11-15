@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar
+
+from src.utils.async_utils import iterate_maybe_async as iterate_maybe_async
 
 T = TypeVar("T")
 _OWNER_LOOP: ContextVar[asyncio.AbstractEventLoop | None] = ContextVar(
@@ -57,25 +59,3 @@ async def call_maybe_async(
     if inspect.isawaitable(result):
         return await result
     return result
-
-
-def _next_or_end(iterator: Iterator[Any]) -> tuple[bool, Any]:
-    try:
-        return False, next(iterator)
-    except StopIteration:
-        return True, None
-
-
-async def iterate_maybe_async(value: AsyncIterator[T] | Iterator[T]) -> AsyncIterator[T]:
-    """Yield an async iterator directly or advance a sync iterator on worker threads."""
-    if isinstance(value, AsyncIterator):
-        async for item in value:
-            yield item
-        return
-
-    iterator = iter(value)
-    while True:
-        done, item = await asyncio.to_thread(lambda: _next_or_end(iterator))
-        if done:
-            return
-        yield cast(T, item)

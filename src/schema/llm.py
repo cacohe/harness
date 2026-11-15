@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from src.core.async_utils import iterate_maybe_async
+from src.utils.async_utils import iterate_maybe_async
 
 ROLE_SYSTEM = "system"
 ROLE_USER = "user"
