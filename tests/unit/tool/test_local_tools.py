@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 from src.core.workspace import Workspace, WorkspaceViolation
+from src.schema.tool import SandboxKind
 from src.tool.local_tools import LocalToolSuite
 
 
@@ -99,6 +100,7 @@ def test_shell_tool_is_opt_in_and_requires_sandbox(tmp_path):
     [shell] = [tool for tool in suite.tools(include_shell=True) if tool.name == "shell"]
 
     assert shell.requires_sandbox is True
+    assert shell.sandbox_kind is SandboxKind.COMMAND
     assert shell.workspace is suite.workspace
     assert all(tool.name != "shell" for tool in suite.tools())
 
