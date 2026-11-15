@@ -1,9 +1,13 @@
+import json
 import math
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from src.core.task import Task
 from src.persistence import SQLiteTaskRepository, TaskRepositoryError
+from src.schema.context import Message
+from src.schema.tool import ToolExecutionResult, ToolExecutionState
 
 
 def _database_version(path) -> int:
@@ -94,3 +98,162 @@ def test_constructor_rejects_unsupported_version_without_modifying_database(tmp_
 def test_persistence_package_exports_sqlite_repository():
     assert SQLiteTaskRepository.__name__ == "SQLiteTaskRepository"
     assert issubclass(TaskRepositoryError, RuntimeError)
+
+
+def test_get_returns_none_for_a_missing_task(tmp_path):
+    repository = SQLiteTaskRepository(tmp_path / "tasks.db")
+
+    assert repository.get("missing") is None
+
+
+def test_save_round_trips_unicode_through_a_new_repository_instance(tmp_path):
+    path = tmp_path / "tasks.db"
+    task = Task(
+        "研究并总结",
+        history=[Message(role="assistant", content="证据 ✅")],
+    )
+    SQLiteTaskRepository(path).save(task)
+
+    restored = SQLiteTaskRepository(path).get(task.id)
+
+    assert restored == task
+    assert restored is not task
+
+
+def test_save_overwrites_and_loaded_objects_are_independent(tmp_path):
+    repository = SQLiteTaskRepository(tmp_path / "tasks.db")
+    task = Task("first")
+    repository.save(task)
+    task.original_input = "second"
+    repository.save(task)
+    task.original_input = "changed after save"
+
+    first = repository.get(task.id)
+    assert first is not None
+    assert first.original_input == "second"
+    first.original_input = "changed after load"
+
+    second = repository.get(task.id)
+    assert second is not None
+    assert second.original_input == "second"
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        "{not-json",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "id": "broken",
+                "original_input": "broken",
+                "state": "completed",
+                "state_reason": None,
+                "plan": None,
+                "history": [],
+                "pending_tool_calls": [],
+                "result": None,
+                "step_count": 0,
+                "elapsed_seconds": 0.0,
+            }
+        ),
+    ],
+)
+def test_get_wraps_corrupt_or_invariant_invalid_snapshots(tmp_path, snapshot):
+    path = tmp_path / "tasks.db"
+    repository = SQLiteTaskRepository(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO tasks (id, snapshot) VALUES (?, ?)",
+            ("broken", snapshot),
+        )
+
+    with pytest.raises(TaskRepositoryError, match="stored task snapshot is invalid") as caught:
+        repository.get("broken")
+
+    assert str(path) not in str(caught.value)
+
+
+def test_failed_upsert_rolls_back_and_preserves_previous_snapshot(tmp_path):
+    path = tmp_path / "tasks.db"
+    repository = SQLiteTaskRepository(path)
+    task = Task("committed")
+    repository.save(task)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_task_update
+            BEFORE UPDATE ON tasks
+            BEGIN
+                SELECT RAISE(ABORT, 'blocked');
+            END
+            """
+        )
+    task.original_input = "must roll back"
+
+    with pytest.raises(TaskRepositoryError, match="save task snapshot") as caught:
+        repository.save(task)
+
+    assert "blocked" not in str(caught.value)
+    assert str(path) not in str(caught.value)
+    restored = repository.get(task.id)
+    assert restored is not None
+    assert restored.original_input == "committed"
+
+
+def test_invalid_task_snapshot_does_not_replace_previous_snapshot(tmp_path):
+    repository = SQLiteTaskRepository(tmp_path / "tasks.db")
+    task = Task("committed")
+    repository.save(task)
+    task.pending_tool_calls = [
+        ToolExecutionResult(
+            tool_id="call-1",
+            tool_name="broken",
+            state=ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED,
+            output=object(),
+        )
+    ]
+
+    with pytest.raises(TaskRepositoryError, match="encode task snapshot"):
+        repository.save(task)
+
+    restored = repository.get(task.id)
+    assert restored is not None
+    assert restored.pending_tool_calls == []
+
+
+def test_multiple_instances_concurrently_save_distinct_tasks(tmp_path):
+    path = tmp_path / "tasks.db"
+    tasks = [Task(f"input-{index}", id=f"task-{index}") for index in range(40)]
+
+    def save(task):
+        SQLiteTaskRepository(path, timeout=10).save(task)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(save, tasks))
+
+    repository = SQLiteTaskRepository(path)
+    assert [repository.get(task.id) for task in tasks] == tasks
+
+
+def test_concurrent_upserts_of_one_id_leave_one_complete_submitted_snapshot(tmp_path):
+    path = tmp_path / "tasks.db"
+    tasks = [
+        Task(
+            f"version-{index}",
+            id="shared",
+            history=[Message(role="assistant", content=f"history-{index}")],
+        )
+        for index in range(40)
+    ]
+    submitted = [task.to_dict() for task in tasks]
+
+    def save(task):
+        SQLiteTaskRepository(path, timeout=10).save(task)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(save, tasks))
+
+    restored = SQLiteTaskRepository(path).get("shared")
+    assert restored is not None
+    assert restored.to_dict() in submitted
