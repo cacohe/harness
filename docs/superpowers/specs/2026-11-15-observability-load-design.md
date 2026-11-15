@@ -28,6 +28,12 @@ Duplicate starts replace the previous timestamp; orphan terminal events incremen
 invent latency. A configurable maximum evicts the oldest in-flight key and increments an eviction
 counter, preventing missing terminal events from causing unbounded cardinality.
 
+Each Harness LLM/tool start is followed by a completed, failed, or paused event, including retry and
+cancellation paths. A retry emits `LLM_FAILED` for the ended attempt before `LLM_RETRYING`, so each
+attempt has a duration. Task terminal events also reconcile any remaining child operations as a
+defensive boundary. Clock sampling and state mutation occur under the same lock so concurrent
+eviction order follows the observed start order.
+
 Snapshots are detached JSON-safe dictionaries. Reading or resetting metrics does not expose mutable
 internal state.
 

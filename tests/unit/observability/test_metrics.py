@@ -1,4 +1,5 @@
 import itertools
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -89,6 +90,21 @@ def test_orphan_terminal_events_count_without_inventing_latency():
     assert all(summary["count"] == 0 for summary in snapshot["durations"].values())
 
 
+def test_task_terminal_reconciles_orphaned_child_operations():
+    ticks = iter([0.0, 1.0, 2.0, 5.0])
+    metrics = MetricsEventSink(clock=lambda: next(ticks))
+
+    metrics.emit(_task(EventType.TASK_STARTED))
+    metrics.emit(_llm(EventType.LLM_STARTED))
+    metrics.emit(_tool(EventType.TOOL_EXECUTION_STARTED))
+    metrics.emit(_task(EventType.TASK_FAILED))
+
+    snapshot = metrics.snapshot()
+    assert snapshot["in_flight"] == {"tasks": 0, "llm": 0, "tools": 0}
+    assert snapshot["durations"]["llm"]["count"] == 1
+    assert snapshot["durations"]["tool"]["count"] == 1
+
+
 def test_inflight_maps_are_bounded_and_evict_oldest_keys():
     ticks = itertools.count()
     metrics = MetricsEventSink(clock=lambda: float(next(ticks)), max_inflight=2)
@@ -139,6 +155,44 @@ def test_metrics_support_concurrent_emission_without_leaking_inflight_ids():
     assert snapshot["task_outcomes"] == {"completed": 1000}
     assert snapshot["in_flight"]["tasks"] == 0
     assert snapshot["durations"]["task"]["count"] == 1000
+
+
+def test_clock_sampling_is_serialized_with_inflight_insertion_order():
+    first_clock_entered = threading.Event()
+    second_emit_started = threading.Event()
+    second_clock_entered = threading.Event()
+    call_lock = threading.Lock()
+    call_count = 0
+    first_observed_second = []
+
+    def clock():
+        nonlocal call_count
+        with call_lock:
+            index = call_count
+            call_count += 1
+        if index == 0:
+            first_clock_entered.set()
+            assert second_emit_started.wait(1)
+            first_observed_second.append(second_clock_entered.wait(0.1))
+        else:
+            second_clock_entered.set()
+        return float(index)
+
+    metrics = MetricsEventSink(clock=clock, max_inflight=1)
+
+    def emit_second():
+        second_emit_started.set()
+        metrics.emit(_task(EventType.TASK_STARTED, "second"))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(metrics.emit, _task(EventType.TASK_STARTED, "first"))
+        assert first_clock_entered.wait(1)
+        second = pool.submit(emit_second)
+        first.result(timeout=1)
+        second.result(timeout=1)
+
+    assert first_observed_second == [False]
+    assert metrics.snapshot()["inflight_evictions"]["tasks"] == 1
 
 
 def test_composite_isolates_sink_failures_and_preserves_channel(caplog):

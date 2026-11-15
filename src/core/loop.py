@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+import threading
 import time
 import uuid
 from typing import NoReturn
@@ -60,6 +61,10 @@ class _EventSinkError(Exception):
 
 class _CancellationRequested(Exception):
     """Move cooperative cancellation to the run-level terminal handler."""
+
+
+class _ToolBatchCancelled(Exception):
+    """Stop an overridden tool batch after its start callback observes cancellation."""
 
 
 class Harness:
@@ -381,17 +386,33 @@ class Harness:
             except (_TaskPersistenceError, _EventSinkError):
                 raise
 
+            except asyncio.CancelledError:
+                token.cancel()
+                try:
+                    self._fail_llm_attempt(
+                        task, "planning", TaskFailReason.TASK_FAILED_CANCEL.value
+                    )
+                except _EventSinkError:
+                    pass
+                raise
+
             except _CancellationRequested:
                 raise
 
-            except LlmCallError:
+            except LlmCallError as error:
                 if token.is_cancelled():
                     self._cancel_llm_attempt(task, "planning")
+                self._fail_llm_attempt(task, "planning", type(error).__name__)
+                if token.is_cancelled():
+                    raise _CancellationRequested
                 raise
 
             except Exception as error:
                 if token.is_cancelled():
                     self._cancel_llm_attempt(task, "planning")
+                self._fail_llm_attempt(task, "planning", type(error).__name__)
+                if token.is_cancelled():
+                    raise _CancellationRequested
                 if attempt == DEFAULT_MAX_LLM_ATTEMPTS or not is_transient_llm_error(error):
                     raise LlmCallError(str(error)) from error
                 self._emit_llm_event(
@@ -402,7 +423,7 @@ class Harness:
                     attempt=attempt,
                 )
                 if await token.await_cancelled(DEFAULT_LLM_ATTEMPT_DELAY_SECONDS):
-                    self._cancel_llm_attempt(task, "planning")
+                    raise _CancellationRequested
         raise LlmCallError("planning retries exhausted")
 
     def _ask_clarification(
@@ -431,6 +452,27 @@ class Harness:
             state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
             output=TOOL_CALL_CANCELLED_OUTPUT,
             fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_CANCELLED,
+        )
+
+    def _emit_cancelled_tool_result(
+        self,
+        task: Task,
+        call: LlmToolCall,
+        result: ToolExecutionResult,
+    ) -> None:
+        try:
+            self._emit_tool_result(task, call, result)
+        except _EventSinkError:
+            pass
+
+    @staticmethod
+    def _failed_tool_result(item: ToolExecutionResult, error: BaseException) -> ToolExecutionResult:
+        return ToolExecutionResult(
+            tool_id=item.tool_id,
+            tool_name=item.tool_name,
+            state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
+            output=f"{type(error).__name__}: {error}",
+            fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_UNKNOWN,
         )
 
     def _finish_pending_tool_calls(
@@ -467,12 +509,24 @@ class Harness:
                 )
                 if sync_override and not async_override:
                     async_method = None
-                result = await call_maybe_async(
-                    async_method,
-                    self.tool_executor.execute_held_tool_call,
-                    item,
-                )
-            self._emit_tool_result(task, call, result)
+                try:
+                    result = await call_maybe_async(
+                        async_method,
+                        self.tool_executor.execute_held_tool_call,
+                        item,
+                    )
+                except asyncio.CancelledError:
+                    if cancellation_token is not None:
+                        cancellation_token.cancel()
+                    raise
+                except Exception as error:
+                    if item.can_run():
+                        self._emit_tool_result(task, call, self._failed_tool_result(item, error))
+                    raise
+            if result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_CANCELLED:
+                self._emit_cancelled_tool_result(task, call, result)
+            else:
+                self._emit_tool_result(task, call, result)
             task.replace_tool_messages([build_tool_message(result)])
             task.set_pending_tool_calls(pending[index + 1 :])
 
@@ -481,7 +535,7 @@ class Harness:
         for item in task.pending_tool_calls:
             call = LlmToolCall(item.tool_id, item.tool_name, item.arguments or "")
             result = self._cancelled_tool_result(item)
-            self._emit_tool_result(task, call, result)
+            self._emit_cancelled_tool_result(task, call, result)
             results.append(result)
         task.replace_tool_messages([build_tool_message(result) for result in results])
         task.set_pending_tool_calls([])
@@ -570,17 +624,31 @@ class Harness:
             except (_TaskPersistenceError, _EventSinkError):
                 raise
 
+            except asyncio.CancelledError:
+                token.cancel()
+                try:
+                    self._fail_llm_attempt(task, "infer", TaskFailReason.TASK_FAILED_CANCEL.value)
+                except _EventSinkError:
+                    pass
+                raise
+
             except _CancellationRequested:
                 raise
 
-            except LlmCallError:
+            except LlmCallError as error:
                 if token.is_cancelled():
                     self._cancel_llm_attempt(task, "infer")
+                self._fail_llm_attempt(task, "infer", type(error).__name__)
+                if token.is_cancelled():
+                    raise _CancellationRequested
                 raise
 
             except Exception as error:
                 if token.is_cancelled():
                     self._cancel_llm_attempt(task, "infer")
+                self._fail_llm_attempt(task, "infer", type(error).__name__)
+                if token.is_cancelled():
+                    raise _CancellationRequested
                 if attempt == DEFAULT_MAX_LLM_ATTEMPTS or not is_transient_llm_error(error):
                     raise LlmCallError(str(error)) from error
                 self._emit_llm_event(
@@ -591,7 +659,7 @@ class Harness:
                     attempt=attempt,
                 )
                 if await token.await_cancelled(DEFAULT_LLM_ATTEMPT_DELAY_SECONDS):
-                    self._cancel_llm_attempt(task, "infer")
+                    raise _CancellationRequested
 
         if not isinstance(output, LLMOutput):
             raise LlmCallError("infer did not return a complete model output")
@@ -602,13 +670,19 @@ class Harness:
         return output
 
     def _cancel_llm_attempt(self, task: Task, phase: str) -> NoReturn:
+        try:
+            self._fail_llm_attempt(task, phase, TaskFailReason.TASK_FAILED_CANCEL.value)
+        except _EventSinkError:
+            pass
+        raise _CancellationRequested
+
+    def _fail_llm_attempt(self, task: Task, phase: str, reason: str) -> None:
         self._emit_llm_event(
             task,
             EventType.LLM_FAILED,
             phase=phase,
-            reason=TaskFailReason.TASK_FAILED_CANCEL.value,
+            reason=reason,
         )
-        raise _CancellationRequested
 
     def _read_inference(self, produced) -> tuple[LLMOutput, list[str]]:
         return run_sync(lambda: self._aread_inference(produced), async_name="ainfer")
@@ -658,15 +732,101 @@ class Harness:
             Completed, failed, and pending tool executions.
         """
 
+        starting_calls: dict[str, LlmToolCall] = {}
+        active_calls: dict[str, LlmToolCall] = {}
+        observed_results: dict[str, ToolExecutionResult] = {}
+        callbacks_closed = False
+        callback_lock = threading.RLock()
+
+        def cancelled_result(call: LlmToolCall) -> ToolExecutionResult:
+            return ToolExecutionResult(
+                tool_id=call.id,
+                tool_name=call.name,
+                state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
+                output=TOOL_CALL_CANCELLED_OUTPUT,
+                fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_CANCELLED,
+            )
+
+        def failed_result(call: LlmToolCall, error: BaseException) -> ToolExecutionResult:
+            return ToolExecutionResult(
+                tool_id=call.id,
+                tool_name=call.name,
+                state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
+                output=f"{type(error).__name__}: {error}",
+                fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_UNKNOWN,
+            )
+
         def before_call(call: LlmToolCall) -> None:
-            if cancellation_token is not None and cancellation_token.is_cancelled():
-                return
-            self._emit_tool_event(EventType.TOOL_EXECUTION_STARTED, task, call)
+            with callback_lock:
+                if callbacks_closed or (
+                    cancellation_token is not None and cancellation_token.is_cancelled()
+                ):
+                    raise _ToolBatchCancelled
+                starting_calls[call.id] = call
+            try:
+                self._emit_tool_event(EventType.TOOL_EXECUTION_STARTED, task, call)
+            except BaseException:
+                with callback_lock:
+                    starting_calls.pop(call.id, None)
+                raise
+            with callback_lock:
+                starting_calls.pop(call.id, None)
+                cancelled = callbacks_closed or (
+                    cancellation_token is not None and cancellation_token.is_cancelled()
+                )
+                if not cancelled:
+                    active_calls[call.id] = call
+            if cancelled:
+                result = cancelled_result(call)
+                with callback_lock:
+                    observed_results[call.id] = result
+                try:
+                    self._emit_tool_result(task, call, result)
+                except _EventSinkError:
+                    pass
+                raise _ToolBatchCancelled
 
         def after_call(call: LlmToolCall, result: ToolExecutionResult) -> None:
-            if cancellation_token is not None and cancellation_token.is_cancelled():
-                return
-            self._emit_tool_result(task, call, result)
+            with callback_lock:
+                if callbacks_closed or active_calls.pop(call.id, None) is None:
+                    return
+                cancelled = cancellation_token is not None and cancellation_token.is_cancelled()
+            if cancelled:
+                result = cancelled_result(call)
+            with callback_lock:
+                observed_results[call.id] = result
+            if cancelled:
+                try:
+                    self._emit_tool_result(task, call, result)
+                except _EventSinkError:
+                    pass
+            else:
+                self._emit_tool_result(task, call, result)
+
+        def cancel_active_calls() -> None:
+            nonlocal callbacks_closed
+            with callback_lock:
+                callbacks_closed = True
+                calls = list(active_calls.values())
+                active_calls.clear()
+            first_error = None
+            for call in calls:
+                try:
+                    self._emit_tool_result(task, call, cancelled_result(call))
+                except _EventSinkError as error:
+                    if first_error is None:
+                        first_error = error
+            if first_error is not None:
+                raise first_error
+
+        def fail_active_calls(error: BaseException) -> None:
+            nonlocal callbacks_closed
+            with callback_lock:
+                callbacks_closed = True
+                calls = list(active_calls.values())
+                active_calls.clear()
+            for call in calls:
+                self._emit_tool_result(task, call, failed_result(call, error))
 
         async_batch = getattr(self.tool_executor, "aexecute_tool_calls", None)
         sync_override = (
@@ -683,22 +843,51 @@ class Harness:
             parameter.name == "should_cancel" or parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters
         )
-        if cancellation_token is not None and supports_cancellation:
+        try:
+            if cancellation_token is not None and supports_cancellation:
+                return await call_maybe_async(
+                    async_batch,
+                    self.tool_executor.execute_tool_calls,
+                    tool_calls,
+                    before_call=before_call,
+                    after_call=after_call,
+                    should_cancel=cancellation_token.is_cancelled,
+                )
             return await call_maybe_async(
                 async_batch,
                 self.tool_executor.execute_tool_calls,
                 tool_calls,
                 before_call=before_call,
                 after_call=after_call,
-                should_cancel=cancellation_token.is_cancelled,
             )
-        return await call_maybe_async(
-            async_batch,
-            self.tool_executor.execute_tool_calls,
-            tool_calls,
-            before_call=before_call,
-            after_call=after_call,
-        )
+        except _ToolBatchCancelled:
+            ordered = [observed_results.get(call.id, cancelled_result(call)) for call in tool_calls]
+            return ToolCallResult(
+                pending_tools=[result for result in ordered if result.is_pending()],
+                completed_tools=[result for result in ordered if result.is_completed()],
+                failed_tools=[result for result in ordered if result.is_failed()],
+                ordered_tools=ordered,
+            )
+        except asyncio.CancelledError:
+            if cancellation_token is not None:
+                cancellation_token.cancel()
+            try:
+                cancel_active_calls()
+            except _EventSinkError:
+                pass
+            raise
+        except Exception as error:
+            try:
+                fail_active_calls(error)
+            except _EventSinkError:
+                pass
+            raise
+        finally:
+            if cancellation_token is not None and cancellation_token.is_cancelled():
+                try:
+                    cancel_active_calls()
+                except _EventSinkError:
+                    pass
 
     def step(self, task: Task, cancellation_token: CancellationToken | None = None) -> StepResult:
         return run_sync(lambda: self.astep(task, cancellation_token), async_name="astep")

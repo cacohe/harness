@@ -717,6 +717,27 @@ def test_agent_uses_an_explicit_event_sink_for_harness_observability():
     assert snapshot["in_flight"] == {"tasks": 0, "llm": 0, "tools": 0}
 
 
+def test_agent_metrics_reconcile_a_permanent_model_failure():
+    class BrokenPlanning(ChatGateway):
+        def planning(self, context, stream=True, response_format=None):
+            raise ValueError("bad request")
+
+    metrics = MetricsEventSink()
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=BrokenPlanning([]),
+        event_sink=metrics,
+    )
+
+    task = agent.chat("hi")
+
+    assert task.state is TaskState.TASK_FAILED
+    snapshot = metrics.snapshot()
+    assert snapshot["events"]["llm_failed"] == 1
+    assert snapshot["task_outcomes"] == {"failed": 1}
+    assert snapshot["in_flight"] == {"tasks": 0, "llm": 0, "tools": 0}
+
+
 def test_agent_shares_injected_long_term_memory_across_isolated_sessions():
     manager = MemoryManager(InMemoryStore(), HybridRetriever())
     gateway = ChatGateway(["first answer", "second answer"])

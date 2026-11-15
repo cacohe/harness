@@ -64,8 +64,8 @@ class MetricsEventSink:
 
     def emit(self, event: Event, channel: EventChannel = EventChannel.CLIENT) -> None:
         del channel
-        now = float(self._clock())
         with self._lock:
+            now = float(self._clock())
             self._events[event.type.value] += 1
             self._observe_task(event, now)
             self._observe_llm(event, now)
@@ -81,7 +81,18 @@ class MetricsEventSink:
             return
         self._outcomes[outcome] += 1
         if task_id:
-            self._finish(self._tasks, str(task_id), now, self._durations["task"])
+            normalized_task_id = str(task_id)
+            self._finish(self._tasks, normalized_task_id, now, self._durations["task"])
+            self._finish_task_children(normalized_task_id, now)
+
+    def _finish_task_children(self, task_id: str, now: float) -> None:
+        for active, duration in (
+            (self._llm, self._durations["llm"]),
+            (self._tools, self._durations["tool"]),
+        ):
+            keys = [key for key in active if isinstance(key, tuple) and key[0] == task_id]
+            for key in keys:
+                self._finish(active, key, now, duration)
 
     def _observe_llm(self, event: Event, now: float) -> None:
         if not isinstance(event.payload, LlmEventPayload):

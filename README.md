@@ -300,7 +300,9 @@ snapshot = metrics.snapshot()
 快照包含各事件类型累计数、Task 终态计数、LLM token 用量、Task/LLM/Tool 当前 in-flight 数、
 被容量限制逐出的 in-flight 条目数，以及已配对操作的耗时次数、总和和最大值。为避免观察器
 自身无界增长，只保留至多 `max_inflight` 个各类别的活动标识；快照是脱离内部状态的 JSON-safe
-副本，`reset()` 可开始新的统计窗口。该实现仅覆盖当前进程生命周期，不负责网络导出、跨进程
+副本，`reset()` 可开始新的统计窗口。LLM 重试会先结束失败的本次 attempt，再发布 retry 事件；
+取消路径也会结束已开始的模型/工具操作，Task 终态还会兜底回收其未配对的子操作。该实现仅覆盖
+当前进程生命周期，不负责网络导出、跨进程
 聚合或告警；部署方应周期性读取 `snapshot()` 并交给自己的 metrics/telemetry 后端。
 
 `tests/load/test_shared_agent_load.py` 是确定性的并发回归，不是吞吐量 SLA 或基准测试。它在一个
