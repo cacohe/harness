@@ -273,7 +273,27 @@ JSON-safe 快照，`Task.from_dict()` 可恢复完整状态；完成和失败任
 
 默认的 `InMemoryTaskRepository` 仅适用于单进程生命周期，但保存和读取使用相互独立的
 可序列化快照，不会因调用方继续修改原 Task 或读取结果而隐式改变仓库内容。需要跨进程恢复时，
-可实现同一 `TaskRepository` 端口，将这些快照保存到数据库或其他 durable storage。
+可显式注入内置的 `SQLiteTaskRepository`：
+
+```python
+from src.config import Config
+from src.demo.agent import Agent
+from src.persistence import SQLiteTaskRepository
+
+repository = SQLiteTaskRepository("./state/tasks.db")
+agent = Agent.from_config(Config.load(), task_repository=repository)
+task = agent.chat("生成一份项目风险报告")
+
+# 进程重启后使用新实例恢复已保存的快照。
+recovered = SQLiteTaskRepository("./state/tasks.db").get(task.id)
+assert recovered == task
+```
+
+SQLite 实现使用版本化 schema、WAL 和事务化 upsert，可以安全地从多个线程或进程创建
+短连接读写同一个本地数据库。新版本数据库会失败关闭，不会被静默降级或重置。
+该端口是同步本地 I/O；虽然每次操作都是有超时的短事务，高并发异步服务仍应将调用
+放入工作线程，或通过 `TaskRepository` 端口注入原生异步/网络数据库实现。
+`Agent.from_config()` 未传入 `task_repository` 时仍使用内存仓库。
 
 ## 验证
 
