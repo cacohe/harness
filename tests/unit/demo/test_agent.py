@@ -6,9 +6,12 @@ import pytest
 from src.config import Config
 from src.core.cancellation import CancellationToken
 from src.core.loop import Harness
+from src.core.memory import MemoryManager
 from src.core.task import Task
 from src.core.workspace import Workspace
 from src.demo.agent import Agent
+from src.memory.retriever import HybridRetriever
+from src.memory.store import InMemoryStore
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
 from src.schema.task import TaskPauseReason, TaskPlan, TaskResult, TaskRunningReason, TaskState
 from src.schema.tool import ApprovalDecision, Tool, ToolExecutionResult
@@ -693,6 +696,26 @@ def test_achat_completes_and_remembers_the_turn():
 
     assert task.result.output == "hello"
     assert agent.transcript == [("user", "hi"), ("assistant", "hello")]
+
+
+def test_agent_shares_injected_long_term_memory_across_isolated_sessions():
+    manager = MemoryManager(InMemoryStore(), HybridRetriever())
+    gateway = ChatGateway(["first answer", "second answer"])
+    agent = Agent(
+        config=Config(llm="test-model", max_steps=3, max_seconds=30),
+        llm_gateway=gateway,
+        memory_manager=manager,
+    )
+    first = agent.new_session()
+    second = agent.new_session()
+
+    first.chat("shared alpha")
+    second.chat("shared alpha followup")
+
+    assert gateway.plans[0] == "shared alpha"
+    assert "Untrusted long-term memory data" in gateway.plans[1]
+    assert "first answer" in gateway.plans[1]
+    assert len(manager.recent()) == 2
 
 
 def test_achat_pauses_and_aresume_finishes_after_a_decision():
