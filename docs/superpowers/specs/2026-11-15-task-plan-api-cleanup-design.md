@@ -27,4 +27,3 @@ Serialized Task/TaskPlan data and model-generated plan schemas are unchanged.
 - Add a public-surface regression test asserting `TaskPlan` does not advertise the unsupported
   method.
 - Run Task model tests and the full quality gate.
-

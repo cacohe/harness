@@ -27,4 +27,3 @@ replacement in `Task.set_plan()`.
 - [ ] Commit implementation and documentation.
 - [ ] Dispatch an independent whole-branch review.
 - [ ] Fix Critical/Important findings, push, verify CI, and merge.
-
