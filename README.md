@@ -261,7 +261,8 @@ agent = Agent.from_config(
 
 Memory 端口是同步的，Session 会在工作线程中调用，不阻塞事件循环。普通 recall/store
 失败不会推翻已完成 Task 或污染 transcript；可通过 `session.memory_failures` 或默认
-Session 的 `agent.memory_failures` 检查。内置 `InMemoryStore` 线程安全且使用深拷贝隔离，但不跨
+Session 的 `agent.memory_failures` 检查最近 100 条，`memory_failure_count` 保留累计数。内置
+`InMemoryStore` 线程安全且使用深拷贝隔离，但不跨
 进程持久化；生产部署可通过 `MemoryStore` 端口注入持久实现。
 
 直接调用 `agent.chat()`、`agent.achat()`、`agent.resume()` 仍使用一个内置默认 Session，因此

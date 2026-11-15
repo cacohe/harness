@@ -2,6 +2,7 @@ import asyncio
 import threading
 
 import pytest
+from src.core.cancellation import CancellationToken
 from src.core.memory import MemoryManager
 from src.demo.session import AgentSession
 from src.memory.retriever import HybridRetriever
@@ -402,6 +403,9 @@ def test_terminal_task_wins_cancellation_during_memory_commit():
         while not remember_started.is_set():
             await asyncio.sleep(0)
         turn.cancel()
+        await asyncio.sleep(0)
+        turn.cancel()
+        await asyncio.sleep(0)
         release_remember.set()
         return session, await turn
 
@@ -409,3 +413,57 @@ def test_terminal_task_wins_cancellation_during_memory_commit():
 
     assert task.is_completed()
     assert session.transcript == [("user", "hello"), ("assistant", "answer-1")]
+
+
+def test_pre_cancelled_turn_skips_long_term_memory_recall():
+    recalled = []
+
+    class RecordingManager:
+        def recall(self, query, **kwargs):
+            recalled.append(query)
+            return []
+
+        def remember(self, content, **kwargs):
+            return None
+
+    class CancellationAwareHarness:
+        async def arun(self, task, cancellation_token=None):
+            assert cancellation_token is not None and cancellation_token.is_cancelled()
+            task.transition_to_failed(TaskFailReason.TASK_FAILED_CANCEL)
+            return task.result
+
+    token = CancellationToken()
+    token.cancel()
+    session = AgentSession(
+        CancellationAwareHarness(),
+        RecordingRepository(),
+        lambda: None,
+        memory_manager=RecordingManager(),
+    )
+
+    task = session.chat("cancelled", cancellation_token=token)
+
+    assert task.is_failed()
+    assert recalled == []
+
+
+def test_memory_failure_history_is_bounded_and_total_is_retained():
+    class BrokenManager:
+        def recall(self, query, **kwargs):
+            raise RuntimeError("recall offline")
+
+        def remember(self, content, **kwargs):
+            raise RuntimeError("store offline")
+
+    session = AgentSession(
+        CompletingHarness(),
+        RecordingRepository(),
+        lambda: None,
+        memory_manager=BrokenManager(),
+    )
+
+    for index in range(60):
+        session.chat(f"turn {index}")
+
+    assert session.memory_failure_count == 120
+    assert len(session.memory_failures) == 100

@@ -48,6 +48,8 @@ class TaskRun:
 class AgentSession:
     """Own one ordered conversation on top of shared Agent dependencies."""
 
+    _MAX_MEMORY_FAILURES = 100
+
     def __init__(
         self,
         harness: HarnessRunner,
@@ -70,6 +72,7 @@ class AgentSession:
             else self._positive_integer(memory_token_budget, "memory_token_budget")
         )
         self.memory_failures: list[MemoryFailure] = []
+        self.memory_failure_count = 0
         self.transcript: list[tuple[str, str]] = []
         self.pending_run: TaskRun | None = None
         self._pending_message_hint: str | None = None
@@ -123,7 +126,7 @@ class AgentSession:
         try:
             if self.pending_run is not None:
                 raise ValueError("session has a task waiting for approval")
-            memories = await self._recall(message)
+            memories = await self._recall(message, cancellation_token)
             task = Task(original_input=self._with_context(message, memories))
             await self.harness.arun(task, cancellation_token=cancellation_token)
             if task.is_paused():
@@ -184,8 +187,12 @@ class AgentSession:
             self.transcript.append(("assistant", task.result.output))
             await self._remember_long_term(message, task)
 
-    async def _recall(self, message: str) -> list[MemoryItem]:
-        if self.memory_manager is None:
+    async def _recall(
+        self, message: str, cancellation_token: CancellationToken | None
+    ) -> list[MemoryItem]:
+        if self.memory_manager is None or (
+            cancellation_token is not None and cancellation_token.is_cancelled()
+        ):
             return []
         try:
             return await asyncio.to_thread(
@@ -215,17 +222,25 @@ class AgentSession:
                 metadata={"session_id": self.id, "task_id": task.id},
             )
         )
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError:
+        while True:
             try:
                 await asyncio.shield(operation)
+                return
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+                if operation.cancelled():
+                    self._record_memory_failure(
+                        "remember", asyncio.CancelledError("memory commit cancelled")
+                    )
+                    return
             except Exception as error:
                 self._record_memory_failure("remember", error)
-        except Exception as error:
-            self._record_memory_failure("remember", error)
+                return
 
-    def _record_memory_failure(self, operation: str, error: Exception) -> None:
+    def _record_memory_failure(self, operation: str, error: BaseException) -> None:
+        self.memory_failure_count += 1
         self.memory_failures.append(
             MemoryFailure(
                 operation=operation,
@@ -233,6 +248,8 @@ class AgentSession:
                 message=str(error),
             )
         )
+        if len(self.memory_failures) > self._MAX_MEMORY_FAILURES:
+            del self.memory_failures[: -self._MAX_MEMORY_FAILURES]
 
     def _with_context(self, message: str, memories: list[MemoryItem]) -> str:
         conversation = self._with_transcript(message)

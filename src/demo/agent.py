@@ -263,6 +263,10 @@ class Agent:
     def memory_failures(self) -> list[MemoryFailure]:
         return self._default_session.memory_failures
 
+    @property
+    def memory_failure_count(self) -> int:
+        return self._default_session.memory_failure_count
+
 
 def _load_skill_directories(
     roots: list[str | Path], *, include_shell: bool
