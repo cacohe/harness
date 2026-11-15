@@ -40,4 +40,3 @@ threaded tests stress concurrent `emit()` and bounded orphan handling.
 
 The test is a repeatable concurrency regression gate, not a hardware benchmark or throughput SLA.
 No external service, packaging, or dependency is added.
-
