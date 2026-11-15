@@ -177,7 +177,7 @@ class DockerSandboxRunner:
         if any(character in source for character in {",", "\r", "\n", "\x00"}):
             raise WorkspaceViolation("workspace path cannot be encoded as a Docker mount")
         container_name = f"agent-harness-{uuid.uuid4().hex}"
-        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if os.name == "nt" else 0
         self._create(container_name, source, container_cwd, command, creationflags)
         try:
             process = self._start(container_name, creationflags)
