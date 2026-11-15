@@ -2,6 +2,7 @@ import json
 import math
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from threading import Event, current_thread
 
 import pytest
 import src.persistence.sqlite as sqlite_module
@@ -55,6 +56,40 @@ def test_concurrent_first_time_instances_initialize_one_database(tmp_path):
         repositories = list(pool.map(lambda _index: SQLiteTaskRepository(path), range(16)))
 
     assert {repository.path for repository in repositories} == {path.resolve()}
+    assert _database_version(path) == 1
+    assert _table_names(path) == {"tasks"}
+
+
+def test_concurrent_initialization_reads_version_and_tables_from_one_snapshot(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "tasks.db"
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+    version_read = Event()
+    continue_table_read = Event()
+    original = SQLiteTaskRepository._application_tables
+
+    def delayed_table_read(connection):
+        if current_thread().name.startswith("delayed-init"):
+            version_read.set()
+            assert continue_table_read.wait(5)
+        return original(connection)
+
+    monkeypatch.setattr(
+        SQLiteTaskRepository, "_application_tables", staticmethod(delayed_table_read)
+    )
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="delayed-init") as pool:
+        delayed = pool.submit(SQLiteTaskRepository, path)
+        assert version_read.wait(5)
+        try:
+            immediate = SQLiteTaskRepository(path)
+        finally:
+            continue_table_read.set()
+        first = delayed.result(timeout=5)
+
+    assert first.path == immediate.path
     assert _database_version(path) == 1
     assert _table_names(path) == {"tasks"}
 

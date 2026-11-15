@@ -182,7 +182,11 @@ class SQLiteTaskRepository:
         connection: sqlite3.Connection | None = None
         try:
             connection = self._connect()
-            self._validate_compatible_database(connection)
+            connection.execute("BEGIN")
+            try:
+                self._validate_compatible_database(connection)
+            finally:
+                connection.rollback()
             self._enable_wal(connection)
             connection.execute("BEGIN IMMEDIATE")
             version = self._validate_compatible_database(connection)
