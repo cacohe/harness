@@ -13,6 +13,7 @@ from src.demo.agent import Agent
 from src.memory.retriever import HybridRetriever
 from src.memory.store import InMemoryStore
 from src.observability import MetricsEventSink
+from src.persistence import SQLiteTaskRepository
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
 from src.schema.task import TaskPauseReason, TaskPlan, TaskResult, TaskRunningReason, TaskState
 from src.schema.tool import ApprovalDecision, Tool, ToolExecutionResult
@@ -235,6 +236,71 @@ def test_agent_injects_resource_governance_config_into_harness():
     assert agent.harness.max_tool_result_bytes == 102
     assert agent.harness.fact_recorder.limits.max_event_bytes == 103
     assert agent.harness.fact_recorder.limits.max_task_snapshot_bytes == 104
+
+
+def test_open_session_reconstructs_completed_transcript_without_model_replay(tmp_path):
+    repository = SQLiteTaskRepository(tmp_path / "sessions.db")
+    first_agent = Agent(
+        config=Config(llm="test-model"),
+        llm_gateway=ChatGateway(["answer"]),
+        task_repository=repository,
+    )
+    original = first_agent.new_session("stable-session")
+    task = original.chat("hello", message_id="message-1")
+    second_gateway = ChatGateway([])
+    second_agent = Agent(
+        config=Config(llm="test-model"),
+        llm_gateway=second_gateway,
+        task_repository=repository,
+    )
+
+    reopened = second_agent.open_session("stable-session")
+
+    assert task.is_completed()
+    assert reopened.transcript == [("user", "hello"), ("assistant", "answer")]
+    assert reopened.pending_task is None
+    assert second_gateway.plans == []
+
+
+def test_open_session_restores_paused_task_and_approval_ownership(tmp_path):
+    class ApprovalGateway(ChatGateway):
+        def infer(self, context, stream=True, response_format=None):
+            return LLMOutput(
+                FinishReason.TOOL_CALLS,
+                None,
+                [LlmToolCall("call-1", "danger", "{}")],
+                None,
+                None,
+            )
+
+    repository = SQLiteTaskRepository(tmp_path / "paused.db")
+    registry = DefaultToolRegistry()
+    registry.register(
+        Tool("danger", "danger", "Danger.", {}, lambda _inputs: "done", requires_approval=True)
+    )
+    first_agent = Agent(
+        config=Config(llm="test-model"),
+        llm_gateway=ApprovalGateway([]),
+        tool_executor=DefaultToolExecutor(registry),
+        task_repository=repository,
+    )
+    paused = first_agent.new_session("paused-session").chat(
+        "run it", message_id="message-1"
+    )
+    second_agent = Agent(
+        config=Config(llm="test-model"),
+        llm_gateway=ChatGateway([]),
+        tool_executor=DefaultToolExecutor(registry),
+        task_repository=repository,
+    )
+
+    reopened = second_agent.open_session("paused-session")
+
+    assert paused.is_paused()
+    assert reopened.pending_task is not None
+    assert reopened.pending_task.id == paused.id
+    assert reopened.pending_message == "run it"
+    assert [request.tool_id for request in reopened.approval_requests()] == ["call-1"]
 
 
 def test_default_composition_shares_one_new_catalog():

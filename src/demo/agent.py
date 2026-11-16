@@ -11,13 +11,15 @@ from src.core.hook import HarnessHook
 from src.core.llm import AsyncLlmGateway, LlmGateway
 from src.core.loop import Harness
 from src.core.persistence import TaskRepository
+from src.core.recovery import ExecutionRecovery
 from src.core.task import Task
 from src.core.tool import SandboxRunner, ToolCatalog, ToolExecutor
 from src.core.workspace import Workspace
-from src.demo.session import AgentSession, MemoryFailure, MemoryRuntime
+from src.demo.session import AgentSession, MemoryFailure, MemoryRuntime, TaskRun
 from src.llm.litellm import LiteLLMGateway
 from src.mcp import MCPManager
 from src.persistence.in_memory import InMemoryTaskRepository
+from src.schema.execution import SessionEventType
 from src.schema.skills import Skill
 from src.schema.tool import Tool, ToolExecutionResult
 from src.skill.directory import SkillDirectory
@@ -232,6 +234,52 @@ class Agent:
             memory_top_k=self.memory_top_k,
             memory_token_budget=self.memory_token_budget,
         )
+
+    def open_session(self, session_id: str) -> AgentSession:
+        """Recover and reopen one durable Session without replaying model or tool work."""
+        self._ensure_open()
+        ExecutionRecovery(self.harness.execution_store).recover_session(session_id)
+        session = self.new_session(session_id)
+        events = self.harness.execution_store.events(session_id)
+        messages: dict[str, str] = {}
+        answers: dict[str, str] = {}
+        for event in events:
+            if event.turn_id is None:
+                continue
+            if event.type is SessionEventType.SUBMISSION_ACCEPTED:
+                message = event.payload.get("message")
+                if isinstance(message, str):
+                    messages[event.turn_id] = message
+            elif event.type is SessionEventType.ASSISTANT_SETTLED:
+                content = event.payload.get("content")
+                if isinstance(content, str):
+                    answers[event.turn_id] = content
+            elif (
+                event.type is SessionEventType.TURN_SETTLED
+                and event.payload.get("outcome") == "completed"
+                and event.turn_id in messages
+                and event.turn_id in answers
+            ):
+                session.transcript.extend(
+                    [
+                        ("user", messages[event.turn_id]),
+                        ("assistant", answers[event.turn_id]),
+                    ]
+                )
+        paused = [
+            record.task
+            for record in self.harness.execution_store.unfinished(session_id)
+            if record.task.is_paused()
+        ]
+        if len(paused) > 1:
+            raise RuntimeError("session has multiple paused Tasks")
+        if paused:
+            task = paused[0]
+            session.pending_run = TaskRun(
+                task=task,
+                message=messages.get(task.turn_id or "", ""),
+            )
+        return session
 
     async def add_mcp_server(self, name: str, source, **options) -> None:
         """Connect an MCP server and publish its tools."""

@@ -351,7 +351,11 @@ class AgentSession:
             facts.append(self._submission_event(task, SessionEventType.SESSION_STARTED))
         facts.extend(
             [
-                self._submission_event(task, SessionEventType.SUBMISSION_ACCEPTED),
+                self._submission_event(
+                    task,
+                    SessionEventType.SUBMISSION_ACCEPTED,
+                    payload={"message": message},
+                ),
                 self._submission_event(task, SessionEventType.TURN_STARTED),
             ]
         )
@@ -391,7 +395,11 @@ class AgentSession:
         return task, submission, False
 
     def _submission_event(
-        self, task: Task, event_type: SessionEventType
+        self,
+        task: Task,
+        event_type: SessionEventType,
+        *,
+        payload: dict[str, Any] | None = None,
     ) -> PendingSessionEvent:
         return PendingSessionEvent(
             event_id=self.id_factory.event(),
@@ -400,7 +408,7 @@ class AgentSession:
             task_id=task.id,
             execution_id=f"submission:{task.message_id}",
             turn_id=task.turn_id,
-            payload={},
+            payload=payload or {},
         )
 
     def _settle_submission(
