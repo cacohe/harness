@@ -42,7 +42,7 @@ MAX_SECONDS=1800
 
 ```python
 from src.config import Config
-from src.demo.agent import Agent
+from src.application import Agent
 
 agent = Agent.from_config(Config.load(), workspace="./my-project")
 task = agent.chat("帮我比较两款手机")
@@ -59,7 +59,7 @@ task = agent.chat("帮我比较两款手机")
 ```python
 from src.config import Config
 from src.core.workspace import Workspace
-from src.demo.agent import Agent
+from src.application import Agent
 
 workspace = Workspace("./my-project")
 agent = Agent.from_config(
@@ -80,7 +80,7 @@ agent = Agent.from_config(
 
 ```python
 from src.config import Config
-from src.demo.agent import Agent
+from src.application import Agent
 from src.sandbox import DockerSandboxRunner
 
 image = "registry.example/agent-runtime@sha256:" + "0123456789abcdef" * 4
@@ -233,7 +233,7 @@ tool-call id 也不会被修改。
 ```python
 from src.config import Config
 from src.core.memory import MemoryManager
-from src.demo.agent import Agent
+from src.application import Agent
 from src.memory.retriever import HybridRetriever
 from src.memory.store import InMemoryStore
 
@@ -282,7 +282,7 @@ Session 都不能再开始或修改任务，已有 transcript 与审批列表仍
 ```python
 from src.config import Config
 from src.core.event import EventHandler
-from src.demo.agent import Agent
+from src.application import Agent
 from src.observability import CompositeEventSink, MetricsEventSink
 
 metrics = MetricsEventSink(max_inflight=10_000)
@@ -319,7 +319,7 @@ MCP 连接属于持久异步资源，应通过 `Agent` 的异步上下文管理�
 import asyncio
 
 from src.config import Config
-from src.demo.agent import Agent
+from src.application import Agent
 
 
 async def main() -> None:
@@ -394,7 +394,7 @@ JSON-safe 快照，`Task.from_dict()` 可恢复完整状态；完成和失败任
 
 ```python
 from src.config import Config
-from src.demo.agent import Agent
+from src.application import Agent
 from src.persistence import SQLiteTaskRepository
 
 repository = SQLiteTaskRepository("./state/tasks.db")

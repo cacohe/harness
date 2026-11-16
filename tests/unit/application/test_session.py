@@ -2,9 +2,9 @@ import asyncio
 import threading
 
 import pytest
+from src.application.session import AgentSession
 from src.core.cancellation import CancellationToken
 from src.core.memory import MemoryManager
-from src.demo.session import AgentSession
 from src.memory.retriever import HybridRetriever
 from src.memory.store import InMemoryStore
 from src.schema.task import (

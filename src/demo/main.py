@@ -1,9 +1,9 @@
 import json
 import sys
 
+from src.application.agent import Agent
 from src.config import ConfigError
 from src.core.task import Task
-from src.demo.agent import Agent
 from src.logger import setup_logging
 
 EXIT_COMMANDS = {"/exit", "/quit", "exit", "quit"}
