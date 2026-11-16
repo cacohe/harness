@@ -74,6 +74,6 @@ command verification.
 - [x] **Step 2: Mark the ten verified historical plans complete and append integration evidence**
 - [x] **Step 3: Verify no scoped historical checklist item remains open**
 - [x] **Step 4: Run lock, Ruff, Mypy, full pytest, and diff gates**
-- [ ] **Step 5: Commit closeout documentation and hygiene changes**
-- [ ] **Step 6: Dispatch one fresh whole-branch review and resolve actionable findings**
-- [ ] **Step 7: Mark this plan complete after final verification**
+- [x] **Step 5: Commit closeout documentation and hygiene changes**
+- [x] **Step 6: Dispatch one fresh whole-branch review and resolve actionable findings**
+- [x] **Step 7: Mark this plan complete after final verification**
