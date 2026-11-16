@@ -1,4 +1,3 @@
-import asyncio
 from pathlib import Path
 
 from src.config import Config
@@ -12,6 +11,7 @@ from src.core.llm import AsyncLlmGateway, LlmGateway
 from src.core.loop import Harness
 from src.core.persistence import TaskRepository
 from src.core.recovery import ExecutionRecovery
+from src.core.runtime import RuntimeCoordinator
 from src.core.task import Task
 from src.core.tool import SandboxRunner, ToolCatalog, ToolExecutor
 from src.core.workspace import Workspace
@@ -52,6 +52,7 @@ class Agent:
         memory_top_k: int = 5,
         memory_token_budget: int | None = None,
         event_sink: EventSink | None = None,
+        owned_resources: list[object] | None = None,
     ):
         """
         Create an agent with a model gateway, a context builder, and the local tools.
@@ -106,11 +107,14 @@ class Agent:
             if tool_executor is not None
             else DefaultToolExecutor(self.tool_registry, sandbox_runner=sandbox_runner)
         )
+        owns_mcp_manager = mcp_manager is None
         self.mcp_manager = (
             mcp_manager if mcp_manager is not None else MCPManager(self.tool_registry)
         )
-        self._closed = False
-        self._close_task: asyncio.Task[None] | None = None
+        resources = list(owned_resources or [])
+        if owns_mcp_manager and self.mcp_manager not in resources:
+            resources.append(self.mcp_manager)
+        self.runtime = RuntimeCoordinator(resources)
         self.context_builder = (
             context_builder if context_builder is not None else DefaultContextBuilder()
         )
@@ -227,6 +231,8 @@ class Agent:
             self.harness,
             self.task_repository,
             self._ensure_open,
+            ensure_started=self.runtime.start,
+            operation_registrar=self.runtime.register_operation,
             session_id=session_id,
             execution_store=self.harness.execution_store,
             max_pending_submissions=getattr(self.config, "max_pending_submissions", 0),
@@ -283,25 +289,25 @@ class Agent:
 
     async def add_mcp_server(self, name: str, source, **options) -> None:
         """Connect an MCP server and publish its tools."""
+        await self.runtime.start()
         self._ensure_open()
         await self.mcp_manager.add_server(name, source, **options)
 
     async def refresh_mcp_server(self, name: str) -> None:
         """Refresh the tools advertised by one MCP server."""
+        await self.runtime.start()
         self._ensure_open()
         await self.mcp_manager.refresh_server(name)
 
     async def remove_mcp_server(self, name: str) -> None:
         """Disconnect one MCP server and unpublish its tools."""
+        await self.runtime.start()
         self._ensure_open()
         await self.mcp_manager.remove_server(name)
 
     async def aclose(self) -> None:
         """Close the Agent and all MCP transports exactly once."""
-        if self._close_task is None:
-            self._closed = True
-            self._close_task = asyncio.create_task(self.mcp_manager.aclose())
-        await asyncio.shield(self._close_task)
+        await self.runtime.aclose(getattr(self.config, "close_timeout_seconds", 30))
 
     async def __aenter__(self) -> "Agent":
         self._ensure_open()
@@ -311,8 +317,7 @@ class Agent:
         await self.aclose()
 
     def _ensure_open(self) -> None:
-        if self._closed:
-            raise RuntimeError("Agent is closed")
+        self.runtime.ensure_accepting()
 
     @property
     def transcript(self) -> list[tuple[str, str]]:

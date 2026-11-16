@@ -586,6 +586,7 @@ def test_agent_mcp_methods_delegate_without_sync_loop_creation():
             llm_gateway=ChatGateway(["hello"]),
             tool_catalog=catalog,
             mcp_manager=manager,
+            owned_resources=[manager],
         )
 
         await agent.add_mcp_server("weather", "memory://weather", timeout=2)
@@ -610,11 +611,30 @@ def test_agent_context_exit_closes_manager_once():
             llm_gateway=ChatGateway(["hello"]),
             tool_catalog=catalog,
             mcp_manager=manager,
+            owned_resources=[manager],
         ) as agent:
             assert agent.mcp_manager is manager
 
         await agent.aclose()
         assert manager.close_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_injected_manager_remains_caller_owned_unless_explicitly_owned():
+    async def scenario():
+        catalog = DefaultToolRegistry()
+        manager = RecordingMCPManager(catalog)
+        agent = Agent(
+            config=Config(llm="test-model"),
+            llm_gateway=ChatGateway(["unused"]),
+            tool_catalog=catalog,
+            mcp_manager=manager,
+        )
+
+        await agent.aclose()
+
+        assert manager.close_calls == 0
 
     asyncio.run(scenario())
 

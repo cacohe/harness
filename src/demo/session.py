@@ -96,6 +96,8 @@ class AgentSession:
         task_repository: TaskRepository,
         ensure_open: Callable[[], None],
         *,
+        ensure_started: Callable[[], Any] | None = None,
+        operation_registrar: Callable[[asyncio.Task], Any] | None = None,
         session_id: str | None = None,
         execution_store: ExecutionStore | None = None,
         id_factory: ExecutionIdFactory | None = None,
@@ -125,6 +127,8 @@ class AgentSession:
             raise ValueError("max_pending_submissions must be a non-negative integer")
         self.max_pending_submissions = max_pending_submissions
         self._ensure_open = ensure_open
+        self._ensure_started = ensure_started
+        self._operation_registrar = operation_registrar
         self.memory_manager = memory_manager
         self.memory_top_k = self._positive_integer(memory_top_k, "memory_top_k")
         self.memory_token_budget = (
@@ -287,6 +291,13 @@ class AgentSession:
 
     async def _begin_operation_async(self) -> None:
         self._ensure_open()
+        if self._ensure_started is not None:
+            started = self._ensure_started()
+            if inspect.isawaitable(started):
+                await started
+        current = asyncio.current_task()
+        if current is not None and self._operation_registrar is not None:
+            self._operation_registrar(current)
         if self._operation_lock.acquire(blocking=False):
             return
         if self.max_pending_submissions == 0:
