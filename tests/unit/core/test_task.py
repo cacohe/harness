@@ -117,7 +117,7 @@ def test_task_round_trips_all_snapshot_fields_through_json_data():
     encoded = json.dumps(serialized)
     restored = Task.from_dict(json.loads(encoded))
 
-    assert serialized["schema_version"] == 1
+    assert serialized["schema_version"] == 2
     assert restored == task
     assert restored is not task
     assert restored.history[0] is not task.history[0]
@@ -306,3 +306,59 @@ def test_legacy_terminal_snapshot_discards_stale_running_reason():
     assert task.state_reason is None
     assert task.history == []
     assert task.pending_tool_calls == []
+
+
+def test_new_task_uses_schema_v2_with_empty_durable_identities():
+    task = Task("new")
+
+    assert task.schema_version == 2
+    assert task.session_id is None
+    assert task.message_id is None
+    assert task.turn_id is None
+    assert task.last_sequence is None
+    assert task.to_dict()["schema_version"] == 2
+
+
+def test_explicit_v1_snapshot_loads_with_compatible_empty_identities():
+    task = Task.from_dict(
+        {
+            "schema_version": 1,
+            "id": "legacy-id",
+            "original_input": "legacy",
+            "state": "created",
+        }
+    )
+
+    assert task.schema_version == 1
+    assert task.session_id is None
+    assert task.message_id is None
+    assert task.turn_id is None
+    assert task.last_sequence is None
+
+
+@pytest.mark.parametrize("field", ["session_id", "message_id", "turn_id"])
+@pytest.mark.parametrize("value", ["", "line\nbreak", "界" * 86])
+def test_task_rejects_invalid_durable_identity(field, value):
+    with pytest.raises(ValidationError, match=field):
+        Task("invalid", **{field: value})
+
+
+def test_task_last_sequence_is_optional_but_never_negative():
+    assert Task("uncommitted").last_sequence is None
+    assert Task("committed", last_sequence=0).last_sequence == 0
+    with pytest.raises(ValidationError):
+        Task("invalid", last_sequence=-1)
+
+
+def test_interrupted_terminal_task_requires_a_result():
+    with pytest.raises(ValidationError):
+        Task(
+            "interrupted",
+            state=TaskState.TASK_FAILED,
+            state_reason=TaskFailReason.TASK_FAILED_INTERRUPTED,
+        )
+
+
+def test_task_rejects_unknown_snapshot_schema_versions():
+    with pytest.raises(ValidationError, match="schema_version"):
+        Task.from_dict({"schema_version": 3, "original_input": "future"})

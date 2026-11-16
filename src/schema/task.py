@@ -39,6 +39,7 @@ class TaskFailReason(Enum):
     TASK_FAILED_TIMEOUT = "timeout"
     TASK_FAILED_MAX_STEPS = "max_steps"
     TASK_FAILED_CANCEL = "cancel"
+    TASK_FAILED_INTERRUPTED = "interrupted"
     TASK_FAILED_UNKNOWN = "unknown"
 
 

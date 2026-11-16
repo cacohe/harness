@@ -6,9 +6,10 @@ from collections.abc import Mapping
 from enum import Enum
 from typing import Any, ClassVar, FrozenSet
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 from src.schema.context import Message
+from src.schema.execution import validate_execution_id
 from src.schema.llm import ROLE_TOOL
 from src.schema.task import (
     TaskFailReason,
@@ -44,9 +45,13 @@ class Task(BaseModel):
         TaskState.TASK_COMPLETED: frozenset([]),
     }
 
-    schema_version: int = 1
+    schema_version: int = Field(default=2, ge=1, le=2)
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     original_input: str
+    session_id: str | None = None
+    message_id: str | None = None
+    turn_id: str | None = None
+    last_sequence: int | None = Field(default=None, ge=0)
     state: TaskState = TaskState.TASK_CREATED
     state_reason: TaskStateReason | None = None
     plan: TaskPlan | None = None
@@ -70,6 +75,13 @@ class Task(BaseModel):
             super().__setattr__(name, value)
             return
         self._apply_updates(**{name: value})
+
+    @field_validator("session_id", "message_id", "turn_id")
+    @classmethod
+    def validate_durable_id(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return validate_execution_id(value, info.field_name)
 
     @model_validator(mode="before")
     @classmethod
