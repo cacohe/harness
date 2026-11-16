@@ -89,4 +89,4 @@
 - [x] **Step 3: Switch internal imports, move prompts/tests, and delete confirmed dead files**
 - [x] **Step 4: Run focused compatibility and moved tests and verify GREEN**
 - [x] **Step 5: Run uv lock, Ruff, Mypy, full pytest, and diff gates**
-- [ ] **Step 6: Commit the cleanup and complete a fresh whole-branch review**
+- [x] **Step 6: Commit the cleanup and complete a fresh whole-branch review**
