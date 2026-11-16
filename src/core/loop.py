@@ -83,6 +83,12 @@ class _FactState:
     attempt_id: str | None = None
     attempt_settled: bool = True
     step_open: bool = False
+    tool_ids: dict[str, str] | None = None
+    started_tools: set[str] | None = None
+
+    def __post_init__(self) -> None:
+        self.tool_ids = {}
+        self.started_tools = set()
 
 
 class _Correlation(TypedDict):
@@ -209,6 +215,27 @@ class Harness:
         state = _FACT_STATE.get()
         assert state is not None
         existing = self.execution_store.events(state.context.session_id)
+        open_steps: dict[str, bool] = {}
+        assert state.tool_ids is not None
+        assert state.started_tools is not None
+        for event in existing:
+            if event.type is SessionEventType.STEP_STARTED and event.step_id is not None:
+                open_steps[event.step_id] = True
+            elif event.type is SessionEventType.STEP_SETTLED and event.step_id is not None:
+                open_steps[event.step_id] = False
+            elif (
+                event.type is SessionEventType.TOOL_CALL_REQUESTED
+                and event.tool_call_id is not None
+                and isinstance(event.payload.get("external_tool_call_id"), str)
+            ):
+                state.tool_ids[event.payload["external_tool_call_id"]] = event.tool_call_id
+            elif event.type is SessionEventType.TOOL_CALL_STARTED and event.tool_call_id is not None:
+                state.started_tools.add(event.tool_call_id)
+        for step_id, is_open in reversed(list(open_steps.items())):
+            if is_open:
+                state.step_id = step_id
+                state.step_open = True
+                break
         facts: list[PendingSessionEvent | None] = []
         if not existing:
             facts.extend(
@@ -222,6 +249,42 @@ class Harness:
         else:
             facts.append(self._fact_event(task, SessionEventType.EXECUTION_STARTED))
         self._record_facts(task, facts)
+
+    def _record_resumed(self, task: Task) -> None:
+        state = _FACT_STATE.get()
+        if state is None or state.step_id is None:
+            return
+        self._record_facts(
+            task,
+            [
+                self._fact_event(
+                    task, SessionEventType.STEP_RESUMED, step_id=state.step_id
+                ),
+                self._fact_event(task, SessionEventType.TURN_RESUMED),
+                self._fact_event(task, SessionEventType.SUBMISSION_RESUMED),
+            ],
+        )
+
+    def _record_paused(self, task: Task) -> None:
+        state = _FACT_STATE.get()
+        if state is None or state.step_id is None:
+            self._save_task(task)
+            return
+        self._record_facts(
+            task,
+            [
+                self._fact_event(
+                    task, SessionEventType.STEP_PAUSED, step_id=state.step_id
+                ),
+                self._fact_event(task, SessionEventType.TURN_PAUSED),
+                self._fact_event(task, SessionEventType.SUBMISSION_PAUSED),
+                self._fact_event(
+                    task,
+                    SessionEventType.EXECUTION_SETTLED,
+                    payload={"outcome": "paused"},
+                ),
+            ],
+        )
 
     def _begin_step(self, task: Task, *, phase: str) -> str | None:
         state = _FACT_STATE.get()
@@ -324,8 +387,91 @@ class Harness:
                     },
                 )
             )
+            assert state.tool_ids is not None
+            for call in output.tool_calls:
+                durable_id = str(uuid.uuid4())
+                state.tool_ids[call.id] = durable_id
+                facts.append(
+                    self._fact_event(
+                        task,
+                        SessionEventType.TOOL_CALL_REQUESTED,
+                        step_id=state.step_id,
+                        attempt_id=state.attempt_id,
+                        tool_call_id=durable_id,
+                        payload={
+                            "external_tool_call_id": call.id,
+                            "name": call.name,
+                            "arguments": call.arguments,
+                        },
+                    )
+                )
         self._record_facts(task, facts)
         state.attempt_settled = True
+
+    def _tool_fact_id(self, call: LlmToolCall) -> str | None:
+        state = _FACT_STATE.get()
+        if state is None:
+            return None
+        assert state.tool_ids is not None
+        return state.tool_ids.get(call.id)
+
+    def _record_tool_started(self, task: Task, call: LlmToolCall) -> None:
+        state = _FACT_STATE.get()
+        durable_id = self._tool_fact_id(call)
+        if state is None or durable_id is None:
+            return
+        assert state.started_tools is not None
+        if durable_id in state.started_tools:
+            return
+        self._record_facts(
+            task,
+            [
+                self._fact_event(
+                    task,
+                    SessionEventType.TOOL_CALL_STARTED,
+                    step_id=state.step_id,
+                    tool_call_id=durable_id,
+                    payload={"external_tool_call_id": call.id, "name": call.name},
+                )
+            ],
+        )
+        state.started_tools.add(durable_id)
+
+    def _record_tool_settled(
+        self, task: Task, call: LlmToolCall, result: ToolExecutionResult
+    ) -> None:
+        state = _FACT_STATE.get()
+        durable_id = self._tool_fact_id(call)
+        if state is None or durable_id is None or result.is_pending():
+            return
+        assert state.started_tools is not None
+        if durable_id in state.started_tools:
+            if result.is_completed():
+                outcome = "completed"
+            elif result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_CANCELLED:
+                outcome = "cancelled"
+            else:
+                outcome = "failed"
+        else:
+            outcome = "rejected"
+        self._record_facts(
+            task,
+            [
+                self._fact_event(
+                    task,
+                    SessionEventType.TOOL_CALL_SETTLED,
+                    step_id=state.step_id,
+                    tool_call_id=durable_id,
+                    payload={
+                        "outcome": outcome,
+                        "external_tool_call_id": call.id,
+                        "state": result.state.value,
+                        "reason": None if result.fail_reason is None else result.fail_reason.value,
+                        "output": result.output,
+                    },
+                )
+            ],
+        )
 
     def _record_terminal(self, task: Task, outcome: str) -> None:
         state = _FACT_STATE.get()
@@ -789,11 +935,14 @@ class Harness:
         pending = list(task.pending_tool_calls)
         for index, item in enumerate(pending):
             call = LlmToolCall(item.tool_id, item.tool_name, item.arguments or "")
+
+            def before_execute(ready_call: LlmToolCall) -> None:
+                self._record_tool_started(task, ready_call)
+                self._emit_tool_event(EventType.TOOL_EXECUTION_RESUMED, task, ready_call)
+
             if cancellation_token is not None and cancellation_token.is_cancelled():
                 result = self._cancelled_tool_result(item)
             else:
-                if item.can_run():
-                    self._emit_tool_event(EventType.TOOL_EXECUTION_RESUMED, task, call)
                 async_method = getattr(self.tool_executor, "aexecute_held_tool_call", None)
                 sync_override = (
                     type(self.tool_executor).execute_held_tool_call
@@ -806,19 +955,40 @@ class Harness:
                 if sync_override and not async_override:
                     async_method = None
                 try:
-                    result = await call_maybe_async(
-                        async_method,
-                        self.tool_executor.execute_held_tool_call,
-                        item,
+                    selected = (
+                        async_method
+                        if async_method is not None
+                        else self.tool_executor.execute_held_tool_call
                     )
+                    supports_before_execute = "before_execute" in inspect.signature(
+                        selected
+                    ).parameters
+                    if supports_before_execute:
+                        result = await call_maybe_async(
+                            async_method,
+                            self.tool_executor.execute_held_tool_call,
+                            item,
+                            before_execute=before_execute,
+                        )
+                    else:
+                        if item.can_run():
+                            before_execute(call)
+                        result = await call_maybe_async(
+                            async_method,
+                            self.tool_executor.execute_held_tool_call,
+                            item,
+                        )
                 except asyncio.CancelledError:
                     if cancellation_token is not None:
                         cancellation_token.cancel()
                     raise
                 except Exception as error:
                     if item.can_run():
-                        self._emit_tool_result(task, call, self._failed_tool_result(item, error))
+                        failed = self._failed_tool_result(item, error)
+                        self._record_tool_settled(task, call, failed)
+                        self._emit_tool_result(task, call, failed)
                     raise
+            self._record_tool_settled(task, call, result)
             if result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_CANCELLED:
                 self._emit_cancelled_tool_result(task, call, result)
             else:
@@ -831,6 +1001,7 @@ class Harness:
         for item in task.pending_tool_calls:
             call = LlmToolCall(item.tool_id, item.tool_name, item.arguments or "")
             result = self._cancelled_tool_result(item)
+            self._record_tool_settled(task, call, result)
             self._emit_cancelled_tool_result(task, call, result)
             results.append(result)
         task.replace_tool_messages([build_tool_message(result) for result in results])
@@ -1069,7 +1240,13 @@ class Harness:
                 ):
                     raise _ToolBatchCancelled
                 starting_calls[call.id] = call
+
+            if not supports_before_execute:
+                before_execute(call)
+
+        def before_execute(call: LlmToolCall) -> None:
             try:
+                self._record_tool_started(task, call)
                 self._emit_tool_event(EventType.TOOL_EXECUTION_STARTED, task, call)
             except BaseException:
                 with callback_lock:
@@ -1087,6 +1264,7 @@ class Harness:
                 with callback_lock:
                     observed_results[call.id] = result
                 try:
+                    self._record_tool_settled(task, call, result)
                     self._emit_tool_result(task, call, result)
                 except _EventSinkError:
                     pass
@@ -1094,13 +1272,18 @@ class Harness:
 
         def after_call(call: LlmToolCall, result: ToolExecutionResult) -> None:
             with callback_lock:
-                if callbacks_closed or active_calls.pop(call.id, None) is None:
+                active = active_calls.get(call.id)
+                requested = starting_calls.pop(call.id, None)
+                if callbacks_closed or (active is None and requested is None):
                     return
                 cancelled = cancellation_token is not None and cancellation_token.is_cancelled()
             if cancelled:
                 result = cancelled_result(call)
             with callback_lock:
                 observed_results[call.id] = result
+            self._record_tool_settled(task, call, result)
+            with callback_lock:
+                active_calls.pop(call.id, None)
             if cancelled:
                 try:
                     self._emit_tool_result(task, call, result)
@@ -1118,7 +1301,9 @@ class Harness:
             first_error = None
             for call in calls:
                 try:
-                    self._emit_tool_result(task, call, cancelled_result(call))
+                    result = cancelled_result(call)
+                    self._record_tool_settled(task, call, result)
+                    self._emit_tool_result(task, call, result)
                 except _EventSinkError as error:
                     if first_error is None:
                         first_error = error
@@ -1132,7 +1317,9 @@ class Harness:
                 calls = list(active_calls.values())
                 active_calls.clear()
             for call in calls:
-                self._emit_tool_result(task, call, failed_result(call, error))
+                result = failed_result(call, error)
+                self._record_tool_settled(task, call, result)
+                self._emit_tool_result(task, call, result)
 
         async_batch = getattr(self.tool_executor, "aexecute_tool_calls", None)
         sync_override = (
@@ -1149,22 +1336,31 @@ class Harness:
             parameter.name == "should_cancel" or parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters
         )
+        supports_before_execute = any(
+            parameter.name == "before_execute"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
         try:
+            callback_arguments = {
+                "before_call": before_call,
+                "after_call": after_call,
+            }
+            if supports_before_execute:
+                callback_arguments["before_execute"] = before_execute
             if cancellation_token is not None and supports_cancellation:
+                callback_arguments["should_cancel"] = cancellation_token.is_cancelled
                 return await call_maybe_async(
                     async_batch,
                     self.tool_executor.execute_tool_calls,
                     tool_calls,
-                    before_call=before_call,
-                    after_call=after_call,
-                    should_cancel=cancellation_token.is_cancelled,
+                    **callback_arguments,
                 )
             return await call_maybe_async(
                 async_batch,
                 self.tool_executor.execute_tool_calls,
                 tool_calls,
-                before_call=before_call,
-                after_call=after_call,
+                **callback_arguments,
             )
         except _ToolBatchCancelled:
             ordered = [observed_results.get(call.id, cancelled_result(call)) for call in tool_calls]
@@ -1327,7 +1523,7 @@ class Harness:
         if blocked_reason == TaskPauseReason.TASK_PAUSED_WAITING_APPROVAL:
             task.set_pending_tool_calls(step_result.tool_call_result.pending_tools)
             task.transition_to_paused(blocked_reason)
-            self._save_task(task)
+            self._record_paused(task)
             self._emit_task_event(
                 EventType.TASK_PAUSED,
                 task,
@@ -1542,9 +1738,11 @@ class Harness:
                     return self._ask_clarification(task, question, start_time, token)
 
             if task.is_paused():
+                self._record_resumed(task)
                 self._emit_task_event(EventType.TASK_RESUMED, task)
                 task.transition_to_running(TaskRunningReason.TASK_RUNNING_RESUME)
                 await self._afinish_pending_tool_calls(task, token)
+                self._settle_step(task, "completed")
                 self._save_task(task)
 
             result = await self.aturn(task, start_time, token)

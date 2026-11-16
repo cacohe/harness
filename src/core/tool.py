@@ -98,7 +98,13 @@ class ToolExecutor:
     def _execute(self, tool: Tool, inputs: dict) -> ToolExecutionResult:
         return run_sync(lambda: self._aexecute(tool, inputs), async_name="aexecute")
 
-    async def _aexecute(self, tool: Tool, inputs: dict) -> ToolExecutionResult:
+    async def _aexecute(
+        self,
+        tool: Tool,
+        inputs: dict,
+        *,
+        before_execute: Callable[[], None] | None = None,
+    ) -> ToolExecutionResult:
         try:
             decision = self.approval_policy.decide(tool, inputs)
         except Exception as error:
@@ -115,6 +121,8 @@ class ToolExecutor:
             return self._failed(tool, ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_TIMEOUT)
         if decision is not ApprovalDecision.APPROVAL_DECISION_APPROVED:
             return self._failed(tool)
+        if before_execute is not None:
+            before_execute()
         return await self._arun_approved(tool, inputs)
 
     def execute_approved(self, tool: Tool, inputs: dict) -> ToolExecutionResult:
@@ -206,6 +214,7 @@ class ToolExecutor:
         tool_calls: list[LlmToolCall],
         *,
         before_call: Callable[[LlmToolCall], None] | None = None,
+        before_execute: Callable[[LlmToolCall], None] | None = None,
         after_call: Callable[[LlmToolCall, ToolExecutionResult], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> ToolCallResult:
@@ -213,6 +222,7 @@ class ToolExecutor:
             lambda: self.aexecute_tool_calls(
                 tool_calls,
                 before_call=before_call,
+                before_execute=before_execute,
                 after_call=after_call,
                 should_cancel=should_cancel,
             ),
@@ -224,6 +234,7 @@ class ToolExecutor:
         tool_calls: list[LlmToolCall],
         *,
         before_call: Callable[[LlmToolCall], None] | None = None,
+        before_execute: Callable[[LlmToolCall], None] | None = None,
         after_call: Callable[[LlmToolCall, ToolExecutionResult], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> ToolCallResult:
@@ -250,7 +261,11 @@ class ToolExecutor:
                 failed_tools.append(result)
                 ordered_tools.append(result)
                 continue
-            result = await self._aexecute_tool_call_compat(call, hold=bool(pending_tools))
+            result = await self._aexecute_tool_call_compat(
+                call,
+                hold=bool(pending_tools),
+                before_execute=before_execute,
+            )
             if after_call is not None:
                 after_call(call, result)
             if result.is_completed():
@@ -269,15 +284,31 @@ class ToolExecutor:
         )
 
     async def _aexecute_tool_call_compat(
-        self, call: LlmToolCall, *, approved: bool = False, hold: bool = False
+        self,
+        call: LlmToolCall,
+        *,
+        approved: bool = False,
+        hold: bool = False,
+        before_execute: Callable[[LlmToolCall], None] | None = None,
     ) -> ToolExecutionResult:
         sync_override = type(self).execute_tool_call is not ToolExecutor.execute_tool_call
         async_override = type(self).aexecute_tool_call is not ToolExecutor.aexecute_tool_call
         if sync_override and not async_override:
+            if before_execute is not None:
+                before_execute(call)
             return await call_maybe_async(
                 None, self.execute_tool_call, call, approved=approved, hold=hold
             )
-        return await self.aexecute_tool_call(call, approved=approved, hold=hold)
+        if async_override:
+            if before_execute is not None:
+                before_execute(call)
+            return await self.aexecute_tool_call(call, approved=approved, hold=hold)
+        return await self.aexecute_tool_call(
+            call,
+            approved=approved,
+            hold=hold,
+            before_execute=before_execute,
+        )
 
     def execute_tool_call(
         self, call: LlmToolCall, approved: bool = False, hold: bool = False
@@ -288,7 +319,12 @@ class ToolExecutor:
         )
 
     async def aexecute_tool_call(
-        self, call: LlmToolCall, approved: bool = False, hold: bool = False
+        self,
+        call: LlmToolCall,
+        approved: bool = False,
+        hold: bool = False,
+        *,
+        before_execute: Callable[[LlmToolCall], None] | None = None,
     ) -> ToolExecutionResult:
         """Run one model tool call, or hold it until an earlier approval is resolved."""
         try:
@@ -333,11 +369,13 @@ class ToolExecutor:
                 workspace_id=self._workspace_id(tool),
                 approval_scope=tool.approval_scope,
             )
-        result = (
-            await self._arun_approved(tool, validated)
-            if approved
-            else await self._aexecute(tool, validated)
-        )
+        if approved:
+            if before_execute is not None:
+                before_execute(call)
+            result = await self._arun_approved(tool, validated)
+        else:
+            callback = None if before_execute is None else lambda: before_execute(call)
+            result = await self._aexecute(tool, validated, before_execute=callback)
         result.tool_id = call.id
         if result.is_pending():
             result.arguments = self._encoded_arguments(validated)
@@ -346,12 +384,26 @@ class ToolExecutor:
             result.approval_scope = tool.approval_scope
         return result
 
-    def execute_held_tool_call(self, held: ToolExecutionResult) -> ToolExecutionResult:
+    def execute_held_tool_call(
+        self,
+        held: ToolExecutionResult,
+        *,
+        before_execute: Callable[[LlmToolCall], None] | None = None,
+    ) -> ToolExecutionResult:
         return run_sync(
-            lambda: self.aexecute_held_tool_call(held), async_name="aexecute_held_tool_call"
+            lambda: self.aexecute_held_tool_call(
+                held,
+                before_execute=before_execute,
+            ),
+            async_name="aexecute_held_tool_call",
         )
 
-    async def aexecute_held_tool_call(self, held: ToolExecutionResult) -> ToolExecutionResult:
+    async def aexecute_held_tool_call(
+        self,
+        held: ToolExecutionResult,
+        *,
+        before_execute: Callable[[LlmToolCall], None] | None = None,
+    ) -> ToolExecutionResult:
         """Run or reject a held tool call after the user decides."""
         call = LlmToolCall(held.tool_id, held.tool_name, held.arguments or "")
         decision = held.approval
@@ -373,7 +425,11 @@ class ToolExecutor:
                 )
                 result.tool_id = call.id
                 return result
-            return await self._aexecute_tool_call_compat(call, approved=True)
+            return await self._aexecute_tool_call_compat(
+                call,
+                approved=True,
+                before_execute=before_execute,
+            )
         if decision == ApprovalDecision.APPROVAL_DECISION_TIMEOUT:
             reason = ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_TIMEOUT
             output = "The approval timed out."

@@ -15,6 +15,7 @@ from src.core.loop import (
     DEFAULT_MAX_STEPS,
     Harness,
 )
+from src.core.persistence import ExecutionCommitError
 from src.core.task import Task
 from src.core.tool import ToolExecutor
 from src.persistence.in_memory import InMemoryTaskRepository
@@ -783,6 +784,116 @@ def test_shell_call_pauses_without_running_or_a_closing_call():
     assert len(gateway.infer_contexts) == 1
     paused = [e for e in output.events if e.type is EventType.TOOL_EXECUTION_PAUSED]
     assert [event.payload.tool_call_id for event in paused] == ["call_1"]
+
+
+def test_approval_pause_and_resume_preserve_turn_and_settle_tool_once():
+    called = []
+    repository = InMemoryTaskRepository()
+    task = _task()
+    harness = _harness(
+        ScriptedGateway([_shell_call(), _model(FinishReason.STOP, "done")]),
+        executor=_recording_executor(called, "shell"),
+        repository=repository,
+    )
+
+    harness.run(task)
+    paused_facts = repository.events(task.session_id)
+
+    assert [fact.type for fact in paused_facts].count(SessionEventType.TOOL_CALL_REQUESTED) == 1
+    assert SessionEventType.TOOL_CALL_STARTED not in [fact.type for fact in paused_facts]
+    assert [fact.type for fact in paused_facts][-4:] == [
+        SessionEventType.STEP_PAUSED,
+        SessionEventType.TURN_PAUSED,
+        SessionEventType.SUBMISSION_PAUSED,
+        SessionEventType.EXECUTION_SETTLED,
+    ]
+    first_execution = paused_facts[-1].execution_id
+    turn_id = paused_facts[-1].turn_id
+
+    task.decide_tool_call("call_1", approved=True)
+    result = harness.run(task)
+
+    facts = repository.events(task.session_id)
+    assert result.output == "done"
+    assert called == [("shell", {"command": "git status"})]
+    assert [fact.type for fact in facts].count(SessionEventType.TOOL_CALL_STARTED) == 1
+    assert [fact.type for fact in facts].count(SessionEventType.TOOL_CALL_SETTLED) == 1
+    resumed = [fact for fact in facts if fact.type is SessionEventType.STEP_RESUMED]
+    assert len(resumed) == 1
+    assert resumed[0].turn_id == turn_id
+    assert resumed[0].execution_id != first_execution
+    assert facts[-1].type is SessionEventType.EXECUTION_SETTLED
+    assert facts[-1].payload["outcome"] == "completed"
+
+
+def test_rejected_approval_settles_requested_tool_without_started_fact():
+    repository = InMemoryTaskRepository()
+    task = _task()
+    harness = _harness(
+        ScriptedGateway([_shell_call(), _model(FinishReason.STOP, "continued")]),
+        executor=_recording_executor([], "shell"),
+        repository=repository,
+    )
+    harness.run(task)
+    task.decide_tool_call("call_1", approved=False)
+
+    harness.run(task)
+
+    facts = repository.events(task.session_id)
+    assert SessionEventType.TOOL_CALL_STARTED not in [fact.type for fact in facts]
+    settled = [fact for fact in facts if fact.type is SessionEventType.TOOL_CALL_SETTLED]
+    assert len(settled) == 1
+    assert settled[0].payload["outcome"] == "rejected"
+
+
+def test_tool_settlement_persistence_failure_stops_later_side_effects_and_compensates():
+    class FailFirstToolSettlement(InMemoryTaskRepository):
+        def __init__(self):
+            super().__init__()
+            self.failed = False
+
+        def commit(self, task, events, *, expected_sequence, submission=None):
+            if not self.failed and any(
+                event.type is SessionEventType.TOOL_CALL_SETTLED for event in events
+            ):
+                self.failed = True
+                raise ExecutionCommitError("settlement unavailable")
+            return super().commit(
+                task,
+                events,
+                expected_sequence=expected_sequence,
+                submission=submission,
+            )
+
+    executed = []
+    repository = FailFirstToolSettlement()
+    gateway = ScriptedGateway(
+        [
+            _model(
+                FinishReason.TOOL_CALLS,
+                calls=[
+                    LlmToolCall("call-1", "first", "{}"),
+                    LlmToolCall("call-2", "second", "{}"),
+                ],
+            )
+        ]
+    )
+    task = _task()
+
+    with pytest.raises(ExecutionCommitError, match="settlement unavailable"):
+        _harness(
+            gateway,
+            executor=_recording_executor(executed, "first", "second"),
+            repository=repository,
+        ).run(task)
+
+    assert executed == [("first", {})]
+    facts = repository.events(task.session_id)
+    started = [fact for fact in facts if fact.type is SessionEventType.TOOL_CALL_STARTED]
+    settled = [fact for fact in facts if fact.type is SessionEventType.TOOL_CALL_SETTLED]
+    assert len(started) == 1
+    assert len(settled) == 1
+    assert settled[0].payload["outcome"] == "failed"
 
 
 def test_precancelled_created_task_does_no_gateway_work():
