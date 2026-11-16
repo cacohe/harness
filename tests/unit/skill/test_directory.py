@@ -1,9 +1,9 @@
 from pathlib import Path
 
 import pytest
-from src.core.workspace import Workspace, WorkspaceViolation
 from src.schema.tool import SandboxKind
 from src.skill.directory import SkillDirectory, SkillDocumentError
+from src.workspace import Workspace, WorkspaceViolation
 
 
 def _skill_dir(tmp_path: Path, document: bytes | str | None) -> Path:

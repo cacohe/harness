@@ -9,7 +9,6 @@ from src.core.cancellation import CancellationToken
 from src.core.loop import Harness
 from src.core.memory import MemoryManager
 from src.core.task import Task
-from src.core.workspace import Workspace
 from src.memory.retriever import HybridRetriever
 from src.memory.store import InMemoryStore
 from src.observability import MetricsEventSink
@@ -18,6 +17,7 @@ from src.schema.task import TaskPauseReason, TaskPlan, TaskResult, TaskRunningRe
 from src.schema.tool import ApprovalDecision, Tool, ToolExecutionResult
 from src.tool.tool_executor import DefaultToolExecutor
 from src.tool.tool_registry import DefaultToolRegistry
+from src.workspace import Workspace
 
 
 class ChatGateway:

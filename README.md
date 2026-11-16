@@ -58,7 +58,7 @@ task = agent.chat("帮我比较两款手机")
 
 ```python
 from src.config import Config
-from src.core.workspace import Workspace
+from src.workspace import Workspace
 from src.application import Agent
 
 workspace = Workspace("./my-project")

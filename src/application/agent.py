@@ -14,7 +14,6 @@ from src.core.loop import Harness
 from src.core.persistence import TaskRepository
 from src.core.task import Task
 from src.core.tool import SandboxRunner, ToolCatalog, ToolExecutor
-from src.core.workspace import Workspace
 from src.llm.litellm import LiteLLMGateway
 from src.mcp import MCPManager
 from src.persistence.in_memory import InMemoryTaskRepository
@@ -23,6 +22,7 @@ from src.skill import load_skill_directories
 from src.tool.local_tools import LocalToolSuite
 from src.tool.tool_executor import DefaultToolExecutor
 from src.tool.tool_registry import DefaultToolRegistry
+from src.workspace import Workspace
 
 SYSTEM_PROMPT = "You are a helpful AI Agent that can help with tasks."
 MEMORY_SYSTEM_PROMPT = (

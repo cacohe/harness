@@ -1,16 +1,22 @@
 from typing import Any
 
-from src.core.context import (
-    DEFAULT_SYSTEM_PROMPT_FOR_FINAL,
-    DEFAULT_SYSTEM_PROMPT_FOR_INFER,
-    DEFAULT_SYSTEM_PROMPT_FOR_PLANNING,
-    ContextBuilderError,
-)
+from src.core.context import ContextBuilderError
 from src.core.task import Task
 from src.schema.context import Context, Message
 from src.schema.skills import Skill
 from src.schema.task import TaskPlan
 from src.schema.tool import Tool
+
+DEFAULT_SYSTEM_PROMPT_FOR_PLANNING = """
+You are an expert in task management, skilled at converting inputs into clear task objectives and designing reasonable execution steps based on those objectives.
+You decide whether this input needs a plan. Write the goal and steps when you plan. Use clarification when you need to ask the user something instead.
+"""
+DEFAULT_SYSTEM_PROMPT_FOR_INFER = """
+You are an expert in task execution, skilled at executing tasks based on the given task objectives and execution steps.
+"""
+DEFAULT_SYSTEM_PROMPT_FOR_FINAL = """
+Answer the original goal from the results above. Do not call tools. Based on the current task state, explain the execution status: what was done, what remains, and why it was not completed.
+"""
 
 
 class DefaultContextBuilder:

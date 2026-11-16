@@ -3,8 +3,8 @@ import re
 from functools import wraps
 from pathlib import Path
 
-from src.core.workspace import Workspace, WorkspaceViolation
 from src.schema.tool import SandboxKind, Tool, ToolOrigin
+from src.workspace import Workspace, WorkspaceViolation
 
 _MAX_READ_LINES = 2000
 _MAX_MATCHES = 200

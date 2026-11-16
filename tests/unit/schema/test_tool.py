@@ -1,4 +1,3 @@
-from src.core.workspace import Workspace
 from src.schema.tool import (
     Tool,
     ToolExecution,
@@ -6,6 +5,7 @@ from src.schema.tool import (
     ToolExecutionResult,
     ToolOrigin,
 )
+from src.workspace import Workspace
 
 
 def test_tool_execution_treats_workspace_capability_as_an_opaque_runtime_type(tmp_path):

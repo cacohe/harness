@@ -6,7 +6,6 @@ import pytest
 from src.core import tool as core_tool
 from src.core.context import build_tool_messages
 from src.core.tool import RemoteToolError, ToolExecutor
-from src.core.workspace import Workspace, WorkspaceViolation
 from src.schema.llm import LlmToolCall
 from src.schema.tool import (
     ApprovalDecision,
@@ -18,6 +17,7 @@ from src.schema.tool import (
 from src.tool.local_tools import LocalToolSuite
 from src.tool.tool_executor import DefaultToolExecutor, LocalToolRunner
 from src.tool.tool_registry import DefaultToolRegistry
+from src.workspace import Workspace, WorkspaceViolation
 
 
 def test_core_exposes_tool_execution_ports():

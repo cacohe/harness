@@ -5,10 +5,10 @@ from typing import Any
 import litellm
 from pydantic import BaseModel
 
-from src.core.async_utils import iterate_maybe_async
 from src.schema.context import Context
 from src.schema.llm import ROLE_TOOL, FinishReason, LLMOutput, LlmToolCall, LlmUsage
 from src.schema.tool import Tool
+from src.utils.async_utils import iterate_maybe_async
 
 
 def _is_deepseek(model: str, api_base: str | None) -> bool:

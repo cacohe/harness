@@ -7,11 +7,11 @@ from typing import Any
 
 import yaml  # type: ignore[import-untyped]
 
-from src.core.workspace import Workspace
 from src.schema.skills import Skill
 from src.schema.tool import Tool
 from src.tool.local_tools import LocalToolSuite
 from src.utils.tool_names import provider_tool_name
+from src.workspace import Workspace
 
 _FRONTMATTER = re.compile(r"\A---\r?\n(.*?)\r?\n---(?:\r?\n|\Z)", re.DOTALL)
 

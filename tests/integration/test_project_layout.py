@@ -55,6 +55,31 @@ def test_schema_layer_does_not_depend_on_core_runtime():
     assert violations == []
 
 
+def test_internal_modules_use_canonical_neutral_imports():
+    compatibility_modules = {
+        ROOT / "src" / "core" / "async_utils.py",
+        ROOT / "src" / "core" / "workspace.py",
+    }
+    violations = []
+    for path in (ROOT / "src").rglob("*.py"):
+        if path in compatibility_modules:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "src.core.workspace":
+                        violations.append(f"{path.relative_to(ROOT)}:{node.lineno}:{alias.name}")
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                if node.module == "src.core.workspace":
+                    violations.append(f"{path.relative_to(ROOT)}:{node.lineno}:{node.module}")
+                if node.module == "src.core.async_utils" and any(
+                    alias.name == "iterate_maybe_async" for alias in node.names
+                ):
+                    violations.append(f"{path.relative_to(ROOT)}:{node.lineno}:iterate_maybe_async")
+    assert violations == []
+
+
 @pytest.mark.parametrize(
     "statement",
     [
