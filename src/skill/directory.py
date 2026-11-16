@@ -38,7 +38,14 @@ class SkillDirectory:
 
     def load(self, *, include_shell: bool = False) -> Skill:
         """Parse this directory's SKILL.md into a data-only Skill."""
-        text = self._read_document()
+        return self._parse_document(self._read_document(), include_shell=include_shell)
+
+    def load_bundle(self, *, include_shell: bool = False) -> tuple[Skill, list[Tool]]:
+        """Load one Skill and derive its resource tools from the same document read."""
+        skill = self._parse_document(self._read_document(), include_shell=include_shell)
+        return skill, self._tools_for(skill.name, include_shell=include_shell)
+
+    def _parse_document(self, text: str, *, include_shell: bool) -> Skill:
         if not (text.startswith("---\n") or text.startswith("---\r\n")):
             raise SkillDocumentError("SKILL.md must start with YAML frontmatter")
         match = _FRONTMATTER.match(text)
@@ -57,6 +64,9 @@ class SkillDirectory:
     def tools(self, *, include_shell: bool = False) -> list[Tool]:
         """Return read-only and optional sandbox-required tools for this skill."""
         skill_name = self.load().name
+        return self._tools_for(skill_name, include_shell=include_shell)
+
+    def _tools_for(self, skill_name: str, *, include_shell: bool) -> list[Tool]:
         wanted = {"read_file"}
         if include_shell:
             wanted.add("shell")

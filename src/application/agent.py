@@ -18,9 +18,8 @@ from src.core.workspace import Workspace
 from src.llm.litellm import LiteLLMGateway
 from src.mcp import MCPManager
 from src.persistence.in_memory import InMemoryTaskRepository
-from src.schema.skills import Skill
 from src.schema.tool import Tool, ToolExecutionResult
-from src.skill.directory import SkillDirectory
+from src.skill import load_skill_directories
 from src.tool.local_tools import LocalToolSuite
 from src.tool.tool_executor import DefaultToolExecutor
 from src.tool.tool_registry import DefaultToolRegistry
@@ -86,7 +85,7 @@ class Agent:
                 include_shell=sandbox_runner is not None
             ):
                 self.tool_registry.register(tool)
-        self.skills, skill_tools = _load_skill_directories(
+        self.skills, skill_tools = load_skill_directories(
             skill_directories or [], include_shell=sandbox_runner is not None
         )
         _register_tools_atomically(self.tool_registry, skill_tools)
@@ -270,23 +269,6 @@ class Agent:
     @property
     def memory_failure_count(self) -> int:
         return self._default_session.memory_failure_count
-
-
-def _load_skill_directories(
-    roots: list[str | Path], *, include_shell: bool
-) -> tuple[list[Skill], list[Tool]]:
-    skills = []
-    tools = []
-    names: set[str] = set()
-    for root in roots:
-        directory = SkillDirectory(root)
-        skill = directory.load(include_shell=include_shell)
-        if skill.name in names:
-            raise ValueError(f"duplicate skill name: {skill.name!r}")
-        names.add(skill.name)
-        skills.append(skill)
-        tools.extend(directory.tools(include_shell=include_shell))
-    return skills, tools
 
 
 def _register_tools_atomically(catalog: ToolCatalog, tools: list[Tool]) -> None:
