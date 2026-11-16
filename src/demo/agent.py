@@ -154,13 +154,21 @@ class Agent:
         self,
         message: str,
         cancellation_token: CancellationToken | None = None,
+        *,
+        message_id: str | None = None,
     ) -> Task:
-        return self._default_session.chat(message, cancellation_token=cancellation_token)
+        return self._default_session.chat(
+            message,
+            cancellation_token=cancellation_token,
+            message_id=message_id,
+        )
 
     async def achat(
         self,
         message: str,
         cancellation_token: CancellationToken | None = None,
+        *,
+        message_id: str | None = None,
     ) -> Task:
         """
         Plan one message, run it to an answer, and remember the turn.
@@ -170,7 +178,11 @@ class Agent:
         Returns:
             The task after planning and execution. A failed turn is not remembered.
         """
-        return await self._default_session.achat(message, cancellation_token=cancellation_token)
+        return await self._default_session.achat(
+            message,
+            cancellation_token=cancellation_token,
+            message_id=message_id,
+        )
 
     def approval_requests(self) -> list[ToolExecutionResult]:
         """
@@ -206,13 +218,16 @@ class Agent:
         """
         return await self._default_session.aresume(cancellation_token=cancellation_token)
 
-    def new_session(self) -> AgentSession:
+    def new_session(self, session_id: str | None = None) -> AgentSession:
         """Create an isolated conversation sharing this Agent's runtime dependencies."""
         self._ensure_open()
         return AgentSession(
             self.harness,
             self.task_repository,
             self._ensure_open,
+            session_id=session_id,
+            execution_store=self.harness.execution_store,
+            max_pending_submissions=getattr(self.config, "max_pending_submissions", 0),
             memory_manager=self.memory_manager,
             memory_top_k=self.memory_top_k,
             memory_token_budget=self.memory_token_budget,
