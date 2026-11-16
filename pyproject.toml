@@ -1,7 +1,7 @@
 [project]
 name = "agent-harness"
 version = "0.1.0"
-description = "Sketch of an agent harness: interfaces and call order only."
+description = "Async-first agent harness with isolated sessions, durable tasks, sandboxed tools, and observability."
 requires-python = ">=3.11"
 readme = "README.md"
 dependencies = ["fastmcp>=2.4", "litellm", "pydantic>=2", "pyyaml>=6"]

@@ -1,6 +1,6 @@
 # agent-harness
 
-Agent harness 的接口与调用顺序草图。运行时依赖由 uv 管理，应用模块从仓库根目录以 `python -m src.<module>` 启动。
+生产级、异步优先的 Agent Harness：提供隔离会话、持久化任务、沙箱工具执行、MCP 集成、记忆与可观测性能力，并包含可直接运行的 Agent demo。运行时依赖由 uv 管理，应用模块从仓库根目录以 `python -m src.<module>` 启动。
 
 ## 环境
 

@@ -51,11 +51,11 @@ command verification.
 - Produces: `src.workspace.Workspace` and `WorkspaceViolation`.
 - Preserves: legacy core workspace imports as the exact same class objects.
 
-- [ ] **Step 1: Add a failing schema-layer dependency test and canonical utility import tests**
-- [ ] **Step 2: Run the focused tests and verify RED on the existing `schema -> core` import**
-- [ ] **Step 3: Move the iterator implementation, update schema, and re-export from core**
-- [ ] **Step 4: Run layout/async/LLM stream tests, Ruff, and Mypy and verify GREEN**
-- [ ] **Step 5: Commit the dependency-direction change**
+- [x] **Step 1: Add a failing schema-layer dependency test and canonical utility import tests**
+- [x] **Step 2: Run the focused tests and verify RED on the existing `schema -> core` import**
+- [x] **Step 3: Move the iterator implementation, update schema, and re-export from core**
+- [x] **Step 4: Run layout/async/LLM stream tests, Ruff, and Mypy and verify GREEN**
+- [x] **Step 5: Commit the dependency-direction change**
 
 ### Task 2: Close roadmap documentation and repository hygiene
 
@@ -70,10 +70,10 @@ command verification.
 - Produces: accurate project positioning and auditable completed-plan status.
 - Produces: root ignore rules for local generated artifacts.
 
-- [ ] **Step 1: Update README/project metadata and root ignore rules**
-- [ ] **Step 2: Mark the ten verified historical plans complete and append integration evidence**
-- [ ] **Step 3: Verify no scoped historical checklist item remains open**
-- [ ] **Step 4: Run lock, Ruff, Mypy, full pytest, and diff gates**
+- [x] **Step 1: Update README/project metadata and root ignore rules**
+- [x] **Step 2: Mark the ten verified historical plans complete and append integration evidence**
+- [x] **Step 3: Verify no scoped historical checklist item remains open**
+- [x] **Step 4: Run lock, Ruff, Mypy, full pytest, and diff gates**
 - [ ] **Step 5: Commit closeout documentation and hygiene changes**
 - [ ] **Step 6: Dispatch one fresh whole-branch review and resolve actionable findings**
 - [ ] **Step 7: Mark this plan complete after final verification**
