@@ -97,7 +97,11 @@ class MetricsEventSink:
     def _observe_llm(self, event: Event, now: float) -> None:
         if not isinstance(event.payload, LlmEventPayload):
             return
-        key = (event.task_id or "", event.payload.phase or "unknown")
+        key = (
+            event.task_id or "",
+            event.payload.phase or "unknown",
+            event.attempt_id or "",
+        )
         if event.type is EventType.LLM_STARTED:
             self._start(self._llm, key, now, "llm")
             return

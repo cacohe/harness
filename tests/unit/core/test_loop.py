@@ -8,6 +8,7 @@ from src.core.cancellation import CancellationToken
 from src.core.context import HELD_TOOL_MESSAGE, PENDING_TOOL_MESSAGE
 from src.core.guard import NoOpGuard
 from src.core.hook import HarnessHook
+from src.core.llm import LlmCallError
 from src.core.loop import (
     DEFAULT_LLM_ATTEMPT_DELAY_SECONDS,
     DEFAULT_MAX_SECONDS,
@@ -19,6 +20,7 @@ from src.core.tool import ToolExecutor
 from src.persistence.in_memory import InMemoryTaskRepository
 from src.schema.context import Context
 from src.schema.event import EventType
+from src.schema.execution import SessionEventType
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
 from src.schema.task import (
     TaskFailReason,
@@ -197,6 +199,135 @@ def test_run_plans_a_new_task_and_returns_the_answer():
     assert harness.run(task).output == "bought"
 
     assert gateway.planning_calls == [(False, TaskPlan)]
+
+
+def test_completed_run_records_balanced_model_and_turn_facts():
+    repository = InMemoryTaskRepository()
+    task = _task()
+
+    _harness(Gateway(), repository=repository).run(task)
+
+    facts = repository.events(task.session_id)
+    types = [fact.type for fact in facts]
+    assert types[:4] == [
+        SessionEventType.SESSION_STARTED,
+        SessionEventType.SUBMISSION_ACCEPTED,
+        SessionEventType.EXECUTION_STARTED,
+        SessionEventType.TURN_STARTED,
+    ]
+    assert types.count(SessionEventType.MODEL_ATTEMPT_STARTED) == 2
+    assert types.count(SessionEventType.MODEL_ATTEMPT_SETTLED) == 2
+    assert types.count(SessionEventType.ASSISTANT_SETTLED) == 2
+    assert types[-3:] == [
+        SessionEventType.TURN_SETTLED,
+        SessionEventType.SUBMISSION_SETTLED,
+        SessionEventType.EXECUTION_SETTLED,
+    ]
+    for started in [
+        index for index, event_type in enumerate(types)
+        if event_type is SessionEventType.MODEL_ATTEMPT_STARTED
+    ]:
+        settled = types.index(SessionEventType.MODEL_ATTEMPT_SETTLED, started + 1)
+        assistant = types.index(SessionEventType.ASSISTANT_SETTLED, settled + 1)
+        assert started < settled < assistant
+    assert all(fact.type is not SessionEventType.USER_MESSAGE for fact in facts)
+
+
+def test_durable_model_facts_precede_matching_observations():
+    repository = InMemoryTaskRepository()
+    observed = []
+
+    class InspectingSink:
+        def emit(self, event):
+            if event.type in {EventType.LLM_STARTED, EventType.LLM_COMPLETED}:
+                durable = repository.events(event.session_id)
+                observed.append((event.type, [fact.type for fact in durable]))
+
+    task = _task()
+    _harness(Gateway(), repository=repository, event_handler=InspectingSink()).run(task)
+
+    for event_type, durable_types in observed:
+        if event_type is EventType.LLM_STARTED:
+            assert durable_types[-1] is SessionEventType.MODEL_ATTEMPT_STARTED
+        else:
+            assert durable_types[-2:] == [
+                SessionEventType.MODEL_ATTEMPT_SETTLED,
+                SessionEventType.ASSISTANT_SETTLED,
+            ]
+
+
+def test_observation_failure_does_not_rollback_already_committed_model_fact():
+    repository = InMemoryTaskRepository()
+
+    class FailingSink:
+        def emit(self, event):
+            if event.type is EventType.LLM_STARTED:
+                raise RuntimeError("observer offline")
+
+    task = _task()
+    with pytest.raises(RuntimeError, match="observer offline"):
+        _harness(Gateway(), repository=repository, event_handler=FailingSink()).run(task)
+
+    assert [fact.type for fact in repository.events(task.session_id)][-1] is (
+        SessionEventType.MODEL_ATTEMPT_STARTED
+    )
+
+
+def test_planning_failure_settles_attempt_before_upper_lifecycles():
+    class FailingPlanning(Gateway):
+        def planning(self, context, stream=True, response_format=None):
+            raise LlmCallError("invalid plan")
+
+    repository = InMemoryTaskRepository()
+    task = _task()
+
+    result = _harness(FailingPlanning(), repository=repository).run(task)
+
+    assert "invalid plan" in result.output
+    types = [fact.type for fact in repository.events(task.session_id)]
+    attempt_settled = types.index(SessionEventType.MODEL_ATTEMPT_SETTLED)
+    assert types[attempt_settled + 1 :] == [
+        SessionEventType.STEP_SETTLED,
+        SessionEventType.TURN_SETTLED,
+        SessionEventType.SUBMISSION_SETTLED,
+        SessionEventType.EXECUTION_SETTLED,
+    ]
+
+
+def test_caller_cancellation_settles_one_attempt_without_assistant_fact():
+    async def scenario():
+        infer_started = asyncio.Event()
+
+        class BlockingGateway(Gateway):
+            async def ainfer(self, context, stream=True, response_format=None):
+                infer_started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+        repository = InMemoryTaskRepository()
+        task = _task()
+        running = asyncio.create_task(_harness(BlockingGateway(), repository=repository).arun(task))
+        await infer_started.wait()
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        return repository, task
+
+    repository, task = asyncio.run(scenario())
+    facts = repository.events(task.session_id)
+    types = [fact.type for fact in facts]
+    assert types.count(SessionEventType.MODEL_ATTEMPT_SETTLED) == 2
+    assert types.count(SessionEventType.ASSISTANT_SETTLED) == 1
+    infer_settlements = [
+        fact
+        for fact in facts
+        if fact.type is SessionEventType.MODEL_ATTEMPT_SETTLED
+        and fact.payload.get("phase") == "infer"
+    ]
+    assert len(infer_settlements) == 1
+    assert infer_settlements[0].payload["outcome"] == "cancelled"
+    assert facts[-1].type is SessionEventType.EXECUTION_SETTLED
+    assert facts[-1].payload["outcome"] == "cancelled"
 
 
 def test_run_saves_state_changes_through_the_repository():

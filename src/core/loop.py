@@ -1,11 +1,13 @@
 """Run a task by planning once, then alternating model calls and tool calls."""
 
 import asyncio
+import contextvars
 import inspect
 import threading
 import time
 import uuid
-from typing import NoReturn
+from dataclasses import dataclass
+from typing import NoReturn, TypedDict, cast
 
 from src.core.async_utils import call_maybe_async, run_sync
 from src.core.cancellation import CancellationToken
@@ -17,14 +19,21 @@ from src.core.context import (
     build_tool_messages,
 )
 from src.core.event import EventHandler, EventSink
+from src.core.execution import ExecutionContext, FactRecorder
 from src.core.guard import GuardError, HarnessGuard, NoOpGuard
 from src.core.hook import HarnessHook
 from src.core.llm import AsyncLlmGateway, LlmCallError, LlmGateway
-from src.core.persistence import NoOpTaskRepository, TaskRepository
+from src.core.persistence import (
+    ExecutionStore,
+    NoOpTaskRepository,
+    SnapshotExecutionStore,
+    TaskRepository,
+)
 from src.core.task import Task
 from src.core.tool import ToolExecutor
 from src.schema.context import Context
 from src.schema.event import Event, EventType, LlmEventPayload, TaskEventPayload, ToolEventPayload
+from src.schema.execution import PendingSessionEvent, SessionEventType
 from src.schema.harness import StepResult
 from src.schema.llm import (
     FinishReason,
@@ -67,6 +76,29 @@ class _ToolBatchCancelled(Exception):
     """Stop an overridden tool batch after its start callback observes cancellation."""
 
 
+@dataclass
+class _FactState:
+    context: ExecutionContext
+    step_id: str | None = None
+    attempt_id: str | None = None
+    attempt_settled: bool = True
+    step_open: bool = False
+
+
+class _Correlation(TypedDict):
+    session_id: str | None
+    execution_id: str | None
+    turn_id: str | None
+    step_id: str | None
+    attempt_id: str | None
+    tool_call_id: str | None
+
+
+_FACT_STATE: contextvars.ContextVar[_FactState | None] = contextvars.ContextVar(
+    "harness_fact_state", default=None
+)
+
+
 class Harness:
     """Run one task from planning through tool use until the model answers or a limit is hit."""
 
@@ -95,8 +127,261 @@ class Harness:
         self.task_repository = (
             task_repository if task_repository is not None else NoOpTaskRepository()
         )
+        self._legacy_execution_store = not isinstance(self.task_repository, ExecutionStore)
+        self.execution_store: ExecutionStore = (
+            SnapshotExecutionStore(self.task_repository)
+            if self._legacy_execution_store
+            else cast(ExecutionStore, self.task_repository)
+        )
+        self.fact_recorder = FactRecorder(self.execution_store)
         self._max_steps = max_steps
         self._max_seconds = max_seconds
+
+    def _fact_event(
+        self,
+        task: Task,
+        event_type: SessionEventType,
+        *,
+        payload: dict | None = None,
+        step_id: str | None = None,
+        attempt_id: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> PendingSessionEvent | None:
+        state = _FACT_STATE.get()
+        if state is None:
+            return None
+        context = state.context
+        return PendingSessionEvent(
+            event_id=str(uuid.uuid4()),
+            session_id=context.session_id,
+            type=event_type,
+            task_id=task.id,
+            execution_id=context.execution_id,
+            turn_id=context.turn_id,
+            step_id=step_id,
+            attempt_id=attempt_id,
+            tool_call_id=tool_call_id,
+            payload=payload or {},
+        )
+
+    def _record_facts(
+        self,
+        task: Task,
+        facts: list[PendingSessionEvent | None],
+    ) -> None:
+        pending = [fact for fact in facts if fact is not None]
+        if pending:
+            try:
+                self.fact_recorder.commit(task, pending)
+                if self._legacy_execution_store:
+                    self.task_repository.save(task)
+            except Exception as error:
+                raise _TaskPersistenceError from error
+
+    def _execution_context(
+        self, task: Task, supplied: ExecutionContext | None
+    ) -> ExecutionContext:
+        if supplied is not None:
+            if supplied.task_id != task.id:
+                raise ValueError("execution context task identity does not match Task")
+            context = supplied
+        else:
+            context = ExecutionContext(
+                session_id=task.session_id or f"task:{task.id}",
+                task_id=task.id,
+                message_id=task.message_id or str(uuid.uuid4()),
+                execution_id=str(uuid.uuid4()),
+                turn_id=task.turn_id or str(uuid.uuid4()),
+                expected_sequence=task.last_sequence or 0,
+            )
+        for field in ("session_id", "message_id", "turn_id"):
+            current = getattr(task, field)
+            incoming = getattr(context, field)
+            if current is not None and incoming is not None and current != incoming:
+                raise ValueError(f"execution context {field} does not match Task")
+            if current is None and incoming is not None:
+                setattr(task, field, incoming)
+        if context.expected_sequence != (task.last_sequence or 0):
+            raise ValueError("execution context sequence does not match Task")
+        return context
+
+    def _start_execution_facts(self, task: Task) -> None:
+        state = _FACT_STATE.get()
+        assert state is not None
+        existing = self.execution_store.events(state.context.session_id)
+        facts: list[PendingSessionEvent | None] = []
+        if not existing:
+            facts.extend(
+                [
+                    self._fact_event(task, SessionEventType.SESSION_STARTED),
+                    self._fact_event(task, SessionEventType.SUBMISSION_ACCEPTED),
+                    self._fact_event(task, SessionEventType.EXECUTION_STARTED),
+                    self._fact_event(task, SessionEventType.TURN_STARTED),
+                ]
+            )
+        else:
+            facts.append(self._fact_event(task, SessionEventType.EXECUTION_STARTED))
+        self._record_facts(task, facts)
+
+    def _begin_step(self, task: Task, *, phase: str) -> str | None:
+        state = _FACT_STATE.get()
+        if state is None:
+            return None
+        if state.step_open:
+            return state.step_id
+        state.step_id = str(uuid.uuid4())
+        state.step_open = True
+        self._record_facts(
+            task,
+            [
+                self._fact_event(
+                    task,
+                    SessionEventType.STEP_STARTED,
+                    step_id=state.step_id,
+                    payload={"phase": phase},
+                )
+            ],
+        )
+        return state.step_id
+
+    def _settle_step(self, task: Task, outcome: str) -> None:
+        state = _FACT_STATE.get()
+        if state is None or not state.step_open or state.step_id is None:
+            return
+        self._record_facts(
+            task,
+            [
+                self._fact_event(
+                    task,
+                    SessionEventType.STEP_SETTLED,
+                    step_id=state.step_id,
+                    payload={"outcome": outcome},
+                )
+            ],
+        )
+        state.step_open = False
+
+    def _begin_model_attempt(self, task: Task, phase: str, attempt: int) -> None:
+        state = _FACT_STATE.get()
+        if state is None:
+            return
+        if not state.step_open:
+            self._begin_step(task, phase=phase)
+        state.attempt_id = str(uuid.uuid4())
+        state.attempt_settled = False
+        self._record_facts(
+            task,
+            [
+                self._fact_event(
+                    task,
+                    SessionEventType.MODEL_ATTEMPT_STARTED,
+                    step_id=state.step_id,
+                    attempt_id=state.attempt_id,
+                    payload={"phase": phase, "attempt": attempt},
+                )
+            ],
+        )
+
+    def _settle_model_attempt(
+        self,
+        task: Task,
+        outcome: str,
+        *,
+        phase: str,
+        output: LLMOutput | None = None,
+        reason: str | None = None,
+    ) -> None:
+        state = _FACT_STATE.get()
+        if state is None or state.attempt_id is None or state.attempt_settled:
+            return
+        payload = {"outcome": outcome, "phase": phase}
+        if reason is not None:
+            payload["error_type"] = reason
+        facts: list[PendingSessionEvent | None] = [
+            self._fact_event(
+                task,
+                SessionEventType.MODEL_ATTEMPT_SETTLED,
+                step_id=state.step_id,
+                attempt_id=state.attempt_id,
+                payload=payload,
+            )
+        ]
+        if output is not None:
+            facts.append(
+                self._fact_event(
+                    task,
+                    SessionEventType.ASSISTANT_SETTLED,
+                    step_id=state.step_id,
+                    attempt_id=state.attempt_id,
+                    payload={
+                        "phase": phase,
+                        "content": output.content,
+                        "finish_reason": (
+                            None
+                            if output.finish_reason is None
+                            else output.finish_reason.value
+                        ),
+                    },
+                )
+            )
+        self._record_facts(task, facts)
+        state.attempt_settled = True
+
+    def _record_terminal(self, task: Task, outcome: str) -> None:
+        state = _FACT_STATE.get()
+        if state is None:
+            self._save_task(task)
+            return
+        facts: list[PendingSessionEvent | None] = []
+        if state.step_open and state.step_id is not None:
+            facts.append(
+                self._fact_event(
+                    task,
+                    SessionEventType.STEP_SETTLED,
+                    step_id=state.step_id,
+                    payload={"outcome": outcome},
+                )
+            )
+        facts.extend(
+            [
+                self._fact_event(
+                    task, SessionEventType.TURN_SETTLED, payload={"outcome": outcome}
+                ),
+                self._fact_event(
+                    task,
+                    SessionEventType.SUBMISSION_SETTLED,
+                    payload={"outcome": outcome},
+                ),
+                self._fact_event(
+                    task,
+                    SessionEventType.EXECUTION_SETTLED,
+                    payload={"outcome": outcome},
+                ),
+            ]
+        )
+        self._record_facts(task, facts)
+        state.step_open = False
+
+    @staticmethod
+    def _correlation() -> _Correlation:
+        state = _FACT_STATE.get()
+        if state is None:
+            return {
+                "session_id": None,
+                "execution_id": None,
+                "turn_id": None,
+                "step_id": None,
+                "attempt_id": None,
+                "tool_call_id": None,
+            }
+        return {
+            "session_id": state.context.session_id,
+            "execution_id": state.context.execution_id,
+            "turn_id": state.context.turn_id,
+            "step_id": state.step_id,
+            "attempt_id": state.attempt_id,
+            "tool_call_id": None,
+        }
 
     def _save_task(self, task: Task) -> None:
         """
@@ -166,6 +451,9 @@ class Harness:
             step_id: The step id of the event.
         """
         task_id = str(task.id)
+        correlation = self._correlation()
+        if step_id is not None:
+            correlation["step_id"] = step_id
         self._emit(
             Event(
                 id=str(uuid.uuid4()),
@@ -177,7 +465,7 @@ class Harness:
                     goal=goal,
                 ),
                 task_id=task_id,
-                step_id=step_id,
+                **correlation,
             )
         )
 
@@ -205,6 +493,8 @@ class Harness:
             tool_call_id = result.tool_id or call.id
             reason = result.fail_reason.value if result.fail_reason else None
             content = None if result.output is None else str(result.output)
+        correlation = self._correlation()
+        correlation["tool_call_id"] = tool_call_id
         self._emit(
             Event(
                 id=str(uuid.uuid4()),
@@ -217,6 +507,7 @@ class Harness:
                     content=content,
                 ),
                 task_id=str(task.id),
+                **correlation,
             )
         )
 
@@ -270,6 +561,7 @@ class Harness:
                     content=content,
                 ),
                 task_id=str(task.id),
+                **self._correlation(),
             )
         )
 
@@ -354,6 +646,7 @@ class Harness:
         for attempt in range(1, DEFAULT_MAX_LLM_ATTEMPTS + 1):
             if token.is_cancelled():
                 raise _CancellationRequested
+            self._begin_model_attempt(task, "planning", attempt)
             self._emit_llm_event(task, EventType.LLM_STARTED, phase="planning")
             if token.is_cancelled():
                 self._cancel_llm_attempt(task, "planning")
@@ -373,6 +666,9 @@ class Harness:
                 if not isinstance(output.structured, TaskPlan):
                     raise LlmCallError("planning did not return a task plan")
 
+                self._settle_model_attempt(
+                    task, "completed", phase="planning", output=output
+                )
                 self._emit_llm_event(
                     task,
                     EventType.LLM_COMPLETED,
@@ -439,7 +735,7 @@ class Harness:
         task.set_progress(task.step_count, time.monotonic() - start_time)
         task.set_result(result)
         task.transition_to_completed()
-        self._save_task(task)
+        self._record_terminal(task, "completed")
         self._emit_llm_event(task, EventType.LLM_DELTA, phase="planning", content=question)
         self._emit_task_event(EventType.TASK_COMPLETED, task, content=question)
         return result
@@ -547,7 +843,7 @@ class Harness:
         task.set_progress(task.step_count, time.monotonic() - start_time)
         task.set_result(result)
         task.transition_to_failed(TaskFailReason.TASK_FAILED_CANCEL)
-        self._save_task(task)
+        self._record_terminal(task, "cancelled")
         self._emit_task_event(
             EventType.TASK_FAILED,
             task,
@@ -604,6 +900,7 @@ class Harness:
         for attempt in range(1, DEFAULT_MAX_LLM_ATTEMPTS + 1):
             if token.is_cancelled():
                 raise _CancellationRequested
+            self._begin_model_attempt(task, "infer", attempt)
             self._emit_llm_event(task, EventType.LLM_STARTED, phase="infer")
             if token.is_cancelled():
                 self._cancel_llm_attempt(task, "infer")
@@ -617,6 +914,7 @@ class Harness:
                 output, parts = await self._aread_inference(produced)
                 if token.is_cancelled():
                     self._cancel_llm_attempt(task, "infer")
+                self._settle_model_attempt(task, "completed", phase="infer", output=output)
                 self._emit_answer(task, output, parts)
                 if token.is_cancelled():
                     self._cancel_llm_attempt(task, "infer")
@@ -678,6 +976,12 @@ class Harness:
         raise _CancellationRequested
 
     def _fail_llm_attempt(self, task: Task, phase: str, reason: str) -> None:
+        outcome = (
+            "cancelled"
+            if reason == TaskFailReason.TASK_FAILED_CANCEL.value
+            else "failed"
+        )
+        self._settle_model_attempt(task, outcome, phase=phase, reason=reason)
         self._emit_llm_event(
             task,
             EventType.LLM_FAILED,
@@ -906,6 +1210,7 @@ class Harness:
             The model output. Tool calls waiting for approval are recorded and
             reported to the next model call.
         """
+        self._begin_step(task, phase="infer")
         context = self.build_infer_context(task)
 
         self.harness_hooks.before_think(task=task, context=context)
@@ -916,6 +1221,7 @@ class Harness:
         self._save_task(task)
 
         if not self._requests_tool_calls(output):
+            self._settle_step(task, "completed")
             return StepResult(llm_output=output)
 
         self.harness_hooks.before_execute_tool_calls(task=task, output=output)
@@ -926,6 +1232,9 @@ class Harness:
 
         task.add_history_messages(build_tool_messages(result))
         self._save_task(task)
+
+        if not result.pending_tools:
+            self._settle_step(task, "completed")
 
         return StepResult(llm_output=output, tool_call_result=result)
 
@@ -1059,7 +1368,7 @@ class Harness:
             result = TaskResult(output=f"An unexpected error occurred: {str(error)}")
             task.set_result(result)
             task.transition_to_failed(failed_reason)
-            self._save_task(task)
+            self._record_terminal(task, "failed")
             self._emit_task_event(
                 EventType.TASK_FAILED,
                 task,
@@ -1072,7 +1381,7 @@ class Harness:
         task.set_progress(step_count, time.monotonic() - start_time)
         task.set_result(result)
         task.transition_to_failed(failed_reason)
-        self._save_task(task)
+        self._record_terminal(task, "failed")
         self._emit_task_event(
             EventType.TASK_FAILED,
             task,
@@ -1097,7 +1406,7 @@ class Harness:
 
         task.set_result(result)
         task.transition_to_completed()
-        self._save_task(task)
+        self._record_terminal(task, "completed")
         self._emit_task_event(
             EventType.TASK_COMPLETED, task, content=result.output, step_id=str(step_count)
         )
@@ -1158,13 +1467,28 @@ class Harness:
             if self._completed(step_result):
                 return self._handle_completed_turn(task, step_result, step_count)
 
-    def run(self, task: Task, cancellation_token: CancellationToken | None = None) -> TaskResult:
+    def run(
+        self,
+        task: Task,
+        cancellation_token: CancellationToken | None = None,
+        *,
+        execution_context: ExecutionContext | None = None,
+    ) -> TaskResult:
         return run_sync(
-            lambda: self.arun(task, cancellation_token=cancellation_token), async_name="arun"
+            lambda: self.arun(
+                task,
+                cancellation_token=cancellation_token,
+                execution_context=execution_context,
+            ),
+            async_name="arun",
         )
 
     async def arun(
-        self, task: Task, cancellation_token: CancellationToken | None = None
+        self,
+        task: Task,
+        cancellation_token: CancellationToken | None = None,
+        *,
+        execution_context: ExecutionContext | None = None,
     ) -> TaskResult:
         """
         Plan a new task, then infer and execute tools until the model answers or a limit is hit.
@@ -1178,6 +1502,7 @@ class Harness:
         """
         token = cancellation_token if cancellation_token is not None else CancellationToken()
         start_time = time.monotonic() - task.elapsed_seconds
+        fact_token: contextvars.Token[_FactState | None] | None = None
         try:
             if task.is_finished():
                 self._emit_task_event(EventType.TASK_FINISHED, task)
@@ -1190,19 +1515,27 @@ class Harness:
             if task.is_paused() and task.approval_requests():
                 raise ValueError("tool calls are waiting for approval")
 
+            was_created = task.is_created()
+            if was_created:
+                task.transition_to_running(TaskRunningReason.TASK_RUNNING_CREATE)
+            context = self._execution_context(task, execution_context)
+            fact_token = _FACT_STATE.set(_FactState(context))
+            self._start_execution_facts(task)
+
             self._emit_task_event(EventType.TASK_STARTED, task)
 
-            if task.is_created():
-                task.transition_to_running(TaskRunningReason.TASK_RUNNING_CREATE)
+            if was_created:
                 self._save_task(task)
                 self.guard_input(task)
 
                 self._emit_task_event(EventType.TASK_PLANNING, task)
+                self._begin_step(task, phase="planning")
                 plan = await self.aplanning(self.build_planning_context(task), task, token)
                 if token.is_cancelled():
                     raise _CancellationRequested
                 task.set_plan(plan)
                 self._save_task(task)
+                self._settle_step(task, "completed")
                 self._emit_task_event(EventType.TASK_PLANNED, task, goal=list(plan.goal))
                 question = (plan.clarification or "").strip()
                 if question:
@@ -1245,7 +1578,7 @@ class Harness:
             task.set_result(result)
             task.transition_to_failed(reason)
             try:
-                self._save_task(task)
+                self._record_terminal(task, "failed")
 
                 fail_reason = task.state_reason.value if task.state_reason else None
                 self._emit_task_event(
@@ -1257,3 +1590,6 @@ class Harness:
             except (_TaskPersistenceError, _EventSinkError) as boundary_error:
                 self._raise_boundary_cause(boundary_error)
             return result
+        finally:
+            if fact_token is not None:
+                _FACT_STATE.reset(fact_token)

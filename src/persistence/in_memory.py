@@ -77,13 +77,12 @@ class InMemoryTaskRepository:
             assigned = _assign_events(pending, current)
             snapshot = Task.from_dict(task.to_dict())
             snapshot.last_sequence = current + len(assigned)
-            encoded_task = _encode_task(snapshot)
             encoded_events = [_encode_event(event) for event in assigned]
             encoded_submission = (
                 None if incoming_submission is None else _encode_submission(incoming_submission)
             )
 
-            self._tasks[snapshot.id] = encoded_task
+            self.save(snapshot)
             self._events.setdefault(session_id, []).extend(encoded_events)
             self._event_ids.update(event.event_id for event in assigned)
             if incoming_submission is not None and encoded_submission is not None:

@@ -63,7 +63,12 @@ class Event:
     payload: TaskEventPayload | ToolEventPayload | LlmEventPayload
     timestamp: datetime = field(default_factory=datetime.now)
     task_id: str | None = None
+    session_id: str | None = None
+    execution_id: str | None = None
+    turn_id: str | None = None
     step_id: str | None = None
+    attempt_id: str | None = None
+    tool_call_id: str | None = None
 
 
 class EventChannel(Enum):
