@@ -1,6 +1,6 @@
 # MCP Integration Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Integrate FastMCP servers as lifecycle-managed, provider-safe, approval-gated Agent tools.
 
@@ -47,27 +47,27 @@
 - Produces: `RemoteToolError(output: Any)` in `src/core/tool.py`; async execution maps it to the
   `remote_error` fail reason while preserving its JSON-safe output.
 
-- [ ] **Step 1: Write failing metadata and policy tests**
+- [x] **Step 1: Write failing metadata and policy tests**
 
 Assert defaults preserve custom/local behavior, `requires_approval=True` returns pending under
 `DefaultApprovalPolicy`, an explicit injected approval policy can approve it, and `RemoteToolError` becomes a
 failed result that round-trips through task snapshots.
 
-- [ ] **Step 2: Run focused tests and verify failure**
+- [x] **Step 2: Run focused tests and verify failure**
 
 Run: `.venv\Scripts\python -m pytest tests/unit/schema/test_tool.py tests/unit/tool/test_tool_executor.py -q -p no:cacheprovider`
 Expected: FAIL on missing metadata and fail reason.
 
-- [ ] **Step 3: Implement metadata and policy enforcement**
+- [x] **Step 3: Implement metadata and policy enforcement**
 
 Mark tools created by `LocalToolSuite` as `LOCAL`. Make `DefaultApprovalPolicy` return `None` for `requires_approval` before name-based rules; injected policies remain authoritative.
 
-- [ ] **Step 4: Run focused tests**
+- [x] **Step 4: Run focused tests**
 
 Run the Step 2 command.
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/schema/tool.py src/core/tool.py src/tool/local_tools.py src/tool/tool_executor.py tests/unit/schema/test_tool.py tests/unit/tool/test_tool_executor.py
@@ -86,29 +86,29 @@ git commit -m "feat: add remote tool approval metadata"
 - Consumes: `RemoteToolError` from Task 1 for `is_error=True` or invalid remote data.
 - Produces: `make_mcp_tool(server_name, remote_tool, invoke) -> Tool` with origin MCP and approval required.
 
-- [ ] **Step 1: Write failing provider-name tests**
+- [x] **Step 1: Write failing provider-name tests**
 
 Assert exact `mcp__weather__forecast` output, allowed character set, deterministic maximum length, rejection of empty normalized segments, and detection-ready equality for normalization collisions.
 
-- [ ] **Step 2: Write failing result-envelope tests**
+- [x] **Step 2: Write failing result-envelope tests**
 
 Assert exactly `content`, `structured_content`, and `is_error` keys; Pydantic content blocks serialize to JSON objects; `is_error=True`, opaque values, and non-JSON data raise `RemoteToolError` with useful JSON-safe output.
 
-- [ ] **Step 3: Run focused tests and verify failure**
+- [x] **Step 3: Run focused tests and verify failure**
 
 Run: `.venv\Scripts\python -m pytest tests/unit/mcp/test_tool_adapter.py -q -p no:cacheprovider`
 Expected: FAIL because the module does not exist.
 
-- [ ] **Step 4: Implement the adapter**
+- [x] **Step 4: Implement the adapter**
 
 Use stable ASCII normalization plus a hash suffix when truncating. Keep all envelope keys. Validate with `json.dumps` rather than coercing opaque objects to strings. The produced Tool calls the supplied async `invoke` function and raises `RemoteToolError` for the executor to classify.
 
-- [ ] **Step 5: Run focused tests**
+- [x] **Step 5: Run focused tests**
 
 Run the Step 3 command.
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/mcp/tool_adapter.py tests/unit/mcp/test_tool_adapter.py
@@ -129,33 +129,33 @@ git commit -m "feat: normalize mcp tools and results"
 - Produces: `add_server`, `refresh_server`, `remove_server`, `aclose`, `__aenter__`, and `__aexit__` async methods.
 - Produces: catalog collision preflight and exact unregister behavior without partially mutating the registry.
 
-- [ ] **Step 1: Replace current shallow tests with failing fake-client lifecycle tests**
+- [x] **Step 1: Replace current shallow tests with failing fake-client lifecycle tests**
 
 Test successful atomic registration/call, duplicate server, catalog/name collision, failed connect, failed list, failed registration rollback, refresh replacement/rollback, remove, idempotent close, and stale tool invocation.
 
-- [ ] **Step 2: Add failing in-flight lease race tests**
+- [x] **Step 2: Add failing in-flight lease race tests**
 
 Start a remote call, invoke remove/close, assert catalog removal and new-call rejection happen immediately, client close waits, and the started call may finish before transport close.
 
-- [ ] **Step 3: Run focused tests and verify failure**
+- [x] **Step 3: Run focused tests and verify failure**
 
 Run: `.venv\Scripts\python -m pytest tests/unit/mcp/test_mcp_client.py tests/unit/tool/test_tool_registry.py -q -p no:cacheprovider`
 Expected: FAIL against the existing unbound manager.
 
-- [ ] **Step 4: Add registry preflight support**
+- [x] **Step 4: Add registry preflight support**
 
 Add only the minimal catalog queries/strict registration needed for atomic MCP batches; preserve existing replacement behavior where current callers depend on it.
 
-- [ ] **Step 5: Implement manager state and lifecycle**
+- [x] **Step 5: Implement manager state and lifecycle**
 
 Use one lifecycle lock plus per-server state containing client, exit stack, registered ids, closing flag, active count, and condition. Build and validate the complete tool set before registration. On removal unregister first, wait for active leases, then close; always clear manager state even if close raises.
 
-- [ ] **Step 6: Run focused tests**
+- [x] **Step 6: Run focused tests**
 
 Run the Step 3 command.
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/mcp/mcp_client.py src/tool/tool_registry.py tests/unit/mcp/test_mcp_client.py tests/unit/tool/test_tool_registry.py
@@ -175,29 +175,29 @@ git commit -m "feat: manage mcp server lifecycle atomically"
 - Produces: `Agent.add_mcp_server`, `refresh_mcp_server`, `remove_mcp_server`, `aclose`, `__aenter__`, and `__aexit__`.
 - Enforces: one authoritative catalog across Agent, executor, and manager.
 
-- [ ] **Step 1: Write failing composition tests**
+- [x] **Step 1: Write failing composition tests**
 
 Cover default catalog creation, executor-catalog reuse, explicit matching injection, and rejection of catalog/executor, catalog/manager, and executor/manager identity mismatches.
 
-- [ ] **Step 2: Write failing lifecycle tests**
+- [x] **Step 2: Write failing lifecycle tests**
 
 Assert async context exit closes the manager, close is idempotent, operations/chat after close fail, and all Agent server methods delegate without hidden sync-loop creation.
 
-- [ ] **Step 3: Run focused tests and verify failure**
+- [x] **Step 3: Run focused tests and verify failure**
 
 Run: `.venv\Scripts\python -m pytest tests/unit/demo/test_agent.py -q -p no:cacheprovider`
 Expected: FAIL on missing composition/lifecycle behavior.
 
-- [ ] **Step 4: Implement authoritative composition and delegation**
+- [x] **Step 4: Implement authoritative composition and delegation**
 
 Choose catalog in this order: explicit catalog, injected executor catalog, new registry. Reject every identity mismatch before registering local or MCP tools. Create a manager only when none is injected.
 
-- [ ] **Step 5: Run focused tests**
+- [x] **Step 5: Run focused tests**
 
 Run the Step 3 command.
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/demo/agent.py src/mcp/__init__.py tests/unit/demo/test_agent.py
@@ -214,24 +214,24 @@ git commit -m "feat: integrate mcp lifecycle with agent"
 - Consumes: all preceding async runtime and MCP interfaces.
 - Produces: documented supported MCP composition path.
 
-- [ ] **Step 1: Write a failing in-process FastMCP integration test**
+- [x] **Step 1: Write a failing in-process FastMCP integration test**
 
 Connect an in-process server with one structured tool, run `Agent.achat`, assert the MCP call pauses by default, approve it, call `aresume`, and assert JSON-safe output reaches model history and the final task completes. Verify context exit removes the tool.
 
-- [ ] **Step 2: Run the integration test and verify failure**
+- [x] **Step 2: Run the integration test and verify failure**
 
 Run: `.venv\Scripts\python -m pytest tests/integration/test_mcp_agent.py -q -p no:cacheprovider`
 Expected: FAIL until the real FastMCP path matches the fake-client unit contract.
 
-- [ ] **Step 3: Fix only adapter discrepancies exposed by the real server**
+- [x] **Step 3: Fix only adapter discrepancies exposed by the real server**
 
 Keep the public envelope and lifecycle contracts unchanged; adapt FastMCP field access in `src/mcp/tool_adapter.py` or `src/mcp/mcp_client.py`.
 
-- [ ] **Step 4: Document MCP usage and trust boundaries**
+- [x] **Step 4: Document MCP usage and trust boundaries**
 
 Show `async with Agent(...)`, `await agent.add_mcp_server(...)`, `await agent.achat(...)`, approval/resume, shutdown, provider-safe names, and the explicit statement that remote MCP is not local sandbox execution.
 
-- [ ] **Step 5: Run all quality gates**
+- [x] **Step 5: Run all quality gates**
 
 Run:
 
@@ -244,9 +244,11 @@ Run:
 
 Expected: all tests pass; Ruff and Mypy report no errors.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/mcp src/demo/agent.py src/schema/tool.py src/tool tests/integration/test_mcp_agent.py README.md
 git commit -m "feat: complete mcp agent integration"
 ```
+
+完成状态：已通过 PR #7 合入 `main`，MCP 工具发现、调用与 Agent 集成路径均已落地。

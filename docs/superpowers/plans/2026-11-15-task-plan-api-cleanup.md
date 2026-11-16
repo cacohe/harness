@@ -16,14 +16,16 @@ replacement in `Task.set_plan()`.
 - Modify: `tests/unit/core/test_task.py`
 - Modify: `src/schema/task.py`
 
-- [ ] Add a failing test that the unsupported method is absent.
-- [ ] Run the focused test and verify RED.
-- [ ] Remove `TaskPlan.advance_plan`.
-- [ ] Run focused Task tests and verify GREEN.
+- [x] Add a failing test that the unsupported method is absent.
+- [x] Run the focused test and verify RED.
+- [x] Remove `TaskPlan.advance_plan`.
+- [x] Run focused Task tests and verify GREEN.
 
 ### Task 2: Verify and integrate
 
-- [ ] Run Ruff format/lint, Mypy, full pytest, and `uv lock --check`.
-- [ ] Commit implementation and documentation.
-- [ ] Dispatch an independent whole-branch review.
-- [ ] Fix Critical/Important findings, push, verify CI, and merge.
+- [x] Run Ruff format/lint, Mypy, full pytest, and `uv lock --check`.
+- [x] Commit implementation and documentation.
+- [x] Dispatch an independent whole-branch review.
+- [x] Fix Critical/Important findings, push, verify CI, and merge.
+
+完成状态：已通过 PR #11 合入 `main`，未支持的 `TaskPlan.advance_plan` API 已移除并完成兼容性验证。

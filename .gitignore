@@ -1,7 +1,13 @@
 .venv/
 __pycache__/
 .pytest_cache/
+.ruff_cache/
 *.egg-info/
 .mypy_cache/
+.superpowers/
+.tmp-local-tools/
+.coverage
+coverage.xml
+htmlcov/
 .env
 .env.*

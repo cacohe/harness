@@ -1,9 +1,19 @@
 import asyncio
+import importlib
+import importlib.util
 import threading
 import time
 
 import pytest
 from src.core.async_utils import call_maybe_async, iterate_maybe_async, run_sync
+
+
+def test_async_iterator_uses_a_layer_neutral_canonical_module():
+    spec = importlib.util.find_spec("src.utils.async_utils")
+
+    assert spec is not None
+    module = importlib.import_module("src.utils.async_utils")
+    assert iterate_maybe_async is module.iterate_maybe_async
 
 
 def test_run_sync_returns_async_result_outside_an_event_loop():
