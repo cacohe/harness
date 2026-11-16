@@ -9,7 +9,7 @@ from src.memory.store import InMemoryStore
 from src.observability import MetricsEventSink
 from src.persistence.in_memory import InMemoryTaskRepository
 from src.schema.llm import FinishReason, LLMOutput
-from src.schema.task import TaskPlan, TaskState
+from src.schema.task import TaskState
 
 
 class YieldingGateway:
@@ -17,10 +17,9 @@ class YieldingGateway:
 
     def __init__(self, expected_calls=64):
         self.expected_calls = expected_calls
-        self.planning_inputs = []
         self.infer_inputs = []
-        self.planning_arrived = 0
-        self.all_planning_arrived = asyncio.Event()
+        self.infer_arrived = 0
+        self.all_infer_arrived = asyncio.Event()
 
     @staticmethod
     def _current_message(context):
@@ -28,28 +27,14 @@ class YieldingGateway:
         marker = "Current user message:\n"
         return content.split(marker, 1)[1] if marker in content else content
 
-    async def aplanning(self, context, stream=True, response_format=None):
-        del stream, response_format
-        current = self._current_message(context)
-        self.planning_inputs.append(current)
-        self.planning_arrived += 1
-        if self.planning_arrived == self.expected_calls:
-            self.all_planning_arrived.set()
-        await self.all_planning_arrived.wait()
-        return LLMOutput(
-            FinishReason.STOP,
-            None,
-            [],
-            None,
-            None,
-            structured=TaskPlan(goal=["answer"]),
-        )
-
     async def ainfer(self, context, stream=True, response_format=None):
         del stream, response_format
-        await asyncio.sleep(0)
         current = self._current_message(context)
         self.infer_inputs.append(current)
+        self.infer_arrived += 1
+        if self.infer_arrived == self.expected_calls:
+            self.all_infer_arrived.set()
+        await self.all_infer_arrived.wait()
         return LLMOutput(FinishReason.STOP, f"answer:{current}", [], None, None)
 
 
@@ -78,9 +63,8 @@ def test_shared_agent_handles_concurrent_sessions_without_state_leaks():
     repository, memory, metrics, gateway, sessions, tasks = asyncio.run(scenario())
 
     expected_inputs = {f"load-{index}" for index in range(64)}
-    assert set(gateway.planning_inputs) == expected_inputs
     assert set(gateway.infer_inputs) == expected_inputs
-    assert gateway.planning_arrived == 64
+    assert gateway.infer_arrived == 64
     assert len({task.id for task in tasks}) == 64
     assert all(task.state is TaskState.TASK_COMPLETED for task in tasks)
     for index, (session, task) in enumerate(zip(sessions, tasks, strict=True)):
@@ -104,10 +88,10 @@ def test_shared_agent_handles_concurrent_sessions_without_state_leaks():
     snapshot = metrics.snapshot()
     assert snapshot["events"]["task_started"] == 64
     assert snapshot["events"]["task_completed"] == 64
-    assert snapshot["events"]["llm_started"] == 128
-    assert snapshot["events"]["llm_completed"] == 128
+    assert snapshot["events"]["llm_started"] == 64
+    assert snapshot["events"]["llm_completed"] == 64
     assert snapshot["task_outcomes"] == {"completed": 64}
     assert snapshot["in_flight"] == {"tasks": 0, "llm": 0, "tools": 0}
     assert snapshot["inflight_evictions"] == {"tasks": 0, "llm": 0, "tools": 0}
     assert snapshot["durations"]["task"]["count"] == 64
-    assert snapshot["durations"]["llm"]["count"] == 128
+    assert snapshot["durations"]["llm"]["count"] == 64

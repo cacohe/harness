@@ -19,18 +19,6 @@ class ContextBuilderError(Exception):
 
 @runtime_checkable
 class ContextBuilder(Protocol):
-    def build_planning_context(self, system_prompt: str, task: Task, **kwargs) -> Context:
-        """
-        Build the context for the planning.
-        Args:
-            system_prompt: The system prompt of the harness.
-            task: The task for the step.
-            **kwargs: Additional keyword arguments.
-        Returns:
-            Messages for one planning call, and an empty tool catalog.
-        """
-        ...
-
     def build_infer_context(
         self, system_prompt: str, task: Task, tools: list, skills: list, **kwargs
     ) -> Context:

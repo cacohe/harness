@@ -150,12 +150,12 @@ class Agent:
         cancellation_token: CancellationToken | None = None,
     ) -> Task:
         """
-        Plan one message, run it to an answer, and remember the turn.
+        Run one message through unified inference and remember the turn.
         Args:
             message: The user's next line.
             cancellation_token: Per-turn cooperative cancellation signal.
         Returns:
-            The task after planning and execution. A failed turn is not remembered.
+            The task after unified inference and execution. A failed turn is not remembered.
         """
         return await self._default_session.achat(message, cancellation_token=cancellation_token)
 
