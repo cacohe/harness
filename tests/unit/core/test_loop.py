@@ -41,24 +41,14 @@ from src.tool.tool_registry import DefaultToolRegistry
 
 class Gateway:
     def __init__(self):
-        self.planning_calls = []
+        self.infer_calls = []
         self.failures = 0
 
-    def planning(self, context, stream=True, response_format=None):
-        self.planning_calls.append((stream, response_format))
+    def infer(self, context, stream=True, response_format=None):
+        self.infer_calls.append((context, stream, response_format))
         if self.failures:
             self.failures -= 1
             raise TimeoutError("timed out")
-        return LLMOutput(
-            FinishReason.STOP,
-            None,
-            [],
-            None,
-            None,
-            structured=TaskPlan(goal=["buy a phone"], current="compare", remaining=["pay"]),
-        )
-
-    def infer(self, context, stream=True, response_format=None):
         return LLMOutput(FinishReason.STOP, "bought", [], None, None)
 
 
@@ -165,6 +155,200 @@ class ScriptedGateway(Gateway):
         return self.answers.pop(0)
 
 
+def test_new_task_answers_in_one_infer_call_without_separate_planning():
+    class DirectGateway:
+        def __init__(self):
+            self.infer_contexts = []
+
+        def planning(self, *_args, **_kwargs):
+            raise AssertionError("separate planning must not run")
+
+        def infer(self, context, stream=True, response_format=None):
+            self.infer_contexts.append(context)
+            return LLMOutput(FinishReason.STOP, "direct answer", [], None, None)
+
+    gateway = DirectGateway()
+    task = _task()
+
+    result = _harness(gateway).run(task)
+
+    assert result == TaskResult(output="direct answer")
+    assert task.plan is None
+    assert len(gateway.infer_contexts) == 1
+
+
+def test_update_plan_control_tool_is_applied_inside_the_infer_loop():
+    gateway = ScriptedGateway(
+        [
+            _model(
+                FinishReason.TOOL_CALLS,
+                calls=[
+                    LlmToolCall(
+                        "plan-1",
+                        "update_plan",
+                        '{"goal":["inspect"],"current":"read",'
+                        '"remaining":["report"],"completed":[]}',
+                    )
+                ],
+            ),
+            _model(FinishReason.STOP, "done"),
+        ]
+    )
+    task = _task()
+    output = RecordingOutput()
+
+    result = _harness(gateway, event_handler=output).run(task)
+
+    assert result == TaskResult(output="done")
+    assert task.plan == TaskPlan(
+        goal=["inspect"], current="read", remaining=["report"], completed=[]
+    )
+    assert [tool.name for tool in gateway.infer_contexts[0].tools][0] == "update_plan"
+    assert _tool_messages(task)[0].content == "Plan updated."
+    planned = [event for event in output.events if event.type is EventType.TASK_PLANNED]
+    assert [event.payload.goal for event in planned] == [["inspect"]]
+
+
+def test_update_plan_and_external_tool_can_share_one_model_response():
+    called = []
+    gateway = ScriptedGateway(
+        [
+            _model(
+                FinishReason.TOOL_CALLS,
+                calls=[
+                    LlmToolCall(
+                        "plan-1",
+                        "update_plan",
+                        '{"goal":["inspect"],"current":"read","remaining":[],"completed":[]}',
+                    ),
+                    LlmToolCall("read-1", "read_file", "{}"),
+                ],
+            ),
+            _model(FinishReason.STOP, "done"),
+        ]
+    )
+    task = _task()
+
+    result = _harness(
+        gateway,
+        executor=_recording_executor(called, "read_file"),
+    ).run(task)
+
+    assert result == TaskResult(output="done")
+    assert task.plan == TaskPlan(goal=["inspect"], current="read", remaining=[], completed=[])
+    assert called == [("read_file", {})]
+    assert [message.tool_call_id for message in _tool_messages(task)] == ["plan-1", "read-1"]
+
+
+def test_update_plan_mixed_batch_preserves_partial_legacy_cancellation():
+    token = CancellationToken()
+    executed = []
+
+    class CancellingLegacyExecutor(Executor):
+        def execute_tool_calls(
+            self,
+            tool_calls,
+            *,
+            before_call=None,
+            after_call=None,
+            should_cancel=None,
+        ):
+            ordered = []
+            for call in tool_calls:
+                if should_cancel is not None and should_cancel():
+                    break
+                if before_call is not None:
+                    before_call(call)
+                executed.append(call.id)
+                result = ToolExecutionResult(
+                    tool_id=call.id,
+                    tool_name=call.name,
+                    state=ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED,
+                    output="done",
+                )
+                ordered.append(result)
+                if after_call is not None:
+                    after_call(call, result)
+                token.cancel()
+            return ToolCallResult(completed_tools=ordered, ordered_tools=ordered)
+
+    gateway = ScriptedGateway(
+        [
+            _model(
+                FinishReason.TOOL_CALLS,
+                calls=[
+                    LlmToolCall(
+                        "plan-1",
+                        "update_plan",
+                        '{"goal":["inspect"],"current":"read",'
+                        '"remaining":["report"],"completed":[]}',
+                    ),
+                    LlmToolCall("first", "read_file", "{}"),
+                    LlmToolCall("second", "write_file", "{}"),
+                ],
+            )
+        ]
+    )
+    tools = [
+        Tool("read_file", "read_file", "Read.", {}, lambda inputs: "read"),
+        Tool("write_file", "write_file", "Write.", {}, lambda inputs: "write"),
+    ]
+    task = _task()
+
+    result = _harness(
+        gateway,
+        executor=CancellingLegacyExecutor(tools),
+    ).run(task, cancellation_token=token)
+
+    assert result == TaskResult(output="Task cancelled.")
+    assert task.state_reason is TaskFailReason.TASK_FAILED_CANCEL
+    assert executed == ["first"]
+
+
+def test_invalid_update_plan_is_reported_to_the_next_infer_call():
+    gateway = ScriptedGateway(
+        [
+            _model(
+                FinishReason.TOOL_CALLS,
+                calls=[
+                    LlmToolCall(
+                        "plan-1",
+                        "update_plan",
+                        '{"goal":["inspect"],"clarification":"legacy"}',
+                    )
+                ],
+            ),
+            _model(FinishReason.STOP, "recovered"),
+        ]
+    )
+    task = _task()
+
+    result = _harness(gateway).run(task)
+
+    assert result == TaskResult(output="recovered")
+    assert task.plan is None
+    [message] = _tool_messages(task)
+    assert message.tool_call_id == "plan-1"
+    assert message.content.startswith("Invalid plan: unexpected plan fields")
+
+
+def test_external_update_plan_name_is_rejected_as_reserved():
+    external = Tool(
+        id="external-plan",
+        name="update_plan",
+        description="Must not shadow the Harness control tool.",
+        input_schema={},
+        executer=lambda _inputs: None,
+    )
+    task = _task()
+
+    result = _harness(Gateway(), tools=[external]).run(task)
+
+    assert task.state is TaskState.TASK_FAILED
+    assert task.state_reason is TaskFailReason.TASK_FAILED_CONTEXT_BUILD_ERROR
+    assert result.output == "An unexpected error occurred: 'update_plan' is reserved by Harness"
+
+
 class CountingExecutor(Executor):
     def __init__(self, tools=None):
         super().__init__(tools)
@@ -189,14 +373,15 @@ def _model(reason, content=None, calls=None) -> LLMOutput:
     return LLMOutput(reason, content, calls or [], None, None)
 
 
-def test_run_plans_a_new_task_and_returns_the_answer():
+def test_run_sends_a_new_task_directly_to_infer_and_returns_the_answer():
     gateway = Gateway()
     task = _task()
     harness = _harness(gateway)
 
     assert harness.run(task).output == "bought"
 
-    assert gateway.planning_calls == [(False, TaskPlan)]
+    assert len(gateway.infer_calls) == 1
+    assert gateway.infer_calls[0][1:] == (True, None)
 
 
 def test_run_saves_state_changes_through_the_repository():
@@ -209,8 +394,7 @@ def test_run_saves_state_changes_through_the_repository():
     assert repository.states[0] is TaskState.TASK_RUNNING
     assert repository.states[-1] is TaskState.TASK_COMPLETED
     assert task.state is TaskState.TASK_COMPLETED
-    assert task.plan.goal == ["buy a phone"]
-    assert task.plan.current == "compare"
+    assert task.plan is None
 
 
 def test_completed_turn_persists_result_and_progress_snapshot():
@@ -229,35 +413,23 @@ def test_completed_turn_persists_result_and_progress_snapshot():
     assert restored.step_count == 1
 
 
-def test_planning_run_emits_task_events():
+def test_unified_infer_run_emits_task_events():
     output = RecordingOutput()
 
     _harness(Gateway(), event_handler=output).run(_task())
 
     assert [event.type for event in output.events] == [
         EventType.TASK_STARTED,
-        EventType.TASK_PLANNING,
-        EventType.LLM_STARTED,
-        EventType.LLM_COMPLETED,
-        EventType.TASK_PLANNED,
         EventType.LLM_STARTED,
         EventType.LLM_DELTA,
         EventType.LLM_COMPLETED,
         EventType.TASK_COMPLETED,
     ]
-    planned = output.events[4]
-    assert planned.payload.goal == ["buy a phone"]
     llm = [event for event in output.events if event.type.name.startswith("LLM_")]
-    assert [event.payload.phase for event in llm] == [
-        "planning",
-        "planning",
-        "infer",
-        "infer",
-        "infer",
-    ]
+    assert [event.payload.phase for event in llm] == ["infer", "infer", "infer"]
 
 
-def test_planning_retry_emits_an_llm_retry_event(monkeypatch):
+def test_infer_retry_emits_an_llm_retry_event(monkeypatch):
     async def no_cancel(_self, _seconds):
         return False
 
@@ -270,15 +442,13 @@ def test_planning_retry_emits_an_llm_retry_event(monkeypatch):
 
     retries = [event for event in output.events if event.type is EventType.LLM_RETRYING]
     assert len(retries) == 1
-    assert retries[0].payload.phase == "planning"
+    assert retries[0].payload.phase == "infer"
     assert retries[0].payload.attempt == 1
     assert retries[0].payload.reason == "TimeoutError"
     assert [event.type for event in output.events if event.type.name.startswith("LLM_")] == [
         EventType.LLM_STARTED,
         EventType.LLM_FAILED,
         EventType.LLM_RETRYING,
-        EventType.LLM_STARTED,
-        EventType.LLM_COMPLETED,
         EventType.LLM_STARTED,
         EventType.LLM_DELTA,
         EventType.LLM_COMPLETED,
@@ -335,7 +505,7 @@ def test_infer_hides_text_that_accompanies_tool_calls():
     ]
 
 
-def test_planning_context_names_tools_but_does_not_offer_them():
+def test_infer_context_offers_the_internal_plan_tool_and_external_tools():
     tool = Tool(
         id="shell",
         name="shell",
@@ -352,10 +522,9 @@ def test_planning_context_names_tools_but_does_not_offer_them():
         harness_guard=NoOpGuard(),
     )
 
-    context = harness.build_planning_context(_task())
+    context = harness.build_infer_context(_task())
 
-    assert context.tools == []
-    assert "shell: Run a command." in context.messages[0].content
+    assert [item.name for item in context.tools] == ["update_plan", "shell"]
 
 
 def test_context_reads_tools_from_the_executor_catalog_at_call_time():
@@ -371,12 +540,12 @@ def test_context_reads_tools_from_the_executor_catalog_at_call_time():
     )
     registry.register(_shell())
 
-    context = harness.build_planning_context(_task())
+    context = harness.build_infer_context(_task())
 
-    assert "shell: Run a command." in context.messages[0].content
+    assert [item.name for item in context.tools] == ["update_plan", "shell"]
 
 
-def test_transient_planning_errors_are_retried(monkeypatch):
+def test_transient_infer_errors_are_retried(monkeypatch):
     waits = []
 
     async def record_wait(_token, seconds):
@@ -390,10 +559,10 @@ def test_transient_planning_errors_are_retried(monkeypatch):
     assert _harness(gateway).run(_task()).output == "bought"
 
     assert waits == [DEFAULT_LLM_ATTEMPT_DELAY_SECONDS]
-    assert len(gateway.planning_calls) == 2
+    assert len(gateway.infer_calls) == 2
 
 
-def test_paused_task_returns_to_running_without_planning():
+def test_paused_task_returns_to_running_without_recreating_a_plan():
     gateway = Gateway()
     task = _task()
     task.transition_to_running(TaskRunningReason.TASK_RUNNING_CREATE)
@@ -402,7 +571,6 @@ def test_paused_task_returns_to_running_without_planning():
 
     assert _harness(gateway).run(task).output == "bought"
 
-    assert gateway.planning_calls == []
     assert task.state is TaskState.TASK_COMPLETED
     assert task.result.output == "bought"
 
@@ -444,7 +612,10 @@ def test_length_continues_once_with_tools_then_completes():
     assert _harness(gateway, tools=[tool]).run(_task()).output == "hello"
 
     assert len(gateway.infer_contexts) == 2
-    assert gateway.infer_contexts[1].tools == [tool]
+    assert [item.name for item in gateway.infer_contexts[1].tools] == [
+        "update_plan",
+        "shell",
+    ]
 
 
 def test_execute_tool_calls_emits_start_and_completion():
@@ -640,7 +811,7 @@ def test_precancelled_created_task_does_no_gateway_work():
     assert result == TaskResult(output="Task cancelled.")
     assert task.state is TaskState.TASK_FAILED
     assert task.state_reason is TaskFailReason.TASK_FAILED_CANCEL
-    assert gateway.planning_calls == []
+    assert gateway.infer_calls == []
     assert repository.get(task.id) == task
 
 
@@ -732,7 +903,7 @@ def test_cancel_between_held_calls_stops_the_remaining_calls():
     ]
 
 
-def test_cancel_during_planning_return_wins_before_plan_is_saved():
+def test_cancel_during_infer_return_wins_before_answer_is_saved():
     token = CancellationToken()
 
     class FailChildCancellation(RecordingOutput):
@@ -743,13 +914,13 @@ def test_cancel_during_planning_return_wins_before_plan_is_saved():
 
     sink = FailChildCancellation()
 
-    class CancellingPlanning(Gateway):
-        def planning(self, context, stream=True, response_format=None):
+    class CancellingInference(Gateway):
+        def infer(self, context, stream=True, response_format=None):
             token.cancel()
-            return super().planning(context, stream, response_format)
+            return super().infer(context, stream, response_format)
 
     task = _task()
-    result = _harness(CancellingPlanning(), event_handler=sink).run(task, cancellation_token=token)
+    result = _harness(CancellingInference(), event_handler=sink).run(task, cancellation_token=token)
 
     assert result == TaskResult(output="Task cancelled.")
     assert task.state_reason is TaskFailReason.TASK_FAILED_CANCEL
@@ -765,7 +936,7 @@ def test_cancel_during_gateway_error_wins_over_llm_error():
     token = CancellationToken()
 
     class CancellingError(Gateway):
-        def planning(self, context, stream=True, response_format=None):
+        def infer(self, context, stream=True, response_format=None):
             token.cancel()
             raise ValueError("gateway failed")
 
@@ -797,7 +968,7 @@ def test_cancel_interrupts_retry_backoff_without_another_attempt():
 
     assert result == TaskResult(output="Task cancelled.")
     assert token.waits == [DEFAULT_LLM_ATTEMPT_DELAY_SECONDS]
-    assert len(gateway.planning_calls) == 1
+    assert len(gateway.infer_calls) == 1
     assert [event.type for event in sink.events if event.type.name.startswith("LLM_")] == [
         EventType.LLM_STARTED,
         EventType.LLM_FAILED,
@@ -884,28 +1055,21 @@ def test_cancel_from_finalization_completed_callback_wins_over_limit_failure():
     ] == ["cancel"]
 
 
-def test_cancel_from_planning_completed_callback_prevents_clarification_completion():
+def test_cancel_from_infer_completed_callback_prevents_clarification_completion():
     token = CancellationToken()
 
     class ClarifyingGateway(Gateway):
-        def planning(self, context, stream=True, response_format=None):
-            return LLMOutput(
-                FinishReason.STOP,
-                None,
-                [],
-                None,
-                None,
-                structured=TaskPlan(goal=[], clarification="Which target?"),
-            )
+        def infer(self, context, stream=True, response_format=None):
+            return _model(FinishReason.STOP, "Which target?")
 
-    class CancelPlanningCompletion(RecordingOutput):
+    class CancelInferenceCompletion(RecordingOutput):
         def emit(self, event):
             super().emit(event)
-            if event.type is EventType.LLM_COMPLETED and event.payload.phase == "planning":
+            if event.type is EventType.LLM_COMPLETED and event.payload.phase == "infer":
                 token.cancel()
 
     task = _task()
-    result = _harness(ClarifyingGateway(), event_handler=CancelPlanningCompletion()).run(
+    result = _harness(ClarifyingGateway(), event_handler=CancelInferenceCompletion()).run(
         task, cancellation_token=token
     )
 
@@ -972,7 +1136,7 @@ def test_cancel_from_llm_started_callback_prevents_gateway_call():
     class CancelOnStart(RecordingOutput):
         def emit(self, event):
             super().emit(event)
-            if event.type is EventType.LLM_STARTED and event.payload.phase == "planning":
+            if event.type is EventType.LLM_STARTED and event.payload.phase == "infer":
                 token.cancel()
 
     gateway = Gateway()
@@ -981,7 +1145,7 @@ def test_cancel_from_llm_started_callback_prevents_gateway_call():
     result = _harness(gateway, event_handler=CancelOnStart()).run(task, cancellation_token=token)
 
     assert result == TaskResult(output="Task cancelled.")
-    assert gateway.planning_calls == []
+    assert gateway.infer_calls == []
 
 
 def test_cancel_from_tool_started_callback_prevents_default_tool_execution():
@@ -1127,7 +1291,7 @@ def test_finished_task_ignores_a_cancelled_token():
 
     assert result == TaskResult(output="done")
     assert task.state is TaskState.TASK_COMPLETED
-    assert gateway.planning_calls == []
+    assert gateway.infer_calls == []
 
 
 def test_approved_shell_runs_before_the_next_inference():
@@ -1290,21 +1454,10 @@ def test_step_limit_counts_steps_taken_before_the_approval():
     assert result.output == "closing"
 
 
-def test_clarification_completes_without_inference():
+def test_clarification_can_be_returned_directly_by_unified_infer():
     class Clarifying(Gateway):
-        def planning(self, context, stream=True, response_format=None):
-            self.planning_calls.append((stream, response_format))
-            return LLMOutput(
-                FinishReason.STOP,
-                None,
-                [],
-                None,
-                None,
-                structured=TaskPlan(goal=[], clarification="What should I do with 12?"),
-            )
-
         def infer(self, context, stream=True, response_format=None):
-            raise AssertionError("infer should not run")
+            return _model(FinishReason.STOP, "What should I do with 12?")
 
     task = _task()
     output = RecordingOutput()
@@ -1323,15 +1476,15 @@ def test_clarification_completes_without_inference():
 
 
 def test_unexpected_error_persists_the_returned_result():
-    class BrokenPlanning(Gateway):
-        def planning(self, context, stream=True, response_format=None):
+    class BrokenInference(Gateway):
+        def infer(self, context, stream=True, response_format=None):
             raise ValueError("bad request")
 
     repository = InMemoryTaskRepository()
     task = _task()
     output = RecordingOutput()
 
-    result = _harness(BrokenPlanning(), repository=repository, event_handler=output).run(task)
+    result = _harness(BrokenInference(), repository=repository, event_handler=output).run(task)
     restored = repository.get(task.id)
 
     assert result is task.result
@@ -1420,17 +1573,17 @@ def test_terminal_event_error_preserves_the_committed_result():
     assert stored.result == TaskResult(output="bought")
 
 
-def test_planning_completion_event_error_escapes_retry_handling():
-    class FailingPlanningSink(RecordingOutput):
+def test_infer_completion_event_error_escapes_retry_handling():
+    class FailingInferSink(RecordingOutput):
         def emit(self, event):
             super().emit(event)
-            if event.type is EventType.LLM_COMPLETED and event.payload.phase == "planning":
-                raise RuntimeError("planning observer failed")
+            if event.type is EventType.LLM_COMPLETED and event.payload.phase == "infer":
+                raise RuntimeError("infer observer failed")
 
     task = _task()
 
-    with pytest.raises(RuntimeError, match="planning observer failed"):
-        _harness(Gateway(), event_handler=FailingPlanningSink()).run(task)
+    with pytest.raises(RuntimeError, match="infer observer failed"):
+        _harness(Gateway(), event_handler=FailingInferSink()).run(task)
 
     assert task.state is TaskState.TASK_RUNNING
     assert task.result is None
@@ -1459,14 +1612,14 @@ def test_error_snapshot_failure_preserves_the_repository_exception():
                 raise OSError("failure snapshot unavailable")
             super().save(task)
 
-    class BrokenPlanning(Gateway):
-        def planning(self, context, stream=True, response_format=None):
+    class BrokenInference(Gateway):
+        def infer(self, context, stream=True, response_format=None):
             raise ValueError("bad request")
 
     task = _task()
 
     with pytest.raises(OSError, match="failure snapshot unavailable"):
-        _harness(BrokenPlanning(), repository=FailingFailureRepository()).run(task)
+        _harness(BrokenInference(), repository=FailingFailureRepository()).run(task)
 
     assert task.state is TaskState.TASK_FAILED
     assert task.result == TaskResult(output="An unexpected error occurred: bad request")
@@ -1517,20 +1670,13 @@ class FakeClock:
         self.value += seconds
 
 
-def test_clarification_elapsed_time_includes_planning(monkeypatch):
+def test_clarification_elapsed_time_includes_unified_infer(monkeypatch):
     clock = FakeClock()
 
     class Clarifying(Gateway):
-        def planning(self, context, stream=True, response_format=None):
+        def infer(self, context, stream=True, response_format=None):
             clock.advance(4)
-            return LLMOutput(
-                FinishReason.STOP,
-                None,
-                [],
-                None,
-                None,
-                structured=TaskPlan(goal=[], clarification="Which target?"),
-            )
+            return _model(FinishReason.STOP, "Which target?")
 
     monkeypatch.setattr("src.core.loop.time.monotonic", clock.monotonic)
     task = _task()
@@ -1540,14 +1686,10 @@ def test_clarification_elapsed_time_includes_planning(monkeypatch):
     assert task.elapsed_seconds == 4.0
 
 
-def test_failed_inference_elapsed_time_includes_planning_and_error(monkeypatch):
+def test_failed_inference_elapsed_time_includes_model_error(monkeypatch):
     clock = FakeClock()
 
     class FailingInference(Gateway):
-        def planning(self, context, stream=True, response_format=None):
-            clock.advance(2)
-            return super().planning(context, stream, response_format)
-
         def infer(self, context, stream=True, response_format=None):
             clock.advance(3)
             raise ValueError("bad request")
@@ -1557,17 +1699,13 @@ def test_failed_inference_elapsed_time_includes_planning_and_error(monkeypatch):
 
     _harness(FailingInference()).run(task)
 
-    assert task.elapsed_seconds == 5.0
+    assert task.elapsed_seconds == 3.0
 
 
 def test_failed_turn_elapsed_time_includes_successful_finalization(monkeypatch):
     clock = FakeClock()
 
     class TimedFinalization(ScriptedGateway):
-        def planning(self, context, stream=True, response_format=None):
-            clock.advance(2)
-            return super().planning(context, stream, response_format)
-
         def infer(self, context, stream=True, response_format=None):
             clock.advance(3 if not self.infer_contexts else 4)
             return super().infer(context, stream, response_format)
@@ -1580,7 +1718,7 @@ def test_failed_turn_elapsed_time_includes_successful_finalization(monkeypatch):
 
     _harness(gateway, max_steps=1).run(task)
 
-    assert task.elapsed_seconds == 9.0
+    assert task.elapsed_seconds == 7.0
 
 
 def test_failed_turn_elapsed_time_includes_finalization_error(monkeypatch):
@@ -1590,10 +1728,6 @@ def test_failed_turn_elapsed_time_includes_finalization_error(monkeypatch):
         def __init__(self):
             super().__init__()
             self.calls = 0
-
-        def planning(self, context, stream=True, response_format=None):
-            clock.advance(2)
-            return super().planning(context, stream, response_format)
 
         def infer(self, context, stream=True, response_format=None):
             self.calls += 1
@@ -1607,30 +1741,16 @@ def test_failed_turn_elapsed_time_includes_finalization_error(monkeypatch):
 
     _harness(TimedFinalizationFailure(), max_steps=1).run(task)
 
-    assert task.elapsed_seconds == 9.0
+    assert task.elapsed_seconds == 7.0
 
 
 class NativeAsyncGateway:
     def __init__(self, answers=None):
         self.answers = list(answers or [_model(FinishReason.STOP, "async answer")])
 
-    async def aplanning(self, context, stream=True, response_format=None):
-        await asyncio.sleep(0)
-        return LLMOutput(
-            FinishReason.STOP,
-            None,
-            [],
-            None,
-            None,
-            structured=TaskPlan(goal=["async"], current="run", remaining=[]),
-        )
-
     async def ainfer(self, context, stream=True, response_format=None):
         await asyncio.sleep(0)
         return self.answers.pop(0)
-
-    def planning(self, context, stream=True, response_format=None):
-        raise AssertionError("native async planning must be preferred")
 
     def infer(self, context, stream=True, response_format=None):
         raise AssertionError("native async inference must be preferred")
@@ -1643,21 +1763,11 @@ def test_arun_completes_with_a_native_async_gateway():
 
     assert result.output == "async answer"
     assert task.state is TaskState.TASK_COMPLETED
-    assert task.plan.goal == ["async"]
+    assert task.plan is None
 
 
 def test_arun_accepts_a_gateway_that_implements_only_the_async_protocol():
     class AsyncOnlyGateway:
-        async def aplanning(self, context, stream=True, response_format=None):
-            return LLMOutput(
-                FinishReason.STOP,
-                None,
-                [],
-                None,
-                None,
-                structured=TaskPlan(goal=["async only"]),
-            )
-
         async def ainfer(self, context, stream=True, response_format=None):
             return _model(FinishReason.STOP, "done")
 

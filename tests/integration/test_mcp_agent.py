@@ -8,22 +8,12 @@ from src.application.agent import Agent
 from src.config import Config
 from src.core.tool import RemoteToolError
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
-from src.schema.task import TaskPlan, TaskState
+from src.schema.task import TaskState
 
 
 class MCPGateway:
     def __init__(self):
         self.infer_contexts = []
-
-    async def aplanning(self, context, stream=True, response_format=None):
-        return LLMOutput(
-            FinishReason.STOP,
-            None,
-            [],
-            None,
-            None,
-            structured=TaskPlan(goal=["add two numbers"]),
-        )
 
     async def ainfer(self, context, stream=True, response_format=None):
         self.infer_contexts.append(context)

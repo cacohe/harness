@@ -13,7 +13,7 @@ from src.memory.retriever import HybridRetriever
 from src.memory.store import InMemoryStore
 from src.observability import MetricsEventSink
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
-from src.schema.task import TaskPauseReason, TaskPlan, TaskResult, TaskRunningReason, TaskState
+from src.schema.task import TaskPauseReason, TaskResult, TaskRunningReason, TaskState
 from src.schema.tool import ApprovalDecision, Tool, ToolExecutionResult
 from src.tool.tool_executor import DefaultToolExecutor
 from src.tool.tool_registry import DefaultToolRegistry
@@ -24,20 +24,10 @@ class ChatGateway:
     def __init__(self, answers):
         self.model = "test-model"
         self.answers = list(answers)
-        self.plans = []
-
-    def planning(self, context, stream=True, response_format=None):
-        self.plans.append(context.messages[1].content)
-        return LLMOutput(
-            FinishReason.STOP,
-            None,
-            [],
-            None,
-            None,
-            structured=TaskPlan(goal=["answer"]),
-        )
+        self.inputs = []
 
     def infer(self, context, stream=True, response_format=None):
+        self.inputs.append(context.messages[1].content)
         return LLMOutput(FinishReason.STOP, self.answers.pop(0), [], None, None)
 
 
@@ -117,7 +107,7 @@ def _write_skill(root: Path, folder: str, name: str) -> Path:
     return skill_dir
 
 
-def test_chat_plans_then_returns_the_answer():
+def test_chat_uses_one_infer_call_and_returns_the_answer():
     gateway = ChatGateway(["hello"])
     agent = Agent(
         config=Config(llm="test-model", max_steps=3, max_seconds=30),
@@ -128,7 +118,7 @@ def test_chat_plans_then_returns_the_answer():
 
     assert task.state is TaskState.TASK_COMPLETED
     assert task.result.output == "hello"
-    assert gateway.plans == ["hi"]
+    assert gateway.inputs == ["hi"]
     assert agent.transcript == [("user", "hi"), ("assistant", "hello")]
 
 
@@ -143,7 +133,7 @@ def test_chat_sends_prior_turns_with_the_next_message():
     task = agent.chat("and you")
 
     assert task.result.output == "fine"
-    assert gateway.plans[1] == "user: hi\nassistant: hello\nuser: and you"
+    assert gateway.inputs[1] == "user: hi\nassistant: hello\nuser: and you"
 
 
 def test_chat_records_missing_model_content_as_an_empty_string():
@@ -158,7 +148,7 @@ def test_chat_records_missing_model_content_as_an_empty_string():
 
     assert first.result.output == ""
     assert agent.transcript[:2] == [("user", "empty"), ("assistant", "")]
-    assert gateway.plans[1] == "user: empty\nassistant: \nuser: continue"
+    assert gateway.inputs[1] == "user: empty\nassistant: \nuser: continue"
 
 
 def test_failed_resume_clears_the_waiting_task():
@@ -554,7 +544,7 @@ def test_closed_agent_rejects_chat_and_mcp_lifecycle_operations():
         with pytest.raises(RuntimeError, match="closed"):
             await agent.remove_mcp_server("server")
 
-        assert gateway.plans == []
+        assert gateway.inputs == []
 
     asyncio.run(scenario())
 
@@ -718,14 +708,14 @@ def test_agent_uses_an_explicit_event_sink_for_harness_observability():
 
 
 def test_agent_metrics_reconcile_a_permanent_model_failure():
-    class BrokenPlanning(ChatGateway):
-        def planning(self, context, stream=True, response_format=None):
+    class BrokenInference(ChatGateway):
+        def infer(self, context, stream=True, response_format=None):
             raise ValueError("bad request")
 
     metrics = MetricsEventSink()
     agent = Agent(
         config=Config(llm="test-model", max_steps=3, max_seconds=30),
-        llm_gateway=BrokenPlanning([]),
+        llm_gateway=BrokenInference([]),
         event_sink=metrics,
     )
 
@@ -752,9 +742,9 @@ def test_agent_shares_injected_long_term_memory_across_isolated_sessions():
     first.chat("shared alpha")
     second.chat("shared alpha followup")
 
-    assert gateway.plans[0] == "shared alpha"
-    assert "Untrusted long-term memory data" in gateway.plans[1]
-    assert "first answer" in gateway.plans[1]
+    assert gateway.inputs[0] == "shared alpha"
+    assert "Untrusted long-term memory data" in gateway.inputs[1]
+    assert "first answer" in gateway.inputs[1]
     assert len(manager.recent()) == 2
 
 
@@ -828,16 +818,6 @@ def test_independent_agents_can_chat_concurrently():
         def __init__(self, rendezvous):
             self.rendezvous = rendezvous
 
-        async def aplanning(self, context, stream=True, response_format=None):
-            return LLMOutput(
-                FinishReason.STOP,
-                None,
-                [],
-                None,
-                None,
-                structured=TaskPlan(goal=["answer"]),
-            )
-
         async def ainfer(self, context, stream=True, response_format=None):
             self.rendezvous["count"] += 1
             if self.rendezvous["count"] == 2:
@@ -864,16 +844,6 @@ def test_sessions_on_one_agent_chat_concurrently_with_isolated_transcripts():
         def __init__(self):
             self.inputs = []
             self.ready = asyncio.Event()
-
-        async def aplanning(self, context, stream=True, response_format=None):
-            return LLMOutput(
-                FinishReason.STOP,
-                None,
-                [],
-                None,
-                None,
-                structured=TaskPlan(goal=["answer"]),
-            )
 
         async def ainfer(self, context, stream=True, response_format=None):
             user_input = context.messages[1].content
@@ -986,7 +956,7 @@ def test_agent_transcript_assignment_restores_default_session_history():
     agent.transcript = [("user", "saved"), ("assistant", "history")]
     task = agent.chat("continue")
 
-    assert gateway.plans == ["user: saved\nassistant: history\nuser: continue"]
+    assert gateway.inputs == ["user: saved\nassistant: history\nuser: continue"]
     assert task.result.output == "restored"
 
 
@@ -1003,4 +973,4 @@ def test_chat_rejects_an_active_event_loop_before_starting_work():
 
     asyncio.run(scenario())
 
-    assert gateway.plans == []
+    assert gateway.inputs == []

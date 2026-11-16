@@ -159,6 +159,20 @@ agent = Agent.from_config(
 Skill shell，因此脚本永远不会回退到宿主进程执行。重复 Skill 名、规范化后的工具名冲突或
 注册中途失败都会在构造阶段报错，并回滚本批已注册的 Skill 工具。
 
+## 统一推理与可选计划
+
+新 Task 不再先执行一次独立 Planning 模型调用，而是直接进入 infer。模型可以在同一次调用中
+直接回答、请求澄清或调用业务工具。只有真正的多步骤任务才应调用 Harness 内置的
+`update_plan` 控制工具；该工具只更新并持久化 `Task.plan`，不进入业务工具目录、不需要审批，
+也不能授权任何外部操作。同一次模型响应可以同时包含 `update_plan` 和普通工具调用。
+
+`update_plan` 是 Harness 保留名称。自定义、本地、Skill 或 MCP 工具不得使用该名称。已有计划
+会作为当前执行进度加入后续 infer 上下文；简单问题和单个明确动作不会因此额外增加模型调用。
+
+兼容性说明：独立的 `planning`/`aplanning`、`build_planning_context`、`TASK_PLANNING` 以及
+`TaskPlan.clarification` 已移除。自定义 LLM Gateway 和 Context Builder 只需实现统一 infer 接口；
+需要澄清时直接返回普通回答，需要计划时调用 `update_plan`。
+
 ## 外部取消
 
 同步 Harness 支持每次运行独立的协作式取消。控制线程创建 `CancellationToken`，将它传给
@@ -180,8 +194,8 @@ token.cancel()
 worker.join()
 ```
 
-取消是线程安全、幂等且按单次运行隔离的。Harness 会立即唤醒模型重试等待，并在规划、
-推理和工具调用边界停止后续工作；任务最终保存为 `failed/cancel`。取消不会强制终止已经
+取消是线程安全、幂等且按单次运行隔离的。Harness 会立即唤醒模型重试等待，并在推理和
+工具调用边界停止后续工作；任务最终保存为 `failed/cancel`。取消不会强制终止已经
 进入第三方模型、工具、线程、进程或 sandbox 的阻塞调用，而会在该调用返回后丢弃其结果并
 停止下一步。一个已经取消的 token 不会自动重置，重复用于其他运行会立即取消该运行。
 
