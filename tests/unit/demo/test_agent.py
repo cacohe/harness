@@ -216,6 +216,27 @@ def test_from_config_builds_the_default_composition():
     assert agent.llm_gateway is gateway
 
 
+def test_agent_injects_resource_governance_config_into_harness():
+    config = Config(
+        llm="test-model",
+        model_timeout_seconds=1.5,
+        tool_timeout_seconds=2.5,
+        max_model_output_bytes=101,
+        max_tool_result_bytes=102,
+        max_event_bytes=103,
+        max_task_snapshot_bytes=104,
+    )
+
+    agent = Agent(config=config, llm_gateway=ChatGateway(["hello"]))
+
+    assert agent.harness.model_timeout_seconds == 1.5
+    assert agent.harness.tool_timeout_seconds == 2.5
+    assert agent.harness.max_model_output_bytes == 101
+    assert agent.harness.max_tool_result_bytes == 102
+    assert agent.harness.fact_recorder.limits.max_event_bytes == 103
+    assert agent.harness.fact_recorder.limits.max_task_snapshot_bytes == 104
+
+
 def test_default_composition_shares_one_new_catalog():
     agent = Agent(
         config=Config(llm="test-model", max_steps=3, max_seconds=30),

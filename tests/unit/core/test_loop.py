@@ -6,6 +6,7 @@ import pytest
 from src.context.context_builder import DefaultContextBuilder
 from src.core.cancellation import CancellationToken
 from src.core.context import HELD_TOOL_MESSAGE, PENDING_TOOL_MESSAGE
+from src.core.execution import PayloadLimitError
 from src.core.guard import NoOpGuard
 from src.core.hook import HarnessHook
 from src.core.llm import LlmCallError
@@ -126,6 +127,7 @@ def _harness(
     tools=None,
     executor=None,
     repository=None,
+    **harness_options,
 ) -> Harness:
     return Harness(
         "Be brief.",
@@ -139,6 +141,7 @@ def _harness(
         task_repository=repository,
         max_steps=max_steps,
         max_seconds=max_seconds,
+        **harness_options,
     )
 
 
@@ -329,6 +332,83 @@ def test_caller_cancellation_settles_one_attempt_without_assistant_fact():
     assert infer_settlements[0].payload["outcome"] == "cancelled"
     assert facts[-1].type is SessionEventType.EXECUTION_SETTLED
     assert facts[-1].payload["outcome"] == "cancelled"
+
+
+def test_model_output_byte_budget_accepts_exact_boundary_and_rejects_one_less():
+    output = _model(FinishReason.STOP, "你好")
+    probe = _harness(ScriptedGateway([output]))
+    boundary = probe._strict_json_size(output.model_dump(mode="json", exclude_none=True))
+
+    accepted = _harness(
+        ScriptedGateway([output]),
+        max_model_output_bytes=boundary,
+    ).infer(Context(), _task())
+
+    assert accepted.content == "你好"
+    with pytest.raises(LlmCallError, match="max_model_output_bytes"):
+        _harness(
+            ScriptedGateway([output]),
+            max_model_output_bytes=boundary - 1,
+        ).infer(Context(), _task())
+
+
+def test_model_deadline_is_distinct_from_provider_retry_timeout():
+    class SlowGateway(Gateway):
+        async def ainfer(self, context, stream=True, response_format=None):
+            await asyncio.sleep(1)
+            return _model(FinishReason.STOP, "late")
+
+    with pytest.raises(LlmCallError, match="timed out"):
+        asyncio.run(
+            _harness(SlowGateway(), model_timeout_seconds=0.01).ainfer(Context(), _task())
+        )
+
+
+def test_tool_result_byte_budget_accepts_exact_boundary_and_rejects_one_less():
+    result = ToolExecutionResult(
+        tool_id="call-1",
+        tool_name="tool",
+        state=ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED,
+        output={"text": "你好"},
+    )
+    probe = _harness(Gateway())
+    boundary = probe._strict_json_size(result.model_dump(mode="json", exclude_none=True))
+
+    probe.max_tool_result_bytes = boundary
+    probe._enforce_tool_result(result)
+    probe.max_tool_result_bytes = boundary - 1
+    with pytest.raises(PayloadLimitError, match="max_tool_result_bytes"):
+        probe._enforce_tool_result(result)
+
+
+def test_tool_timeout_suppresses_late_thread_result_observation():
+    finished = threading.Event()
+    sink = RecordingOutput()
+
+    def slow(_inputs):
+        import time
+
+        time.sleep(0.1)
+        finished.set()
+        return "late"
+
+    tool = Tool("slow", "slow", "Slow.", {}, slow)
+    gateway = ScriptedGateway(
+        [_model(FinishReason.TOOL_CALLS, calls=[LlmToolCall("call-1", "slow", "{}")])]
+    )
+    task = _task()
+
+    result = _harness(
+        gateway,
+        tools=[tool],
+        event_handler=sink,
+        tool_timeout_seconds=0.01,
+    ).run(task)
+    terminal_count = len(sink.events)
+    assert finished.wait(1)
+
+    assert "timed out" in result.output.lower() or "timeout" in result.output.lower()
+    assert len(sink.events) == terminal_count
 
 
 def test_run_saves_state_changes_through_the_repository():

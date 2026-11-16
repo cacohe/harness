@@ -3,6 +3,7 @@
 import asyncio
 import contextvars
 import inspect
+import json
 import threading
 import time
 import uuid
@@ -19,7 +20,12 @@ from src.core.context import (
     build_tool_messages,
 )
 from src.core.event import EventHandler, EventSink
-from src.core.execution import ExecutionContext, FactRecorder
+from src.core.execution import (
+    ExecutionContext,
+    ExecutionLimits,
+    FactRecorder,
+    PayloadLimitError,
+)
 from src.core.guard import GuardError, HarnessGuard, NoOpGuard
 from src.core.hook import HarnessHook
 from src.core.llm import AsyncLlmGateway, LlmCallError, LlmGateway
@@ -58,6 +64,10 @@ DEFAULT_MAX_SECONDS = 60 * 30
 DEFAULT_MAX_LLM_ATTEMPTS = 5
 DEFAULT_LLM_ATTEMPT_DELAY_SECONDS = 10
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+DEFAULT_MODEL_TIMEOUT_SECONDS = 90.0
+DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0
+DEFAULT_MAX_MODEL_OUTPUT_BYTES = 1_048_576
+DEFAULT_MAX_TOOL_RESULT_BYTES = 1_048_576
 
 
 class _TaskPersistenceError(Exception):
@@ -74,6 +84,10 @@ class _CancellationRequested(Exception):
 
 class _ToolBatchCancelled(Exception):
     """Stop an overridden tool batch after its start callback observes cancellation."""
+
+
+class _ModelDeadlineExceeded(Exception):
+    """Distinguish Harness deadlines from provider timeout errors that may be retried."""
 
 
 @dataclass
@@ -121,6 +135,12 @@ class Harness:
         task_repository: TaskRepository | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
         max_seconds: int = DEFAULT_MAX_SECONDS,
+        model_timeout_seconds: float = DEFAULT_MODEL_TIMEOUT_SECONDS,
+        tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
+        max_model_output_bytes: int = DEFAULT_MAX_MODEL_OUTPUT_BYTES,
+        max_tool_result_bytes: int = DEFAULT_MAX_TOOL_RESULT_BYTES,
+        max_event_bytes: int = 1_048_576,
+        max_task_snapshot_bytes: int = 8_388_608,
     ):
         self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
         self.llm_gateway = llm_gateway
@@ -139,9 +159,43 @@ class Harness:
             if self._legacy_execution_store
             else cast(ExecutionStore, self.task_repository)
         )
-        self.fact_recorder = FactRecorder(self.execution_store)
+        self.fact_recorder = FactRecorder(
+            self.execution_store,
+            limits=ExecutionLimits(
+                max_event_bytes=max_event_bytes,
+                max_task_snapshot_bytes=max_task_snapshot_bytes,
+            ),
+        )
         self._max_steps = max_steps
         self._max_seconds = max_seconds
+        self.model_timeout_seconds = float(model_timeout_seconds)
+        self.tool_timeout_seconds = float(tool_timeout_seconds)
+        self.max_model_output_bytes = max_model_output_bytes
+        self.max_tool_result_bytes = max_tool_result_bytes
+
+    @staticmethod
+    def _strict_json_size(value) -> int:
+        try:
+            encoded = json.dumps(
+                value,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        except (TypeError, ValueError) as error:
+            raise PayloadLimitError("payload is not strict JSON") from error
+        return len(encoded.encode("utf-8"))
+
+    def _enforce_model_output(self, output: LLMOutput) -> None:
+        size = self._strict_json_size(output.model_dump(mode="json", exclude_none=True))
+        if size > self.max_model_output_bytes:
+            raise PayloadLimitError("model output exceeds max_model_output_bytes")
+
+    def _enforce_tool_result(self, result: ToolExecutionResult) -> None:
+        size = self._strict_json_size(result.model_dump(mode="json", exclude_none=True))
+        if size > self.max_tool_result_bytes:
+            raise PayloadLimitError("tool result exceeds max_tool_result_bytes")
 
     def _fact_event(
         self,
@@ -444,6 +498,7 @@ class Harness:
         durable_id = self._tool_fact_id(call)
         if state is None or durable_id is None or result.is_pending():
             return
+        self._enforce_tool_result(result)
         assert state.started_tools is not None
         if durable_id in state.started_tools:
             if result.is_completed():
@@ -797,13 +852,20 @@ class Harness:
             if token.is_cancelled():
                 self._cancel_llm_attempt(task, "planning")
             try:
-                output = await call_maybe_async(
-                    getattr(self.llm_gateway, "aplanning", None),
-                    getattr(self.llm_gateway, "planning", None),
-                    context,
-                    stream=False,
-                    response_format=TaskPlan,
-                )
+                deadline = asyncio.timeout(self.model_timeout_seconds)
+                try:
+                    async with deadline:
+                        output = await call_maybe_async(
+                            getattr(self.llm_gateway, "aplanning", None),
+                            getattr(self.llm_gateway, "planning", None),
+                            context,
+                            stream=False,
+                            response_format=TaskPlan,
+                        )
+                except TimeoutError as error:
+                    if deadline.expired():
+                        raise _ModelDeadlineExceeded from error
+                    raise
                 if token.is_cancelled():
                     self._cancel_llm_attempt(task, "planning")
                 if not isinstance(output, LLMOutput):
@@ -811,6 +873,7 @@ class Harness:
 
                 if not isinstance(output.structured, TaskPlan):
                     raise LlmCallError("planning did not return a task plan")
+                self._enforce_model_output(output)
 
                 self._settle_model_attempt(
                     task, "completed", phase="planning", output=output
@@ -840,6 +903,10 @@ class Harness:
 
             except _CancellationRequested:
                 raise
+
+            except _ModelDeadlineExceeded as error:
+                self._fail_llm_attempt(task, "planning", "model_timeout")
+                raise LlmCallError("model call timed out") from error
 
             except LlmCallError as error:
                 if token.is_cancelled():
@@ -1076,13 +1143,21 @@ class Harness:
             if token.is_cancelled():
                 self._cancel_llm_attempt(task, "infer")
             try:
-                produced = await call_maybe_async(
-                    getattr(self.llm_gateway, "ainfer", None),
-                    getattr(self.llm_gateway, "infer", None),
-                    context,
-                    stream=True,
-                )
-                output, parts = await self._aread_inference(produced)
+                deadline = asyncio.timeout(self.model_timeout_seconds)
+                try:
+                    async with deadline:
+                        produced = await call_maybe_async(
+                            getattr(self.llm_gateway, "ainfer", None),
+                            getattr(self.llm_gateway, "infer", None),
+                            context,
+                            stream=True,
+                        )
+                        output, parts = await self._aread_inference(produced)
+                except TimeoutError as error:
+                    if deadline.expired():
+                        raise _ModelDeadlineExceeded from error
+                    raise
+                self._enforce_model_output(output)
                 if token.is_cancelled():
                     self._cancel_llm_attempt(task, "infer")
                 self._settle_model_attempt(task, "completed", phase="infer", output=output)
@@ -1104,6 +1179,10 @@ class Harness:
 
             except _CancellationRequested:
                 raise
+
+            except _ModelDeadlineExceeded as error:
+                self._fail_llm_attempt(task, "infer", "model_timeout")
+                raise LlmCallError("model call timed out") from error
 
             except LlmCallError as error:
                 if token.is_cancelled():
@@ -1341,7 +1420,8 @@ class Harness:
             or parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters
         )
-        try:
+
+        async def invoke_batch():
             callback_arguments = {
                 "before_call": before_call,
                 "after_call": after_call,
@@ -1350,18 +1430,16 @@ class Harness:
                 callback_arguments["before_execute"] = before_execute
             if cancellation_token is not None and supports_cancellation:
                 callback_arguments["should_cancel"] = cancellation_token.is_cancelled
-                return await call_maybe_async(
-                    async_batch,
-                    self.tool_executor.execute_tool_calls,
-                    tool_calls,
-                    **callback_arguments,
-                )
             return await call_maybe_async(
                 async_batch,
                 self.tool_executor.execute_tool_calls,
                 tool_calls,
                 **callback_arguments,
             )
+
+        try:
+            async with asyncio.timeout(self.tool_timeout_seconds):
+                return await invoke_batch()
         except _ToolBatchCancelled:
             ordered = [observed_results.get(call.id, cancelled_result(call)) for call in tool_calls]
             return ToolCallResult(
@@ -1378,6 +1456,13 @@ class Harness:
             except _EventSinkError:
                 pass
             raise
+        except TimeoutError as error:
+            timeout_error = TimeoutError("tool call timed out")
+            try:
+                fail_active_calls(timeout_error)
+            except _EventSinkError:
+                pass
+            raise timeout_error from error
         except Exception as error:
             try:
                 fail_active_calls(error)
