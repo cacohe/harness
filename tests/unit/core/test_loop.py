@@ -228,7 +228,8 @@ def test_completed_run_records_balanced_model_and_turn_facts():
         SessionEventType.EXECUTION_SETTLED,
     ]
     for started in [
-        index for index, event_type in enumerate(types)
+        index
+        for index, event_type in enumerate(types)
         if event_type is SessionEventType.MODEL_ATTEMPT_STARTED
     ]:
         settled = types.index(SessionEventType.MODEL_ATTEMPT_SETTLED, started + 1)
@@ -359,9 +360,7 @@ def test_model_deadline_is_distinct_from_provider_retry_timeout():
             return _model(FinishReason.STOP, "late")
 
     with pytest.raises(LlmCallError, match="timed out"):
-        asyncio.run(
-            _harness(SlowGateway(), model_timeout_seconds=0.01).ainfer(Context(), _task())
-        )
+        asyncio.run(_harness(SlowGateway(), model_timeout_seconds=0.01).ainfer(Context(), _task()))
 
 
 def test_tool_result_byte_budget_accepts_exact_boundary_and_rejects_one_less():

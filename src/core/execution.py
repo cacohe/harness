@@ -240,9 +240,7 @@ class LifecycleTracker:
         if identity not in self._started[kind]:
             raise LifecycleError(f"{kind} {identity} was not started")
 
-    def _require_open_parent(
-        self, event: PendingSessionEvent | SessionEvent, kind: _Kind
-    ) -> None:
+    def _require_open_parent(self, event: PendingSessionEvent | SessionEvent, kind: _Kind) -> None:
         if kind == "step":
             parent_kind: _Kind = "turn"
             parent_id = event.turn_id
@@ -268,9 +266,7 @@ class LifecycleTracker:
 class FactRecorder:
     """Validate and atomically persist facts with their Task snapshot."""
 
-    def __init__(
-        self, store: ExecutionStore, *, limits: ExecutionLimits | None = None
-    ) -> None:
+    def __init__(self, store: ExecutionStore, *, limits: ExecutionLimits | None = None) -> None:
         self.store = store
         self.limits = limits or ExecutionLimits()
 

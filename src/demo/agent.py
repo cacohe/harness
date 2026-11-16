@@ -211,16 +211,10 @@ class Agent:
             max_seconds=self.config.max_seconds,
             model_timeout_seconds=getattr(self.config, "model_timeout_seconds", 90),
             tool_timeout_seconds=getattr(self.config, "tool_timeout_seconds", 30),
-            max_model_output_bytes=getattr(
-                self.config, "max_model_output_bytes", 1_048_576
-            ),
-            max_tool_result_bytes=getattr(
-                self.config, "max_tool_result_bytes", 1_048_576
-            ),
+            max_model_output_bytes=getattr(self.config, "max_model_output_bytes", 1_048_576),
+            max_tool_result_bytes=getattr(self.config, "max_tool_result_bytes", 1_048_576),
             max_event_bytes=getattr(self.config, "max_event_bytes", 1_048_576),
-            max_task_snapshot_bytes=getattr(
-                self.config, "max_task_snapshot_bytes", 8_388_608
-            ),
+            max_task_snapshot_bytes=getattr(self.config, "max_task_snapshot_bytes", 8_388_608),
         )
         self._default_session = self.new_session()
 
@@ -231,12 +225,8 @@ class Agent:
             "max_seconds": self.config.max_seconds,
             "model_timeout_seconds": getattr(self.config, "model_timeout_seconds", 90),
             "tool_timeout_seconds": getattr(self.config, "tool_timeout_seconds", 30),
-            "max_model_output_bytes": getattr(
-                self.config, "max_model_output_bytes", 1_048_576
-            ),
-            "max_tool_result_bytes": getattr(
-                self.config, "max_tool_result_bytes", 1_048_576
-            ),
+            "max_model_output_bytes": getattr(self.config, "max_model_output_bytes", 1_048_576),
+            "max_tool_result_bytes": getattr(self.config, "max_tool_result_bytes", 1_048_576),
         }
         return build_agent_profile(
             system_prompt=self.harness.system_prompt,

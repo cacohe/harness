@@ -335,8 +335,18 @@ def test_fact_recorder_does_not_advance_sequence_and_preserves_commit_error():
 @pytest.mark.parametrize(
     "limits, event_payload, task_text, message",
     [
-        (ExecutionLimits(max_event_bytes=120, max_task_snapshot_bytes=10_000), {"x": "y"}, "ok", "event"),
-        (ExecutionLimits(max_event_bytes=10_000, max_task_snapshot_bytes=120), {}, "x" * 500, "snapshot"),
+        (
+            ExecutionLimits(max_event_bytes=120, max_task_snapshot_bytes=10_000),
+            {"x": "y"},
+            "ok",
+            "event",
+        ),
+        (
+            ExecutionLimits(max_event_bytes=10_000, max_task_snapshot_bytes=120),
+            {},
+            "x" * 500,
+            "snapshot",
+        ),
     ],
 )
 def test_fact_recorder_rejects_oversize_payloads_before_store_mutation(

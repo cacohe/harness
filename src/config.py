@@ -301,9 +301,7 @@ def _pick_nonnegative_int(settings: Settings, keys: tuple[str, ...], default: in
     return default
 
 
-def _pick_positive_float(
-    settings: Settings, keys: tuple[str, ...], default: float
-) -> float:
+def _pick_positive_float(settings: Settings, keys: tuple[str, ...], default: float) -> float:
     for key in keys:
         if key not in settings:
             continue

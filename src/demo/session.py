@@ -368,9 +368,7 @@ class AgentSession:
                     task,
                     SessionEventType.SESSION_STARTED,
                     payload={
-                        "profile": None
-                        if profile is None
-                        else profile.model_dump(mode="json")
+                        "profile": None if profile is None else profile.model_dump(mode="json")
                     },
                 )
             )

@@ -288,9 +288,7 @@ def test_v2_schema_has_expected_foreign_keys(tmp_path):
             "PRAGMA foreign_key_list(submissions)"
         ).fetchall()
 
-    assert [(row[2], row[3], row[4]) for row in event_foreign_keys] == [
-        ("tasks", "task_id", "id")
-    ]
+    assert [(row[2], row[3], row[4]) for row in event_foreign_keys] == [("tasks", "task_id", "id")]
     assert [(row[2], row[3], row[4]) for row in submission_foreign_keys] == [
         ("tasks", "task_id", "id")
     ]

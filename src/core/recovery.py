@@ -69,9 +69,7 @@ class ExecutionRecovery:
                 raise RecoveryError("session event sequence contains a gap")
 
     @staticmethod
-    def _validate_task_identity(
-        record: ExecutionRecord, events: Sequence[SessionEvent]
-    ) -> None:
+    def _validate_task_identity(record: ExecutionRecord, events: Sequence[SessionEvent]) -> None:
         task_events = [event for event in events if event.task_id == record.task.id]
         if not task_events:
             raise RecoveryError("unfinished Task has no durable events")
@@ -212,11 +210,23 @@ class ExecutionRecovery:
     @staticmethod
     def _open_lifecycles(events: Sequence[SessionEvent]) -> _OpenLifecycles:
         starts = {
-            "submissions": (SessionEventType.SUBMISSION_ACCEPTED, SessionEventType.SUBMISSION_SETTLED, "turn_id"),
-            "executions": (SessionEventType.EXECUTION_STARTED, SessionEventType.EXECUTION_SETTLED, "execution_id"),
+            "submissions": (
+                SessionEventType.SUBMISSION_ACCEPTED,
+                SessionEventType.SUBMISSION_SETTLED,
+                "turn_id",
+            ),
+            "executions": (
+                SessionEventType.EXECUTION_STARTED,
+                SessionEventType.EXECUTION_SETTLED,
+                "execution_id",
+            ),
             "turns": (SessionEventType.TURN_STARTED, SessionEventType.TURN_SETTLED, "turn_id"),
             "steps": (SessionEventType.STEP_STARTED, SessionEventType.STEP_SETTLED, "step_id"),
-            "attempts": (SessionEventType.MODEL_ATTEMPT_STARTED, SessionEventType.MODEL_ATTEMPT_SETTLED, "attempt_id"),
+            "attempts": (
+                SessionEventType.MODEL_ATTEMPT_STARTED,
+                SessionEventType.MODEL_ATTEMPT_SETTLED,
+                "attempt_id",
+            ),
         }
         result: dict[str, list[SessionEvent]] = {}
         for name, (started_type, settled_type, field) in starts.items():

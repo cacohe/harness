@@ -183,7 +183,9 @@ class SQLiteTaskRepository:
         expected = _validate_expected_sequence(expected_sequence, allow_none=False)
         assert expected is not None
         pending = [PendingSessionEvent.model_validate(event.model_dump()) for event in events]
-        incoming = None if submission is None else _decode_submission(_encode_submission(submission))
+        incoming = (
+            None if submission is None else _decode_submission(_encode_submission(submission))
+        )
         session_id = _commit_session_id(task, pending, incoming)
         connection: sqlite3.Connection | None = None
         try:
@@ -362,8 +364,15 @@ class SQLiteTaskRepository:
         if row is None:
             return None
         names = (
-            "session_id", "message_id", "digest_algorithm", "message_digest", "task_id",
-            "turn_id", "state", "created_at", "updated_at",
+            "session_id",
+            "message_id",
+            "digest_algorithm",
+            "message_digest",
+            "task_id",
+            "turn_id",
+            "state",
+            "created_at",
+            "updated_at",
         )
         encoded = json.dumps(
             dict(zip(names, row, strict=True)),

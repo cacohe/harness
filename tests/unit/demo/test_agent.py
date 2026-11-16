@@ -287,9 +287,7 @@ def test_open_session_restores_paused_task_and_approval_ownership(tmp_path):
         tool_executor=DefaultToolExecutor(registry),
         task_repository=repository,
     )
-    paused = first_agent.new_session("paused-session").chat(
-        "run it", message_id="message-1"
-    )
+    paused = first_agent.new_session("paused-session").chat("run it", message_id="message-1")
     second_agent = Agent(
         config=Config(llm="test-model"),
         llm_gateway=ChatGateway([]),

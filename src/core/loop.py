@@ -238,9 +238,7 @@ class Harness:
             except Exception as error:
                 raise _TaskPersistenceError from error
 
-    def _execution_context(
-        self, task: Task, supplied: ExecutionContext | None
-    ) -> ExecutionContext:
+    def _execution_context(self, task: Task, supplied: ExecutionContext | None) -> ExecutionContext:
         if supplied is not None:
             if supplied.task_id != task.id:
                 raise ValueError("execution context task identity does not match Task")
@@ -283,7 +281,9 @@ class Harness:
                 and isinstance(event.payload.get("external_tool_call_id"), str)
             ):
                 state.tool_ids[event.payload["external_tool_call_id"]] = event.tool_call_id
-            elif event.type is SessionEventType.TOOL_CALL_STARTED and event.tool_call_id is not None:
+            elif (
+                event.type is SessionEventType.TOOL_CALL_STARTED and event.tool_call_id is not None
+            ):
                 state.started_tools.add(event.tool_call_id)
         for step_id, is_open in reversed(list(open_steps.items())):
             if is_open:
@@ -311,9 +311,7 @@ class Harness:
         self._record_facts(
             task,
             [
-                self._fact_event(
-                    task, SessionEventType.STEP_RESUMED, step_id=state.step_id
-                ),
+                self._fact_event(task, SessionEventType.STEP_RESUMED, step_id=state.step_id),
                 self._fact_event(task, SessionEventType.TURN_RESUMED),
                 self._fact_event(task, SessionEventType.SUBMISSION_RESUMED),
             ],
@@ -327,9 +325,7 @@ class Harness:
         self._record_facts(
             task,
             [
-                self._fact_event(
-                    task, SessionEventType.STEP_PAUSED, step_id=state.step_id
-                ),
+                self._fact_event(task, SessionEventType.STEP_PAUSED, step_id=state.step_id),
                 self._fact_event(task, SessionEventType.TURN_PAUSED),
                 self._fact_event(task, SessionEventType.SUBMISSION_PAUSED),
                 self._fact_event(
@@ -434,9 +430,7 @@ class Harness:
                         "phase": phase,
                         "content": output.content,
                         "finish_reason": (
-                            None
-                            if output.finish_reason is None
-                            else output.finish_reason.value
+                            None if output.finish_reason is None else output.finish_reason.value
                         ),
                     },
                 )
@@ -545,9 +539,7 @@ class Harness:
             )
         facts.extend(
             [
-                self._fact_event(
-                    task, SessionEventType.TURN_SETTLED, payload={"outcome": outcome}
-                ),
+                self._fact_event(task, SessionEventType.TURN_SETTLED, payload={"outcome": outcome}),
                 self._fact_event(
                     task,
                     SessionEventType.SUBMISSION_SETTLED,
@@ -875,9 +867,7 @@ class Harness:
                     raise LlmCallError("planning did not return a task plan")
                 self._enforce_model_output(output)
 
-                self._settle_model_attempt(
-                    task, "completed", phase="planning", output=output
-                )
+                self._settle_model_attempt(task, "completed", phase="planning", output=output)
                 self._emit_llm_event(
                     task,
                     EventType.LLM_COMPLETED,
@@ -1027,9 +1017,9 @@ class Harness:
                         if async_method is not None
                         else self.tool_executor.execute_held_tool_call
                     )
-                    supports_before_execute = "before_execute" in inspect.signature(
-                        selected
-                    ).parameters
+                    supports_before_execute = (
+                        "before_execute" in inspect.signature(selected).parameters
+                    )
                     if supports_before_execute:
                         result = await call_maybe_async(
                             async_method,
@@ -1226,11 +1216,7 @@ class Harness:
         raise _CancellationRequested
 
     def _fail_llm_attempt(self, task: Task, phase: str, reason: str) -> None:
-        outcome = (
-            "cancelled"
-            if reason == TaskFailReason.TASK_FAILED_CANCEL.value
-            else "failed"
-        )
+        outcome = "cancelled" if reason == TaskFailReason.TASK_FAILED_CANCEL.value else "failed"
         self._settle_model_attempt(task, outcome, phase=phase, reason=reason)
         self._emit_llm_event(
             task,
@@ -1416,8 +1402,7 @@ class Harness:
             for parameter in parameters
         )
         supports_before_execute = any(
-            parameter.name == "before_execute"
-            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            parameter.name == "before_execute" or parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters
         )
 
