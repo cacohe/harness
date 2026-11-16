@@ -43,11 +43,11 @@
 - Produces: `src.application.Agent`, `AgentSession`, `MemoryFailure`, `MemoryRuntime`, and `TaskRun`.
 - Preserves: all corresponding `src.demo.agent` and `src.demo.session` objects by identity.
 
-- [ ] **Step 1: Add canonical import and exact compatibility-identity tests**
-- [ ] **Step 2: Run the focused export test and verify RED because `src.application` is absent**
-- [ ] **Step 3: Move the implementations, add compatibility modules, and update repository-owned imports**
-- [ ] **Step 4: Run application, demo, integration, load, Ruff, and Mypy checks and verify GREEN**
-- [ ] **Step 5: Commit the application API migration**
+- [x] **Step 1: Add canonical import and exact compatibility-identity tests**
+- [x] **Step 2: Run the focused export test and verify RED because `src.application` is absent**
+- [x] **Step 3: Move the implementations, add compatibility modules, and update repository-owned imports**
+- [x] **Step 4: Run application, demo, integration, load, Ruff, and Mypy checks and verify GREEN**
+- [x] **Step 5: Commit the application API migration**
 
 ### Task 2: Move Skill batch loading into `src.skill`
 
@@ -64,11 +64,11 @@
 - Produces: `load_skill_directories(roots, *, include_shell: bool) -> tuple[list[Skill], list[Tool]]`.
 - Consumes: Task 1's canonical `src.application.agent.Agent`.
 
-- [ ] **Step 1: Add failing tests for the loader API, duplicate names, and one-read Skill/tool consistency**
-- [ ] **Step 2: Run focused Skill tests and verify RED on the missing APIs**
-- [ ] **Step 3: Implement bundle and batch loading and remove Agent's private loading helper**
-- [ ] **Step 4: Run Skill and application tests, Ruff, and Mypy and verify GREEN**
-- [ ] **Step 5: Commit the Skill ownership change**
+- [x] **Step 1: Add failing tests for the loader API, duplicate names, and one-read Skill/tool consistency**
+- [x] **Step 2: Run focused Skill tests and verify RED on the missing APIs**
+- [x] **Step 3: Implement bundle and batch loading and remove Agent's private loading helper**
+- [x] **Step 4: Run Skill and application tests, Ruff, and Mypy and verify GREEN**
+- [x] **Step 5: Commit the Skill ownership change**
 
 ### Task 3: Complete the selected low-risk cleanup
 
@@ -84,9 +84,9 @@
 - Consumes: canonical application and Skill paths from Tasks 1 and 2.
 - Preserves: core workspace and iterator compatibility exports by exact identity.
 
-- [ ] **Step 1: Add a failing layout test that rejects internal compatibility-path imports**
-- [ ] **Step 2: Run the layout test and verify RED on current internal imports**
-- [ ] **Step 3: Switch internal imports, move prompts/tests, and delete confirmed dead files**
-- [ ] **Step 4: Run focused compatibility and moved tests and verify GREEN**
-- [ ] **Step 5: Run uv lock, Ruff, Mypy, full pytest, and diff gates**
+- [x] **Step 1: Add a failing layout test that rejects internal compatibility-path imports**
+- [x] **Step 2: Run the layout test and verify RED on current internal imports**
+- [x] **Step 3: Switch internal imports, move prompts/tests, and delete confirmed dead files**
+- [x] **Step 4: Run focused compatibility and moved tests and verify GREEN**
+- [x] **Step 5: Run uv lock, Ruff, Mypy, full pytest, and diff gates**
 - [ ] **Step 6: Commit the cleanup and complete a fresh whole-branch review**
