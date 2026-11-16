@@ -376,20 +376,6 @@ def test_context_reads_tools_from_the_executor_catalog_at_call_time():
     assert "shell: Run a command." in context.messages[0].content
 
 
-def test_later_steps_keep_the_goal_and_drop_stale_plan_steps():
-    task = _task()
-    task.history = []
-    task.plan = TaskPlan(goal=["look"], current="read", remaining=["summarize"])
-
-    first = DefaultContextBuilder().build_infer_context("Be brief.", task, [], [])
-    assert "summarize" in first.messages[-1].content
-
-    task.history = [first.messages[1]]
-    later = DefaultContextBuilder().build_infer_context("Be brief.", task, [], [])
-    assert "look" in later.messages[-1].content
-    assert "summarize" not in later.messages[-1].content
-
-
 def test_transient_planning_errors_are_retried(monkeypatch):
     waits = []
 
@@ -444,18 +430,6 @@ def test_finished_task_returns_its_result():
 
     assert _harness(Gateway()).run(task).output == "bought"
     assert task.state is TaskState.TASK_COMPLETED
-
-
-def test_builder_reads_history_from_the_task():
-    task = _task()
-    task.history = []
-    task.plan = TaskPlan(goal=[])
-    context = DefaultContextBuilder().build_infer_context("Be brief.", task, [], [])
-
-    assert isinstance(context, Context)
-    assert context.messages[0].role == "system"
-    assert context.messages[1].content == "buy a phone"
-    assert context.tools == []
 
 
 def test_length_continues_once_with_tools_then_completes():

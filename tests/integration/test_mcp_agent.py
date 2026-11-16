@@ -4,9 +4,9 @@ import asyncio
 import pytest
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from src.application.agent import Agent
 from src.config import Config
 from src.core.tool import RemoteToolError
-from src.demo.agent import Agent
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
 from src.schema.task import TaskPlan, TaskState
 

@@ -1,9 +1,9 @@
 import asyncio
 import json
 
+from src.application.agent import Agent
 from src.config import Config
 from src.core.memory import MemoryManager
-from src.demo.agent import Agent
 from src.memory.retriever import HybridRetriever
 from src.memory.store import InMemoryStore
 from src.observability import MetricsEventSink

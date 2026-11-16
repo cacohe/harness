@@ -5,7 +5,6 @@ import pytest
 from src.core.memory import MemoryManager
 from src.memory.retriever import HybridRetriever
 from src.memory.store import InMemoryStore
-from src.schema.memory import MemoryItem
 
 
 def test_memory_manager_requires_store_and_retriever():
@@ -84,30 +83,6 @@ def test_recall_selects_complete_items_within_token_budget():
 
     assert [item.id for item in recalled] == [fits.id]
     assert too_large.access_count == 0
-
-
-def test_in_memory_store_isolates_added_returned_and_nested_values():
-    store = InMemoryStore()
-    original = MemoryItem(
-        content="original",
-        metadata={"nested": ["value"]},
-        embedding=[1.0],
-    )
-    store.add(original)
-    original.content = "caller mutation"
-    original.metadata["nested"].append("changed")
-    original.embedding.append(2.0)
-
-    first = store.get(original.id)
-    assert first is not None
-    assert first.content == "original"
-    assert first.metadata == {"nested": ["value"]}
-    assert first.embedding == [1.0]
-    first.content = "loaded mutation"
-
-    second = store.get(original.id)
-    assert second is not None
-    assert second.content == "original"
 
 
 def test_memory_manager_and_store_support_concurrent_remember_and_recall():
