@@ -594,6 +594,7 @@ class Harness:
         Args:
             context: The inference context.
             task: The task being executed. Text deltas and retry events are emitted for this task.
+            cancellation_token: The cancellation token.
         Returns:
             The finished model output. Text is streamed by default and assembled into this result.
         Raises:
@@ -728,6 +729,7 @@ class Harness:
         Args:
             tool_calls: Tool calls from the model, in order.
             task: The task whose id is attached to the tool events.
+            cancellation_token: The cancellation token.
         Returns:
             Completed, failed, and pending tool executions.
         """
@@ -899,6 +901,7 @@ class Harness:
         Build the context, run one inference, and execute any requested tool calls.
         Args:
             task: The task being executed.
+            cancellation_token: The cancellation token.
         Returns:
             The model output. Tool calls waiting for approval are recorded and
             reported to the next model call.
@@ -1038,6 +1041,8 @@ class Harness:
             task: The task being executed.
             step_count: The number of steps in the turn.
             failed_reason: The reason of the failed.
+            start_time: The time when the turn started.
+            cancellation_token: The cancellation token.
         Returns:
             The task result.
         """
@@ -1119,6 +1124,8 @@ class Harness:
         Infer and execute tools until the model answers or a limit is hit.
         Args:
             task: The task being executed.
+            start_time: The time when the turn started.
+            cancellation_token: The cancellation token.
         Returns:
             The task result. A completed task carries the assistant text. A paused or
             failed task carries the result recorded while closing the turn.
@@ -1163,6 +1170,7 @@ class Harness:
         Plan a new task, then infer and execute tools until the model answers or a limit is hit.
         Args:
             task: The task to run.
+            cancellation_token: The cancellation token.
         Returns:
             The task result. Its output is the assistant text when the task is completed.
         Raises:
