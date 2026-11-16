@@ -1,3 +1,6 @@
+import hashlib
+import json
+
 from src.schema.tool import Tool
 
 
@@ -45,3 +48,34 @@ class DefaultToolRegistry:
 
     def get_all_tools(self) -> list[Tool]:
         return list(self._tools.values())
+
+    def capability_contracts(self) -> list[dict]:
+        """Return deterministic public contracts without callables or workspace paths."""
+        return sorted(
+            [
+                {
+                    "id": tool.id,
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.input_schema,
+                    "origin": tool.origin.value,
+                    "requires_approval": tool.requires_approval,
+                    "requires_sandbox": tool.requires_sandbox,
+                    "sandbox_kind": (
+                        None if tool.sandbox_kind is None else tool.sandbox_kind.value
+                    ),
+                }
+                for tool in self._tools.values()
+            ],
+            key=lambda item: (item["id"], item["name"]),
+        )
+
+    def capability_digest(self) -> str:
+        encoded = json.dumps(
+            self.capability_contracts(),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()

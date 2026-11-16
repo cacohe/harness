@@ -23,6 +23,7 @@ from src.core.persistence import (
 )
 from src.core.task import Task
 from src.schema.execution import (
+    AgentProfile,
     PendingSessionEvent,
     SessionEventType,
     SubmissionRecord,
@@ -98,6 +99,7 @@ class AgentSession:
         *,
         ensure_started: Callable[[], Any] | None = None,
         operation_registrar: Callable[[asyncio.Task], Any] | None = None,
+        profile_provider: Callable[[], AgentProfile] | None = None,
         session_id: str | None = None,
         execution_store: ExecutionStore | None = None,
         id_factory: ExecutionIdFactory | None = None,
@@ -129,6 +131,7 @@ class AgentSession:
         self._ensure_open = ensure_open
         self._ensure_started = ensure_started
         self._operation_registrar = operation_registrar
+        self._profile_provider = profile_provider
         self.memory_manager = memory_manager
         self.memory_top_k = self._positive_integer(memory_top_k, "memory_top_k")
         self.memory_token_budget = (
@@ -358,8 +361,38 @@ class AgentSession:
         expected = existing_events[-1].sequence if existing_events else 0
         task.last_sequence = expected
         facts = []
+        profile = None if self._profile_provider is None else self._profile_provider()
         if not existing_events:
-            facts.append(self._submission_event(task, SessionEventType.SESSION_STARTED))
+            facts.append(
+                self._submission_event(
+                    task,
+                    SessionEventType.SESSION_STARTED,
+                    payload={
+                        "profile": None
+                        if profile is None
+                        else profile.model_dump(mode="json")
+                    },
+                )
+            )
+        elif profile is not None:
+            previous = next(
+                (
+                    event.payload.get("profile")
+                    for event in reversed(existing_events)
+                    if event.type
+                    in {SessionEventType.PROFILE_CHANGED, SessionEventType.SESSION_STARTED}
+                ),
+                None,
+            )
+            current = profile.model_dump(mode="json")
+            if previous != current:
+                facts.append(
+                    self._submission_event(
+                        task,
+                        SessionEventType.PROFILE_CHANGED,
+                        payload={"profile": current},
+                    )
+                )
         facts.extend(
             [
                 self._submission_event(

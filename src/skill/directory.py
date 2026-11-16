@@ -47,7 +47,7 @@ class SkillDirectory:
         metadata = self._load_metadata(f"{match.group(1)}\n")
         name = self._required_text(metadata, "name")
         description = self._required_text(metadata, "description")
-        body = text[match.end() :].replace("\r\n", "\n").replace("\r", "\n")
+        body = text[match.end() :]
         return Skill(
             name=name,
             description=description,

@@ -9,12 +9,15 @@ from src.core.loop import Harness
 from src.core.memory import MemoryManager
 from src.core.task import Task
 from src.core.workspace import Workspace
-from src.demo.agent import Agent
+from src.demo.agent import Agent, build_agent_profile
 from src.memory.retriever import HybridRetriever
 from src.memory.store import InMemoryStore
 from src.observability import MetricsEventSink
 from src.persistence import SQLiteTaskRepository
+from src.persistence.in_memory import InMemoryTaskRepository
+from src.schema.execution import SessionEventType
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
+from src.schema.skills import Skill
 from src.schema.task import TaskPauseReason, TaskPlan, TaskResult, TaskRunningReason, TaskState
 from src.schema.tool import ApprovalDecision, Tool, ToolExecutionResult
 from src.tool.tool_executor import DefaultToolExecutor
@@ -301,6 +304,111 @@ def test_open_session_restores_paused_task_and_approval_ownership(tmp_path):
     assert reopened.pending_task.id == paused.id
     assert reopened.pending_message == "run it"
     assert [request.tool_id for request in reopened.approval_requests()] == ["call-1"]
+
+
+def test_agent_profile_is_order_independent_and_excludes_secrets_and_paths(tmp_path):
+    first_tool = Tool("b", "beta", "Beta.", {"type": "object"}, lambda _: "one")
+    second_tool = Tool("a", "alpha", "Alpha.", {"type": "object"}, lambda _: "two")
+    first_tool.workspace = Workspace(tmp_path)
+    settings = {
+        "temperature": 0,
+        "api_key": "super-secret",
+        "api_base": "https://credential.example",
+    }
+
+    first = build_agent_profile(
+        system_prompt="prompt",
+        model_identifier="model",
+        model_settings=settings,
+        skills=[Skill("skill", "desc", "body")],
+        tools=[first_tool, second_tool],
+    )
+    second = build_agent_profile(
+        system_prompt="prompt",
+        model_identifier="model",
+        model_settings=settings,
+        skills=[Skill("skill", "desc", "body")],
+        tools=[second_tool, first_tool],
+    )
+
+    assert first == second
+    serialized = first.model_dump_json()
+    assert "super-secret" not in serialized
+    assert "credential.example" not in serialized
+    assert str(tmp_path) not in serialized
+
+
+def test_agent_profile_preserves_skill_line_ending_differences():
+    common = {
+        "system_prompt": "prompt",
+        "model_identifier": "model",
+        "model_settings": {},
+        "tools": [],
+    }
+
+    lf = build_agent_profile(skills=[Skill("skill", "desc", "one\ntwo")], **common)
+    crlf = build_agent_profile(skills=[Skill("skill", "desc", "one\r\ntwo")], **common)
+
+    assert lf.skills_digest != crlf.skills_digest
+
+
+def test_session_records_initial_profile_and_one_change_before_next_submission():
+    repository = InMemoryTaskRepository()
+    gateway = ChatGateway(["first", "second"])
+    agent = Agent(
+        config=Config(llm="test-model"),
+        llm_gateway=gateway,
+        task_repository=repository,
+    )
+    session = agent.new_session("profile-session")
+    session.chat("one", message_id="message-1")
+    initial_profile = agent.profile
+    agent.tool_registry.register(Tool("new", "new", "New.", {}, lambda _: "new"))
+
+    session.chat("two", message_id="message-2")
+
+    events = repository.events("profile-session")
+    assert events[0].type is SessionEventType.SESSION_STARTED
+    assert events[0].payload["profile"]["id"] == initial_profile.id
+    changes = [event for event in events if event.type is SessionEventType.PROFILE_CHANGED]
+    assert len(changes) == 1
+    second_acceptance = next(
+        event.sequence
+        for event in events
+        if event.type is SessionEventType.SUBMISSION_ACCEPTED
+        and event.payload.get("message") == "two"
+    )
+    assert changes[0].sequence < second_acceptance
+
+
+def test_reopen_appends_profile_change_once_and_unchanged_reopen_adds_none(tmp_path):
+    repository = SQLiteTaskRepository(tmp_path / "profiles.db")
+    first = Agent(
+        config=Config(llm="test-model", max_steps=3),
+        llm_gateway=ChatGateway(["one"]),
+        task_repository=repository,
+    )
+    first.new_session("profile-reopen").chat("one", message_id="message-1")
+    changed = Agent(
+        config=Config(llm="test-model", max_steps=4),
+        llm_gateway=ChatGateway(["two"]),
+        task_repository=repository,
+    )
+    changed.open_session("profile-reopen").chat("two", message_id="message-2")
+    unchanged = Agent(
+        config=Config(llm="test-model", max_steps=4),
+        llm_gateway=ChatGateway(["three"]),
+        task_repository=repository,
+    )
+    unchanged.open_session("profile-reopen").chat("three", message_id="message-3")
+
+    changes = [
+        event
+        for event in repository.events("profile-reopen")
+        if event.type is SessionEventType.PROFILE_CHANGED
+    ]
+    assert len(changes) == 1
+    assert changes[0].payload["profile"]["id"] == changed.profile.id
 
 
 def test_default_composition_shares_one_new_catalog():
