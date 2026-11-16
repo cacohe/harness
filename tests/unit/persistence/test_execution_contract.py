@@ -7,6 +7,7 @@ from src.core.persistence import (
     SubmissionConflictError,
 )
 from src.core.task import Task
+from src.persistence import SQLiteTaskRepository
 from src.persistence.in_memory import InMemoryTaskRepository
 from src.schema.execution import (
     PendingSessionEvent,
@@ -59,8 +60,14 @@ def _task() -> Task:
     )
 
 
-def test_commit_assigns_contiguous_sequences_and_saves_independent_snapshots():
-    repository = InMemoryTaskRepository()
+@pytest.fixture(params=["memory", "sqlite"])
+def repository(request, tmp_path):
+    if request.param == "memory":
+        return InMemoryTaskRepository()
+    return SQLiteTaskRepository(tmp_path / "execution.db")
+
+
+def test_commit_assigns_contiguous_sequences_and_saves_independent_snapshots(repository):
     task = _task()
 
     first = repository.commit(
@@ -86,8 +93,7 @@ def test_commit_assigns_contiguous_sequences_and_saves_independent_snapshots():
     assert repository.events("session-1")[0].payload == {}
 
 
-def test_commit_filters_events_after_sequence_and_returns_independent_events():
-    repository = InMemoryTaskRepository()
+def test_commit_filters_events_after_sequence_and_returns_independent_events(repository):
     repository.commit(_task(), [_event("event-1"), _event("event-2")], expected_sequence=0)
 
     events = repository.events("session-1", after_sequence=1)
@@ -97,8 +103,7 @@ def test_commit_filters_events_after_sequence_and_returns_independent_events():
     assert repository.events("session-1", after_sequence=1)[0].payload == {}
 
 
-def test_stale_sequence_conflict_does_not_change_task_events_or_submission():
-    repository = InMemoryTaskRepository()
+def test_stale_sequence_conflict_does_not_change_task_events_or_submission(repository):
     repository.commit(_task(), [_event("event-1")], expected_sequence=0)
     changed = _task()
     changed.original_input = "must not persist"
@@ -116,8 +121,7 @@ def test_stale_sequence_conflict_does_not_change_task_events_or_submission():
     assert repository.submission("session-1", "message-1") is None
 
 
-def test_submission_conflict_does_not_partially_commit_other_changes():
-    repository = InMemoryTaskRepository()
+def test_submission_conflict_does_not_partially_commit_other_changes(repository):
     repository.commit(_task(), [_event("event-1")], expected_sequence=0, submission=_submission())
     changed = _task()
     changed.original_input = "must not persist"
@@ -135,8 +139,7 @@ def test_submission_conflict_does_not_partially_commit_other_changes():
     assert repository.submission("session-1", "message-1").message_digest == "a" * 64
 
 
-def test_matching_submission_can_advance_state_without_changing_identity():
-    repository = InMemoryTaskRepository()
+def test_matching_submission_can_advance_state_without_changing_identity(repository):
     task = _task()
     created_at = datetime(2026, 11, 16, tzinfo=timezone.utc)
     repository.commit(
@@ -162,8 +165,7 @@ def test_matching_submission_can_advance_state_without_changing_identity():
     assert stored.updated_at == created_at + timedelta(seconds=1)
 
 
-def test_unfinished_returns_only_independent_nonterminal_execution_records():
-    repository = InMemoryTaskRepository()
+def test_unfinished_returns_only_independent_nonterminal_execution_records(repository):
     running = _task()
     running.transition_to_running(TaskRunningReason.TASK_RUNNING_CREATE)
     repository.commit(running, [_event("event-1")], expected_sequence=0)
@@ -191,8 +193,7 @@ def test_unfinished_returns_only_independent_nonterminal_execution_records():
     assert repository.get("task-1").original_input == "work"
 
 
-def test_real_execution_store_requires_an_integer_expected_sequence():
-    repository = InMemoryTaskRepository()
+def test_real_execution_store_requires_an_integer_expected_sequence(repository):
 
     with pytest.raises(TypeError, match="expected_sequence"):
         repository.commit(_task(), [_event("event-1")], expected_sequence=None)
