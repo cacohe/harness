@@ -167,7 +167,7 @@ def _initial_state(state: RunState | None) -> RunState:
             or state.status is not RunStatus.RUNNING
             or type(state.version) is not int
             or state.version != 1
-            or type(state.elapsed_seconds) not in (int, float)
+            or not _is_exact_number(state.elapsed_seconds)
             or state.elapsed_seconds != 0
             or type(state.used_step_ids) is not frozenset
             or state.used_step_ids
@@ -183,7 +183,7 @@ def _initial_state(state: RunState | None) -> RunState:
         if (
             type(limits.max_steps) is not int
             or type(limits.max_inline_result_bytes) is not int
-            or type(elapsed) not in (int, float)
+            or not _is_exact_number(elapsed)
             or not math.isfinite(elapsed)
             or elapsed <= 0
         ):
@@ -200,6 +200,11 @@ def _initial_state(state: RunState | None) -> RunState:
         )
     except (AttributeError, OverflowError, TypeError, ValueError):
         raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+
+
+def _is_exact_number(value: object) -> bool:
+    value_type = type(value)
+    return value_type is int or value_type is float
 
 
 def _same_initial_state(left: RunState, right: RunState) -> bool:

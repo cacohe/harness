@@ -461,6 +461,59 @@ class CompetingJournal(CorruptReceiptJournal):
         return await super().commit(batch, expected_version)
 
 
+@pytest.mark.parametrize("field", ["elapsed_seconds", "max_elapsed_seconds"])
+@pytest.mark.parametrize("cas_loser", [False, True])
+def test_replay_rejects_numbers_with_overloaded_metaclass_equality(
+    field: str, cas_loser: bool
+) -> None:
+    comparisons: list[str] = []
+
+    class ForgedNumberType(type):
+        def __eq__(cls, other: object) -> bool:
+            comparisons.append("type equality")
+            return True
+
+    class ForgedFloat(float, metaclass=ForgedNumberType):
+        def __ne__(self, other: object) -> bool:
+            raise RuntimeError("elapsed value comparison")
+
+        def __le__(self, other: object) -> bool:
+            raise RuntimeError("elapsed limit comparison")
+
+    def corrupt(receipt: SubmissionAcceptance) -> SubmissionAcceptance:
+        if field == "elapsed_seconds":
+            object.__setattr__(receipt.state, field, ForgedFloat(0))
+        else:
+            object.__setattr__(receipt.state.limits, field, ForgedFloat(30))
+        return receipt
+
+    async def scenario() -> None:
+        journal = CompetingJournal()
+        journal.corrupt = corrupt
+        first = service(journal, "first")
+        if cas_loser:
+            journal.synchronize_next_two_commits()
+            results = await asyncio.gather(
+                first.accept(SESSION, "hello", FIRST, PROFILE),
+                service(journal, "second").accept(SESSION, "hello", FIRST, PROFILE),
+                return_exceptions=True,
+            )
+            accepted = [result for result in results if isinstance(result, AcceptedRun)]
+            assert len(accepted) == 1
+            (error,) = [result for result in results if result is not accepted[0]]
+            assert isinstance(error, JournalError)
+        else:
+            await first.accept(SESSION, "hello", FIRST, PROFILE)
+            with pytest.raises(JournalError) as raised:
+                await first.accept(SESSION, "hello", FIRST, PROFILE)
+            error = raised.value
+        assert error.failure.code is RunErrorCode.INVARIANT_VIOLATION
+        assert comparisons == []
+        assert (await journal.load_head(SESSION)).version == 1
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("corrupt", [future_version, other_state])
 def test_cas_loser_cross_checks_receipt_against_refreshed_head(
     corrupt: Callable[[SubmissionAcceptance], SubmissionAcceptance],
