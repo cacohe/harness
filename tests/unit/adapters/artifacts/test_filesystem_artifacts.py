@@ -3,6 +3,9 @@ import errno
 import hashlib
 import os
 import stat
+import subprocess
+import sys
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -16,6 +19,10 @@ def _address(content):
 
 def _object(root, artifact_id):
     return root / artifact_id.removeprefix("sha256:")
+
+
+def _contents(root):
+    return {path for path in root.iterdir() if path.name != ".locks"}
 
 
 async def _chunks(*chunks):
@@ -72,7 +79,7 @@ def test_large_stream_publishes_complete_read_only_object(tmp_path, monkeypatch)
         )
         assert receipt.artifact_id == artifact_id
         assert receipt.name == "CON"
-        assert list(root.iterdir()) == [_object(root, artifact_id)]
+        assert _contents(root) == {_object(root, artifact_id)}
         assert len(list(_object(root, artifact_id).iterdir())) == 2
         for file in _object(root, artifact_id).iterdir():
             assert file.stat().st_mode & stat.S_IWUSR == 0
@@ -128,7 +135,7 @@ def test_concurrent_writers_across_instances_deduplicate(tmp_path):
         )
         assert all(ref == results[0] for ref in results)
         assert results[0] == await repos[0].stat(_address(b"abc"))
-        assert list(tmp_path.iterdir()) == [_object(tmp_path, _address(b"abc"))]
+        assert _contents(tmp_path) == {_object(tmp_path, _address(b"abc"))}
 
     asyncio.run(scenario())
 
@@ -142,16 +149,16 @@ def test_atomic_rename_loser_returns_the_other_publishers_receipt(tmp_path, monk
         winner = await other.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
         real_rename = os.rename
 
-        def rename_with_winner(source, target):
-            real_rename(_object(other_root, winner.artifact_id), target)
-            real_rename(source, target)
+        def rename_with_winner(source, target, *args, **kwargs):
+            real_rename(_object(other_root, winner.artifact_id), root / os.path.basename(target))
+            real_rename(source, target, *args, **kwargs)
 
         with monkeypatch.context() as patch:
             patch.setattr(os, "rename", rename_with_winner)
             result = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
         assert result == winner == await repo.stat(winner.artifact_id)
         assert await _read(repo, winner.artifact_id) == b"abc"
-        assert list(root.iterdir()) == [_object(root, winner.artifact_id)]
+        assert _contents(root) == {_object(root, winner.artifact_id)}
 
     asyncio.run(scenario())
 
@@ -181,7 +188,7 @@ def test_conflicting_descriptor_preserves_first_complete_publication(tmp_path):
             await pending
         assert await second_repo.stat(first.artifact_id) == first
         assert await _read(second_repo, first.artifact_id) == b"abc"
-        assert list(tmp_path.iterdir()) == [_object(tmp_path, first.artifact_id)]
+        assert _contents(tmp_path) == {_object(tmp_path, first.artifact_id)}
 
     asyncio.run(scenario())
 
@@ -214,7 +221,7 @@ def test_invalid_stream_preserves_other_entries(tmp_path, chunk, request_kwargs,
 
         assert await repo.stat(_address(b"abc")) is None
         assert await _read(repo, prior.artifact_id) == b"ok"
-        assert set(tmp_path.iterdir()) == {other_temp, _object(tmp_path, prior.artifact_id)}
+        assert _contents(tmp_path) == {other_temp, _object(tmp_path, prior.artifact_id)}
 
     asyncio.run(scenario())
 
@@ -231,7 +238,7 @@ def test_invalid_request_is_rejected_before_reading_stream(tmp_path):
         object.__setattr__(request, "name", "../escaped")
         with pytest.raises(ValueError):
             await repo.put(request)
-        assert not list(tmp_path.iterdir())
+        assert not _contents(tmp_path)
 
     asyncio.run(scenario())
 
@@ -246,7 +253,7 @@ def test_iterator_error_removes_own_partial_write(tmp_path):
 
         with pytest.raises(RuntimeError, match="error from source"):
             await repo.put(ArtifactWrite(broken(), "text/plain"))
-        assert not list(tmp_path.iterdir())
+        assert not _contents(tmp_path)
 
     asyncio.run(scenario())
 
@@ -272,7 +279,7 @@ def test_cancelled_put_removes_own_partial_write(tmp_path, suppress):
         pending.cancel()
         with pytest.raises(asyncio.CancelledError):
             await pending
-        assert not list(tmp_path.iterdir())
+        assert not _contents(tmp_path)
 
     asyncio.run(scenario())
 
@@ -292,7 +299,7 @@ def test_filesystem_failure_hides_path_and_removes_only_staging(tmp_path, monkey
                 await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
         assert str(tmp_path) not in str(caught.value)
         assert caught.value.__cause__ is None
-        assert list(tmp_path.iterdir()) == [_object(tmp_path, prior.artifact_id)]
+        assert _contents(tmp_path) == {_object(tmp_path, prior.artifact_id)}
         assert await _read(repo, prior.artifact_id) == b"ok"
 
     asyncio.run(scenario())
@@ -405,7 +412,7 @@ def test_staged_data_replacement_cannot_publish_a_ref(tmp_path, monkeypatch):
                 await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
         assert replaced
         assert await repo.stat(_address(b"abc")) is None
-        assert {path.name for path in tmp_path.iterdir()} == {"displaced-data"}
+        assert {path.name for path in _contents(tmp_path)} == {"displaced-data"}
 
     asyncio.run(scenario())
 
@@ -470,7 +477,7 @@ def test_cancelled_read_and_early_close_allow_deletion(tmp_path):
         with pytest.raises(asyncio.CancelledError):
             await pending
         await repo.delete(ref.artifact_id)
-        assert not list(tmp_path.iterdir())
+        assert not _contents(tmp_path)
 
     asyncio.run(scenario())
 
@@ -532,5 +539,305 @@ def test_orphan_collection_requires_an_exact_utc_cutoff(tmp_path, threshold):
         repo = FilesystemArtifactRepository(tmp_path, 3)
         with pytest.raises(ValueError):
             await repo.collect_orphans([], threshold)
+
+    asyncio.run(scenario())
+
+
+def test_deduplicated_put_refreshes_the_orphan_grace_period(tmp_path):
+    async def scenario():
+        repo = FilesystemArtifactRepository(tmp_path, 3)
+        ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
+        cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+        old = int((cutoff - timedelta(days=1)).timestamp())
+        os.utime(_object(tmp_path, ref.artifact_id), (old, old))
+
+        duplicate = await repo.put(ArtifactWrite(_chunks(b"a", b"bc"), "text/plain"))
+        assert duplicate == ref
+        assert await repo.collect_orphans([], cutoff) == 0
+        assert await _read(repo, ref.artifact_id) == b"abc"
+
+    asyncio.run(scenario())
+
+
+def test_open_reports_same_size_disk_corruption_on_full_consumption(tmp_path):
+    async def scenario():
+        repo = FilesystemArtifactRepository(tmp_path, 3)
+        ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
+        data = _object(tmp_path, ref.artifact_id) / "data"
+        os.chmod(data, stat.S_IWRITE)
+        data.write_bytes(b"bad")
+        os.chmod(data, stat.S_IREAD)
+
+        with pytest.raises(ArtifactRepositoryError, match="SHA-256"):
+            await _read(repo, ref.artifact_id)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("recovery", ["delete", "gc"])
+def test_tombstone_cleanup_is_retryable(tmp_path, monkeypatch, recovery):
+    async def scenario():
+        repo = FilesystemArtifactRepository(tmp_path, 3)
+        ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
+        original_unlink = os.unlink
+
+        def block_descriptor(path, *args, **kwargs):
+            if os.fspath(path).endswith("descriptor.json"):
+                raise PermissionError(errno.EACCES, "transient failure")
+            return original_unlink(path, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "unlink", block_descriptor)
+            with pytest.raises(ArtifactRepositoryError):
+                await repo.delete(ref.artifact_id)
+        assert await repo.stat(ref.artifact_id) is None
+        assert list(tmp_path.glob(".delete-*"))
+
+        if recovery == "gc":
+            assert await repo.collect_orphans([], datetime.now(timezone.utc)) == 1
+        else:
+            await repo.delete(ref.artifact_id)
+        assert not list(tmp_path.glob(".delete-*"))
+
+    asyncio.run(scenario())
+
+
+def test_delete_rolls_back_a_replacement_captured_at_rename(tmp_path, monkeypatch):
+    async def scenario():
+        root = tmp_path / "repo"
+        replacement_root = tmp_path / "replacement"
+        repo = FilesystemArtifactRepository(root, 3)
+        other = FilesystemArtifactRepository(replacement_root, 3)
+        ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="old"))
+        replacement = await other.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="new"))
+        object_path = _object(root, ref.artifact_id)
+        actual_rename = os.rename
+
+        def substitute(source, target, *args, **kwargs):
+            if os.path.basename(source) == object_path.name:
+                actual_rename(object_path, tmp_path / "displaced")
+                actual_rename(_object(replacement_root, ref.artifact_id), object_path)
+            return actual_rename(source, target, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "rename", substitute)
+            with pytest.raises(ArtifactRepositoryError):
+                await repo.delete(ref.artifact_id)
+        assert await repo.stat(ref.artifact_id) == replacement
+        assert await _read(repo, ref.artifact_id) == b"abc"
+
+    asyncio.run(scenario())
+
+
+def test_gc_preserves_an_object_refreshed_immediately_before_capture(tmp_path, monkeypatch):
+    async def scenario():
+        repo = FilesystemArtifactRepository(tmp_path, 3)
+        ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
+        final = _object(tmp_path, ref.artifact_id)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+        old = int((cutoff - timedelta(days=1)).timestamp())
+        os.utime(final, (old, old))
+        actual_rename = os.rename
+
+        def refresh_lease(source, target, *args, **kwargs):
+            if os.path.basename(source) == final.name:
+                os.utime(final, None)
+            return actual_rename(source, target, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "rename", refresh_lease)
+            assert await repo.collect_orphans([], cutoff) == 0
+        assert await repo.stat(ref.artifact_id) == ref
+        assert _contents(tmp_path) == {final}
+
+    asyncio.run(scenario())
+
+
+def test_failed_rollback_does_not_allow_gc_to_remove_the_replacement(tmp_path, monkeypatch):
+    async def scenario():
+        root = tmp_path / "repo"
+        other_root = tmp_path / "replacement"
+        repo = FilesystemArtifactRepository(root, 3)
+        other = FilesystemArtifactRepository(other_root, 3)
+        ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="old"))
+        replacement = await other.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="new"))
+        actual_rename = os.rename
+
+        def substitute(source, target, *args, **kwargs):
+            source_name = os.path.basename(source)
+            if source_name == ref.artifact_id[7:]:
+                final = _object(root, ref.artifact_id)
+                actual_rename(final, tmp_path / "displaced")
+                actual_rename(_object(other_root, ref.artifact_id), final)
+            elif source_name.startswith(".delete-"):
+                raise PermissionError(errno.EACCES, "temporarily unable to restore")
+            return actual_rename(source, target, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "rename", substitute)
+            with pytest.raises(ArtifactRepositoryError):
+                await repo.delete(ref.artifact_id)
+        assert await repo.collect_orphans([], datetime.now(timezone.utc) - timedelta(days=1)) == 0
+        assert await repo.stat(ref.artifact_id) is None
+        (tombstone,) = root.glob(".delete-*")
+        assert (tombstone / "data").read_bytes() == b"abc"
+        assert replacement.name.encode() in (tombstone / "descriptor.json").read_bytes()
+
+    asyncio.run(scenario())
+
+
+def test_cancel_during_publication_waits_for_rename_and_leaves_collectible_object(
+    tmp_path, monkeypatch
+):
+    async def scenario():
+        repo = FilesystemArtifactRepository(tmp_path, 3)
+        entered = threading.Event()
+        release = threading.Event()
+        actual_rename = os.rename
+
+        def pause_rename(source, target, *args, **kwargs):
+            if os.path.basename(source).startswith(".put-"):
+                entered.set()
+                assert release.wait(timeout=15)
+            return actual_rename(source, target, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "rename", pause_rename)
+            pending = asyncio.create_task(repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain")))
+            try:
+                assert await asyncio.to_thread(entered.wait, 10)
+                pending.cancel()
+                await asyncio.sleep(0)
+                assert not pending.done()
+            finally:
+                release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        assert await _read(repo, _address(b"abc")) == b"abc"
+        assert await repo.collect_orphans([], datetime.now(timezone.utc) + timedelta(days=1)) == 1
+
+    asyncio.run(scenario())
+
+
+def test_cleanup_does_not_follow_tombstone_directory_substitution(tmp_path, monkeypatch):
+    async def scenario():
+        root = tmp_path / "repository"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        victim = outside / "data"
+        victim.write_bytes(b"keep")
+        repo = FilesystemArtifactRepository(root, 3)
+        ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
+        original_unlink = os.unlink
+
+        def substitute_before_unlink(path, *args, **kwargs):
+            tombstone = next(root.glob(".delete-*"), None)
+            if tombstone and os.path.basename(path) == "data":
+                tombstone.rename(tmp_path / "displaced")
+                _junction(tombstone, outside)
+            return original_unlink(path, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "unlink", substitute_before_unlink)
+            try:
+                await repo.delete(ref.artifact_id)
+            except ArtifactRepositoryError:
+                pass
+        assert victim.read_bytes() == b"keep"
+
+    asyncio.run(scenario())
+
+
+def test_publication_and_failure_cleanup_do_not_run_on_event_loop(tmp_path, monkeypatch):
+    async def scenario():
+        repo = FilesystemArtifactRepository(tmp_path, 3)
+        real_rename = os.rename
+        real_unlink = os.unlink
+        loop_thread = threading.get_ident()
+        rename_threads = []
+        unlink_threads = []
+
+        def rename(source, target, *args, **kwargs):
+            rename_threads.append(threading.get_ident())
+            return real_rename(source, target, *args, **kwargs)
+
+        def unlink(path, *args, **kwargs):
+            unlink_threads.append(threading.get_ident())
+            return real_unlink(path, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "rename", rename)
+            patch.setattr(os, "unlink", unlink)
+            await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
+            with pytest.raises(ValueError):
+                await repo.put(ArtifactWrite(_chunks(b"x"), "text/plain", expected_size_bytes=2))
+        assert rename_threads and loop_thread not in rename_threads
+        assert unlink_threads and loop_thread not in unlink_threads
+
+    asyncio.run(scenario())
+
+
+def test_independent_process_waits_for_an_in_progress_delete(tmp_path, monkeypatch):
+    child = """
+import asyncio
+import sys
+from pathlib import Path
+from src.adapters.artifacts.filesystem import FilesystemArtifactRepository
+from src.core.artifacts import ArtifactWrite
+
+async def chunks():
+    yield b"abc"
+
+class SignalingRepository(FilesystemArtifactRepository):
+    def _publish(self, *args, **kwargs):
+        print("waiting", flush=True)
+        return super()._publish(*args, **kwargs)
+
+async def main():
+    repo = SignalingRepository(Path(sys.argv[1]), 3)
+    await repo.put(ArtifactWrite(chunks(), "text/plain", name="replacement"))
+    print("published", flush=True)
+
+asyncio.run(main())
+"""
+
+    async def scenario():
+        repo = FilesystemArtifactRepository(tmp_path, 3)
+        ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="initial"))
+        real_rename = os.rename
+        observed = []
+        processes = []
+
+        def pause_delete(source, target, *args, **kwargs):
+            if os.path.basename(source) == ref.artifact_id[7:]:
+                process = subprocess.Popen(
+                    [sys.executable, "-c", child, str(tmp_path)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                processes.append(process)
+                assert process.stdout is not None
+                assert process.stdout.readline().strip() == "waiting"
+                try:
+                    observed.append(process.wait(timeout=0.8))
+                except subprocess.TimeoutExpired:
+                    observed.append("blocked")
+            return real_rename(source, target, *args, **kwargs)
+
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(os, "rename", pause_delete)
+                await repo.delete(ref.artifact_id)
+            assert observed == ["blocked"]
+            out, error = processes[0].communicate(timeout=10)
+            assert processes[0].returncode == 0, error
+            assert out.strip() == "published"
+            assert (await repo.stat(ref.artifact_id)).name == "replacement"
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate()
 
     asyncio.run(scenario())

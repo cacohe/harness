@@ -4,6 +4,7 @@ import asyncio
 import errno
 import json
 import os
+import re
 import stat
 from collections.abc import AsyncGenerator, Callable, Collection, Iterator
 from contextlib import contextmanager
@@ -11,11 +12,22 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
-from tempfile import mkdtemp
-from threading import Lock
+from threading import Event
 from typing import TypeVar
 from uuid import uuid4
 
+from src.adapters.artifacts.filesystem_platform import (
+    ArtifactRepositoryError as ArtifactRepositoryError,
+)
+from src.adapters.artifacts.filesystem_platform import (
+    Directory,
+    directory_info,
+    object_lock,
+    pin_root,
+    regular_file,
+    same_entry,
+    same_file,
+)
 from src.core.artifacts import (
     MAX_ARTIFACT_SIZE_BYTES,
     ArtifactRef,
@@ -28,16 +40,13 @@ _CHUNK_BYTES = 65_536
 _DESCRIPTOR_BYTES = 65_536 + 1024
 _DATA = "data"
 _DESCRIPTOR = "descriptor.json"
-_BINARY = getattr(os, "O_BINARY", 0)
-_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_MEMBERS = {_DATA, _DESCRIPTOR}
+_RETIRED = ".retired"
+_RETIRED_MEMBERS = _MEMBERS | {_RETIRED}
+_LOCKS = ".locks"
+_TOMBSTONE = re.compile(r"\.delete-([0-9a-f]{64})-[0-9a-f]{32}")
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-_OBJECT_LOCK = Lock()
 _T = TypeVar("_T")
-
-
-class ArtifactRepositoryError(RuntimeError):
-    """A storage failure or an invalid on-disk artifact."""
 
 
 @dataclass(frozen=True)
@@ -48,6 +57,18 @@ class _Object:
     ref: ArtifactRef
 
 
+@dataclass
+class _Stage:
+    name: str
+    directory: os.stat_result | None = None
+    fd: int | None = None
+
+    def close(self) -> None:
+        fd, self.fd = self.fd, None
+        if fd is not None:
+            os.close(fd)
+
+
 @contextmanager
 def _repository_io() -> Iterator[None]:
     try:
@@ -56,12 +77,14 @@ def _repository_io() -> Iterator[None]:
         raise ArtifactRepositoryError("Artifact filesystem operation failed") from None
 
 
-async def _finish_io(operation: Callable[[], _T]) -> _T:
+async def _finish_io(operation: Callable[[], _T], cancel: Event | None = None) -> _T:
     """Wait for an in-flight I/O operation before its caller closes or cleans up."""
     pending = asyncio.create_task(asyncio.to_thread(operation))
     try:
         return await asyncio.shield(pending)
     except asyncio.CancelledError:
+        if cancel is not None:
+            cancel.set()
         while not pending.done():
             try:
                 await asyncio.shield(pending)
@@ -72,64 +95,6 @@ async def _finish_io(operation: Callable[[], _T]) -> _T:
         if not pending.cancelled():
             pending.exception()
         raise
-
-
-def _entry(path: Path, expected_type: Callable[[int], bool]) -> os.stat_result:
-    info = path.lstat()
-    if not expected_type(info.st_mode) or (
-        getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
-    ):
-        raise ArtifactRepositoryError("Invalid artifact filesystem entry")
-    return info
-
-
-def _same_entry(current: os.stat_result, expected: os.stat_result) -> None:
-    if not os.path.samestat(current, expected):
-        raise ArtifactRepositoryError("Artifact filesystem entry changed")
-
-
-def _same_file(current: os.stat_result, expected: os.stat_result) -> None:
-    _same_entry(current, expected)
-    if (
-        current.st_nlink != 1
-        or current.st_size != expected.st_size
-        or current.st_mtime_ns != expected.st_mtime_ns
-        or current.st_mode != expected.st_mode
-    ):
-        raise ArtifactRepositoryError("Artifact file changed")
-
-
-def _read_fd(path: Path) -> int:
-    if os.name != "nt":
-        return os.open(path, os.O_RDONLY | _BINARY | _NOFOLLOW)
-
-    import _winapi
-    import msvcrt
-
-    generic_read = 0x80000000
-    share_read = 0x01
-    open_existing = 3
-    open_reparse_point = 0x00200000
-    handle = _winapi.CreateFile(
-        str(path), generic_read, share_read, 0, open_existing, open_reparse_point, 0
-    )
-    try:
-        return msvcrt.open_osfhandle(handle, os.O_RDONLY | _BINARY)
-    except BaseException:
-        _winapi.CloseHandle(handle)
-        raise
-
-
-@contextmanager
-def _open_file(path: Path, expected: os.stat_result) -> Iterator[int]:
-    _same_file(_entry(path, stat.S_ISREG), expected)
-    fd = _read_fd(path)
-    try:
-        _same_file(os.fstat(fd), expected)
-        _same_file(_entry(path, stat.S_ISREG), expected)
-        yield fd
-    finally:
-        os.close(fd)
 
 
 def _write_bytes(fd: int, content: memoryview) -> None:
@@ -185,30 +150,102 @@ def _validated_write(request: ArtifactWrite) -> ArtifactWrite:
         raise ValueError("Invalid artifact write request") from None
 
 
-def _sync_directory(directory: Path) -> None:
-    # Windows does not support opening directory fds through os.open.
-    if os.name != "nt":
-        fd = os.open(directory, os.O_RDONLY | _DIRECTORY | _NOFOLLOW)
+def _members(directory: Directory, allowed: set[str] = _MEMBERS) -> set[str]:
+    with directory.entries() as entries:
+        members = {member.name for _, member in zip(range(len(allowed) + 1), entries)}
+    if not members <= allowed:
+        raise ArtifactRepositoryError("Invalid artifact object members")
+    return members
+
+
+def _descriptor(directory: Directory, info: os.stat_result, artifact_id: str) -> ArtifactRef:
+    if info.st_size > _DESCRIPTOR_BYTES:
+        raise ArtifactRepositoryError("Invalid artifact descriptor file")
+    with directory.read(_DESCRIPTOR, info) as fd:
+        content = bytearray()
+        while len(content) <= _DESCRIPTOR_BYTES:
+            block = os.read(fd, min(_CHUNK_BYTES, _DESCRIPTOR_BYTES + 1 - len(content)))
+            if not block:
+                break
+            content.extend(block)
+        same_file(os.fstat(fd), info)
+    if len(content) != info.st_size:
+        raise ArtifactRepositoryError("Invalid artifact descriptor file")
+    return _decode_descriptor(bytes(content), artifact_id)
+
+
+def _load(root: Directory, name: str, artifact_id: str) -> _Object | None:
+    try:
+        info = directory_info(root.stat(name))
+    except FileNotFoundError:
+        return None
+    with root.child(name, info) as directory:
+        if _members(directory) != _MEMBERS:
+            raise ArtifactRepositoryError("Invalid artifact object members")
+        descriptor = regular_file(directory.stat(_DESCRIPTOR))
+        data = regular_file(directory.stat(_DATA))
+        if (descriptor.st_mode | data.st_mode) & stat.S_IWUSR:
+            raise ArtifactRepositoryError("Artifact object is writable")
+        ref = _descriptor(directory, descriptor, artifact_id)
+        if data.st_size != ref.size_bytes:
+            raise ArtifactRepositoryError("Invalid artifact data file")
+        return _Object(directory.info, descriptor, data, ref)
+
+
+def _check_object(current: _Object | None, expected: _Object) -> _Object:
+    if current is None or current.ref != expected.ref:
+        raise ArtifactRepositoryError("Artifact object changed")
+    same_entry(current.directory, expected.directory)
+    same_file(current.data, expected.data)
+    same_file(current.descriptor, expected.descriptor)
+    return current
+
+
+def _restore(root: Directory, captured: str, original: str) -> None:
+    try:
+        root.stat(original)
+    except FileNotFoundError:
         try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+            root.rename(captured, original)
+            root.sync()
+            return
+        except OSError:
+            pass
+    raise ArtifactRepositoryError("Could not restore captured artifact")
 
 
-def _seal_file(path: Path, fd: int) -> None:
-    if hasattr(os, "fchmod"):
-        os.fchmod(fd, stat.S_IRUSR)
-    else:
-        _same_entry(_entry(path, stat.S_ISREG), os.fstat(fd))
-        os.chmod(path, stat.S_IREAD)
-    os.fsync(fd)
+def _remove_directory(
+    root: Directory,
+    name: str,
+    info: os.stat_result,
+    *,
+    artifact_id: str | None = None,
+) -> None:
+    with root.child(name, info) as directory:
+        members = _members(directory, _RETIRED_MEMBERS if artifact_id is not None else _MEMBERS)
+        entries = {member: regular_file(directory.stat(member)) for member in members}
+        if artifact_id is not None and members:
+            marker = entries.get(_RETIRED)
+            if marker is None or marker.st_size != 0 or members == {_DATA, _RETIRED}:
+                raise ArtifactRepositoryError("Invalid artifact tombstone")
+            if _DESCRIPTOR in members:
+                ref = _descriptor(directory, entries[_DESCRIPTOR], artifact_id)
+                if _DATA in members and entries[_DATA].st_size != ref.size_bytes:
+                    raise ArtifactRepositoryError("Invalid artifact tombstone data")
+        for member in (_DATA, _DESCRIPTOR, _RETIRED):
+            if member in entries:
+                directory.unlink(member, entries[member])
+    same_entry(directory_info(root.stat(name)), info)
+    root.rmdir(name)
+    root.sync()
 
 
 class FilesystemArtifactRepository:
-    """Store immutable artifacts as directories beneath a fixed local root.
+    """Immutable local artifacts in a root writable exclusively by the adapter.
 
-    Each read chunk belongs to the object first observed by the reader. Deletion
-    between chunks stops the reader, even if the same address is recreated.
+    Processes using this repository coordinate by digest. Each read chunk belongs
+    to the object first observed by the reader. A fully consumed stream verifies
+    its SHA-256. Deletion between chunks stops a reader of the deleted object.
     """
 
     def __init__(self, root: Path, max_artifact_bytes: int) -> None:
@@ -224,121 +261,95 @@ class FilesystemArtifactRepository:
             except RuntimeError:
                 raise ArtifactRepositoryError("Invalid artifact repository root") from None
             self._root.mkdir(mode=0o700, parents=True, exist_ok=True)
-            self._root_info = _entry(self._root, stat.S_ISDIR)
-
-    def _check_root(self) -> None:
-        _same_entry(_entry(self._root, stat.S_ISDIR), self._root_info)
-        if self._root.resolve(strict=True) != self._root:
-            raise ArtifactRepositoryError("Artifact repository root changed")
-
-    def _object_path(self, artifact_id: str) -> Path:
-        validate_artifact_id(artifact_id)
-        return self._root / artifact_id[7:]
-
-    def _check_directory(self, path: Path, expected: os.stat_result) -> None:
-        self._check_root()
-        if path.parent != self._root:
-            raise ArtifactRepositoryError("Invalid artifact object directory")
-        _same_entry(_entry(path, stat.S_ISDIR), expected)
-        resolved = path.resolve(strict=True)
-        if resolved != path or resolved.name != path.name:
-            raise ArtifactRepositoryError("Invalid artifact object directory")
-
-    def _check_members(self, path: Path) -> None:
-        with os.scandir(path) as entries:
-            if {member.name for _, member in zip(range(3), entries)} != {_DATA, _DESCRIPTOR}:
-                raise ArtifactRepositoryError("Invalid artifact object members")
-
-    def _load(self, path: Path, artifact_id: str) -> _Object | None:
-        self._check_root()
-        try:
-            directory = _entry(path, stat.S_ISDIR)
-        except FileNotFoundError:
-            return None
-        self._check_directory(path, directory)
-        self._check_members(path)
-        descriptor_path = path / _DESCRIPTOR
-        descriptor = _entry(descriptor_path, stat.S_ISREG)
-        if (
-            descriptor.st_size > _DESCRIPTOR_BYTES
-            or descriptor.st_nlink != 1
-            or descriptor.st_mode & stat.S_IWUSR
-        ):
-            raise ArtifactRepositoryError("Invalid artifact descriptor file")
-        with _open_file(descriptor_path, descriptor) as fd:
-            self._check_directory(path, directory)
-            content = bytearray()
-            while len(content) <= _DESCRIPTOR_BYTES:
-                block = os.read(fd, min(_CHUNK_BYTES, _DESCRIPTOR_BYTES + 1 - len(content)))
-                if not block:
-                    break
-                content.extend(block)
-            _same_file(os.fstat(fd), descriptor)
-        if len(content) != descriptor.st_size:
-            raise ArtifactRepositoryError("Invalid artifact descriptor file")
-
-        ref = _decode_descriptor(bytes(content), artifact_id)
-        data = _entry(path / _DATA, stat.S_ISREG)
-        if data.st_size != ref.size_bytes or data.st_nlink != 1 or data.st_mode & stat.S_IWUSR:
-            raise ArtifactRepositoryError("Invalid artifact data file")
-        self._check_directory(path, directory)
-        return _Object(directory, descriptor, data, ref)
-
-    def _write_descriptor(
-        self, directory: Path, info: os.stat_result, ref: ArtifactRef
-    ) -> os.stat_result:
-        self._check_directory(directory, info)
-        path = directory / _DESCRIPTOR
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _BINARY | _NOFOLLOW, 0o600)
-        try:
-            content = memoryview(_encode_descriptor(ref))
-            for offset in range(0, len(content), _CHUNK_BYTES):
-                _write_bytes(fd, content[offset : offset + _CHUNK_BYTES])
-            _seal_file(path, fd)
-            return os.fstat(fd)
-        finally:
-            os.close(fd)
-
-    def _publish(self, staging: Path, obj: _Object) -> bool:
-        artifact_id = obj.ref.artifact_id
-        path = self._object_path(artifact_id)
-        with _OBJECT_LOCK:
-            existing = self._load(path, artifact_id)
-            if existing is None:
-                self._check_directory(staging, obj.directory)
-                self._check_members(staging)
-                _same_file(_entry(staging / _DATA, stat.S_ISREG), obj.data)
-                _same_file(_entry(staging / _DESCRIPTOR, stat.S_ISREG), obj.descriptor)
-                _sync_directory(staging)
+            self._root_info = directory_info(self._root.lstat())
+            with pin_root(self._root, self._root_info) as directory:
                 try:
-                    os.rename(staging, path)
+                    directory.mkdir(_LOCKS)
+                except FileExistsError:
+                    pass
+                self._locks_info = directory_info(directory.stat(_LOCKS))
+
+    @contextmanager
+    def _pinned_root(self) -> Iterator[Directory]:
+        with pin_root(self._root, self._root_info) as root:
+            yield root
+
+    @contextmanager
+    def _locked(self, root: Directory, digest: str) -> Iterator[None]:
+        with root.child(_LOCKS, self._locks_info) as locks, object_lock(locks, digest):
+            yield
+
+    def _start(self, stage: _Stage) -> int:
+        with self._pinned_root() as root:
+            root.mkdir(stage.name)
+            stage.directory = directory_info(root.stat(stage.name))
+            with root.child(stage.name, stage.directory) as directory:
+                stage.fd = directory.open(_DATA, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+                return stage.fd
+
+    def _seal_data(self, stage: _Stage, fd: int) -> os.stat_result:
+        assert stage.directory is not None
+        with self._pinned_root() as root, root.child(stage.name, stage.directory) as directory:
+            same_entry(regular_file(directory.stat(_DATA)), regular_file(os.fstat(fd)))
+            directory.set_mode(_DATA, fd, stat.S_IRUSR)
+            os.fsync(fd)
+            return os.fstat(fd)
+
+    def _describe(self, stage: _Stage, ref: ArtifactRef) -> os.stat_result:
+        assert stage.directory is not None
+        with self._pinned_root() as root, root.child(stage.name, stage.directory) as directory:
+            fd = directory.open(_DESCRIPTOR, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            try:
+                content = memoryview(_encode_descriptor(ref))
+                for offset in range(0, len(content), _CHUNK_BYTES):
+                    _write_bytes(fd, content[offset : offset + _CHUNK_BYTES])
+                directory.set_mode(_DESCRIPTOR, fd, stat.S_IRUSR)
+                os.fsync(fd)
+                return os.fstat(fd)
+            finally:
+                os.close(fd)
+
+    def _publish(self, stage: _Stage, obj: _Object, cancel: Event) -> None:
+        digest = obj.ref.sha256
+        with self._pinned_root() as root, self._locked(root, digest):
+            if cancel.is_set():
+                return
+            existing = _load(root, digest, obj.ref.artifact_id)
+            if existing is None:
+                _check_object(_load(root, stage.name, obj.ref.artifact_id), obj)
+                with root.child(stage.name, obj.directory, writable=True) as directory:
+                    directory.refresh()
+                if cancel.is_set():
+                    return
+                try:
+                    root.rename(stage.name, digest)
                 except OSError:
-                    # Another process can publish a complete directory before rename.
-                    existing = self._load(path, artifact_id)
+                    existing = _load(root, digest, obj.ref.artifact_id)
                     if existing is None:
                         raise
                 else:
-                    _sync_directory(self._root)
-                    return True
+                    try:
+                        _check_object(_load(root, digest, obj.ref.artifact_id), obj)
+                    except (OSError, ArtifactRepositoryError):
+                        _restore(root, digest, stage.name)
+                        raise ArtifactRepositoryError("Published artifact changed") from None
+                    root.sync()
+                    return
             if existing.ref != obj.ref:
                 raise ValueError("Artifact descriptor conflict for content address")
-            return False
+            with root.child(digest, existing.directory, writable=True) as directory:
+                directory.refresh()
 
-    def _remove_directory(self, path: Path, info: os.stat_result) -> None:
-        self._check_directory(path, info)
-        for name in (_DATA, _DESCRIPTOR):
-            member = path / name
+    def _discard(self, stage: _Stage) -> None:
+        stage.close()
+        if stage.directory is None:
+            return
+        with self._pinned_root() as root:
             try:
-                member_info = _entry(member, stat.S_ISREG)
+                root.stat(stage.name)
             except FileNotFoundError:
-                continue
-            if member_info.st_nlink != 1:
-                raise ArtifactRepositoryError("Invalid artifact filesystem entry")
-            self._check_directory(path, info)
-            if os.name == "nt" and not member_info.st_mode & stat.S_IWUSR:
-                os.chmod(member, stat.S_IWRITE)
-            member.unlink()
-        path.rmdir()
+                return
+            _remove_directory(root, stage.name, stage.directory)
 
     async def put(self, request: ArtifactWrite) -> ArtifactRef:
         await asyncio.sleep(0)
@@ -357,48 +368,34 @@ class FilesystemArtifactRepository:
                 raise ValueError("Expected artifact size exceeds the repository write limit")
             limit = expected_size
 
+        stage = _Stage(".put-" + uuid4().hex)
         with _repository_io():
-            self._check_root()
-            staging = Path(mkdtemp(prefix=".put-", dir=self._root))
-            info = _entry(staging, stat.S_ISDIR)
             try:
-                self._check_directory(staging, info)
-                path = staging / _DATA
-                fd = os.open(
-                    path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _BINARY | _NOFOLLOW, 0o600
-                )
-                try:
-                    size = 0
-                    digest = sha256()
-                    async for chunk in request.stream:
-                        check_cancellation()
-                        if type(chunk) is not bytes:
-                            raise ValueError("Artifact stream chunks must be exact bytes")
-                        size += len(chunk)
-                        if size > limit:
-                            raise ValueError(
-                                "Artifact stream exceeds its write limit or expected size"
-                            )
-                        if not chunk:
-                            await asyncio.sleep(0)
-                        for offset in range(0, len(chunk), _CHUNK_BYTES):
-                            view = memoryview(chunk)[offset : offset + _CHUNK_BYTES]
-                            digest.update(view)
-                            await _finish_io(lambda: _write_bytes(fd, view))
-
+                fd = await _finish_io(lambda: self._start(stage))
+                size = 0
+                digest = sha256()
+                async for chunk in request.stream:
                     check_cancellation()
-                    checksum = digest.hexdigest()
-                    if expected_size is not None and size != expected_size:
-                        raise ValueError("Artifact stream size does not match the expected size")
-                    if request.expected_sha256 is not None and request.expected_sha256 != checksum:
-                        raise ValueError(
-                            "Artifact stream SHA-256 does not match the expected digest"
-                        )
-                    await _finish_io(lambda: _seal_file(path, fd))
-                    data = os.fstat(fd)
-                finally:
-                    os.close(fd)
+                    if type(chunk) is not bytes:
+                        raise ValueError("Artifact stream chunks must be exact bytes")
+                    size += len(chunk)
+                    if size > limit:
+                        raise ValueError("Artifact stream exceeds its write limit or expected size")
+                    if not chunk:
+                        await asyncio.sleep(0)
+                    for offset in range(0, len(chunk), _CHUNK_BYTES):
+                        view = memoryview(chunk)[offset : offset + _CHUNK_BYTES]
+                        digest.update(view)
+                        await _finish_io(lambda: _write_bytes(fd, view))
 
+                check_cancellation()
+                checksum = digest.hexdigest()
+                if expected_size is not None and size != expected_size:
+                    raise ValueError("Artifact stream size does not match the expected size")
+                if request.expected_sha256 is not None and request.expected_sha256 != checksum:
+                    raise ValueError("Artifact stream SHA-256 does not match the expected digest")
+                data = await _finish_io(lambda: self._seal_data(stage, fd))
+                await _finish_io(stage.close)
                 ref = ArtifactRef(
                     artifact_id_from_sha256(checksum),
                     request.media_type,
@@ -407,77 +404,115 @@ class FilesystemArtifactRepository:
                     request.name,
                     request.metadata,
                 )
-                descriptor = await _finish_io(lambda: self._write_descriptor(staging, info, ref))
+                descriptor = await _finish_io(lambda: self._describe(stage, ref))
                 check_cancellation()
-                if self._publish(staging, _Object(info, descriptor, data, ref)):
-                    return ref
+                assert stage.directory is not None
+                obj = _Object(stage.directory, descriptor, data, ref)
+                cancel = Event()
+                await _finish_io(lambda: self._publish(stage, obj, cancel), cancel)
             except BaseException:
                 try:
-                    self._remove_directory(staging, info)
+                    await _finish_io(lambda: self._discard(stage))
                 except (OSError, ArtifactRepositoryError):
                     # The original failure takes precedence over cleanup failure.
                     pass
                 raise
-            self._remove_directory(staging, info)
+            await _finish_io(lambda: self._discard(stage))
             return ref
 
+    def _find(self, digest: str, artifact_id: str) -> _Object | None:
+        with self._pinned_root() as root, self._locked(root, digest):
+            return _load(root, digest, artifact_id)
+
     async def stat(self, artifact_id: str) -> ArtifactRef | None:
-        path = self._object_path(artifact_id)
+        validate_artifact_id(artifact_id)
         with _repository_io():
-            found = await asyncio.to_thread(self._find, path, artifact_id)
+            found = await _finish_io(lambda: self._find(artifact_id[7:], artifact_id))
         return found.ref if found is not None else None
 
-    def _find(self, path: Path, artifact_id: str) -> _Object | None:
-        with _OBJECT_LOCK:
-            return self._load(path, artifact_id)
-
-    def _read_chunk(self, path: Path, obj: _Object, offset: int) -> bytes:
-        with _OBJECT_LOCK:
+    def _read_chunk(self, obj: _Object, offset: int) -> bytes:
+        digest = obj.ref.sha256
+        with self._pinned_root() as root, self._locked(root, digest):
             try:
-                self._check_directory(path, obj.directory)
+                directory_info(root.stat(digest))
             except FileNotFoundError:
                 raise KeyError(obj.ref.artifact_id) from None
-            _same_file(_entry(path / _DESCRIPTOR, stat.S_ISREG), obj.descriptor)
-            with _open_file(path / _DATA, obj.data) as fd:
-                self._check_directory(path, obj.directory)
-                os.lseek(fd, offset, os.SEEK_SET)
-                block = os.read(fd, min(_CHUNK_BYTES, obj.ref.size_bytes - offset))
-                _same_file(os.fstat(fd), obj.data)
-            if not block and offset != obj.ref.size_bytes:
+            with root.child(digest, obj.directory) as directory:
+                same_file(directory.stat(_DESCRIPTOR), obj.descriptor)
+                with directory.read(_DATA, obj.data) as fd:
+                    os.lseek(fd, offset, os.SEEK_SET)
+                    block = os.read(fd, min(_CHUNK_BYTES, obj.ref.size_bytes - offset))
+                    same_file(os.fstat(fd), obj.data)
+            if not block:
                 raise ArtifactRepositoryError("Artifact file ended during reading")
             return block
 
     async def open(self, artifact_id: str) -> AsyncGenerator[bytes, None]:
-        path = self._object_path(artifact_id)
+        validate_artifact_id(artifact_id)
         with _repository_io():
-            obj = await _finish_io(lambda: self._find(path, artifact_id))
+            obj = await _finish_io(lambda: self._find(artifact_id[7:], artifact_id))
             if obj is None:
                 raise KeyError(artifact_id)
             offset = 0
+            digest = sha256()
             while offset < obj.ref.size_bytes:
-                block = await _finish_io(lambda: self._read_chunk(path, obj, offset))
+                block = await _finish_io(lambda: self._read_chunk(obj, offset))
                 offset += len(block)
+                digest.update(block)
                 yield block
+            if offset != obj.ref.size_bytes or digest.hexdigest() != obj.ref.sha256:
+                raise ArtifactRepositoryError("Artifact content does not match its size or SHA-256")
 
-    def _delete_object(self, path: Path, obj: _Object) -> None:
-        self._check_directory(path, obj.directory)
-        _same_file(_entry(path / _DATA, stat.S_ISREG), obj.data)
-        _same_file(_entry(path / _DESCRIPTOR, stat.S_ISREG), obj.descriptor)
-        # Unpublish both members together before changing permissions or unlinking.
-        tombstone = self._root / (".delete-" + uuid4().hex)
-        os.rename(path, tombstone)
-        self._remove_directory(tombstone, obj.directory)
+    def _delete_object(self, root: Directory, obj: _Object, cutoff_ns: int | None = None) -> bool:
+        digest = obj.ref.sha256
+        tombstone = f".delete-{digest}-{uuid4().hex}"
+        root.rename(digest, tombstone)
+        try:
+            current = _check_object(_load(root, tombstone, obj.ref.artifact_id), obj)
+        except (OSError, ArtifactRepositoryError):
+            _restore(root, tombstone, digest)
+            raise ArtifactRepositoryError("Captured artifact changed") from None
+        if cutoff_ns is not None and current.directory.st_mtime_ns >= cutoff_ns:
+            _restore(root, tombstone, digest)
+            return False
+        # Record approval inside the verified directory. An unapproved capture
+        # left by a failed rollback must never be treated as pending cleanup.
+        with root.child(tombstone, current.directory) as directory:
+            same_file(directory.stat(_DATA), current.data)
+            same_file(directory.stat(_DESCRIPTOR), current.descriptor)
+            fd = directory.open(_RETIRED, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            directory.sync()
+        root.sync()
+        _remove_directory(root, tombstone, current.directory, artifact_id=obj.ref.artifact_id)
+        return True
 
-    def _delete(self, path: Path, artifact_id: str) -> None:
-        with _OBJECT_LOCK:
-            obj = self._load(path, artifact_id)
+    def _recover(self, root: Directory, name: str, artifact_id: str) -> bool:
+        try:
+            info = directory_info(root.stat(name))
+        except FileNotFoundError:
+            return False
+        _remove_directory(root, name, info, artifact_id=artifact_id)
+        return True
+
+    def _delete(self, digest: str, artifact_id: str) -> None:
+        with self._pinned_root() as root, self._locked(root, digest):
+            obj = _load(root, digest, artifact_id)
             if obj is not None:
-                self._delete_object(path, obj)
+                self._delete_object(root, obj)
+            with root.entries() as entries:
+                for entry in entries:
+                    tombstone = _TOMBSTONE.fullmatch(entry.name)
+                    if tombstone is not None and tombstone[1] == digest:
+                        self._recover(root, entry.name, artifact_id)
 
     async def delete(self, artifact_id: str) -> None:
-        path = self._object_path(artifact_id)
+        validate_artifact_id(artifact_id)
         with _repository_io():
-            await _finish_io(lambda: self._delete(path, artifact_id))
+            await _finish_io(lambda: self._delete(artifact_id[7:], artifact_id))
 
     async def collect_orphans(self, referenced_ids: Collection[str], older_than: datetime) -> int:
         if (
@@ -496,22 +531,26 @@ class FilesystemArtifactRepository:
             return await _finish_io(lambda: self._collect(references, cutoff_ns))
 
     def _collect(self, references: set[str], cutoff_ns: int) -> int:
-        self._check_root()
         removed = 0
-        for path in self._root.iterdir():
-            try:
-                artifact_id = artifact_id_from_sha256(path.name)
-            except ValueError:
-                continue
-            if artifact_id in references:
-                continue
-            try:
-                with _OBJECT_LOCK:
-                    obj = self._load(path, artifact_id)
-                    if obj is not None and obj.directory.st_mtime_ns < cutoff_ns:
-                        self._delete_object(path, obj)
-                        removed += 1
-            except (OSError, ArtifactRepositoryError):
-                # A corrupt, replaced, or busy entry is not a collectible object.
-                continue
+        with self._pinned_root() as root, root.entries() as entries:
+            for entry in entries:
+                tombstone = _TOMBSTONE.fullmatch(entry.name)
+                digest = tombstone[1] if tombstone is not None else entry.name
+                try:
+                    artifact_id = artifact_id_from_sha256(digest)
+                except ValueError:
+                    continue
+                if tombstone is None and artifact_id in references:
+                    continue
+                try:
+                    with self._locked(root, digest):
+                        if tombstone is not None:
+                            removed += self._recover(root, entry.name, artifact_id)
+                            continue
+                        obj = _load(root, digest, artifact_id)
+                        if obj is not None and obj.directory.st_mtime_ns < cutoff_ns:
+                            removed += self._delete_object(root, obj, cutoff_ns)
+                except (OSError, ArtifactRepositoryError):
+                    # Corrupt, replaced, or busy entries are left for inspection or retry.
+                    continue
         return removed
