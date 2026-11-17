@@ -6,6 +6,7 @@ from datetime import datetime
 from threading import Lock
 from typing import Any, TypeAlias, TypeVar
 
+from src.core.artifacts import ArtifactRef, snapshot_artifact_ref
 from src.core.commands import RunLimits, ToolCallRequest
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.events import DomainEvent, DomainEventType, _is_canonical_timestamp
@@ -263,6 +264,11 @@ def _rebuild(value: object) -> Any:
         return value
     if type(value) is datetime and _is_canonical_timestamp(value):
         return value.replace()
+    if type(value) is ArtifactRef:
+        try:
+            return snapshot_artifact_ref(value)
+        except ValueError:
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
     if type(value) is tuple:
         return tuple(_rebuild(item) for item in value)
     if type(value) is frozenset and all(type(item) is str for item in value):
@@ -315,6 +321,22 @@ def _intent_value(value: object) -> _IntentValue:
         return ("bytes", value)
     if type(value) is datetime:
         return ("datetime", value.isoformat(timespec="microseconds"))
+    if type(value) is ArtifactRef:
+        try:
+            ref = snapshot_artifact_ref(value)
+        except ValueError:
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        return (
+            "artifact_ref",
+            (
+                ref.artifact_id,
+                ref.media_type,
+                ref.size_bytes,
+                ref.sha256,
+                ref.name,
+                object.__getattribute__(ref, "_metadata_json"),
+            ),
+        )
     if type(value) is RunStatus or type(value) is RunErrorCode or type(value) is DomainEventType:
         return ("enum", (type(value).__name__, value.value))
     if (
@@ -409,6 +431,7 @@ def _validate_members(batch: JournalCommit, sequence: int) -> None:
         or not summary.policy_version
         or not _is_text(summary.summary)
         or not summary.summary
+        or not _valid_artifact_refs(summary.artifacts)
     ):
         raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
 
@@ -419,5 +442,20 @@ def _is_text(value: object) -> bool:
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _valid_artifact_refs(value: object) -> bool:
+    if (
+        type(value) is not tuple
+        or len(value) > 16
+        or any(type(ref) is not ArtifactRef for ref in value)
+    ):
+        return False
+    try:
+        for ref in value:
+            snapshot_artifact_ref(ref)
+    except ValueError:
         return False
     return True

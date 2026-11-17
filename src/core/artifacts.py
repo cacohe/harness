@@ -377,7 +377,7 @@ def _rebuild_inline(content: InlineContent) -> InlineContent:
         raise ValueError("Invalid inline artifact content") from None
 
 
-def _rebuild_artifact_ref(ref: ArtifactRef) -> ArtifactRef:
+def snapshot_artifact_ref(ref: ArtifactRef) -> ArtifactRef:
     try:
         return ArtifactRef(
             ref.artifact_id,
@@ -435,7 +435,7 @@ class ExternalizedContent:
             _rebuild_inline(inline_content) if inline_content is not None else None,
         )
         object.__setattr__(
-            self, "_artifacts", tuple(_rebuild_artifact_ref(ref) for ref in artifacts)
+            self, "_artifacts", tuple(snapshot_artifact_ref(ref) for ref in artifacts)
         )
         object.__setattr__(self, "summary", summary)
 

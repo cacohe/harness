@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from src.adapters.context.summarization import SummaryCheckpointService
 from src.core.context import (
     ContextBudget,
     ContextBudgetExceeded,
@@ -12,6 +13,7 @@ from src.core.context import (
     OmittedContextRef,
     TokenCounter,
 )
+from src.core.journal import ConversationSummaryCheckpoint
 from src.core.model import ModelMessage, ModelRole
 
 
@@ -31,13 +33,26 @@ class BoundedContextProvider:
     """Select a deterministic, newest-first transcript window without loading it whole."""
 
     def __init__(
-        self, reader: ConversationReader, counter: TokenCounter, *, page_size: int = 128
+        self,
+        reader: ConversationReader,
+        counter: TokenCounter,
+        *,
+        page_size: int = 128,
+        summary_service: SummaryCheckpointService | None = None,
+        max_compaction_interactions: int = 128,
     ) -> None:
-        if type(page_size) is not int or not 1 <= page_size <= 1_024:
+        if (
+            type(page_size) is not int
+            or not 1 <= page_size <= 1_024
+            or type(max_compaction_interactions) is not int
+            or not 1 <= max_compaction_interactions <= 1_024
+        ):
             raise ValueError("Context page size is outside its supported range")
         self._reader = reader
         self._counter = counter
         self._page_size = page_size
+        self._summary_service = summary_service or SummaryCheckpointService()
+        self._max_compaction_interactions = max_compaction_interactions
 
     async def build(self, request: ContextRequest, budget: ContextBudget) -> ContextWindow:
         if type(request) is not ContextRequest or type(budget) is not ContextBudget:
@@ -52,9 +67,14 @@ class BoundedContextProvider:
             raise ContextBudgetExceeded
 
         selected: list[ConversationInteraction] = []
+        compaction: list[ConversationInteraction] = []
         omission: _Omission | None = None
+        durable = self._summary_service.find_latest_reusable(request.summary_checkpoints, request)
+        covered_through = durable.covered_through_sequence if durable is not None else 0
+        suffix_open = True
         cursor: int | None = None
         seen_cursors: set[int | None] = set()
+        reached_covered_history = False
         while True:
             if cursor in seen_cursors:
                 raise ValueError("Conversation reader repeated a pagination cursor")
@@ -65,16 +85,28 @@ class BoundedContextProvider:
             ):
                 raise ValueError("Conversation reader returned an item outside its cursor")
             for item in page.interactions:
-                candidate = [*selected, item]
-                messages = self._assemble(request, candidate, (), (), ())
-                candidate_estimate = self._counter.count(messages, request.tools)
-                if candidate_estimate.tokens <= budget.input_allowance_tokens:
-                    selected.append(item)
-                    estimate = candidate_estimate
-                elif omission is None:
+                if item.sequence_through <= covered_through:
+                    reached_covered_history = True
+                    break
+                if item.sequence_from <= covered_through:
+                    raise ValueError("Summary checkpoint splits a transcript interaction")
+                if suffix_open:
+                    candidate = [*selected, item]
+                    messages = self._assemble(request, candidate, (), (), ())
+                    candidate_estimate = self._counter.count(messages, request.tools)
+                    if candidate_estimate.tokens <= budget.input_allowance_tokens:
+                        selected.append(item)
+                        estimate = candidate_estimate
+                        continue
+                    suffix_open = False
+                if omission is None:
                     omission = _Omission(item.sequence_from, item.sequence_through, 1)
                 else:
                     omission.include(item)
+                if len(compaction) < self._max_compaction_interactions:
+                    compaction.append(item)
+            if reached_covered_history:
+                break
             cursor = page.next_before_sequence
             if cursor is None:
                 break
@@ -88,13 +120,27 @@ class BoundedContextProvider:
                 OmittedContextRef("transcript", omission.first, omission.last, omission.count)
             )
 
-        if request.summary_checkpoint is not None:
-            message = ModelMessage(ModelRole.SYSTEM, request.summary_checkpoint.summary)
-            summary, estimate = self._include_optional(
-                request, budget, selected, summary, memory, skills, (message,), estimate
-            )
-            if not summary:
-                checkpoint = request.summary_checkpoint
+        candidate_checkpoint: ConversationSummaryCheckpoint | None = None
+        if compaction:
+            outcome = await self._summary_service.compact_or_retain(request, tuple(compaction))
+            candidate_checkpoint = outcome.checkpoint
+
+        checkpoints = tuple(
+            checkpoint for checkpoint in (candidate_checkpoint, durable) if checkpoint is not None
+        )
+        included_checkpoints: list[ConversationSummaryCheckpoint] = []
+        for checkpoint in sorted(
+            checkpoints, key=lambda item: item.covered_through_sequence, reverse=True
+        ):
+            proposed = [*included_checkpoints, checkpoint]
+            proposed_messages = self._summary_messages(proposed)
+            messages = self._assemble(request, selected, proposed_messages, memory, skills)
+            candidate_estimate = self._counter.count(messages, request.tools)
+            if candidate_estimate.tokens <= budget.input_allowance_tokens:
+                included_checkpoints.append(checkpoint)
+                summary = proposed_messages
+                estimate = candidate_estimate
+            else:
                 omitted.append(
                     OmittedContextRef(
                         "summary",
@@ -121,25 +167,24 @@ class BoundedContextProvider:
             budget,
             tuple(omitted),
             request.policy_version,
-            request.new_checkpoint,
+            candidate_checkpoint,
         )
 
-    def _include_optional(
-        self,
-        request: ContextRequest,
-        budget: ContextBudget,
-        selected: list[ConversationInteraction],
-        summary: tuple[ModelMessage, ...],
-        memory: tuple[ModelMessage, ...],
-        skills: tuple[ModelMessage, ...],
-        candidate: tuple[ModelMessage, ...],
-        prior_estimate,
-    ):
-        messages = self._assemble(request, selected, candidate, memory, skills)
-        estimate = self._counter.count(messages, request.tools)
-        if estimate.tokens <= budget.input_allowance_tokens:
-            return candidate, estimate
-        return summary, prior_estimate
+    @staticmethod
+    def _summary_messages(
+        checkpoints: list[ConversationSummaryCheckpoint],
+    ) -> tuple[ModelMessage, ...]:
+        messages: list[ModelMessage] = []
+        for checkpoint in sorted(checkpoints, key=lambda item: item.covered_through_sequence):
+            messages.append(ModelMessage(ModelRole.SYSTEM, checkpoint.summary))
+            if checkpoint.artifacts:
+                messages.append(
+                    ModelMessage(
+                        ModelRole.SYSTEM,
+                        "Artifacts: " + ", ".join(ref.artifact_id for ref in checkpoint.artifacts),
+                    )
+                )
+        return tuple(messages)
 
     def _include_messages(
         self,

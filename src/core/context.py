@@ -3,6 +3,7 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
+from src.core.artifacts import ArtifactRef
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.ids import ProfileId, SessionId
 from src.core.journal import ConversationSummaryCheckpoint
@@ -166,13 +167,32 @@ def snapshot_summary_checkpoint(
     try:
         if type(value) is not ConversationSummaryCheckpoint:
             raise ValueError
+        raw_session = object.__getattribute__(value, "session_id")
+        raw_through = object.__getattribute__(value, "covered_through_sequence")
+        raw_policy = object.__getattribute__(value, "policy_version")
+        raw_profile = object.__getattribute__(value, "profile_id")
+        raw_summary = object.__getattribute__(value, "summary")
+        raw_from = object.__getattribute__(value, "covered_from_sequence")
+        raw_artifacts = object.__getattribute__(value, "artifacts")
+        if (
+            type(raw_session) is not SessionId
+            or type(raw_profile) is not ProfileId
+            or type(raw_through) is not int
+            or type(raw_from) is not int
+            or type(raw_policy) is not str
+            or type(raw_summary) is not str
+            or type(raw_artifacts) is not tuple
+            or any(type(ref) is not ArtifactRef for ref in raw_artifacts)
+        ):
+            raise ValueError
         result = ConversationSummaryCheckpoint(
-            SessionId(object.__getattribute__(value.session_id, "value")),
-            value.covered_through_sequence,
-            _policy(value.policy_version),
-            ProfileId(object.__getattribute__(value.profile_id, "value")),
-            value.summary,
-            value.covered_from_sequence,
+            SessionId(object.__getattribute__(raw_session, "value")),
+            raw_through,
+            _policy(raw_policy),
+            ProfileId(object.__getattribute__(raw_profile, "value")),
+            raw_summary,
+            raw_from,
+            raw_artifacts,
         )
         if (
             type(result.covered_from_sequence) is not int
@@ -219,10 +239,9 @@ class ContextRequest:
     current_input: ModelMessage
     tools: tuple[ToolSpec, ...] = ()
     open_tool_messages: tuple[ModelMessage, ...] = ()
-    summary_checkpoint: ConversationSummaryCheckpoint | None = None
+    summary_checkpoints: tuple[ConversationSummaryCheckpoint, ...] = ()
     memory_messages: tuple[ModelMessage, ...] = ()
     skill_messages: tuple[ModelMessage, ...] = ()
-    new_checkpoint: ConversationSummaryCheckpoint | None = None
 
     def __post_init__(self) -> None:
         if type(self.session_id) is not SessionId or type(self.profile_id) is not ProfileId:
@@ -262,30 +281,24 @@ class ContextRequest:
         object.__setattr__(self, "current_input", current)
         object.__setattr__(self, "tools", tuple(replace(tool) for tool in self.tools))
         object.__setattr__(self, "open_tool_messages", open_messages)
-        object.__setattr__(
-            self,
-            "summary_checkpoint",
-            snapshot_summary_checkpoint(
-                self.summary_checkpoint,
-                session_id=session_id,
-                profile_id=profile_id,
-                policy_version=policy_version,
-            ),
-        )
+        if (
+            type(self.summary_checkpoints) is not tuple
+            or len(self.summary_checkpoints) > 128
+            or any(
+                type(item) is not ConversationSummaryCheckpoint for item in self.summary_checkpoints
+            )
+        ):
+            raise ValueError("Context request requires bounded summary checkpoints")
+        summaries: list[ConversationSummaryCheckpoint] = []
+        for item in self.summary_checkpoints:
+            checkpoint = snapshot_summary_checkpoint(item)
+            assert checkpoint is not None
+            summaries.append(checkpoint)
+        object.__setattr__(self, "summary_checkpoints", tuple(summaries))
         object.__setattr__(
             self, "memory_messages", _optional_messages(self.memory_messages, "Memory")
         )
         object.__setattr__(self, "skill_messages", _optional_messages(self.skill_messages, "Skill"))
-        object.__setattr__(
-            self,
-            "new_checkpoint",
-            snapshot_summary_checkpoint(
-                self.new_checkpoint,
-                session_id=session_id,
-                profile_id=profile_id,
-                policy_version=policy_version,
-            ),
-        )
 
 
 @dataclass(frozen=True, slots=True)

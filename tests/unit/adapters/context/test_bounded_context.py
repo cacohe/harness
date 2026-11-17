@@ -88,8 +88,10 @@ def test_open_tool_pair_is_mandatory_and_never_split() -> None:
 def test_selection_is_newest_first_but_output_is_chronological() -> None:
     reader = Reader(tuple(_interaction(index, str(index) * 3) for index in range(1, 6)))
     request = _request(
-        summary_checkpoint=ConversationSummaryCheckpoint(
-            SessionId("session"), 1, "policy-v1", ProfileId("profile"), "SUM"
+        summary_checkpoints=(
+            ConversationSummaryCheckpoint(
+                SessionId("session"), 1, "policy-v1", ProfileId("profile"), "SUM"
+            ),
         ),
         memory_messages=(ModelMessage(ModelRole.SYSTEM, "MEM"),),
         skill_messages=(ModelMessage(ModelRole.SYSTEM, "SKL"),),
@@ -102,8 +104,8 @@ def test_selection_is_newest_first_but_output_is_chronological() -> None:
     assert contents == ["SS", "444", "555", "UUU"]
     assert window.estimate.tokens <= window.budget.input_allowance_tokens
     assert len(window.omitted) == 4
-    assert (window.omitted[0].first_sequence, window.omitted[0].last_sequence) == (1, 3)
-    assert window.omitted[0].item_count == 3
+    assert (window.omitted[0].first_sequence, window.omitted[0].last_sequence) == (2, 3)
+    assert window.omitted[0].item_count == 2
     assert [item.source for item in window.omitted] == [
         "transcript",
         "summary",
@@ -179,17 +181,58 @@ def test_tools_are_counted_in_the_budget() -> None:
     assert asyncio.run(provider.build(request, ContextBudget(25, 1, 0))).tools == (tool,)
 
 
-def test_uncommitted_checkpoint_is_returned_only_as_a_candidate() -> None:
-    candidate = ConversationSummaryCheckpoint(
-        SessionId("session"), 7, "policy-v1", ProfileId("profile"), "candidate"
+def test_durable_summary_excludes_covered_raw_history() -> None:
+    records = tuple(_interaction(index, f"raw-{index}") for index in range(1, 5))
+    checkpoint = ConversationSummaryCheckpoint(
+        SessionId("session"), 3, "policy-v1", ProfileId("profile"), "summary-1-3"
     )
     window = asyncio.run(
-        BoundedContextProvider(Reader(()), ExactTokenCounter(), page_size=2).build(
-            _request(new_checkpoint=candidate), ContextBudget(32, 1, 0)
+        BoundedContextProvider(Reader(records), ExactTokenCounter(), page_size=2).build(
+            _request(summary_checkpoints=(checkpoint,)), ContextBudget(128, 1, 0)
         )
     )
-    assert window.new_checkpoint == candidate
-    assert "candidate" not in [message.content for message in window.messages]
+    contents = [message.content for message in window.messages]
+    assert "summary-1-3" in contents
+    assert "raw-4" in contents
+    assert not {"raw-1", "raw-2", "raw-3"} & set(contents)
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        ConversationSummaryCheckpoint(
+            SessionId("other"), 1, "policy-v1", ProfileId("profile"), "wrong-session"
+        ),
+        ConversationSummaryCheckpoint(
+            SessionId("session"), 1, "policy-v2", ProfileId("profile"), "wrong-policy"
+        ),
+        ConversationSummaryCheckpoint(
+            SessionId("session"), 1, "policy-v1", ProfileId("other"), "wrong-profile"
+        ),
+    ],
+)
+def test_mismatched_durable_summary_is_not_reused(checkpoint) -> None:
+    window = asyncio.run(
+        BoundedContextProvider(
+            Reader((_interaction(1, "raw-1"),)), ExactTokenCounter(), page_size=1
+        ).build(_request(summary_checkpoints=(checkpoint,)), ContextBudget(64, 1, 0))
+    )
+    contents = [message.content for message in window.messages]
+    assert "raw-1" in contents
+    assert checkpoint.summary not in contents
+
+
+def test_history_selection_is_a_contiguous_newest_suffix() -> None:
+    records = (_interaction(2, "X" * 80), _interaction(1, "old"))
+    window = asyncio.run(
+        BoundedContextProvider(Reader(records), ExactTokenCounter(), page_size=1).build(
+            _request(), ContextBudget(40, 1, 0)
+        )
+    )
+    contents = [message.content for message in window.messages]
+    assert "X" * 80 not in contents
+    assert "old" not in contents
+    assert window.omitted[0].item_count == 2
 
 
 def test_conservative_fallback_applies_safety_factor() -> None:

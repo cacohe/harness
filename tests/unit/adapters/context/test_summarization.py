@@ -1,8 +1,16 @@
 import asyncio
 from dataclasses import replace
 
+from src.adapters.context.bounded import BoundedContextProvider
 from src.adapters.context.summarization import SummaryCheckpointService
-from src.core.context import ContextRequest, ConversationInteraction
+from src.adapters.context.tokenizers import ExactTokenCounter
+from src.core.artifacts import ArtifactRef
+from src.core.context import (
+    ContextBudget,
+    ContextRequest,
+    ConversationInteraction,
+    ConversationPage,
+)
 from src.core.ids import ProfileId, SessionId
 from src.core.journal import ConversationSummaryCheckpoint
 from src.core.model import ModelMessage, ModelRole
@@ -31,6 +39,20 @@ class Compactor:
         if self.error is not None:
             raise self.error
         return self.checkpoint
+
+
+class Reader:
+    def __init__(self, records):
+        self.records = records
+
+    async def read_page(self, session_id, before_sequence, limit):
+        records = tuple(
+            record
+            for record in self.records
+            if before_sequence is None or record.sequence_through < before_sequence
+        )
+        page = records[:limit]
+        return ConversationPage(page, page[-1].sequence_from if len(records) > len(page) else None)
 
 
 def test_reuse_requires_every_checkpoint_key_component() -> None:
@@ -80,6 +102,54 @@ def test_new_checkpoint_is_only_a_candidate_until_journal_commit() -> None:
     assert outcome.retained == records
     assert service.find_reusable((), request, 8) is None
     assert service.find_reusable((candidate,), request, 8) == candidate
+
+
+def test_build_invokes_compactor_and_projects_candidate_summary_and_refs() -> None:
+    request = _request()
+    records = tuple(
+        ConversationInteraction(index, index, (ModelMessage(ModelRole.ASSISTANT, "X" * 120),))
+        for index in range(3, 0, -1)
+    )
+    digest = "b" * 64
+    ref = ArtifactRef(f"sha256:{digest}", "application/json", 20, digest)
+    candidate = ConversationSummaryCheckpoint(
+        request.session_id,
+        3,
+        request.policy_version,
+        request.profile_id,
+        "compacted",
+        artifacts=(ref,),
+    )
+    compactor = Compactor(candidate)
+    provider = BoundedContextProvider(
+        Reader(records),
+        ExactTokenCounter(),
+        page_size=2,
+        summary_service=SummaryCheckpointService(compactor),
+    )
+    window = asyncio.run(provider.build(request, ContextBudget(127, 1, 0)))
+    assert len(compactor.calls) == 1
+    assert window.new_checkpoint == candidate
+    rendered = "\n".join(message.content or "" for message in window.messages)
+    assert "compacted" in rendered
+    assert ref.artifact_id in rendered
+    assert request.summary_checkpoints == ()
+
+
+def test_build_compactor_failure_keeps_raw_records_authoritative() -> None:
+    records = tuple(
+        ConversationInteraction(index, index, (ModelMessage(ModelRole.ASSISTANT, "X" * 40),))
+        for index in range(2, 0, -1)
+    )
+    provider = BoundedContextProvider(
+        Reader(records),
+        ExactTokenCounter(),
+        page_size=1,
+        summary_service=SummaryCheckpointService(Compactor(error=RuntimeError("secret"))),
+    )
+    window = asyncio.run(provider.build(_request(), ContextBudget(40, 1, 0)))
+    assert window.new_checkpoint is None
+    assert window.omitted[0].item_count == 2
 
 
 def test_invalid_compactor_binding_is_rejected_and_raw_records_remain() -> None:

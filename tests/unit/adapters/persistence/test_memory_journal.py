@@ -76,7 +76,8 @@ def test_unhashable_checkpoint_identity_rejects_every_commit_member() -> None:
     assert pending.summary is not None
     asyncio.run(journal.commit(first, expected_version=0))
     before = asyncio.run(journal.load_session(session_id))
-    malformed = replace(pending.summary, session_id=UnhashableSession(session_id.value))
+    malformed = replace(pending.summary)
+    object.__setattr__(malformed, "session_id", UnhashableSession(session_id.value))
 
     with pytest.raises((TypeError, JournalError)) as error:
         asyncio.run(journal.commit(replace(pending, summary=malformed), expected_version=1))

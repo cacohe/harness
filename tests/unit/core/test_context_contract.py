@@ -1,6 +1,7 @@
 from dataclasses import replace
 
 import pytest
+from src.core.artifacts import ArtifactRef
 from src.core.context import (
     ContextBudget,
     ContextRequest,
@@ -8,6 +9,7 @@ from src.core.context import (
     EstimateQuality,
     OmittedContextRef,
     TokenEstimate,
+    snapshot_summary_checkpoint,
 )
 from src.core.ids import ProfileId, SessionId
 from src.core.journal import ConversationSummaryCheckpoint
@@ -102,16 +104,56 @@ def test_request_rejects_checkpoint_from_another_policy_or_profile() -> None:
     checkpoint = ConversationSummaryCheckpoint(
         request.session_id, 4, request.policy_version, request.profile_id, "summary"
     )
-    assert replace(request, summary_checkpoint=checkpoint).summary_checkpoint == checkpoint
-    for invalid in (
-        replace(checkpoint, session_id=SessionId("other")),
-        replace(checkpoint, policy_version="policy-v2"),
-        replace(checkpoint, profile_id=ProfileId("other")),
-    ):
-        with pytest.raises(ValueError):
-            replace(request, summary_checkpoint=invalid)
+    snapshots = replace(request, summary_checkpoints=(checkpoint,)).summary_checkpoints
+    assert snapshots == (checkpoint,)
+    assert replace(checkpoint, session_id=SessionId("other")) not in snapshots
+    assert replace(checkpoint, policy_version="policy-v2") not in snapshots
+    assert replace(checkpoint, profile_id=ProfileId("other")) not in snapshots
 
 
 def test_request_rejects_non_tool_messages_in_the_open_pair_slot() -> None:
     with pytest.raises(ValueError):
         _request(open_tool_messages=(ModelMessage(ModelRole.ASSISTANT, "plain"),))
+
+
+def test_checkpoint_snapshot_uses_only_trusted_fixed_fields() -> None:
+    class Trap:
+        reads = 0
+
+        @property
+        def value(self):
+            Trap.reads += 1
+            raise RuntimeError("must not execute")
+
+    checkpoint = ConversationSummaryCheckpoint(
+        SessionId("session"), 4, "policy-v1", ProfileId("profile"), "summary"
+    )
+    object.__setattr__(checkpoint, "session_id", Trap())
+    object.__setattr__(checkpoint, "__dataclass_fields__", Trap())
+    with pytest.raises(ValueError):
+        snapshot_summary_checkpoint(checkpoint)
+    assert Trap.reads == 0
+
+    missing = ConversationSummaryCheckpoint(
+        SessionId("session"), 4, "policy-v1", ProfileId("profile"), "summary"
+    )
+    object.__delattr__(missing, "profile_id")
+    with pytest.raises(ValueError):
+        snapshot_summary_checkpoint(missing)
+
+
+def test_checkpoint_snapshot_copies_structured_artifact_refs() -> None:
+    digest = "a" * 64
+    ref = ArtifactRef(f"sha256:{digest}", "application/json", 2, digest)
+    checkpoint = ConversationSummaryCheckpoint(
+        SessionId("session"),
+        4,
+        "policy-v1",
+        ProfileId("profile"),
+        "two keys",
+        artifacts=(ref,),
+    )
+    snapshot = snapshot_summary_checkpoint(checkpoint)
+    assert snapshot is not None
+    object.__setattr__(ref, "size_bytes", 99)
+    assert snapshot.artifacts[0].size_bytes == 2

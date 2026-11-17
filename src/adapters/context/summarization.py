@@ -21,8 +21,28 @@ class CompactionOutcome:
 
 
 class SummaryCheckpointService:
-    def __init__(self, compactor: ConversationCompactor) -> None:
+    def __init__(self, compactor: ConversationCompactor | None = None) -> None:
         self._compactor = compactor
+
+    def find_latest_reusable(
+        self,
+        checkpoints: tuple[ConversationSummaryCheckpoint, ...],
+        request: ContextRequest,
+    ) -> ConversationSummaryCheckpoint | None:
+        reusable: list[ConversationSummaryCheckpoint] = []
+        for candidate in checkpoints:
+            try:
+                checkpoint = snapshot_summary_checkpoint(
+                    candidate,
+                    session_id=request.session_id,
+                    profile_id=request.profile_id,
+                    policy_version=request.policy_version,
+                )
+            except ValueError:
+                continue
+            assert checkpoint is not None
+            reusable.append(checkpoint)
+        return max(reusable, key=lambda item: item.covered_through_sequence, default=None)
 
     def find_reusable(
         self,
@@ -59,6 +79,8 @@ class SummaryCheckpointService:
             interactions,
         )
         retained = compaction.interactions
+        if self._compactor is None:
+            return CompactionOutcome(None, retained)
         try:
             candidate = await self._compactor.compact(compaction)
             checkpoint = snapshot_summary_checkpoint(

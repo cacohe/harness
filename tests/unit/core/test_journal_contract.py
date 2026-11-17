@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone, tzinfo
 
 import pytest
 from src.adapters.persistence.memory import InMemoryRunJournal
+from src.core.artifacts import ArtifactRef
 from src.core.commands import RunLimits
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.events import DomainEvent, DomainEventType
@@ -20,6 +21,11 @@ from src.core.state import RunState, RunStatus
 
 NOW = datetime(2026, 11, 17, tzinfo=timezone.utc)
 LIMITS = RunLimits(5, 30, 1024)
+
+
+def artifact_ref(seed: str = "a") -> ArtifactRef:
+    digest = seed * 64
+    return ArtifactRef(f"sha256:{digest}", "application/json", 2, digest)
 
 
 @pytest.fixture
@@ -55,7 +61,12 @@ def acceptance(
             TranscriptEntry(state.session_id, state.run_id, state.submission_id, "user", name),
         ),
         summary=ConversationSummaryCheckpoint(
-            state.session_id, 2, "v1", state.profile_id, f"summary-{name}"
+            state.session_id,
+            2,
+            "v1",
+            state.profile_id,
+            f"summary-{name}",
+            artifacts=(artifact_ref(),),
         ),
     )
 
@@ -199,6 +210,7 @@ def test_expected_version_conflict_leaves_prior_snapshot_intact(journal: RunJour
         "summary_policy",
         "summary_ahead",
         "summary_covered_range",
+        "summary_artifacts",
         "state",
     ],
 )
@@ -217,6 +229,10 @@ def test_invalid_commit_member_leaves_the_session_empty(
         "event_run": (RunId("wrong"), state.session_id, NOW),
         "event_timestamp": (state.run_id, state.session_id, "invalid"),
     }
+    bad_summary_policy = replace(summary)
+    object.__setattr__(bad_summary_policy, "policy_version", "")
+    bad_summary_range = replace(summary)
+    object.__setattr__(bad_summary_range, "covered_from_sequence", 3)
     malformed = {
         "submission_session": {"submission": replace(submission, session_id=SessionId("wrong"))},
         "submission_run": {"submission": replace(submission, run_id=RunId("wrong"))},
@@ -229,9 +245,10 @@ def test_invalid_commit_member_leaves_the_session_empty(
         },
         "transcript_sequence": {"transcript": (replace(transcript, sequence=1),)},
         "summary_session": {"summary": replace(summary, session_id=SessionId("wrong"))},
-        "summary_policy": {"summary": replace(summary, policy_version="")},
+        "summary_policy": {"summary": bad_summary_policy},
         "summary_ahead": {"summary": replace(summary, covered_through_sequence=3)},
-        "summary_covered_range": {"summary": replace(summary, covered_from_sequence=3)},
+        "summary_covered_range": {"summary": bad_summary_range},
+        "summary_artifacts": {"summary": replace(summary)},
         "state": {"state": None},
     }
     if invalid_field in malformed_event:
@@ -241,6 +258,9 @@ def test_invalid_commit_member_leaves_the_session_empty(
         batch = replace(valid, events=(bad_event,))
     else:
         batch = replace(valid, **malformed[invalid_field])
+    if invalid_field == "summary_artifacts":
+        assert batch.summary is not None
+        object.__setattr__(batch.summary, "artifacts", [artifact_ref()])
 
     before = asyncio.run(journal.load_session(state.session_id))
     with pytest.raises(JournalError) as error:
@@ -287,14 +307,15 @@ def _event_with_timestamp(event: DomainEvent, timestamp: datetime) -> DomainEven
 
 
 @pytest.mark.parametrize(
-    "change", ["digest", "state", "events", "timestamp", "transcript", "summary"]
+    "change",
+    ["digest", "state", "events", "timestamp", "transcript", "summary", "summary_artifacts"],
 )
 def test_reused_submission_id_with_changed_intent_conflicts(
     journal: RunJournal, change: str
 ) -> None:
     original = acceptance("first")
     state = original.state
-    assert original.submission is not None
+    assert original.submission is not None and original.summary is not None
     asyncio.run(journal.commit(original, expected_version=0))
     before = asyncio.run(journal.load_session(state.session_id))
     updates = {
@@ -306,6 +327,7 @@ def test_reused_submission_id_with_changed_intent_conflicts(
         },
         "transcript": {"transcript": ()},
         "summary": {"summary": None},
+        "summary_artifacts": {"summary": replace(original.summary, artifacts=(artifact_ref("b"),))},
     }
 
     with pytest.raises(JournalError) as error:
@@ -435,6 +457,39 @@ def test_summary_checkpoints_use_all_key_components(journal: RunJournal) -> None
     assert set(summaries) == {first, *variations}
     assert first.key == (state.session_id, 2, "v1", state.profile_id)
     assert asyncio.run(journal.load_session(other.state.session_id)).summaries == (other.summary,)
+
+
+def test_summary_artifact_refs_are_structural_and_copy_isolated(journal: RunJournal) -> None:
+    batch = acceptance("artifact-summary")
+    assert batch.summary is not None
+    receipt = asyncio.run(journal.commit(batch, expected_version=0))
+    persisted = receipt.summaries[0]
+    assert persisted.artifacts == batch.summary.artifacts
+    object.__setattr__(batch.summary.artifacts[0], "size_bytes", 99)
+    later = asyncio.run(journal.load_session(batch.state.session_id)).summaries[0]
+    assert later.artifacts[0].size_bytes == 2
+
+
+def test_summary_artifact_refs_are_bounded_exact_tuples() -> None:
+    values = (artifact_ref(),) * 17
+    with pytest.raises(ValueError):
+        ConversationSummaryCheckpoint(
+            SessionId("session"),
+            1,
+            "v1",
+            ProfileId("profile"),
+            "summary",
+            artifacts=values,
+        )
+    with pytest.raises(ValueError):
+        ConversationSummaryCheckpoint(
+            SessionId("session"),
+            1,
+            "v1",
+            ProfileId("profile"),
+            "summary",
+            artifacts=[artifact_ref()],
+        )
 
 
 def test_same_run_cannot_regress_its_transition_version(journal: RunJournal) -> None:
