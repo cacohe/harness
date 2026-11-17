@@ -119,3 +119,48 @@ Task 14 的 legacy `agent.py` 主体。
 
 全仓 4 个失败仍是报告前述 legacy 清单中的非 `test_agent.py` 部分：
 `test_mcp_agent.py` 2 项、`test_shared_agent_load.py` 1 项、`test_ports.py` 1 项。
+
+## Review fix round 2/5
+
+基于 `1b909aa` 将 development/production composition factories 改为 async-only API，未提供
+sync wrapper。输入与静态 port 验证在 factory coroutine 内、任何资源创建或首次挂起之前完成。
+
+### RED 与修复
+
+新测试首先证明 sync factory 无法 `await`，成功资源不能保证与调用者同 loop，构造失败期间
+的 cancellation 也不受 coroutine lifecycle 管理。实现随后移除了新线程/foreign event loop
+cleanup：
+
+- 资源在调用者 current running loop 逐个构造，并立即压入 owned stack；
+- 任一步构造或 `_compose()` 失败时，在同 loop 创建一个 shared cleanup task，逆序调用
+  `await _close_resource()`；
+- caller cancellation 使用 `asyncio.shield()` 隔离 cleanup task，并等待 task 完成后再传播
+  `CancelledError`；
+- cleanup failures 使用 `BaseExceptionGroup` 作为明确 cause，原 construction exception 仍是
+  主异常，并添加 cleanup failure note；取消与 cleanup failure 同时发生时 cause 同时保留原异常
+  和全部 cleanup failures；
+- 成功返回 `Agent` 后 factory 不再清理，完整 owned stack 转交 `RuntimeCoordinator`；注入的
+  journal/artifacts/model 等仍为 caller-owned。
+
+### 攻击与生命周期测试
+
+- journal async closer 与 factory 调用位于同一 event loop；
+- 第二资源和第三资源构造失败，已创建资源按逆序 exactly-once cleanup；
+- 两个 cleanup 同时抛错，原 `RuntimeError` 保持主异常且两个 cleanup error 均在 group cause；
+- factory task 在失败 cleanup 中被 cancel，cleanup 完成后才传播取消；
+- 成功后 `Agent.close()` 在同 loop 逆序关闭 factory resources，重复 close 不重复关闭；
+- development factory 的 injected journal/artifacts 在 Agent close 后仍未关闭；
+- 无效输入继续保持零资源、零 filesystem/SQLite 副作用。
+
+### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| composition/facade v3 | `19 passed in 15.17s` |
+| application/runtime related | `86 passed in 16.22s` |
+| 排除旧 `test_agent.py` 的全仓 pytest | `1703 passed, 7 skipped, 4 legacy failures in 224.24s` |
+| mypy `src` | `Success: no issues found in 103 source files` |
+| Ruff lint `src tests` | `All checks passed!` |
+| Ruff format `src tests` | `165 files already formatted` |
+
+4 个失败仍是既有 deferred legacy 清单，没有新增失败。

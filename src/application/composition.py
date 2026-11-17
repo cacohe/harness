@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NoReturn
 
 from src.adapters.artifacts.externalizer import (
     ArtifactPolicy,
@@ -16,7 +16,7 @@ from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.application.agent_v3 import Agent
-from src.application.runtime import RuntimeCoordinator
+from src.application.runtime import RuntimeCoordinator, _close_resource
 from src.application.submissions import SubmissionService
 from src.core.artifacts import ArtifactExternalizer
 from src.core.commands import RunLimits
@@ -82,7 +82,7 @@ class ApplicationConfig:
             object.__setattr__(self, name, rebuilt)
 
 
-def create_development_agent(
+async def create_development_agent(
     config: ApplicationConfig,
     *,
     model: ModelGateway,
@@ -136,12 +136,11 @@ def create_development_agent(
             artifacts=selected_artifacts,
             owned_resources=(*owned_resources, *created),
         )
-    except BaseException:
-        _close_constructed(created)
-        raise
+    except BaseException as error:
+        await _cleanup_and_raise(error, created)
 
 
-def create_production_agent(
+async def create_production_agent(
     config: ApplicationConfig,
     *,
     model: ModelGateway,
@@ -208,9 +207,8 @@ def create_production_agent(
             artifacts=selected_artifacts,
             owned_resources=(*owned_resources, *created),
         )
-    except BaseException:
-        _close_constructed(created)
-        raise
+    except BaseException as error:
+        await _cleanup_and_raise(error, created)
 
 
 def _compose(
@@ -386,40 +384,42 @@ def _snapshot_context_budget(value: object) -> ContextBudget:
         raise ValueError("Application configuration limits are invalid") from None
 
 
-def _close_constructed(resources: list[object]) -> None:
+async def _cleanup_resources(resources: list[object]) -> tuple[BaseException, ...]:
+    failures: list[BaseException] = []
     for resource in reversed(resources):
-        closer = getattr(resource, "aclose", None)
-        if closer is None:
-            closer = getattr(resource, "close", None)
-        if closer is None:
-            continue
         try:
-            result = closer()
-            if inspect.isawaitable(result):
-                _await_cleanup(result)
-        except BaseException:
-            continue
-
-
-def _await_cleanup(awaitable) -> None:
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        asyncio.run(awaitable)
-        return
-    failure: list[BaseException] = []
-
-    def run() -> None:
-        try:
-            asyncio.run(awaitable)
+            await _close_resource(resource)
         except BaseException as error:
-            failure.append(error)
+            failures.append(error)
+    return tuple(failures)
 
-    thread = threading.Thread(target=run)
-    thread.start()
-    thread.join()
-    if failure:
-        raise failure[0]
+
+async def _cleanup_and_raise(original: BaseException, resources: list[object]) -> NoReturn:
+    cleanup = asyncio.create_task(_cleanup_resources(resources))
+    cancellation: asyncio.CancelledError | None = None
+    try:
+        failures = await asyncio.shield(cleanup)
+    except asyncio.CancelledError as error:
+        cancellation = error
+        while True:
+            try:
+                failures = await asyncio.shield(cleanup)
+                break
+            except asyncio.CancelledError as repeated:
+                cancellation = repeated
+    if cancellation is not None:
+        cause: BaseException = original
+        if failures:
+            cause = BaseExceptionGroup(
+                "Composition construction and cleanup failed",
+                (original, *failures),
+            )
+        raise cancellation from cause
+    if failures:
+        original.add_note("One or more composition resources also failed to close")
+        cleanup_group = BaseExceptionGroup("Composition resource cleanup failed", failures)
+        raise original from cleanup_group
+    raise original
 
 
 def _artifact_policy(config: ApplicationConfig) -> ArtifactPolicy:
