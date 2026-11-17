@@ -240,16 +240,28 @@ def test_submission_retry_returns_original_commit_receipt(journal: RunJournal) -
     original = acceptance("first")
     session = original.state.session_id
     receipt = asyncio.run(journal.commit(original, expected_version=0))
-    asyncio.run(journal.commit(acceptance("next"), expected_version=1))
+    asyncio.run(
+        journal.commit(
+            JournalCommit(
+                replace(original.state, version=2, status=RunStatus.COMPLETED, final_text="done")
+            ),
+            expected_version=1,
+        )
+    )
+    asyncio.run(journal.commit(acceptance("next"), expected_version=2))
 
     retry = asyncio.run(journal.commit(acceptance("first"), expected_version=0))
 
     assert retry == receipt
     assert retry.submission == original.submission
-    assert asyncio.run(journal.find_submission(session, original.state.submission_id)) == (
-        original.submission
+    accepted = asyncio.run(journal.find_submission(session, original.state.submission_id))
+    assert accepted is not None
+    assert (accepted.submission, accepted.state, accepted.version) == (
+        original.submission,
+        original.state,
+        1,
     )
-    assert asyncio.run(journal.load_session(session)).version == 2
+    assert asyncio.run(journal.load_session(session)).version == 3
 
 
 def _event_with_timestamp(event: DomainEvent, timestamp: datetime) -> DomainEvent:
@@ -320,10 +332,25 @@ def test_same_submission_id_is_independent_between_sessions(journal: RunJournal)
     asyncio.run(journal.commit(second, expected_version=0))
 
     for batch in (first, second):
-        assert (
-            asyncio.run(journal.find_submission(batch.state.session_id, batch.state.submission_id))
-            == batch.submission
+        accepted = asyncio.run(
+            journal.find_submission(batch.state.session_id, batch.state.submission_id)
         )
+        assert accepted is not None and accepted.submission == batch.submission
+
+
+def test_acceptance_lookup_detaches_record_and_state_from_storage(journal: RunJournal) -> None:
+    batch = acceptance("first")
+    state = batch.state
+    asyncio.run(journal.commit(batch, expected_version=0))
+
+    lookup = asyncio.run(journal.find_submission(state.session_id, state.submission_id))
+    assert lookup is not None
+    object.__setattr__(lookup.submission, "digest", "tampered")
+    object.__setattr__(lookup.state.run_id, "value", "tampered")
+
+    later = asyncio.run(journal.find_submission(state.session_id, state.submission_id))
+    assert later is not None
+    assert (later.submission, later.state, later.version) == (batch.submission, state, 1)
 
 
 @pytest.mark.parametrize("message", [False, ("bool", 0)])

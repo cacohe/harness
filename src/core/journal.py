@@ -25,6 +25,15 @@ class SubmissionRecord:
 
 
 @dataclass(frozen=True)
+class SubmissionAcceptance:
+    """The immutable record, Run state, and Session CAS version at acceptance."""
+
+    submission: SubmissionRecord
+    state: RunState
+    version: int
+
+
+@dataclass(frozen=True)
 class TranscriptEntry:
     session_id: SessionId
     run_id: RunId
@@ -105,6 +114,10 @@ class RunJournal(Protocol):
 
     def find_submission(
         self, session_id: SessionId, submission_id: SubmissionId
-    ) -> Awaitable[SubmissionRecord | None]:
-        """Read the original acceptance record for a Session submission."""
+    ) -> Awaitable[SubmissionAcceptance | None]:
+        """Read the original acceptance, independent of subsequent Session changes.
+
+        Persist the acceptance with its commit, so a durable journal can return
+        the same snapshot and version after reopening.
+        """
         ...

@@ -46,8 +46,8 @@ MAX_SECONDS=1800
 本地工具目录、工具执行器和内存任务仓库：
 
 ```python
+from src.application.agent import Agent
 from src.config import Config
-from src.application import Agent
 
 agent = Agent.from_config(Config.load(), workspace="./my-project")
 task = agent.chat("帮我比较两款手机")
@@ -62,9 +62,9 @@ task = agent.chat("帮我比较两款手机")
 默认不会注册 shell。要启用 shell，调用方必须注入真正提供隔离能力的 `SandboxRunner`：
 
 ```python
+from src.application.agent import Agent
 from src.config import Config
 from src.workspace import Workspace
-from src.application import Agent
 
 workspace = Workspace("./my-project")
 agent = Agent.from_config(
@@ -84,8 +84,8 @@ agent = Agent.from_config(
 `/bin/sh` 和所需命令的 Linux 镜像，然后使用不可变 digest 注入：
 
 ```python
+from src.application.agent import Agent
 from src.config import Config
-from src.application import Agent
 from src.sandbox import DockerSandboxRunner
 
 image = "registry.example/agent-runtime@sha256:" + "0123456789abcdef" * 4
@@ -250,9 +250,9 @@ tool-call id 也不会被修改。
 需要跨 Session 召回时，显式注入 `MemoryManager`：
 
 ```python
+from src.application.agent import Agent
 from src.config import Config
 from src.core.memory import MemoryManager
-from src.application import Agent
 from src.memory.retriever import HybridRetriever
 from src.memory.store import InMemoryStore
 
@@ -299,9 +299,9 @@ Session 都不能再开始或修改任务，已有 transcript 与审批列表仍
 `EventHandler`；生产服务可以通过 `event_sink` 显式替换，或将默认输出与进程内指标组合：
 
 ```python
+from src.application.agent import Agent
 from src.config import Config
 from src.core.event import EventHandler
-from src.application import Agent
 from src.observability import CompositeEventSink, MetricsEventSink
 
 metrics = MetricsEventSink(max_inflight=10_000)
@@ -337,8 +337,8 @@ MCP 连接属于持久异步资源，应通过 `Agent` 的异步上下文管理�
 ```python
 import asyncio
 
+from src.application.agent import Agent
 from src.config import Config
-from src.application import Agent
 
 
 async def main() -> None:
@@ -412,8 +412,8 @@ JSON-safe 快照，`Task.from_dict()` 可恢复完整状态；完成和失败任
 可显式注入内置的 `SQLiteTaskRepository`：
 
 ```python
+from src.application.agent import Agent
 from src.config import Config
-from src.application import Agent
 from src.persistence import SQLiteTaskRepository
 
 repository = SQLiteTaskRepository("./state/tasks.db")

@@ -16,6 +16,7 @@ from src.core.journal import (
     JournalError,
     JournalEvent,
     JournalSnapshot,
+    SubmissionAcceptance,
     SubmissionRecord,
     TranscriptEntry,
 )
@@ -206,7 +207,7 @@ class InMemoryRunJournal:
 
     async def find_submission(
         self, session_id: SessionId, submission_id: SubmissionId
-    ) -> SubmissionRecord | None:
+    ) -> SubmissionAcceptance | None:
         if type(session_id) is not SessionId or type(submission_id) is not SubmissionId:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
         session_id = _canonical_copy(session_id)
@@ -216,7 +217,13 @@ class InMemoryRunJournal:
 
         session = store.sessions.get(session_id.value)
         accepted = session.submissions.get(submission_id.value) if session is not None else None
-        return _canonical_copy(accepted[1].submission) if accepted is not None else None
+        if accepted is None:
+            return None
+        _, receipt = accepted
+        assert receipt.submission is not None and receipt.state is not None
+        return SubmissionAcceptance(
+            _canonical_copy(receipt.submission), _canonical_copy(receipt.state), receipt.version
+        )
 
 
 _T = TypeVar("_T")

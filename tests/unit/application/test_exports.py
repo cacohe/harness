@@ -1,42 +1,37 @@
-from src.application import (
-    Agent,
-    AgentSession,
-    HarnessRunner,
-    MemoryFailure,
-    MemoryRuntime,
-    TaskRun,
-)
-from src.application.agent import Agent as CanonicalAgent
-from src.application.session import AgentSession as CanonicalAgentSession
-from src.application.session import HarnessRunner as CanonicalHarnessRunner
-from src.demo.agent import Agent as LegacyAgent
-from src.demo.session import (
-    AgentSession as LegacyAgentSession,
-)
-from src.demo.session import (
-    HarnessRunner as LegacyHarnessRunner,
-)
-from src.demo.session import (
-    MemoryFailure as LegacyMemoryFailure,
-)
-from src.demo.session import (
-    MemoryRuntime as LegacyMemoryRuntime,
-)
-from src.demo.session import (
-    TaskRun as LegacyTaskRun,
-)
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3]
 
 
-def test_application_package_exports_the_canonical_agent_api():
-    assert Agent is CanonicalAgent
-    assert AgentSession is CanonicalAgentSession
+def test_importing_submissions_does_not_load_runtime_dependencies() -> None:
+    program = """
+import sys
+from importlib.abc import MetaPathFinder
 
 
-def test_demo_agent_and_session_are_exact_compatibility_exports():
-    assert LegacyAgent is Agent
-    assert LegacyAgentSession is AgentSession
-    assert LegacyHarnessRunner is HarnessRunner
-    assert HarnessRunner is CanonicalHarnessRunner
-    assert LegacyMemoryFailure is MemoryFailure
-    assert LegacyMemoryRuntime is MemoryRuntime
-    assert LegacyTaskRun is TaskRun
+class RejectRuntimeImports(MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        forbidden = (
+            "src.application.agent", "src.application.session", "src.adapters", "src.config",
+            "src.llm", "src.mcp", "litellm", "fastmcp", "sqlite3",
+        )
+        if any(fullname == name or fullname.startswith(name + ".") for name in forbidden):
+            raise AssertionError(f"unexpected runtime import: {fullname}")
+
+
+sys.meta_path.insert(0, RejectRuntimeImports())
+from src.application.submissions import SubmissionService
+"""
+    completed = subprocess.run(
+        [sys.executable, "-S", "-c", program],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr

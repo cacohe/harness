@@ -151,7 +151,7 @@ def test_competing_threads_commit_exactly_one_complete_batch() -> None:
             assert batch.transcript[0].content != snapshot.transcript[0].content
             assert batch.summary not in snapshot.summaries
         else:
-            assert submission == batch.submission
+            assert submission is not None and submission.submission == batch.submission
             assert snapshot.state == batch.state
             assert [record.event for record in snapshot.events] == list(batch.events)
             assert [record.content for record in snapshot.transcript] == [
