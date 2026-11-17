@@ -480,3 +480,17 @@ def _register_tools_atomically(catalog: ToolCatalog, tools: list[Tool]) -> None:
             if catalog.find_tool(tool.id) is not None:
                 catalog.unregister(tool.id)
         raise
+
+
+# Task 11 switches the public module surface to the async v3 facade. The legacy
+# implementation above is deleted with the rest of the v2 architecture in Task 14.
+from src.application.agent_v3 import Agent as _AgentV3  # noqa: E402
+from src.application.agent_v3 import AgentSession as _AgentSessionV3  # noqa: E402
+
+
+class Agent(_AgentV3):  # type: ignore[no-redef]  # noqa: F811
+    pass
+
+
+class AgentSession(_AgentSessionV3):  # type: ignore[no-redef]
+    pass
