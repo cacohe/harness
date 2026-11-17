@@ -267,26 +267,9 @@ class SQLiteRunJournal:
             connection.execute("BEGIN IMMEDIATE")
             state = batch.state
             session_key = state.session_id.value
-            row = connection.execute(
-                "SELECT session_id, version, sequence, state_json FROM sessions WHERE session_id = ?",
-                (session_key,),
-            ).fetchone()
+            row, _current = _preflight_existing_ledger(connection, session_key)
             version = int(row["version"]) if row is not None else 0
             previous_sequence = int(row["sequence"]) if row is not None else 0
-            if row is not None:
-                current = decode(row["state_json"], RunState)
-                _validate_session_row(row, session_key, current)
-                current_run_row = connection.execute(
-                    "SELECT session_id, run_id, submission_id, profile_id, status, state_version, state_json "
-                    "FROM runs WHERE session_id = ? AND run_id = ?",
-                    (session_key, current.run_id.value),
-                ).fetchone()
-                if (
-                    current_run_row is None
-                    or decode(current_run_row["state_json"], RunState) != current
-                ):
-                    raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
-                _validate_run_row(current_run_row, current)
             existing = connection.execute(
                 "SELECT session_id, submission_id, run_id, digest, intent_json, receipt_json, "
                 "acceptance_state_json, acceptance_version FROM submissions "
@@ -705,6 +688,133 @@ def _expected_schema_signature() -> tuple[tuple[str, str, str, str], ...]:
         return _schema_signature(connection)
     finally:
         connection.close()
+
+
+def _preflight_existing_ledger(
+    connection: sqlite3.Connection, session_key: str
+) -> tuple[sqlite3.Row | None, RunState | None]:
+    """Validate one Session's immutable ledger before a commit reads its CAS counters."""
+    row = connection.execute(
+        "SELECT session_id, version, sequence, state_json FROM sessions WHERE session_id = ?",
+        (session_key,),
+    ).fetchone()
+    anchor_stats = connection.execute(
+        "SELECT COUNT(*), MIN(sequence), MAX(sequence) FROM journal_entries WHERE session_id = ?",
+        (session_key,),
+    ).fetchone()
+    event_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM events WHERE session_id = ?", (session_key,)
+        ).fetchone()[0]
+    )
+    transcript_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM transcript WHERE session_id = ?", (session_key,)
+        ).fetchone()[0]
+    )
+    anchor_count = int(anchor_stats[0])
+    if row is None:
+        if anchor_count or event_count or transcript_count:
+            raise ValueError("SQLite ledger has records without a Session")
+        return None, None
+
+    state = decode(row["state_json"], RunState)
+    _, head_sequence = _validate_session_row(row, session_key, state)
+    current_run_row = connection.execute(
+        "SELECT session_id, run_id, submission_id, profile_id, status, state_version, state_json "
+        "FROM runs WHERE session_id = ? AND run_id = ?",
+        (session_key, state.run_id.value),
+    ).fetchone()
+    if current_run_row is None or decode(current_run_row["state_json"], RunState) != state:
+        raise ValueError("SQLite Session head disagrees with its Run projection")
+    _validate_run_row(current_run_row, state)
+
+    minimum = anchor_stats[1]
+    maximum = anchor_stats[2]
+    if (
+        anchor_count != head_sequence
+        or event_count + transcript_count != head_sequence
+        or (head_sequence == 0 and (minimum is not None or maximum is not None))
+        or (head_sequence > 0 and (minimum != 1 or maximum != head_sequence))
+    ):
+        raise ValueError("SQLite ledger sequence range disagrees with its Session head")
+
+    bad_anchor = int(
+        connection.execute(
+            "SELECT EXISTS("
+            "SELECT 1 FROM journal_entries AS j "
+            "LEFT JOIN events AS e ON e.session_id=j.session_id AND e.sequence=j.sequence "
+            "LEFT JOIN transcript AS t ON t.session_id=j.session_id AND t.sequence=j.sequence "
+            "WHERE j.session_id=? AND ("
+            "j.kind NOT IN ('event', 'transcript') OR "
+            "(j.kind='event' AND (e.sequence IS NULL OR t.sequence IS NOT NULL)) OR "
+            "(j.kind='transcript' AND (t.sequence IS NULL OR e.sequence IS NOT NULL))"
+            ") LIMIT 1)",
+            (session_key,),
+        ).fetchone()[0]
+    )
+    orphan_event = int(
+        connection.execute(
+            "SELECT EXISTS("
+            "SELECT 1 FROM events AS e "
+            "LEFT JOIN journal_entries AS j "
+            "ON j.session_id=e.session_id AND j.sequence=e.sequence AND j.kind='event' "
+            "WHERE e.session_id=? AND j.sequence IS NULL LIMIT 1)",
+            (session_key,),
+        ).fetchone()[0]
+    )
+    orphan_transcript = int(
+        connection.execute(
+            "SELECT EXISTS("
+            "SELECT 1 FROM transcript AS t "
+            "LEFT JOIN journal_entries AS j "
+            "ON j.session_id=t.session_id AND j.sequence=t.sequence AND j.kind='transcript' "
+            "WHERE t.session_id=? AND j.sequence IS NULL LIMIT 1)",
+            (session_key,),
+        ).fetchone()[0]
+    )
+    if bad_anchor or orphan_event or orphan_transcript:
+        raise ValueError("SQLite ledger anchors disagree with physical records")
+
+    for event_row in connection.execute(
+        "SELECT event_id, session_id, sequence, run_id, event_json FROM events "
+        "WHERE session_id = ? ORDER BY sequence",
+        (session_key,),
+    ):
+        _decode_event_row(event_row, session_key)
+    for transcript_row in connection.execute(
+        "SELECT session_id, sequence, run_id, submission_id, role, content, entry_json "
+        "FROM transcript WHERE session_id = ? ORDER BY sequence",
+        (session_key,),
+    ):
+        _decode_transcript_row(transcript_row, session_key)
+
+    for submission_row in connection.execute(
+        "SELECT session_id, submission_id, run_id, digest, intent_json, receipt_json, "
+        "acceptance_state_json, acceptance_version FROM submissions "
+        "WHERE session_id = ? ORDER BY submission_id",
+        (session_key,),
+    ):
+        receipt, _, _ = _decode_submission_row(
+            submission_row, session_key, str(submission_row["submission_id"])
+        )
+        for expected_event in receipt.events:
+            physical = connection.execute(
+                "SELECT event_id, session_id, sequence, run_id, event_json FROM events "
+                "WHERE session_id = ? AND sequence = ?",
+                (session_key, expected_event.sequence),
+            ).fetchone()
+            if physical is None or _decode_event_row(physical, session_key) != expected_event:
+                raise ValueError("SQLite acceptance Event disagrees with physical history")
+        for expected_entry in receipt.transcript:
+            physical = connection.execute(
+                "SELECT session_id, sequence, run_id, submission_id, role, content, entry_json "
+                "FROM transcript WHERE session_id = ? AND sequence = ?",
+                (session_key, expected_entry.sequence),
+            ).fetchone()
+            if physical is None or _decode_transcript_row(physical, session_key) != expected_entry:
+                raise ValueError("SQLite acceptance transcript disagrees with physical history")
+    return row, state
 
 
 def _validate_session_row(row: sqlite3.Row, session_key: str, state: RunState) -> tuple[int, int]:

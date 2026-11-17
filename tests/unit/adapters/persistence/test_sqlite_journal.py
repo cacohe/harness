@@ -18,7 +18,7 @@ from src.core.journal import (
     JournalSnapshot,
     TranscriptEntry,
 )
-from src.core.state import RunStatus
+from src.core.state import RunState, RunStatus
 from tests.unit.core.test_journal_contract import acceptance
 
 
@@ -383,6 +383,209 @@ def test_shared_sequence_preserves_kind_for_non_acceptance_commits(tmp_path: Pat
     with pytest.raises(JournalError) as caught:
         asyncio.run(journal.load_session(state.session_id))
     assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+def _append_second_pair(journal: SQLiteRunJournal, first: JournalCommit) -> JournalSnapshot:
+    state = replace(
+        first.state,
+        version=2,
+        journal_version=2,
+        journal_sequence=4,
+    )
+    event = type(first.events[0])(
+        EventId("second-pair-event"),
+        first.events[0].type,
+        state.run_id,
+        state.session_id,
+        first.events[0].timestamp,
+        {},
+    )
+    entry = TranscriptEntry(
+        state.session_id,
+        state.run_id,
+        state.submission_id,
+        "assistant",
+        "second pair",
+    )
+    return asyncio.run(
+        journal.commit(JournalCommit(state, events=(event,), transcript=(entry,)), 1)
+    )
+
+
+def _raw_session_rows(path: Path, session_id: SessionId) -> tuple[tuple[str, tuple], ...]:
+    result = []
+    with sqlite3.connect(path) as connection:
+        for table, order in (
+            ("sessions", "session_id"),
+            ("runs", "run_id"),
+            ("journal_entries", "sequence"),
+            ("events", "sequence"),
+            ("transcript", "sequence"),
+            ("summary_checkpoints", "covered_through_sequence, policy_version, profile_id"),
+            ("submissions", "submission_id"),
+        ):
+            rows = tuple(
+                connection.execute(
+                    f"SELECT * FROM {table} WHERE session_id=? ORDER BY {order}",
+                    (session_id.value,),
+                )
+            )
+            result.append((table, rows))
+    return tuple(result)
+
+
+def _new_commit_after(
+    state: RunState,
+    *,
+    version: int,
+    sequence: int,
+    with_records: bool,
+) -> JournalCommit:
+    projected = replace(
+        state,
+        version=state.version + 1,
+        journal_version=version + 1,
+        journal_sequence=sequence + (2 if with_records else 0),
+    )
+    if not with_records:
+        return JournalCommit(projected)
+    template = acceptance("template").events[0]
+    event = type(template)(
+        EventId(f"attempt-event-{version}"),
+        template.type,
+        projected.run_id,
+        projected.session_id,
+        template.timestamp,
+        {},
+    )
+    entry = TranscriptEntry(
+        projected.session_id,
+        projected.run_id,
+        projected.submission_id,
+        "assistant",
+        "attempt",
+    )
+    return JournalCommit(projected, events=(event,), transcript=(entry,))
+
+
+@pytest.mark.parametrize("with_records", [False, True], ids=["state-only", "with-records"])
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "delete-event-anchor",
+        "delete-event-row",
+        "delete-transcript-anchor",
+        "delete-transcript-row",
+        "wrong-anchor-kind",
+        "orphan-event-balanced-row-count",
+        "middle-gap-masked-by-cross-table-duplicate",
+    ],
+)
+def test_commit_preflights_existing_session_ledger_before_any_write(
+    tmp_path: Path, corruption: str, with_records: bool
+) -> None:
+    journal = make_journal(tmp_path)
+    first = acceptance(f"preflight-{corruption}")
+    receipt = asyncio.run(journal.commit(first, 0))
+    if corruption == "middle-gap-masked-by-cross-table-duplicate":
+        receipt = _append_second_pair(journal, first)
+    attempted = _new_commit_after(
+        receipt.state,
+        version=receipt.version,
+        sequence=receipt.sequence,
+        with_records=with_records,
+    )
+    with sqlite3.connect(journal.path) as connection:
+        if corruption == "delete-event-anchor":
+            connection.execute(
+                "DELETE FROM journal_entries WHERE session_id=? AND sequence=1",
+                (first.state.session_id.value,),
+            )
+        elif corruption == "delete-event-row":
+            connection.execute(
+                "DELETE FROM events WHERE session_id=? AND sequence=1",
+                (first.state.session_id.value,),
+            )
+        elif corruption == "delete-transcript-anchor":
+            connection.execute(
+                "DELETE FROM journal_entries WHERE session_id=? AND sequence=2",
+                (first.state.session_id.value,),
+            )
+        elif corruption == "delete-transcript-row":
+            connection.execute(
+                "DELETE FROM transcript WHERE session_id=? AND sequence=2",
+                (first.state.session_id.value,),
+            )
+        elif corruption == "wrong-anchor-kind":
+            connection.execute("PRAGMA ignore_check_constraints=ON")
+            connection.execute(
+                "UPDATE journal_entries SET kind='transcript' WHERE session_id=? AND sequence=1",
+                (first.state.session_id.value,),
+            )
+        elif corruption == "orphan-event-balanced-row-count":
+            source = first.events[0]
+            orphan_event = type(source)(
+                EventId("orphan-event"),
+                source.type,
+                source.run_id,
+                source.session_id,
+                source.timestamp,
+                source.payload,
+            )
+            orphan = JournalEvent(2, orphan_event)
+            connection.execute(
+                "INSERT INTO events(event_id, session_id, sequence, run_id, event_json) "
+                "VALUES (?, ?, 2, ?, ?)",
+                (
+                    orphan.event.event_id.value,
+                    first.state.session_id.value,
+                    first.state.run_id.value,
+                    encode(orphan),
+                ),
+            )
+            connection.execute(
+                "DELETE FROM journal_entries WHERE session_id=? AND sequence=1",
+                (first.state.session_id.value,),
+            )
+        else:
+            later = receipt.events[-1]
+            connection.execute(
+                "UPDATE events SET sequence=2, event_json=? WHERE session_id=? AND sequence=3",
+                (
+                    encode(JournalEvent(2, later.event)),
+                    first.state.session_id.value,
+                ),
+            )
+    before = _raw_session_rows(journal.path, first.state.session_id)
+
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(journal.commit(attempted, receipt.version))
+
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    assert _raw_session_rows(journal.path, first.state.session_id) == before
+
+
+def test_commit_ledger_preflight_is_session_local(tmp_path: Path) -> None:
+    journal = make_journal(tmp_path)
+    damaged = acceptance("damaged", session="damaged")
+    healthy = acceptance("healthy", session="healthy")
+    asyncio.run(journal.commit(damaged, 0))
+    healthy_receipt = asyncio.run(journal.commit(healthy, 0))
+    with sqlite3.connect(journal.path) as connection:
+        connection.execute(
+            "DELETE FROM journal_entries WHERE session_id=? AND sequence=1",
+            (damaged.state.session_id.value,),
+        )
+    next_healthy = _new_commit_after(
+        healthy_receipt.state,
+        version=healthy_receipt.version,
+        sequence=healthy_receipt.sequence,
+        with_records=False,
+    )
+
+    receipt = asyncio.run(journal.commit(next_healthy, healthy_receipt.version))
+
+    assert (receipt.version, receipt.sequence) == (2, 2)
 
 
 @pytest.mark.parametrize(
