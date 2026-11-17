@@ -66,15 +66,19 @@ class BoundedContextProvider:
         if estimate.tokens > budget.input_allowance_tokens:
             raise ContextBudgetExceeded
 
-        selected: list[ConversationInteraction] = []
-        compaction: list[ConversationInteraction] = []
-        omission: _Omission | None = None
         durable = self._summary_service.find_latest_reusable(request.summary_checkpoints, request)
-        covered_through = durable.covered_through_sequence if durable is not None else 0
+        durable_processed = durable is None
+        selected: list[ConversationInteraction] = []
+        included_checkpoints: list[ConversationSummaryCheckpoint] = []
+        omitted_checkpoints: list[ConversationSummaryCheckpoint] = []
+        omission_segments: list[_Omission] = []
+        current_omission: _Omission | None = None
+        compaction: list[ConversationInteraction] = []
+        compaction_open = True
         suffix_open = True
         cursor: int | None = None
         seen_cursors: set[int | None] = set()
-        reached_covered_history = False
+
         while True:
             if cursor in seen_cursors:
                 raise ValueError("Conversation reader repeated a pagination cursor")
@@ -85,80 +89,116 @@ class BoundedContextProvider:
             ):
                 raise ValueError("Conversation reader returned an item outside its cursor")
             for item in page.interactions:
-                if item.sequence_through <= covered_through:
-                    reached_covered_history = True
-                    break
-                if item.sequence_from <= covered_through:
+                relation = self._checkpoint_relation(item, durable)
+                if relation == "split":
                     raise ValueError("Summary checkpoint splits a transcript interaction")
+                if relation != "newer" and not durable_processed:
+                    suffix_open, estimate = self._consider_checkpoint(
+                        request,
+                        budget,
+                        selected,
+                        included_checkpoints,
+                        omitted_checkpoints,
+                        durable,
+                        suffix_open,
+                        estimate,
+                    )
+                    durable_processed = True
+                    current_omission = None
+                    if compaction:
+                        compaction_open = False
+                if relation == "covered":
+                    continue
                 if suffix_open:
-                    candidate = [*selected, item]
-                    messages = self._assemble(request, candidate, (), (), ())
-                    candidate_estimate = self._counter.count(messages, request.tools)
+                    proposed = [*selected, item]
+                    candidate_estimate = self._counter.count(
+                        self._assemble(request, proposed, tuple(included_checkpoints), (), ()),
+                        request.tools,
+                    )
                     if candidate_estimate.tokens <= budget.input_allowance_tokens:
                         selected.append(item)
                         estimate = candidate_estimate
                         continue
                     suffix_open = False
-                if omission is None:
-                    omission = _Omission(item.sequence_from, item.sequence_through, 1)
+                if current_omission is None:
+                    current_omission = _Omission(item.sequence_from, item.sequence_through, 1)
+                    omission_segments.append(current_omission)
                 else:
-                    omission.include(item)
-                if len(compaction) < self._max_compaction_interactions:
+                    current_omission.include(item)
+                if compaction_open and len(compaction) < self._max_compaction_interactions:
                     compaction.append(item)
-            if reached_covered_history:
-                break
             cursor = page.next_before_sequence
             if cursor is None:
                 break
 
-        summary: tuple[ModelMessage, ...] = ()
-        memory: tuple[ModelMessage, ...] = ()
-        skills: tuple[ModelMessage, ...] = ()
-        omitted: list[OmittedContextRef] = []
-        if omission is not None:
-            omitted.append(
-                OmittedContextRef("transcript", omission.first, omission.last, omission.count)
+        if not durable_processed:
+            suffix_open, estimate = self._consider_checkpoint(
+                request,
+                budget,
+                selected,
+                included_checkpoints,
+                omitted_checkpoints,
+                durable,
+                suffix_open,
+                estimate,
             )
 
         candidate_checkpoint: ConversationSummaryCheckpoint | None = None
         if compaction:
             outcome = await self._summary_service.compact_or_retain(request, tuple(compaction))
             candidate_checkpoint = outcome.checkpoint
+        if candidate_checkpoint is not None:
+            _, estimate = self._consider_checkpoint(
+                request,
+                budget,
+                selected,
+                included_checkpoints,
+                omitted_checkpoints,
+                candidate_checkpoint,
+                True,
+                estimate,
+            )
 
-        checkpoints = tuple(
-            checkpoint for checkpoint in (candidate_checkpoint, durable) if checkpoint is not None
+        omitted = [
+            OmittedContextRef("transcript", item.first, item.last, item.count)
+            for item in reversed(omission_segments)
+        ]
+        omitted.extend(
+            OmittedContextRef(
+                "summary",
+                checkpoint.covered_from_sequence,
+                checkpoint.covered_through_sequence,
+                1,
+            )
+            for checkpoint in omitted_checkpoints
         )
-        included_checkpoints: list[ConversationSummaryCheckpoint] = []
-        for checkpoint in sorted(
-            checkpoints, key=lambda item: item.covered_through_sequence, reverse=True
-        ):
-            proposed = [*included_checkpoints, checkpoint]
-            proposed_messages = self._summary_messages(proposed)
-            messages = self._assemble(request, selected, proposed_messages, memory, skills)
-            candidate_estimate = self._counter.count(messages, request.tools)
-            if candidate_estimate.tokens <= budget.input_allowance_tokens:
-                included_checkpoints.append(checkpoint)
-                summary = proposed_messages
-                estimate = candidate_estimate
-            else:
-                omitted.append(
-                    OmittedContextRef(
-                        "summary",
-                        checkpoint.covered_from_sequence,
-                        checkpoint.covered_through_sequence,
-                        1,
-                    )
-                )
 
+        memory: tuple[ModelMessage, ...] = ()
+        skills: tuple[ModelMessage, ...] = ()
+        checkpoints = tuple(included_checkpoints)
         memory, memory_omitted, estimate = self._include_messages(
-            request, budget, selected, summary, memory, skills, request.memory_messages, "memory"
+            request,
+            budget,
+            selected,
+            checkpoints,
+            memory,
+            skills,
+            request.memory_messages,
+            "memory",
         )
         omitted.extend(memory_omitted)
         skills, skill_omitted, estimate = self._include_messages(
-            request, budget, selected, summary, memory, skills, request.skill_messages, "skills"
+            request,
+            budget,
+            selected,
+            checkpoints,
+            memory,
+            skills,
+            request.skill_messages,
+            "skills",
         )
         omitted.extend(skill_omitted)
-        messages = self._assemble(request, selected, summary, memory, skills)
+        messages = self._assemble(request, selected, checkpoints, memory, skills)
         estimate = self._counter.count(messages, request.tools)
         return ContextWindow(
             messages,
@@ -171,19 +211,57 @@ class BoundedContextProvider:
         )
 
     @staticmethod
-    def _summary_messages(
-        checkpoints: list[ConversationSummaryCheckpoint],
+    def _checkpoint_relation(
+        item: ConversationInteraction,
+        checkpoint: ConversationSummaryCheckpoint | None,
+    ) -> str:
+        if checkpoint is None:
+            return "none"
+        if item.sequence_from > checkpoint.covered_through_sequence:
+            return "newer"
+        if item.sequence_through < checkpoint.covered_from_sequence:
+            return "older"
+        if (
+            item.sequence_from >= checkpoint.covered_from_sequence
+            and item.sequence_through <= checkpoint.covered_through_sequence
+        ):
+            return "covered"
+        return "split"
+
+    def _consider_checkpoint(
+        self,
+        request: ContextRequest,
+        budget: ContextBudget,
+        selected: list[ConversationInteraction],
+        included: list[ConversationSummaryCheckpoint],
+        omitted: list[ConversationSummaryCheckpoint],
+        checkpoint: ConversationSummaryCheckpoint | None,
+        suffix_open: bool,
+        prior_estimate,
+    ):
+        assert checkpoint is not None
+        proposed = (*included, checkpoint)
+        estimate = self._counter.count(
+            self._assemble(request, selected, proposed, (), ()), request.tools
+        )
+        if suffix_open and estimate.tokens <= budget.input_allowance_tokens:
+            included.append(checkpoint)
+            return True, estimate
+        omitted.append(checkpoint)
+        return False, prior_estimate
+
+    @staticmethod
+    def _checkpoint_messages(
+        checkpoint: ConversationSummaryCheckpoint,
     ) -> tuple[ModelMessage, ...]:
-        messages: list[ModelMessage] = []
-        for checkpoint in sorted(checkpoints, key=lambda item: item.covered_through_sequence):
-            messages.append(ModelMessage(ModelRole.SYSTEM, checkpoint.summary))
-            if checkpoint.artifacts:
-                messages.append(
-                    ModelMessage(
-                        ModelRole.SYSTEM,
-                        "Artifacts: " + ", ".join(ref.artifact_id for ref in checkpoint.artifacts),
-                    )
+        messages = [ModelMessage(ModelRole.SYSTEM, checkpoint.summary)]
+        if checkpoint.artifacts:
+            messages.append(
+                ModelMessage(
+                    ModelRole.SYSTEM,
+                    "Artifacts: " + ", ".join(ref.artifact_id for ref in checkpoint.artifacts),
                 )
+            )
         return tuple(messages)
 
     def _include_messages(
@@ -191,7 +269,7 @@ class BoundedContextProvider:
         request: ContextRequest,
         budget: ContextBudget,
         selected: list[ConversationInteraction],
-        summary: tuple[ModelMessage, ...],
+        checkpoints: tuple[ConversationSummaryCheckpoint, ...],
         current: tuple[ModelMessage, ...],
         later: tuple[ModelMessage, ...],
         candidates: tuple[ModelMessage, ...],
@@ -200,14 +278,14 @@ class BoundedContextProvider:
         included = list(current)
         omitted_count = 0
         estimate = self._counter.count(
-            self._assemble(request, selected, summary, current, later), request.tools
+            self._assemble(request, selected, checkpoints, current, later), request.tools
         )
         for message in candidates:
             proposed = (*included, message)
             if source == "memory":
-                assembled = self._assemble(request, selected, summary, proposed, later)
+                assembled = self._assemble(request, selected, checkpoints, proposed, later)
             else:
-                assembled = self._assemble(request, selected, summary, current, proposed)
+                assembled = self._assemble(request, selected, checkpoints, current, proposed)
             candidate_estimate = self._counter.count(assembled, request.tools)
             if candidate_estimate.tokens <= budget.input_allowance_tokens:
                 included.append(message)
@@ -221,18 +299,28 @@ class BoundedContextProvider:
     def _assemble(
         request: ContextRequest,
         selected: list[ConversationInteraction],
-        summary: tuple[ModelMessage, ...],
+        checkpoints: tuple[ConversationSummaryCheckpoint, ...],
         memory: tuple[ModelMessage, ...],
         skills: tuple[ModelMessage, ...],
     ) -> tuple[ModelMessage, ...]:
-        history = tuple(
-            message
-            for interaction in sorted(selected, key=lambda item: item.sequence_from)
-            for message in interaction.messages
+        segments = [
+            (interaction.sequence_from, interaction.sequence_through, interaction.messages)
+            for interaction in selected
+        ]
+        segments.extend(
+            (
+                checkpoint.covered_from_sequence,
+                checkpoint.covered_through_sequence,
+                BoundedContextProvider._checkpoint_messages(checkpoint),
+            )
+            for checkpoint in checkpoints
         )
+        ordered = sorted(segments, key=lambda item: item[0])
+        if any(earlier[1] >= later[0] for earlier, later in zip(ordered, ordered[1:])):
+            raise ValueError("Context history segments overlap")
+        history = tuple(message for _, _, messages in ordered for message in messages)
         return (
             request.system_message,
-            *summary,
             *memory,
             *skills,
             *history,

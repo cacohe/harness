@@ -172,6 +172,33 @@ def test_ten_thousand_records_are_paged_and_output_remains_bounded() -> None:
     assert first.omitted[0].item_count > 9_990
 
 
+def test_ten_thousand_records_with_partial_checkpoint_remain_bounded_and_deterministic() -> None:
+    records = tuple(_interaction(index, f"history-{index:05d}") for index in range(1, 10_001))
+    checkpoint = ConversationSummaryCheckpoint(
+        SessionId("session"),
+        6_000,
+        "policy-v1",
+        ProfileId("profile"),
+        "middle-summary",
+        covered_from_sequence=4_001,
+    )
+    reader = Reader(records)
+    provider = BoundedContextProvider(reader, ExactTokenCounter(), page_size=127)
+    request = _request(summary_checkpoints=(checkpoint,))
+
+    first = asyncio.run(provider.build(request, ContextBudget(128, 8, 8)))
+    second = asyncio.run(provider.build(request, ContextBudget(128, 8, 8)))
+
+    assert first == second
+    assert first.estimate.tokens <= 112
+    transcript = [item for item in first.omitted if item.source == "transcript"]
+    assert [(item.first_sequence, item.last_sequence) for item in transcript] == [
+        (1, 4_000),
+        (6_001, 9_996),
+    ]
+    assert len(reader.calls) > 100
+
+
 def test_tools_are_counted_in_the_budget() -> None:
     tool = ToolSpec("read", "DDD", "{}")
     request = _request(tools=(tool,))
@@ -195,6 +222,109 @@ def test_durable_summary_excludes_covered_raw_history() -> None:
     assert "summary-1-3" in contents
     assert "raw-4" in contents
     assert not {"raw-1", "raw-2", "raw-3"} & set(contents)
+
+
+@pytest.mark.parametrize("page_size", [2, 10])
+def test_partial_range_summary_keeps_older_raw_in_time_order(page_size: int) -> None:
+    records = tuple(_interaction(index, f"raw-{index}") for index in range(1, 8))
+    reader = Reader(records)
+    checkpoint = ConversationSummaryCheckpoint(
+        SessionId("session"),
+        5,
+        "policy-v1",
+        ProfileId("profile"),
+        "summary-3-5",
+        covered_from_sequence=3,
+    )
+    window = asyncio.run(
+        BoundedContextProvider(reader, ExactTokenCounter(), page_size=page_size).build(
+            _request(summary_checkpoints=(checkpoint,)), ContextBudget(128, 1, 0)
+        )
+    )
+    assert [message.content for message in window.messages] == [
+        "SS",
+        "raw-1",
+        "raw-2",
+        "summary-3-5",
+        "raw-6",
+        "raw-7",
+        "UUU",
+    ]
+    if page_size == 2:
+        assert len(reader.calls) == 4
+
+
+def test_older_raw_after_partial_summary_is_precisely_omitted_when_too_large() -> None:
+    records = (
+        _interaction(7, "n"),
+        _interaction(6, "n"),
+        _interaction(5, "covered"),
+        _interaction(4, "covered"),
+        _interaction(3, "covered"),
+        _interaction(2, "X" * 20),
+        _interaction(1, "X" * 20),
+    )
+    checkpoint = ConversationSummaryCheckpoint(
+        SessionId("session"),
+        5,
+        "policy-v1",
+        ProfileId("profile"),
+        "sum",
+        covered_from_sequence=3,
+    )
+    window = asyncio.run(
+        BoundedContextProvider(Reader(records), ExactTokenCounter(), page_size=2).build(
+            _request(summary_checkpoints=(checkpoint,)), ContextBudget(50, 1, 0)
+        )
+    )
+    contents = [message.content for message in window.messages]
+    assert contents == ["SS", "sum", "n", "n", "UUU"]
+    transcript_omissions = [item for item in window.omitted if item.source == "transcript"]
+    assert len(transcript_omissions) == 1
+    assert (
+        transcript_omissions[0].first_sequence,
+        transcript_omissions[0].last_sequence,
+        transcript_omissions[0].item_count,
+    ) == (1, 2, 2)
+
+
+def test_persisted_candidate_does_not_hide_history_before_its_source_range() -> None:
+    candidate = ConversationSummaryCheckpoint(
+        SessionId("session"),
+        5,
+        "policy-v1",
+        ProfileId("profile"),
+        "persisted-candidate",
+        covered_from_sequence=3,
+    )
+    records = tuple(_interaction(index, f"raw-{index}") for index in range(1, 7))
+    window = asyncio.run(
+        BoundedContextProvider(Reader(records), ExactTokenCounter(), page_size=2).build(
+            _request(summary_checkpoints=(candidate,)), ContextBudget(128, 1, 0)
+        )
+    )
+    contents = [message.content for message in window.messages]
+    assert contents.index("raw-1") < contents.index("persisted-candidate")
+    assert contents.index("raw-2") < contents.index("persisted-candidate")
+    assert contents.index("persisted-candidate") < contents.index("raw-6")
+
+
+def test_checkpoint_boundary_cannot_split_an_interaction() -> None:
+    checkpoint = ConversationSummaryCheckpoint(
+        SessionId("session"),
+        5,
+        "policy-v1",
+        ProfileId("profile"),
+        "summary",
+        covered_from_sequence=3,
+    )
+    interaction = ConversationInteraction(2, 4, (ModelMessage(ModelRole.ASSISTANT, "overlap"),))
+    with pytest.raises(ValueError, match="splits"):
+        asyncio.run(
+            BoundedContextProvider(Reader((interaction,)), ExactTokenCounter(), page_size=1).build(
+                _request(summary_checkpoints=(checkpoint,)), ContextBudget(64, 1, 0)
+            )
+        )
 
 
 @pytest.mark.parametrize(
