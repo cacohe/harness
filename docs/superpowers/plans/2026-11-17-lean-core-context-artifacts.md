@@ -172,6 +172,7 @@ git commit -m "refactor: add pure run state machine"
 - Consumes: `RunState`, `DomainEvent`。
 - Produces: `SubmissionRecord`, `TranscriptEntry`, `ConversationSummaryCheckpoint`, `JournalCommit`, `JournalSnapshot`, `RunJournal.commit(batch: JournalCommit, expected_version: int) -> Awaitable[JournalSnapshot]`, `load_session(session_id, after_sequence=0)`, `find_submission(session_id, submission_id)`。
 - `JournalCommit` 原子包含 state、events、submission update、transcript append 和可选 summary checkpoint。
+- journal 持久化边界验证 `EventId` 全局唯一性，覆盖同批次、不同 commit 和不同 Session。发现重复 ID 时整个 commit 零写入。
 
 - [ ] **Step 1: 写共享 contract 失败测试**
 

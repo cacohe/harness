@@ -6,11 +6,12 @@ from typing import TypeAlias
 from unicodedata import category
 
 from src.core.errors import InvalidTransition, RunFailure
-from src.core.events import JsonValue, _contains_host_path, _encode_payload
+from src.core.events import JsonValue, _contains_host_path
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 
 _MAX_CHILD_ID_BYTES = 256
 _MAX_TOOL_ARGUMENT_BYTES = 16_384
+_MAX_TOOL_ARGUMENT_DEPTH = 16
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,8 @@ class CommandContext:
             isinstance(event_id, EventId) for event_id in self.event_ids
         ):
             raise ValueError("event_ids must be a tuple of EventId values")
+        if len({event_id.value for event_id in self.event_ids}) != len(self.event_ids):
+            raise InvalidTransition
 
 
 @dataclass(frozen=True)
@@ -120,8 +123,9 @@ class ToolCallRequest:
         _check_bounded_text(self.arguments_json, _MAX_TOOL_ARGUMENT_BYTES)
         try:
             arguments = json.loads(self.arguments_json, object_pairs_hook=_unique_json_object)
-            # Reuse the domain JSON rules after decoding escapes and rejecting duplicate keys.
-            _encode_payload(arguments)
+            if not isinstance(arguments, dict):
+                raise ValueError("Tool arguments must be a JSON object")
+            _validate_tool_json(arguments, depth=0)
         except (ValueError, RecursionError):
             raise InvalidTransition from None
 
@@ -208,3 +212,18 @@ def _unique_json_object(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonVal
     if len(result) != len(pairs):
         raise ValueError("Duplicate tool argument key")
     return result
+
+
+def _validate_tool_json(value: JsonValue, depth: int) -> None:
+    if isinstance(value, (dict, list)):
+        if depth >= _MAX_TOOL_ARGUMENT_DEPTH:
+            raise ValueError("Tool arguments are nested too deeply")
+        if isinstance(value, dict):
+            for key in value:
+                key.encode("utf-8")
+        for child in value.values() if isinstance(value, dict) else value:
+            _validate_tool_json(child, depth + 1)
+    elif isinstance(value, str):
+        value.encode("utf-8")
+    elif isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("Tool arguments must contain finite numbers")

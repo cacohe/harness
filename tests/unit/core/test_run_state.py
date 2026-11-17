@@ -24,7 +24,7 @@ from src.core.commands import (
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.events import DomainEventType
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
-from src.core.state import InvalidTransition, RunState, RunStatus, TaskStateMachine
+from src.core.state import ApprovalState, InvalidTransition, RunState, RunStatus, TaskStateMachine
 
 RUN = RunId("run")
 SESSION = SessionId("session")
@@ -398,6 +398,13 @@ def test_normal_and_limited_start_accept_same_event_pool():
         TaskStateMachine.apply(exhausted, replace(command, context=context()))
 
 
+def test_event_pool_rejects_equal_ids_before_they_can_be_consumed():
+    duplicate = (EventId("shared"), EventId("fresh"), EventId("shared"))
+    with pytest.raises(InvalidTransition) as error:
+        CommandContext(NOW, 0, duplicate)
+    assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -453,6 +460,46 @@ def test_snapshot_cannot_skip_resume_or_smuggle_result_while_waiting():
         )
 
 
+@pytest.mark.parametrize("outcome", ["pending", "approved", "resumed", "denied"])
+def test_required_approval_cannot_be_erased_from_restored_tool(outcome):
+    waiting = advance(initial(), submit(), *begin_step(), ask_approval())
+    match outcome:
+        case "pending":
+            snapshot = waiting
+        case "approved":
+            snapshot = advance(waiting, decide())
+        case "resumed":
+            snapshot = advance(waiting, decide(), resume())
+        case _:
+            snapshot = advance(waiting, decide(False), resume())
+    step = snapshot.current_step
+    assert step is not None and step.tool_call is not None
+    with pytest.raises(InvalidTransition):
+        replace(
+            snapshot,
+            status=RunStatus.RUNNING,
+            current_step=replace(step, tool_call=replace(step.tool_call, approval=None)),
+        )
+
+
+def test_tool_without_required_approval_can_settle_but_cannot_gain_approval():
+    command = replace(ask_approval(), requires_approval=False, context=context())
+    running = advance(initial(), submit(), *begin_step(), command)
+    step = running.current_step
+    assert running.status is RunStatus.RUNNING
+    assert step is not None and step.tool_call is not None
+    assert step.tool_call.approval is None
+    assert advance(RunState(**vars(running)), finish_tool(), finish_step()).current_step is None
+    with pytest.raises(InvalidTransition):
+        replace(
+            running,
+            current_step=replace(
+                step,
+                tool_call=replace(step.tool_call, approval=ApprovalState(True, resumed=True)),
+            ),
+        )
+
+
 def test_snapshot_rejects_missing_or_mismatched_child_ownership():
     waiting = advance(initial(), submit(), *begin_step(), ask_approval())
     step = waiting.current_step
@@ -500,7 +547,7 @@ def test_rejects_unsafe_ids_at_first_acceptance(kind, value):
 
 
 def test_approved_tool_request_can_be_restored_and_resumed():
-    request = ToolCallRequest("tool", "lookup", '{"query":"weather","city":"北京"}')
+    request = ToolCallRequest("tool", "read_file", '{"path":"README.md"}')
     start_step, start_model, finish_model = begin_step()
     model_done = advance(
         initial(), submit(), start_step, start_model, replace(finish_model, tool_request=request)
@@ -528,10 +575,12 @@ def test_approved_tool_request_can_be_restored_and_resumed():
     [
         '["not an object"]',
         '{"n":NaN}',
+        '{"n":1e999}',
         '{"n":1,"n":2}',
-        '{"local":"C:\\\\temp\\\\host.txt"}',
-        '{"local":"\\u002ftmp\\u002fhost.txt"}',
+        '{"n":1,"\\u006e":2}',
         '{"\\ud800":"value"}',
+        '{"text":"\\ud800"}',
+        '{"nested":' + "[" * 16 + "0" + "]" * 16 + "}",
         '{"text":"' + "é" * 8192 + '"}',
     ],
 )
@@ -544,3 +593,18 @@ def test_rejects_invalid_or_oversized_tool_request_payload(arguments_json):
         )
         TaskStateMachine.apply(running, command)
     assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+@pytest.mark.parametrize(
+    "arguments_json",
+    [
+        '{"path":"src/nested/main.py"}',
+        '{"path":"C:\\\\temp\\\\host.txt"}',
+        '{"path":"\\u002ftmp\\u002fhost.txt"}',
+        '{"nested":' + "[" * 15 + "0" + "]" * 15 + "}",
+        '{"path":"' + "é" * 8186 + 'x"}',
+    ],
+)
+def test_tool_request_retains_path_and_exact_boundaries_for_tool_adapter(arguments_json):
+    request = ToolCallRequest("tool", "read_file", arguments_json)
+    assert request.arguments_json == arguments_json

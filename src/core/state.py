@@ -49,6 +49,7 @@ class ApprovalState:
 @dataclass(frozen=True)
 class ToolCallState:
     request: ToolCallRequest
+    requires_approval: bool
     approval: ApprovalState | None = None
     result: str | RunFailure | None = None
 
@@ -282,7 +283,7 @@ def _start_tool(state: RunState, command: StartToolCall) -> tuple[RunState, _Eve
     if type(command.requires_approval) is not bool:
         raise InvalidTransition
     approval = ApprovalState() if command.requires_approval else None
-    tool = ToolCallState(request, approval=approval)
+    tool = ToolCallState(request, requires_approval=command.requires_approval, approval=approval)
     next_state = replace(
         state,
         current_step=replace(step, tool_call=tool),
@@ -438,10 +439,13 @@ def _validate_step(state: RunState, step: StepState) -> None:
         or type(tool.request) is not ToolCallRequest
         or tool.request != request
         or request.tool_call_id not in state.used_tool_call_ids
+        or type(tool.requires_approval) is not bool
     ):
         raise InvalidTransition
 
     approval = tool.approval
+    if tool.requires_approval != (approval is not None):
+        raise InvalidTransition
     if approval is not None:
         if (
             type(approval) is not ApprovalState
