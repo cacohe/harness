@@ -224,6 +224,32 @@ def test_cancellation_can_interrupt_an_iterator_that_does_not_suspend():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("yield_after_cancellation", [False, True])
+def test_put_honors_cancellation_even_when_the_stream_swallows_it(yield_after_cancellation):
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+        entered = asyncio.Event()
+
+        async def stream():
+            yield b"ab"
+            entered.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                if yield_after_cancellation:
+                    yield b"c"
+
+        pending = asyncio.create_task(repo.put(ArtifactWrite(stream(), "text/plain")))
+        await entered.wait()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert await repo.stat(_address(b"ab")) is None
+        assert await repo.stat(_address(b"abc")) is None
+
+    asyncio.run(scenario())
+
+
 def test_repository_isolates_request_and_receipt_records():
     async def scenario():
         repo = InMemoryArtifactRepository(max_artifact_bytes=3)

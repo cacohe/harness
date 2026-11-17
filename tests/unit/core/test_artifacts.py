@@ -35,6 +35,76 @@ def test_metadata_at_the_exact_encoded_size_limit_is_accepted():
 
 
 @pytest.mark.parametrize(
+    "location",
+    [
+        "source,/private/secret",
+        "source|/private/secret",
+        "source;/private/secret",
+        "source,C:\\private\\secret",
+        "source|file:secret",
+    ],
+)
+def test_metadata_rejects_host_locations_after_punctuation(location):
+    with pytest.raises(ValueError):
+        ArtifactRef(ARTIFACT_ID, "text/plain", 0, DIGEST, metadata={"source": location})
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "bucket_access_key",
+        "bucket_secret_key",
+        "aws_access_key_id",
+        "AWS_SECRET_ACCESS_KEY",
+        "secret_access_key",
+        "presigned_url",
+        "signed-url",
+        "credentials",
+    ],
+)
+def test_metadata_rejects_credential_fields_at_any_depth(key):
+    with pytest.raises(ValueError):
+        ArtifactRef(
+            ARTIFACT_ID,
+            "text/plain",
+            0,
+            DIGEST,
+            metadata={"nested": [{key: "opaque"}]},
+        )
+
+
+def test_metadata_preserves_ordinary_statistics_fields():
+    ref = ArtifactRef(
+        ARTIFACT_ID,
+        "text/plain",
+        0,
+        DIGEST,
+        metadata={"token_count": 3, "key_count": 2},
+    )
+    assert ref.metadata == {"token_count": 3, "key_count": 2}
+
+
+@pytest.mark.parametrize(
+    "forged",
+    [
+        '{"nested":[NaN]}',
+        '{"result":Infinity}',
+        '{"result":-Infinity}',
+        '{"result":9e999}',
+        '{"result":"source|/private/secret"}',
+        '{"nested":{"bucket_secret_key":"opaque"}}',
+        '{"result":' + "[" * 16 + "0" + "]" * 16 + "}",
+        "[]",
+    ],
+)
+def test_metadata_read_validates_untrusted_serialized_fields(forged):
+    ref = ArtifactRef(ARTIFACT_ID, "text/plain", 0, DIGEST)
+    object.__setattr__(ref, "_metadata_json", forged)
+    with pytest.raises(ValueError):
+        _ = ref.metadata
+
+
+@pytest.mark.parametrize(
     "metadata",
     [
         "{}",
@@ -174,6 +244,57 @@ def test_externalized_content_requires_one_complete_variant():
     ):
         with pytest.raises(ValueError):
             ExternalizedContent(**kwargs)
+
+
+def test_externalized_content_isolates_inputs_and_readers_from_nested_mutations():
+    ref = ArtifactRef(ARTIFACT_ID, "text/plain", 0, DIGEST, name="original.txt")
+    inline = InlineContent({"value": 1}, "application/json")
+    externalized = ExternalizedContent(artifacts=(ref,), summary="summary")
+    inlined = ExternalizedContent(inline_content=inline)
+
+    object.__setattr__(ref, "artifact_id", "corrupted")
+    object.__setattr__(inline, "_encoded", b'{"value":2}')
+    object.__setattr__(externalized.artifacts[0], "name", "mutated.txt")
+    object.__setattr__(inlined.inline_content, "size_bytes", 0)
+
+    assert externalized.artifacts[0].artifact_id == ARTIFACT_ID
+    assert externalized.artifacts[0].name == "original.txt"
+    assert inlined.inline_content.value == {"value": 1}
+    assert inlined.inline_content.size_bytes == 11
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("artifact_id", "sha256:" + "b" * 64),
+        ("size_bytes", -1),
+        ("_metadata_json", '{"x":NaN}'),
+    ],
+)
+def test_externalized_content_rejects_forged_refs(field, value):
+    ref = ArtifactRef(ARTIFACT_ID, "text/plain", 0, DIGEST)
+    object.__setattr__(ref, field, value)
+    with pytest.raises(ValueError):
+        ExternalizedContent(artifacts=(ref,), summary="valid summary")
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("size_bytes", 0),
+        ("size_bytes", True),
+        ("_is_binary", "yes"),
+        ("_is_binary", True),
+        ("_encoded", b"NaN!"),
+        ("_encoded", b"01.0"),
+        ("media_type", "text/plain;invalid"),
+    ],
+)
+def test_externalized_content_rejects_forged_inline_values(field, value):
+    inline = InlineContent(None, "application/json")
+    object.__setattr__(inline, field, value)
+    with pytest.raises(ValueError):
+        ExternalizedContent(inline_content=inline)
 
 
 @pytest.mark.parametrize(

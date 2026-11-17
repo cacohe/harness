@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass, field
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from dataclasses import dataclass, field, fields
 from io import StringIO
-from typing import Protocol, TypeAlias, cast
+from typing import NoReturn, Protocol, TypeAlias, TypeVar, cast
 from unicodedata import category
 
 from src.core.events import JsonValue, _contains_host_path
@@ -23,10 +23,24 @@ _MEDIA_TOKEN = r"[a-z0-9][a-z0-9!#$&^_.+-]{0,126}"
 _MEDIA_TYPE_PATTERN = re.compile(rf"{_MEDIA_TOKEN}/{_MEDIA_TOKEN}")
 _METADATA_LOCATION = re.compile(
     r"(?i)(?:(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://|"
-    r"(?:^|\s)(?:[a-z]:\S|(?:file|data|mailto|urn):))"
+    r"(?:^|[\s,;|])(?:[a-z]:\S|(?:file|data|mailto|urn):)|"
+    r"[,;|](?:~|\.{1,2})?[/\\]\S)"
+)
+_CREDENTIAL_FIELDS = frozenset(
+    {
+        "bucket_access_key",
+        "bucket_secret_key",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "secret_access_key",
+        "presigned_url",
+        "signed_url",
+        "credentials",
+    }
 )
 
 ArtifactContent: TypeAlias = "JsonValue | bytes"
+_JsonRootObserver: TypeAlias = Callable[[Sequence[str] | int], None]
 
 
 def artifact_id_from_sha256(sha256: str) -> str:
@@ -77,6 +91,7 @@ def _json_fragments(
     max_bytes: int,
     *,
     reject_locations: bool,
+    observe_root: _JsonRootObserver | None = None,
 ) -> Iterator[str]:
     value_type = type(value)
     if type(value) is dict or type(value) is list:
@@ -88,11 +103,14 @@ def _json_fragments(
     if type(value) is dict:
         if any(type(key) is not str for key in value):
             raise ValueError("Artifact JSON object keys must be strings")
+        keys = sorted(value)
         yield "{"
-        for index, key in enumerate(sorted(value)):
+        for index, key in enumerate(keys):
             if index:
                 yield ","
             yield from _json_fragments(key, depth + 1, max_bytes, reject_locations=reject_locations)
+            if reject_locations and key.casefold().replace("-", "_") in _CREDENTIAL_FIELDS:
+                raise ValueError("Artifact metadata must not contain credential fields")
             yield ":"
             yield from _json_fragments(
                 value[key],
@@ -101,15 +119,20 @@ def _json_fragments(
                 reject_locations=reject_locations,
             )
         yield "}"
+        if observe_root is not None:
+            observe_root(keys)
     elif type(value) is list:
+        count = 0
         yield "["
-        for index, item in enumerate(value):
-            if index:
+        for count, item in enumerate(value, start=1):
+            if count > 1:
                 yield ","
             yield from _json_fragments(
                 item, depth + 1, max_bytes, reject_locations=reject_locations
             )
         yield "]"
+        if observe_root is not None:
+            observe_root(count)
     elif type(value) is str:
         if len(value) > max_bytes:
             raise ValueError("Artifact JSON exceeds its byte limit")
@@ -124,10 +147,22 @@ def _json_fragments(
         raise ValueError("Artifact JSON requires exact JSON types")
 
 
-def _encode_json(value: object, max_bytes: int, *, reject_locations: bool = False) -> str:
+def _encode_json(
+    value: object,
+    max_bytes: int,
+    *,
+    reject_locations: bool = False,
+    observe_root: _JsonRootObserver | None = None,
+) -> str:
     encoded = StringIO()
     size = 0
-    for fragment in _json_fragments(value, 0, max_bytes, reject_locations=reject_locations):
+    for fragment in _json_fragments(
+        value,
+        0,
+        max_bytes,
+        reject_locations=reject_locations,
+        observe_root=observe_root,
+    ):
         size += len(fragment.encode("utf-8"))
         if size > max_bytes:
             raise ValueError("Artifact JSON exceeds its byte limit")
@@ -147,17 +182,37 @@ def _unique_json_object(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonVal
     result: dict[str, JsonValue] = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError("Artifact metadata contains a duplicate JSON key")
+            raise ValueError("Artifact JSON contains a duplicate object key")
         result[key] = value
     return result
+
+
+def _reject_json_constant(_value: str) -> NoReturn:
+    raise ValueError("Artifact JSON must use finite numbers")
+
+
+def _decode_json(encoded: str | bytes) -> JsonValue:
+    try:
+        return cast(
+            JsonValue,
+            json.loads(
+                encoded,
+                object_pairs_hook=_unique_json_object,
+                parse_constant=_reject_json_constant,
+            ),
+        )
+    except RecursionError:
+        raise ValueError("Artifact JSON is nested too deeply") from None
 
 
 def _decode_metadata(encoded: str) -> dict[str, JsonValue]:
     if type(encoded) is not str or not _bounded_text(encoded, _MAX_METADATA_BYTES):
         raise ValueError("Artifact metadata exceeds its byte limit")
-    value = json.loads(encoded, object_pairs_hook=_unique_json_object)
+    value = _decode_json(encoded)
     if type(value) is not dict:
         raise ValueError("Artifact metadata must be a JSON object")
+    if _encode_metadata(value) != encoded:
+        raise ValueError("Artifact metadata must use canonical JSON")
     return value
 
 
@@ -165,9 +220,15 @@ def _is_json_media_type(media_type: str) -> bool:
     return media_type == "application/json" or media_type.endswith("+json")
 
 
-def _encode_content(content: ArtifactContent, media_type: str, max_bytes: int) -> bytes:
+def _encode_content(
+    content: ArtifactContent,
+    media_type: str,
+    max_bytes: int,
+    *,
+    observe_json_root: _JsonRootObserver | None = None,
+) -> bytes:
     if _is_json_media_type(media_type):
-        return _encode_json(content, max_bytes).encode("utf-8")
+        return _encode_json(content, max_bytes, observe_root=observe_json_root).encode("utf-8")
     if type(content) is bytes:
         encoded = content
     elif type(content) is str and len(content) <= max_bytes:
@@ -284,36 +345,106 @@ class InlineContent:
         if self._is_binary:
             return self._encoded
         if _is_json_media_type(self.media_type):
-            return cast(JsonValue, json.loads(self._encoded))
+            return _decode_json(self._encoded)
         return self._encoded.decode("utf-8")
 
 
-@dataclass(frozen=True, slots=True)
-class ExternalizedContent:
-    inline_content: InlineContent | None = None
-    artifacts: tuple[ArtifactRef, ...] = ()
-    summary: str | None = None
-
-    def __post_init__(self) -> None:
+def _rebuild_inline(content: InlineContent) -> InlineContent:
+    try:
+        media_type, size_bytes = content.media_type, content.size_bytes
+        encoded, is_binary = content._encoded, content._is_binary
+        validate_media_type(media_type)
         if (
-            type(self.artifacts) is not tuple
-            or len(self.artifacts) > _MAX_ARTIFACT_REFS
-            or any(type(ref) is not ArtifactRef for ref in self.artifacts)
+            type(size_bytes) is not int
+            or type(encoded) is not bytes
+            or len(encoded) != size_bytes
+            or size_bytes > MAX_INLINE_CONTENT_BYTES
+            or type(is_binary) is not bool
+        ):
+            raise ValueError
+        if is_binary:
+            value: ArtifactContent = encoded
+        elif _is_json_media_type(media_type):
+            value = _decode_json(encoded)
+        else:
+            value = encoded.decode("utf-8")
+        rebuilt = InlineContent(value, media_type)
+        if rebuilt._encoded != encoded:
+            raise ValueError
+        return rebuilt
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("Invalid inline artifact content") from None
+
+
+def _rebuild_artifact_ref(ref: ArtifactRef) -> ArtifactRef:
+    try:
+        return ArtifactRef(
+            ref.artifact_id,
+            ref.media_type,
+            ref.size_bytes,
+            ref.sha256,
+            ref.name,
+            ref.metadata,
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("Invalid artifact reference") from None
+
+
+_NestedContent = TypeVar("_NestedContent", InlineContent, ArtifactRef)
+
+
+def _copy_canonical(value: _NestedContent) -> _NestedContent:
+    record_type = type(value)
+    result = object.__new__(record_type)
+    for member in fields(record_type):
+        object.__setattr__(result, member.name, object.__getattribute__(value, member.name))
+    return result
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ExternalizedContent:
+    _inline_content: InlineContent | None = field(repr=False)
+    _artifacts: tuple[ArtifactRef, ...] = field(repr=False)
+    summary: str | None
+
+    def __init__(
+        self,
+        inline_content: InlineContent | None = None,
+        artifacts: tuple[ArtifactRef, ...] = (),
+        summary: str | None = None,
+    ) -> None:
+        if (
+            type(artifacts) is not tuple
+            or len(artifacts) > _MAX_ARTIFACT_REFS
+            or any(type(ref) is not ArtifactRef for ref in artifacts)
         ):
             raise ValueError("Externalized content requires a bounded tuple of artifact refs")
-        if self.inline_content is not None:
-            if (
-                type(self.inline_content) is not InlineContent
-                or self.artifacts
-                or self.summary is not None
-            ):
+        if inline_content is not None:
+            if type(inline_content) is not InlineContent or artifacts or summary is not None:
                 raise ValueError("Inline content cannot be combined with artifact refs or summary")
         elif (
-            not self.artifacts
-            or type(self.summary) is not str
-            or not _bounded_text(self.summary, MAX_SUMMARY_BYTES)
+            not artifacts
+            or type(summary) is not str
+            or not _bounded_text(summary, MAX_SUMMARY_BYTES)
         ):
             raise ValueError("Externalized artifacts require a bounded non-empty summary")
+        object.__setattr__(
+            self,
+            "_inline_content",
+            _rebuild_inline(inline_content) if inline_content is not None else None,
+        )
+        object.__setattr__(
+            self, "_artifacts", tuple(_rebuild_artifact_ref(ref) for ref in artifacts)
+        )
+        object.__setattr__(self, "summary", summary)
+
+    @property
+    def inline_content(self) -> InlineContent | None:
+        return _copy_canonical(self._inline_content) if self._inline_content is not None else None
+
+    @property
+    def artifacts(self) -> tuple[ArtifactRef, ...]:
+        return tuple(_copy_canonical(ref) for ref in self._artifacts)
 
 
 class ArtifactRepository(Protocol):

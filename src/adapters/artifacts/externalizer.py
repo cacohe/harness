@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 
 from src.core.artifacts import (
@@ -67,12 +67,30 @@ class PolicyArtifactExternalizer:
         if media_type not in policy.allowed_media_types:
             raise ValueError("Artifact media type is not allowed by the policy")
 
-        payload = _encode_content(content, media_type, policy.max_artifact_bytes)
+        summary: str | None = None
+
+        def observe_json_root(root: Sequence[str] | int) -> None:
+            nonlocal summary
+            limit = policy.max_summary_bytes
+            if isinstance(root, int):
+                summary = _prefix(f"JSON array ({root} items)", limit)
+            else:
+                summary = _object_summary(root, limit)
+
+        payload = _encode_content(
+            content,
+            media_type,
+            policy.max_artifact_bytes,
+            observe_json_root=observe_json_root,
+        )
         if len(payload) <= policy.max_inline_bytes:
             value = json.loads(payload) if _is_json_media_type(media_type) else content
             return ExternalizedContent(inline_content=InlineContent(value, media_type))
 
-        summary = _summarize(payload, media_type, type(content) is bytes, policy.max_summary_bytes)
+        if summary is None:
+            summary = _summarize(
+                payload, media_type, type(content) is bytes, policy.max_summary_bytes
+            )
         ref = await self._repository.put(
             ArtifactWrite(
                 _chunks(payload),
@@ -91,12 +109,6 @@ async def _chunks(payload: bytes) -> AsyncIterator[bytes]:
 
 
 def _summarize(payload: bytes, media_type: str, is_binary: bool, limit: int) -> str:
-    if _is_json_media_type(media_type):
-        value = json.loads(payload)
-        if type(value) is dict:
-            return _object_summary(value, limit)
-        if type(value) is list:
-            return _prefix(f"JSON array ({len(value)} items)", limit)
     if is_binary:
         return _prefix(f"{len(payload)} bytes ({media_type})", limit)
     marker_bytes = len(_ELLIPSIS.encode("utf-8"))
@@ -110,17 +122,17 @@ def _summarize(payload: bytes, media_type: str, is_binary: bool, limit: int) -> 
     return head + _ELLIPSIS + tail
 
 
-def _object_summary(value: dict[str, object], limit: int) -> str:
-    count = len(value)
+def _object_summary(keys: Sequence[str], limit: int) -> str:
+    count = len(keys)
     noun = "key" if count == 1 else "keys"
     label = f"JSON object ({count} {noun})"
-    if len(label) >= limit or not value:
+    if len(label) >= limit or not keys:
         return label[:limit]
     parts = [label]
     remaining = limit - len(label)
-    for index, key in enumerate(value):
+    for index, key in enumerate(keys):
         separator = ": " if index == 0 else ", "
-        part = _prefix(separator + json.dumps(key, ensure_ascii=False), remaining)
+        part = _prefix(separator + json.dumps(key[:remaining], ensure_ascii=False), remaining)
         parts.append(part)
         remaining -= len(part.encode("utf-8"))
         if remaining < 4:

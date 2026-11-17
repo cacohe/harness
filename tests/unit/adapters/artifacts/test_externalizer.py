@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 
 import pytest
 from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactExternalizer
@@ -90,6 +91,42 @@ def test_json_array_summary_keeps_item_count_and_json_null_stays_inline():
         assert inline.inline_content.size_bytes == 4
         external = await externalizer.externalize([1, 2, 3], "application/json")
         assert "3 items" in external.summary
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("probe", ["decode", "reencode-key"])
+def test_large_json_preview_does_not_parse_payload_or_reencode_large_keys(monkeypatch, probe):
+    key = "a" * 200_000
+    content = {key: [{"detail": "v" * 80}] * 20_000, "z": "source"}
+    real_loads = json.loads
+    real_dumps = json.dumps
+    full_key_encodes = 0
+
+    def observe_loads(payload, *args, **kwargs):
+        if probe == "decode":
+            assert len(payload) < 50, "summary decoded an entire JSON payload"
+        return real_loads(payload, *args, **kwargs)
+
+    def observe_dumps(value, *args, **kwargs):
+        nonlocal full_key_encodes
+        if type(value) is str and value == key:
+            full_key_encodes += 1
+            if probe == "reencode-key":
+                assert full_key_encodes == 1, "summary re-encoded an oversized key"
+        return real_dumps(value, *args, **kwargs)
+
+    monkeypatch.setattr(json, "loads", observe_loads)
+    monkeypatch.setattr(json, "dumps", observe_dumps)
+
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3_000_000)
+        externalizer = _externalizer(repo, inline=0, artifact=3_000_000, summary=40)
+        result = await externalizer.externalize(content, "application/json")
+        assert result.artifacts[0].size_bytes > 2_000_000
+        assert result.summary.startswith('JSON object (2 keys): "aaa')
+        assert len(result.summary.encode()) <= 40
+        assert full_key_encodes == 1
 
     asyncio.run(scenario())
 

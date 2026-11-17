@@ -1,4 +1,4 @@
-from asyncio import sleep
+from asyncio import CancelledError, current_task, sleep
 from collections.abc import AsyncIterator
 from hashlib import sha256
 from threading import Lock
@@ -29,6 +29,15 @@ class InMemoryArtifactRepository:
         self._lock = Lock()
 
     async def put(self, request: ArtifactWrite) -> ArtifactRef:
+        task = current_task()
+        cancellation_count = task.cancelling() if task is not None else 0
+        if cancellation_count:
+            raise CancelledError
+
+        def check_cancellation() -> None:
+            if task is not None and task.cancelling() > cancellation_count:
+                raise CancelledError
+
         request = _validated_write(request)
         limit = min(request.max_bytes, self._max_artifact_bytes)
         expected_size = request.expected_size_bytes
@@ -41,6 +50,7 @@ class InMemoryArtifactRepository:
         digest = sha256()
         chunks_since_checkpoint = 0
         async for chunk in request.stream:
+            check_cancellation()
             if type(chunk) is not bytes:
                 raise ValueError("Artifact stream chunks must be exact bytes")
             if len(content) + len(chunk) > limit:
@@ -52,6 +62,7 @@ class InMemoryArtifactRepository:
                 await sleep(0)
                 chunks_since_checkpoint = 0
 
+        check_cancellation()
         checksum = digest.hexdigest()
         if expected_size is not None and expected_size != len(content):
             raise ValueError("Artifact stream size does not match the expected size")
@@ -71,6 +82,7 @@ class InMemoryArtifactRepository:
         # An iterator can complete without suspending. Honor pending cancellation before publication.
         await sleep(0)
         with self._lock:
+            check_cancellation()
             existing = self._objects.get(artifact_id)
             if existing is not None and existing[0] != ref:
                 raise ValueError("Artifact descriptor conflict for content address")
