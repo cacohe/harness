@@ -1,9 +1,16 @@
 import json
-from decimal import Decimal, InvalidOperation
+from dataclasses import dataclass
 from typing import NoReturn
 
 MAX_TOOL_ARGUMENT_BYTES = 16_384
 _MAX_JSON_DEPTH = 16
+
+
+@dataclass(frozen=True, slots=True)
+class _JsonNumberToken:
+    """A number lexeme validated by the JSON scanner."""
+
+    source: str
 
 
 def validate_bounded_text(text: str, max_bytes: int) -> None:
@@ -17,15 +24,15 @@ def validate_json_text(text: str, max_bytes: int, *, allow_boolean_root: bool = 
         validate_bounded_text(text, max_bytes)
         value = json.loads(
             text,
-            parse_float=Decimal,
-            parse_int=int,
+            parse_float=_JsonNumberToken,
+            parse_int=_JsonNumberToken,
             parse_constant=_reject_constant,
             object_pairs_hook=_unique_object,
         )
         if type(value) is not dict and not (allow_boolean_root and type(value) is bool):
             raise ValueError
         _validate_structure(value, depth=0)
-    except (InvalidOperation, RecursionError, ValueError):
+    except (RecursionError, ValueError):
         raise ValueError("Expected bounded strict JSON text") from None
 
 
@@ -51,5 +58,5 @@ def _validate_structure(value: object, depth: int) -> None:
             _validate_structure(item, depth + 1)
     elif type(value) is str:
         value.encode("utf-8")
-    elif type(value) is Decimal and not value.is_finite():
+    elif value is not None and type(value) not in (bool, _JsonNumberToken):
         raise ValueError

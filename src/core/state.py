@@ -21,6 +21,7 @@ from src.core.commands import (
     ToolCallRequest,
     _check_bounded_text,
     _check_child_id,
+    snapshot_tool_call,
 )
 from src.core.errors import InvalidTransition, RunErrorCode, RunFailure
 from src.core.events import DomainEvent, DomainEventType, JsonValue
@@ -251,9 +252,7 @@ def _advance_running(
             _check_text(state, command.result)
             request = command.tool_request
             if request is not None:
-                if type(request) is not ToolCallRequest:
-                    raise InvalidTransition
-                request = replace(request)
+                request = snapshot_tool_call(request)
             model = replace(model, result=command.result, tool_request=request)
             return replace(state, current_step=replace(step, model_call=model)), None
         case StartToolCall():

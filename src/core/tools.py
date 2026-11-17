@@ -1,10 +1,10 @@
 from collections.abc import Awaitable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
 
 from src.core.artifacts import ArtifactRef, ExternalizedContent, InlineContent
-from src.core.commands import ToolCallRequest, _check_child_id
+from src.core.commands import ToolCallRequest, _check_child_id, snapshot_tool_call
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.ids import RunId, SessionId
 from src.core.json_values import validate_bounded_text, validate_json_text
@@ -65,9 +65,7 @@ class ToolRequest:
         )
         original = self.original_call
         if original is not None:
-            if type(original) is not ToolCallRequest:
-                raise ValueError("Tool request requires a valid original call")
-            original = replace(original)
+            original = snapshot_tool_call(original)
             if original != call:
                 raise ValueError("Tool request must match its original call and approval binding")
             object.__setattr__(self, "original_call", original)
@@ -88,8 +86,7 @@ class ToolRequest:
         approval: ToolApproval,
     ) -> "ToolRequest":
         """Carry the persisted call and its original approval binding into execution."""
-        if type(call) is not ToolCallRequest:
-            raise ValueError("Tool request requires a valid original call")
+        call = snapshot_tool_call(call)
         return cls(
             tool_call_id=call.tool_call_id,
             name=call.name,

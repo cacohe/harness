@@ -128,6 +128,22 @@ class ToolCallRequest:
             raise InvalidTransition from None
 
 
+def snapshot_tool_call(request: object) -> ToolCallRequest:
+    """Rebuild from declared fields without reading instance dataclass metadata."""
+    if type(request) is not ToolCallRequest:
+        raise InvalidTransition
+    try:
+        return ToolCallRequest(
+            object.__getattribute__(request, "tool_call_id"),
+            object.__getattribute__(request, "name"),
+            object.__getattribute__(request, "arguments_json"),
+            approval_scope=object.__getattribute__(request, "approval_scope"),
+            workspace_id=object.__getattribute__(request, "workspace_id"),
+        )
+    except AttributeError:
+        raise InvalidTransition from None
+
+
 @dataclass(frozen=True)
 class FinishModelCall(_RunCommand):
     step_id: str

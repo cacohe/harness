@@ -686,3 +686,59 @@ def test_resumed_tool_request_uses_original_journaled_binding(decision):
     ):
         with pytest.raises(ValueError):
             replace(tool, **changes)
+
+
+@pytest.mark.parametrize("fields_kind", ["trapping", "empty"])
+@pytest.mark.parametrize("bad_field", [None, "invalid", "missing"])
+@pytest.mark.parametrize("boundary", ["state", "tool", "from_call"])
+def test_tool_call_snapshots_use_trusted_fields(boundary, bad_field, fields_kind):
+    field_reads = []
+
+    class TrappingFields(dict):
+        def values(self):
+            field_reads.append("values")
+            raise AssertionError("Instance dataclass metadata was read")
+
+    request = ToolCallRequest("tool", "lookup", "{}", approval_scope="read", workspace_id="work")
+    expected = replace(request)
+    object.__setattr__(
+        request, "__dataclass_fields__", TrappingFields() if fields_kind == "trapping" else {}
+    )
+    if bad_field == "missing":
+        object.__delattr__(request, "name")
+    elif bad_field == "invalid":
+        object.__setattr__(request, "workspace_id", "/host")
+
+    def capture():
+        if boundary == "state":
+            start_step, start_model, finish_model = begin_step()
+            running = advance(initial(), submit(), start_step, start_model)
+            current = advance(running, replace(finish_model, tool_request=request)).current_step
+            return current.model_call.tool_request
+        if boundary == "tool":
+            return ToolRequest(
+                expected.tool_call_id,
+                expected.name,
+                expected.arguments_json,
+                RUN,
+                SESSION,
+                "step",
+                expected.approval_scope,
+                expected.workspace_id,
+                ToolApproval.APPROVED,
+                original_call=request,
+            ).original_call
+        return ToolRequest.from_call(
+            request, run_id=RUN, session_id=SESSION, step_id="step", approval=ToolApproval.APPROVED
+        ).original_call
+
+    if bad_field is None:
+        snapshot = capture()
+        assert snapshot == expected
+        assert snapshot is not request
+        assert "__dataclass_fields__" not in vars(snapshot)
+    else:
+        with pytest.raises(InvalidTransition) as error:
+            capture()
+        assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    assert field_reads == []

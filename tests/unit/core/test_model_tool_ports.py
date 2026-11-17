@@ -1,4 +1,5 @@
 from dataclasses import FrozenInstanceError
+from decimal import Inexact, InvalidOperation, localcontext
 
 import pytest
 from src.core.artifacts import MAX_SUMMARY_BYTES, ArtifactRef, InlineContent
@@ -469,3 +470,27 @@ def test_decided_approval_cannot_be_constructed_without_original_call():
     for decision in (ToolApproval.APPROVED, ToolApproval.DENIED):
         with pytest.raises(ValueError):
             _request(approval=decision, original_call=None)
+
+
+@pytest.mark.parametrize("trap", [False, True])
+def test_raw_json_numbers_ignore_decimal_context(trap):
+    with localcontext() as context:
+        context.traps[InvalidOperation] = trap
+        context.flags[Inexact] = True
+        saved_flags, saved_traps = dict(context.flags), dict(context.traps)
+        for token in (
+            "1e-10000000000000000000",
+            "1e10000000000000000000",
+            "9007199254740993.00000000000000000001",
+            "9" * 4501,
+        ):
+            arguments = '{"number":' + token + "}"
+            schema = '{"multipleOf":' + token + "}"
+            assert ModelToolCall("one", "read", arguments).arguments_json == arguments
+            assert _request(arguments_json=arguments).arguments_json == arguments
+            assert ToolSpec("read", "Read", schema).input_schema_json == schema
+        for token in ("NaN", "Infinity", "-Infinity", "01", "1e", "1."):
+            with pytest.raises(ValueError):
+                ModelToolCall("one", "read", '{"number":' + token + "}")
+        assert dict(context.flags) == saved_flags
+        assert dict(context.traps) == saved_traps
