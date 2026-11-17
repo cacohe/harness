@@ -8,14 +8,24 @@ import pytest
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.application.recovery import RecoveryCorruption, RecoveryService
-from src.core.artifacts import ArtifactRef, ArtifactRepository
+from src.core.artifacts import ArtifactRef, ArtifactRepository, ExternalizedContent
 from src.core.commands import RunLimits
 from src.core.errors import RunErrorCode
+from src.core.events import DomainEvent, DomainEventType
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import JournalCommit
+from src.core.journal import ConversationSummaryCheckpoint, JournalCommit
 from src.core.state import RunState, RunStatus
 from tests.unit.core.test_journal_contract import acceptance
-from tests.unit.core.test_run_state import advance, ask_approval, begin_step, initial, submit
+from tests.unit.core.test_run_state import (
+    advance,
+    ask_approval,
+    begin_step,
+    decide,
+    finish_tool,
+    initial,
+    resume,
+    submit,
+)
 
 NOW = datetime(2026, 11, 18, tzinfo=timezone.utc)
 
@@ -80,6 +90,7 @@ def test_recovery_preserves_valid_waiting_approval(tmp_path: Path) -> None:
 def test_recovery_settles_durable_unexecuted_tool_batch_without_gateway(tmp_path: Path) -> None:
     journal, recovery = service(tmp_path / "tool-batch.sqlite3")
     pending = advance(initial(), submit(), *begin_step())
+    pending = replace(pending, journal_version=1, journal_sequence=0)
     asyncio.run(journal.commit(JournalCommit(pending), 0))
 
     outcome = asyncio.run(recovery.recover_session(pending.session_id))
@@ -120,6 +131,7 @@ def test_terminal_dangling_artifact_is_repository_corruption(tmp_path: Path) -> 
         status=RunStatus.COMPLETED,
         final_text="summary",
         final_artifacts=batch.summary.artifacts,
+        journal_sequence=0,
     )
     asyncio.run(journal.commit(JournalCommit(terminal), 0))
 
@@ -155,6 +167,7 @@ def test_untrusted_artifact_stat_maps_to_stable_corruption(tmp_path: Path, mode:
         status=RunStatus.COMPLETED,
         final_text="summary",
         final_artifacts=batch.summary.artifacts,
+        journal_sequence=0,
     )
     asyncio.run(journal.commit(JournalCommit(terminal), 0))
     expected = terminal.final_artifacts[0]
@@ -190,3 +203,104 @@ def test_untrusted_artifact_stat_maps_to_stable_corruption(tmp_path: Path, mode:
     with pytest.raises(RecoveryCorruption) as caught:
         asyncio.run(recovery.recover_session(terminal.session_id))
     assert caught.value.failure.code is RunErrorCode.ARTIFACT_FAILED
+
+
+def _conflicting_ref(ref: ArtifactRef) -> ArtifactRef:
+    return ArtifactRef(ref.artifact_id, "text/plain", ref.size_bytes, ref.sha256)
+
+
+class _OneDescriptorRepository:
+    def __init__(self, ref: ArtifactRef) -> None:
+        self.ref = ref
+        self.stat_calls = 0
+
+    async def stat(self, artifact_id: str):
+        self.stat_calls += 1
+        return self.ref if artifact_id == self.ref.artifact_id else None
+
+
+def test_final_and_summary_same_id_with_conflicting_descriptors_is_stable_corruption(
+    tmp_path: Path,
+) -> None:
+    journal = SQLiteRunJournal((tmp_path / "final-summary-conflict.sqlite3").resolve())
+    batch = acceptance("descriptor-conflict")
+    assert batch.summary is not None
+    expected = batch.summary.artifacts[0]
+    terminal = replace(
+        batch.state,
+        version=2,
+        status=RunStatus.COMPLETED,
+        final_text="done",
+        final_artifacts=(_conflicting_ref(expected),),
+    )
+    asyncio.run(journal.commit(replace(batch, state=terminal), 0))
+    repository = _OneDescriptorRepository(terminal.final_artifacts[0])
+    recovery = RecoveryService(
+        journal=journal,
+        artifacts=cast(ArtifactRepository, repository),
+        clock=FixedClock(),
+        ids=RecoveryIds(),
+    )
+
+    for _ in range(2):
+        with pytest.raises(RecoveryCorruption) as caught:
+            asyncio.run(recovery.recover_session(terminal.session_id))
+        assert caught.value.failure.code is RunErrorCode.ARTIFACT_FAILED
+    assert repository.stat_calls == 0
+
+
+def test_tool_and_summary_same_id_with_conflicting_descriptors_settles_once(
+    tmp_path: Path,
+) -> None:
+    journal = SQLiteRunJournal((tmp_path / "tool-summary-conflict.sqlite3").resolve())
+    template = acceptance("tool-descriptor")
+    assert template.summary is not None
+    expected = template.summary.artifacts[0]
+    state = advance(
+        initial(), submit(), *begin_step(), ask_approval(), decide(), resume(), finish_tool()
+    )
+    step = state.current_step
+    assert step is not None and step.tool_calls
+    tool_ref = _conflicting_ref(expected)
+    tool = replace(
+        step.tool_calls[0],
+        result=ExternalizedContent(artifacts=(tool_ref,), summary="tool result"),
+    )
+    state = replace(
+        state,
+        current_step=replace(step, tool_calls=(tool,)),
+        journal_version=1,
+        journal_sequence=1,
+    )
+    event = DomainEvent(
+        EventId("tool-conflict-event"),
+        DomainEventType.RUN_STARTED,
+        state.run_id,
+        state.session_id,
+        NOW,
+        {},
+    )
+    summary = ConversationSummaryCheckpoint(
+        state.session_id,
+        1,
+        "v1",
+        state.profile_id,
+        "summary",
+        artifacts=(expected,),
+    )
+    asyncio.run(journal.commit(JournalCommit(state, events=(event,), summary=summary), 0))
+    repository = _OneDescriptorRepository(tool_ref)
+    recovery = RecoveryService(
+        journal=journal,
+        artifacts=cast(ArtifactRepository, repository),
+        clock=FixedClock(),
+        ids=RecoveryIds(),
+    )
+
+    first = asyncio.run(recovery.recover_session(state.session_id))
+    second = asyncio.run(recovery.recover_session(state.session_id))
+
+    assert first.changed and first.state is not None and first.state.failure is not None
+    assert first.state.failure.code is RunErrorCode.ARTIFACT_FAILED
+    assert second == replace(first, changed=False)
+    assert repository.stat_calls == 1

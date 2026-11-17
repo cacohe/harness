@@ -85,13 +85,18 @@ class RecoveryService:
         return RecoveryOutcome(persisted, True)
 
     async def _has_dangling_ref(self, refs: tuple[ArtifactRef, ...]) -> bool:
-        seen: set[str] = set()
+        expected_by_id: dict[str, ArtifactRef] = {}
         for ref in refs:
             try:
                 expected = snapshot_artifact_ref(ref)
-                if expected.artifact_id in seen:
-                    continue
-                seen.add(expected.artifact_id)
+                prior = expected_by_id.get(expected.artifact_id)
+                if prior is not None and prior != expected:
+                    return True
+                expected_by_id[expected.artifact_id] = expected
+            except Exception:
+                return True
+        for expected in expected_by_id.values():
+            try:
                 current = await self._artifacts.stat(expected.artifact_id)
                 if current is None or type(current) is not ArtifactRef:
                     return True

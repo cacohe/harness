@@ -226,7 +226,9 @@ class SQLiteRunJournal:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             objects = self._application_objects(connection)
             if not objects and version == 0:
-                selected = str(connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]).lower()
+                selected = str(
+                    connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+                ).lower()
                 if selected != "wal":
                     raise ValueError("SQLite journal requires WAL mode")
                 connection.executescript(
@@ -279,7 +281,10 @@ class SQLiteRunJournal:
                     "FROM runs WHERE session_id = ? AND run_id = ?",
                     (session_key, current.run_id.value),
                 ).fetchone()
-                if current_run_row is None or decode(current_run_row["state_json"], RunState) != current:
+                if (
+                    current_run_row is None
+                    or decode(current_run_row["state_json"], RunState) != current
+                ):
                     raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
                 _validate_run_row(current_run_row, current)
             existing = connection.execute(
@@ -415,7 +420,10 @@ class SQLiteRunJournal:
                     )
                 else:
                     persisted_summary = _decode_summary_row(prior_summary, session_key)
-                    if persisted_summary != summary or prior_summary["checkpoint_json"] != summary_json:
+                    if (
+                        persisted_summary != summary
+                        or prior_summary["checkpoint_json"] != summary_json
+                    ):
                         raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
             if batch.submission is not None and intent_json is not None:
                 connection.execute(
@@ -568,9 +576,7 @@ class SQLiteRunJournal:
             if (
                 len(order_rows) != sequence
                 or [row["sequence"] for row in order_rows] != list(range(1, sequence + 1))
-                or any(
-                    expected_order.get(row["sequence"]) != row["kind"] for row in order_rows
-                )
+                or any(expected_order.get(row["sequence"]) != row["kind"] for row in order_rows)
             ):
                 raise ValueError
             for receipt in acceptance_receipts:

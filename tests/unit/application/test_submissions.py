@@ -96,7 +96,12 @@ async def finish(journal: RunJournal, accepted: AcceptedRun) -> None:
         context=CommandContext(NOW, 1, (EventId("completed"),)),
     )
     terminal = TaskStateMachine.apply(state, command)
-    await journal.commit(JournalCommit(terminal.state, terminal.events), accepted.version)
+    persisted = replace(
+        terminal.state,
+        journal_version=accepted.version + 1,
+        journal_sequence=state.journal_sequence + len(terminal.events),
+    )
+    await journal.commit(JournalCommit(persisted, terminal.events), accepted.version)
 
 
 def test_accept_persists_running_state_start_event_and_exact_user_text() -> None:
@@ -219,7 +224,12 @@ def test_waiting_for_approval_reserves_the_session() -> None:
             StartToolCall(*identity, "step", "model", "tool-call", True, context=context),
         )
         assert transition.state.status is RunStatus.WAITING_APPROVAL
-        await journal.commit(JournalCommit(transition.state, transition.events), accepted.version)
+        persisted = replace(
+            transition.state,
+            journal_version=accepted.version + 1,
+            journal_sequence=state.journal_sequence + len(transition.events),
+        )
+        await journal.commit(JournalCommit(persisted, transition.events), accepted.version)
         before = await journal.load_session(SESSION)
 
         with pytest.raises(JournalError) as error:

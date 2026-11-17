@@ -124,7 +124,9 @@ class RunJournal(Protocol):
 
         The Session sequence starts at one and advances for each event, then each
         transcript entry, in the supplied order. RunState.version tracks state
-        transitions independently. Return a receipt containing this batch's entries.
+        transitions independently. The submitted RunState must project the successful
+        commit's journal_version and journal_sequence. Return a receipt containing
+        this batch's entries.
 
         An identical acceptance batch for a recorded submission returns its
         original receipt even after the Session advances. A changed digest or

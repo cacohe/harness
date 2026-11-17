@@ -101,7 +101,6 @@ class InMemoryRunJournal:
             if session is None:
                 session = _Session()
 
-            _validate_members(batch, session.sequence)
             intent = _intent_value(batch) if batch.submission is not None else None
             accepted = session.submissions.get(submission_key)
             if accepted is not None:
@@ -115,6 +114,7 @@ class InMemoryRunJournal:
 
             if session.version != expected_version:
                 raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
+            _validate_members(batch, session.sequence, expected_version)
             previous = session.runs.get(run_key)
             if previous is not None and (
                 previous.submission_id != state.submission_id
@@ -390,7 +390,7 @@ def _intent_value(value: object) -> _IntentValue:
     raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
 
 
-def _validate_members(batch: JournalCommit, sequence: int) -> None:
+def _validate_members(batch: JournalCommit, sequence: int, expected_version: int) -> None:
     state = batch.state
     if type(batch.events) is not tuple or type(batch.transcript) is not tuple:
         raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
@@ -442,6 +442,8 @@ def _validate_members(batch: JournalCommit, sequence: int) -> None:
 
     summary = batch.summary
     next_sequence = sequence + len(batch.events) + len(batch.transcript)
+    if state.journal_version != expected_version + 1 or state.journal_sequence != next_sequence:
+        raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
     if summary is not None and (
         type(summary) is not ConversationSummaryCheckpoint
         or type(summary.session_id) is not SessionId

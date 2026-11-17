@@ -8,10 +8,17 @@ from threading import Barrier
 import pytest
 import src.adapters.persistence.sqlite as sqlite_module
 from src.adapters.persistence.sqlite import SQLiteRunJournal
-from src.adapters.persistence.sqlite_codec import encode
+from src.adapters.persistence.sqlite_codec import decode, encode
 from src.core.errors import RunErrorCode
 from src.core.ids import EventId, SessionId
-from src.core.journal import JournalError, JournalEvent, JournalSnapshot
+from src.core.journal import (
+    JournalCommit,
+    JournalError,
+    JournalEvent,
+    JournalSnapshot,
+    TranscriptEntry,
+)
+from src.core.state import RunStatus
 from tests.unit.core.test_journal_contract import acceptance
 
 
@@ -90,6 +97,7 @@ def test_schema_is_exact_v3_and_has_required_indexes(tmp_path: Path) -> None:
         }
         assert tables == {
             "sessions",
+            "journal_entries",
             "runs",
             "events",
             "submissions",
@@ -118,6 +126,46 @@ def test_old_or_future_schema_is_rejected_without_mutation(tmp_path: Path, versi
         SQLiteRunJournal(path)
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT name FROM sqlite_master WHERE name='legacy'").fetchone()
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "CREATE VIEW unknown_view AS SELECT 1;",
+        "CREATE TABLE unknown(value INTEGER);"
+        "CREATE TRIGGER unknown_trigger AFTER INSERT ON unknown BEGIN SELECT 1; END;",
+        "CREATE TABLE unknown(value INTEGER);CREATE INDEX unknown_index ON unknown(value);",
+    ],
+)
+def test_version_zero_unknown_objects_are_rejected_without_mutation(
+    tmp_path: Path, script: str
+) -> None:
+    path = (tmp_path / "unknown.sqlite3").resolve()
+    with sqlite3.connect(path) as connection:
+        connection.executescript(script)
+    before_bytes = path.read_bytes()
+    with sqlite3.connect(path) as connection:
+        before_objects = tuple(
+            connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_schema "
+                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+            )
+        )
+
+    with pytest.raises(ValueError, match="schema v3"):
+        SQLiteRunJournal(path)
+
+    assert path.read_bytes() == before_bytes
+    with sqlite3.connect(path) as connection:
+        assert (
+            tuple(
+                connection.execute(
+                    "SELECT type, name, tbl_name, sql FROM sqlite_schema "
+                    "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+                )
+            )
+            == before_objects
+        )
 
 
 def test_load_missing_session_is_empty(tmp_path: Path) -> None:
@@ -184,11 +232,13 @@ def test_failed_initialization_leaves_no_partial_application_schema(
                 "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             )
         }
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
 
 
 @pytest.mark.parametrize(
     ("table", "column", "value", "operation"),
     [
+        ("sessions", "version", 99, "head"),
         ("sessions", "sequence", 99, "session"),
         ("runs", "status", "failed", "head"),
         ("runs", "state_version", 99, "head"),
@@ -239,6 +289,155 @@ def test_event_payload_identity_must_match_index_columns(tmp_path: Path) -> None
         connection.execute("UPDATE events SET event_json = ?", (encode(forged),))
     with pytest.raises(JournalError):
         asyncio.run(journal.load_session(batch.state.session_id))
+
+
+def test_state_journal_metadata_must_match_session_and_run_rows(tmp_path: Path) -> None:
+    journal = make_journal(tmp_path)
+    batch = acceptance("metadata")
+    asyncio.run(journal.commit(batch, 0))
+    forged = replace(batch.state, journal_version=99)
+    with sqlite3.connect(journal.path) as connection:
+        connection.execute("UPDATE sessions SET state_json = ?", (encode(forged),))
+        connection.execute("UPDATE runs SET state_json = ?", (encode(forged),))
+
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(journal.load_head(batch.state.session_id))
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+@pytest.mark.parametrize("corruption", ["gap", "cross_table_reorder"])
+def test_shared_sequence_must_be_dense_and_globally_ordered(
+    tmp_path: Path, corruption: str
+) -> None:
+    journal = make_journal(tmp_path)
+    batch = acceptance("sequence")
+    receipt = asyncio.run(journal.commit(batch, 0))
+    event = receipt.events[0]
+    transcript = receipt.transcript[0]
+    with sqlite3.connect(journal.path) as connection:
+        if corruption == "gap":
+            forged_state = replace(batch.state, journal_sequence=3)
+            connection.execute(
+                "UPDATE sessions SET sequence=3, state_json=?", (encode(forged_state),)
+            )
+            connection.execute("UPDATE runs SET state_json=?", (encode(forged_state),))
+            connection.execute(
+                "UPDATE transcript SET sequence=3, entry_json=?",
+                (encode(replace(transcript, sequence=3)),),
+            )
+        else:
+            connection.execute(
+                "UPDATE events SET sequence=2, event_json=?",
+                (encode(JournalEvent(2, event.event)),),
+            )
+            connection.execute(
+                "UPDATE transcript SET sequence=1, entry_json=?",
+                (encode(replace(transcript, sequence=1)),),
+            )
+
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(journal.load_session(batch.state.session_id))
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+def test_shared_sequence_preserves_kind_for_non_acceptance_commits(tmp_path: Path) -> None:
+    journal = make_journal(tmp_path)
+    first = acceptance("sequence-kind")
+    asyncio.run(journal.commit(first, 0))
+    state = replace(
+        first.state,
+        version=2,
+        status=RunStatus.COMPLETED,
+        final_text="done",
+        journal_version=2,
+        journal_sequence=4,
+    )
+    event = type(first.events[0])(
+        EventId("later-event"),
+        first.events[0].type,
+        state.run_id,
+        state.session_id,
+        first.events[0].timestamp,
+        {},
+    )
+    entry = TranscriptEntry(
+        state.session_id,
+        state.run_id,
+        state.submission_id,
+        "assistant",
+        "done",
+    )
+    receipt = asyncio.run(
+        journal.commit(JournalCommit(state, events=(event,), transcript=(entry,)), 1)
+    )
+    with sqlite3.connect(journal.path) as connection:
+        connection.execute(
+            "UPDATE events SET sequence=4, event_json=? WHERE event_id='later-event'",
+            (encode(JournalEvent(4, event)),),
+        )
+        connection.execute(
+            "UPDATE transcript SET sequence=3, entry_json=? WHERE sequence=4",
+            (encode(replace(receipt.transcript[0], sequence=3)),),
+        )
+
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(journal.load_session(state.session_id))
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+@pytest.mark.parametrize(
+    ("member", "operation"),
+    [
+        ("events", "find"),
+        ("transcript", "find"),
+        ("summary", "find"),
+        ("events", "replay"),
+        ("transcript", "replay"),
+        ("summary", "replay"),
+    ],
+)
+def test_submission_intent_must_fully_match_original_receipt(
+    tmp_path: Path, member: str, operation: str
+) -> None:
+    journal = make_journal(tmp_path)
+    batch = acceptance("intent")
+    asyncio.run(journal.commit(batch, 0))
+    with sqlite3.connect(journal.path) as connection:
+        encoded = connection.execute("SELECT intent_json FROM submissions").fetchone()[0]
+        intent = decode(encoded, JournalCommit)
+        changed = replace(intent, **{member: () if member != "summary" else None})
+        connection.execute("UPDATE submissions SET intent_json=?", (encode(changed),))
+
+    with pytest.raises(JournalError) as caught:
+        if operation == "find":
+            asyncio.run(journal.find_submission(batch.state.session_id, batch.state.submission_id))
+        else:
+            asyncio.run(journal.commit(batch, 0))
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+def test_corrupt_existing_summary_key_blocks_commit_without_writes(tmp_path: Path) -> None:
+    journal = make_journal(tmp_path)
+    batch = acceptance("summary-row")
+    asyncio.run(journal.commit(batch, 0))
+    next_state = replace(
+        batch.state,
+        version=2,
+        journal_version=2,
+        journal_sequence=2,
+    )
+    with sqlite3.connect(journal.path) as connection:
+        connection.execute("UPDATE summary_checkpoints SET covered_from_sequence=2")
+        before = tuple(connection.execute("SELECT version, sequence, state_json FROM sessions"))
+
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(journal.commit(JournalCommit(next_state, summary=batch.summary), 1))
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    with sqlite3.connect(journal.path) as connection:
+        assert (
+            tuple(connection.execute("SELECT version, sequence, state_json FROM sessions"))
+            == before
+        )
 
 
 @pytest.mark.parametrize(

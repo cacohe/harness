@@ -47,6 +47,8 @@ def acceptance(
         LIMITS,
         version=1,
         status=RunStatus.RUNNING,
+        journal_version=1,
+        journal_sequence=2,
     )
     event = DomainEvent(
         EventId(event_id or f"event-{name}"),
@@ -72,6 +74,30 @@ def acceptance(
             artifacts=(artifact_ref(),),
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("journal_version", "journal_sequence"),
+    [(0, 2), (1, 0), (2, 2), (1, 3)],
+)
+def test_commit_requires_state_to_project_resulting_journal_counters(
+    journal: RunJournal, journal_version: int, journal_sequence: int
+) -> None:
+    valid = acceptance("metadata")
+    invalid = replace(
+        valid,
+        state=replace(
+            valid.state,
+            journal_version=journal_version,
+            journal_sequence=journal_sequence,
+        ),
+    )
+
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(journal.commit(invalid, expected_version=0))
+
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    assert asyncio.run(journal.load_session(valid.state.session_id)).version == 0
 
 
 def test_commit_schema_ignores_instance_field_metadata(journal: RunJournal) -> None:
@@ -117,13 +143,19 @@ def test_session_sequence_orders_events_before_transcript(journal: RunJournal) -
     batch = acceptance("first")
     state = batch.state
     first = asyncio.run(journal.commit(batch, expected_version=0))
-    state_only = asyncio.run(
-        journal.commit(JournalCommit(replace(state, version=4)), expected_version=1)
-    )
+    advanced = replace(state, version=4, journal_version=2)
+    state_only = asyncio.run(journal.commit(JournalCommit(advanced), expected_version=1))
     end_event = DomainEvent(
         EventId("end"), DomainEventType.RUN_COMPLETED, state.run_id, state.session_id, NOW, {}
     )
-    terminal = replace(state, version=6, status=RunStatus.COMPLETED, final_text="done")
+    terminal = replace(
+        state,
+        version=6,
+        status=RunStatus.COMPLETED,
+        final_text="done",
+        journal_version=3,
+        journal_sequence=4,
+    )
     second = asyncio.run(
         journal.commit(
             JournalCommit(
@@ -167,7 +199,7 @@ def test_session_head_returns_only_current_projection_and_counters(journal: RunJ
     empty = asyncio.run(journal.load_head(session_id))
     assert vars(empty) == {"version": 0, "sequence": 0, "state": None}
     asyncio.run(journal.commit(batch, expected_version=0))
-    latest = replace(batch.state, version=4)
+    latest = replace(batch.state, version=4, journal_version=2)
     asyncio.run(journal.commit(JournalCommit(latest), expected_version=1))
 
     head = asyncio.run(journal.load_head(session_id))
@@ -179,7 +211,12 @@ def test_session_head_returns_only_current_projection_and_counters(journal: RunJ
 
 def test_expected_version_conflict_leaves_prior_snapshot_intact(journal: RunJournal) -> None:
     initial = acceptance("first")
-    pending = replace(acceptance("pending"), summary=None)
+    pending_batch = acceptance("pending")
+    pending = replace(
+        pending_batch,
+        state=replace(pending_batch.state, journal_version=2, journal_sequence=4),
+        summary=None,
+    )
     asyncio.run(journal.commit(initial, expected_version=0))
     before = asyncio.run(journal.load_session(initial.state.session_id))
 
@@ -282,12 +319,28 @@ def test_submission_retry_returns_original_commit_receipt(journal: RunJournal) -
     asyncio.run(
         journal.commit(
             JournalCommit(
-                replace(original.state, version=2, status=RunStatus.COMPLETED, final_text="done")
+                replace(
+                    original.state,
+                    version=2,
+                    status=RunStatus.COMPLETED,
+                    final_text="done",
+                    journal_version=2,
+                )
             ),
             expected_version=1,
         )
     )
-    asyncio.run(journal.commit(replace(acceptance("next"), summary=None), expected_version=2))
+    next_batch = acceptance("next")
+    asyncio.run(
+        journal.commit(
+            replace(
+                next_batch,
+                state=replace(next_batch.state, journal_version=3, journal_sequence=4),
+                summary=None,
+            ),
+            expected_version=2,
+        )
+    )
 
     retry = asyncio.run(journal.commit(acceptance("first"), expected_version=0))
 
@@ -452,7 +505,8 @@ def test_summary_checkpoints_use_all_key_components(journal: RunJournal) -> None
         replace(first, profile_id=ProfileId("summarizer"), summary="profile"),
     )
     for version, checkpoint in enumerate(variations, start=1):
-        asyncio.run(journal.commit(JournalCommit(state, summary=checkpoint), version))
+        projected = replace(state, journal_version=version + 1)
+        asyncio.run(journal.commit(JournalCommit(projected, summary=checkpoint), version))
     other = acceptance("other", session="other")
     asyncio.run(journal.commit(other, expected_version=0))
 
@@ -466,13 +520,17 @@ def test_summary_checkpoint_full_key_is_immutable(journal: RunJournal) -> None:
     initial = acceptance("first")
     assert initial.summary is not None
     asyncio.run(journal.commit(initial, 0))
-    same = JournalCommit(initial.state, summary=initial.summary)
+    same = JournalCommit(replace(initial.state, journal_version=2), summary=initial.summary)
     asyncio.run(journal.commit(same, 1))
     before = asyncio.run(journal.load_session(initial.state.session_id))
 
     changed = replace(initial.summary, summary="changed")
     with pytest.raises(JournalError) as caught:
-        asyncio.run(journal.commit(JournalCommit(initial.state, summary=changed), 2))
+        asyncio.run(
+            journal.commit(
+                JournalCommit(replace(initial.state, journal_version=3), summary=changed), 2
+            )
+        )
 
     assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
     assert asyncio.run(journal.load_session(initial.state.session_id)) == before
@@ -515,11 +573,19 @@ def test_same_run_cannot_regress_its_transition_version(journal: RunJournal) -> 
     original = acceptance("first")
     state = original.state
     asyncio.run(journal.commit(original, expected_version=0))
-    asyncio.run(journal.commit(JournalCommit(replace(state, version=4)), expected_version=1))
+    asyncio.run(
+        journal.commit(
+            JournalCommit(replace(state, version=4, journal_version=2)), expected_version=1
+        )
+    )
     before = asyncio.run(journal.load_session(state.session_id))
 
     with pytest.raises(JournalError) as error:
-        asyncio.run(journal.commit(JournalCommit(replace(state, version=3)), expected_version=2))
+        asyncio.run(
+            journal.commit(
+                JournalCommit(replace(state, version=3, journal_version=3)), expected_version=2
+            )
+        )
 
     assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
     after = asyncio.run(journal.load_session(state.session_id))

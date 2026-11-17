@@ -745,7 +745,8 @@ def test_resumed_tool_request_uses_original_journaled_binding(decision):
 
     async def recover():
         journal = InMemoryRunJournal()
-        await journal.commit(JournalCommit(waiting), expected_version=0)
+        persisted = replace(waiting, journal_version=1, journal_sequence=0)
+        await journal.commit(JournalCommit(persisted), expected_version=0)
         return (await journal.load_head(SESSION)).state
 
     restored = asyncio.run(recover())
