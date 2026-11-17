@@ -3,16 +3,21 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from src.application.agent import Agent
+from src.application.agent import Agent, build_agent_profile
 from src.config import Config
 from src.core.cancellation import CancellationToken
+from src.core.execution import PayloadLimitError
 from src.core.loop import Harness
 from src.core.memory import MemoryManager
 from src.core.task import Task
 from src.memory.retriever import HybridRetriever
 from src.memory.store import InMemoryStore
 from src.observability import MetricsEventSink
+from src.persistence import SQLiteTaskRepository
+from src.persistence.in_memory import InMemoryTaskRepository
+from src.schema.execution import AgentProfile, SessionEventType, SubmissionState
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
+from src.schema.skills import Skill
 from src.schema.task import TaskPauseReason, TaskResult, TaskRunningReason, TaskState
 from src.schema.tool import ApprovalDecision, Tool, ToolExecutionResult
 from src.tool.tool_executor import DefaultToolExecutor
@@ -204,6 +209,282 @@ def test_from_config_builds_the_default_composition():
 
     assert agent.config is config
     assert agent.llm_gateway is gateway
+
+
+def test_agent_injects_resource_governance_config_into_harness():
+    config = Config(
+        llm="test-model",
+        model_timeout_seconds=1.5,
+        tool_timeout_seconds=2.5,
+        max_model_output_bytes=101,
+        max_tool_result_bytes=102,
+        max_event_bytes=103,
+        max_task_snapshot_bytes=104,
+    )
+
+    agent = Agent(config=config, llm_gateway=ChatGateway(["hello"]))
+
+    assert agent.harness.model_timeout_seconds == 1.5
+    assert agent.harness.tool_timeout_seconds == 2.5
+    assert agent.harness.max_model_output_bytes == 101
+    assert agent.harness.max_tool_result_bytes == 102
+    assert agent.harness.fact_recorder.limits.max_event_bytes == 103
+    assert agent.harness.fact_recorder.limits.max_task_snapshot_bytes == 104
+
+
+def test_open_session_reconstructs_completed_transcript_without_model_replay(tmp_path):
+    repository = SQLiteTaskRepository(tmp_path / "sessions.db")
+    first_agent = Agent(
+        config=Config(llm="test-model"),
+        llm_gateway=ChatGateway(["answer"]),
+        task_repository=repository,
+    )
+    original = first_agent.new_session("stable-session")
+    task = original.chat("hello", message_id="message-1")
+    second_gateway = ChatGateway([])
+    second_agent = Agent(
+        config=Config(llm="test-model"),
+        llm_gateway=second_gateway,
+        task_repository=repository,
+    )
+
+    reopened = second_agent.open_session("stable-session")
+
+    assert task.is_completed()
+    assert reopened.transcript == [("user", "hello"), ("assistant", "answer")]
+    assert reopened.pending_task is None
+    assert second_gateway.inputs == []
+
+
+def test_open_session_restores_paused_task_and_approval_ownership(tmp_path):
+    class ApprovalGateway(ChatGateway):
+        def infer(self, context, stream=True, response_format=None):
+            return LLMOutput(
+                FinishReason.TOOL_CALLS,
+                None,
+                [LlmToolCall("call-1", "danger", "{}")],
+                None,
+                None,
+            )
+
+    repository = SQLiteTaskRepository(tmp_path / "paused.db")
+    registry = DefaultToolRegistry()
+    registry.register(
+        Tool("danger", "danger", "Danger.", {}, lambda _inputs: "done", requires_approval=True)
+    )
+    first_agent = Agent(
+        config=Config(llm="test-model"),
+        llm_gateway=ApprovalGateway([]),
+        tool_executor=DefaultToolExecutor(registry),
+        task_repository=repository,
+    )
+    paused = first_agent.new_session("paused-session").chat("run it", message_id="message-1")
+    second_agent = Agent(
+        config=Config(llm="test-model"),
+        llm_gateway=ChatGateway([]),
+        tool_executor=DefaultToolExecutor(registry),
+        task_repository=repository,
+    )
+
+    reopened = second_agent.open_session("paused-session")
+
+    assert paused.is_paused()
+    assert reopened.pending_task is not None
+    assert reopened.pending_task.id == paused.id
+    assert reopened.pending_message == "run it"
+    assert [request.tool_id for request in reopened.approval_requests()] == ["call-1"]
+
+
+def test_agent_profile_is_order_independent_and_excludes_secrets_and_paths(tmp_path):
+    first_tool = Tool("b", "beta", "Beta.", {"type": "object"}, lambda _: "one")
+    second_tool = Tool("a", "alpha", "Alpha.", {"type": "object"}, lambda _: "two")
+    first_tool.workspace = Workspace(tmp_path)
+    settings = {
+        "temperature": 0,
+        "api_key": "super-secret",
+        "api_base": "https://credential.example",
+    }
+
+    first = build_agent_profile(
+        system_prompt="prompt",
+        model_identifier="model",
+        model_settings=settings,
+        skills=[Skill("skill", "desc", "body")],
+        tools=[first_tool, second_tool],
+    )
+    second = build_agent_profile(
+        system_prompt="prompt",
+        model_identifier="model",
+        model_settings=settings,
+        skills=[Skill("skill", "desc", "body")],
+        tools=[second_tool, first_tool],
+    )
+
+    assert first == second
+    serialized = first.model_dump_json()
+    assert "super-secret" not in serialized
+    assert "credential.example" not in serialized
+    assert str(tmp_path) not in serialized
+
+
+def test_agent_profile_preserves_skill_line_ending_differences():
+    common = {
+        "system_prompt": "prompt",
+        "model_identifier": "model",
+        "model_settings": {},
+        "tools": [],
+    }
+
+    lf = build_agent_profile(skills=[Skill("skill", "desc", "one\ntwo")], **common)
+    crlf = build_agent_profile(skills=[Skill("skill", "desc", "one\r\ntwo")], **common)
+
+    assert lf.skills_digest != crlf.skills_digest
+
+
+def test_session_records_initial_profile_and_one_change_before_next_submission():
+    repository = InMemoryTaskRepository()
+    gateway = ChatGateway(["first", "second"])
+    agent = Agent(
+        config=Config(llm="test-model"),
+        llm_gateway=gateway,
+        task_repository=repository,
+    )
+    session = agent.new_session("profile-session")
+    session.chat("one", message_id="message-1")
+    initial_profile = agent.profile
+    agent.tool_registry.register(Tool("new", "new", "New.", {}, lambda _: "new"))
+
+    session.chat("two", message_id="message-2")
+
+    events = repository.events("profile-session")
+    assert events[0].type is SessionEventType.SESSION_STARTED
+    assert events[0].payload["profile"]["id"] == initial_profile.id
+    changes = [event for event in events if event.type is SessionEventType.PROFILE_CHANGED]
+    assert len(changes) == 1
+    second_acceptance = next(
+        event.sequence
+        for event in events
+        if event.type is SessionEventType.SUBMISSION_ACCEPTED
+        and event.payload.get("message") == "two"
+    )
+    assert changes[0].sequence < second_acceptance
+    turn_starts = [event for event in events if event.type is SessionEventType.TURN_STARTED]
+    assert all(event.payload["capability_digest"] for event in turn_starts)
+    assert repository.submission("profile-session", "message-2").state is (
+        SubmissionState.COMPLETED
+    )
+
+
+def test_agent_accepts_an_explicit_audit_profile():
+    explicit = AgentProfile(
+        id="profile-override",
+        version="1",
+        system_prompt_digest="a" * 64,
+        model_identifier="injected-model",
+        model_settings_digest="b" * 64,
+        skills_digest="c" * 64,
+        tools_digest="d" * 64,
+        memory_policy_version="custom-v1",
+        fact_schema_version=1,
+    )
+
+    agent = Agent(
+        config=Config(llm="configured-model"),
+        llm_gateway=ChatGateway(["done"]),
+        profile=explicit,
+    )
+
+    assert agent.profile is explicit
+
+
+def test_automatic_profile_uses_the_injected_gateway_model_identifier():
+    gateway = ChatGateway(["done"])
+    gateway.model = "actual-gateway-model"
+    agent = Agent(
+        config=Config(llm="configured-placeholder"),
+        llm_gateway=gateway,
+    )
+
+    assert agent.profile.model_identifier == "actual-gateway-model"
+
+
+def test_submission_acceptance_enforces_durable_event_budget_before_write():
+    repository = InMemoryTaskRepository()
+    agent = Agent(
+        config=Config(llm="test-model", max_event_bytes=200),
+        llm_gateway=ChatGateway(["unused"]),
+        task_repository=repository,
+    )
+
+    with pytest.raises(PayloadLimitError, match="max_event_bytes"):
+        agent.new_session("bounded").chat("x" * 1000, message_id="message-1")
+
+    assert repository.events("bounded") == []
+    assert repository.submission("bounded", "message-1") is None
+
+
+def test_terminal_submission_state_is_committed_with_terminal_facts():
+    class RecordingStore(InMemoryTaskRepository):
+        def __init__(self):
+            super().__init__()
+            self.commits = []
+
+        def commit(self, task, events, *, expected_sequence, submission=None):
+            self.commits.append(
+                ([event.type for event in events], None if submission is None else submission.state)
+            )
+            return super().commit(
+                task,
+                events,
+                expected_sequence=expected_sequence,
+                submission=submission,
+            )
+
+    repository = RecordingStore()
+    agent = Agent(
+        config=Config(llm="test-model"),
+        llm_gateway=ChatGateway(["done"]),
+        task_repository=repository,
+    )
+
+    agent.new_session("atomic").chat("one", message_id="message-1")
+
+    terminal = next(
+        (types, state)
+        for types, state in repository.commits
+        if SessionEventType.SUBMISSION_SETTLED in types
+    )
+    assert terminal[1] is SubmissionState.COMPLETED
+
+
+def test_reopen_appends_profile_change_once_and_unchanged_reopen_adds_none(tmp_path):
+    repository = SQLiteTaskRepository(tmp_path / "profiles.db")
+    first = Agent(
+        config=Config(llm="test-model", max_steps=3),
+        llm_gateway=ChatGateway(["one"]),
+        task_repository=repository,
+    )
+    first.new_session("profile-reopen").chat("one", message_id="message-1")
+    changed = Agent(
+        config=Config(llm="test-model", max_steps=4),
+        llm_gateway=ChatGateway(["two"]),
+        task_repository=repository,
+    )
+    changed.open_session("profile-reopen").chat("two", message_id="message-2")
+    unchanged = Agent(
+        config=Config(llm="test-model", max_steps=4),
+        llm_gateway=ChatGateway(["three"]),
+        task_repository=repository,
+    )
+    unchanged.open_session("profile-reopen").chat("three", message_id="message-3")
+
+    changes = [
+        event
+        for event in repository.events("profile-reopen")
+        if event.type is SessionEventType.PROFILE_CHANGED
+    ]
+    assert len(changes) == 1
+    assert changes[0].payload["profile"]["id"] == changed.profile.id
 
 
 def test_default_composition_shares_one_new_catalog():
@@ -489,6 +770,7 @@ def test_agent_mcp_methods_delegate_without_sync_loop_creation():
             llm_gateway=ChatGateway(["hello"]),
             tool_catalog=catalog,
             mcp_manager=manager,
+            owned_resources=[manager],
         )
 
         await agent.add_mcp_server("weather", "memory://weather", timeout=2)
@@ -513,11 +795,30 @@ def test_agent_context_exit_closes_manager_once():
             llm_gateway=ChatGateway(["hello"]),
             tool_catalog=catalog,
             mcp_manager=manager,
+            owned_resources=[manager],
         ) as agent:
             assert agent.mcp_manager is manager
 
         await agent.aclose()
         assert manager.close_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_injected_manager_remains_caller_owned_unless_explicitly_owned():
+    async def scenario():
+        catalog = DefaultToolRegistry()
+        manager = RecordingMCPManager(catalog)
+        agent = Agent(
+            config=Config(llm="test-model"),
+            llm_gateway=ChatGateway(["unused"]),
+            tool_catalog=catalog,
+            mcp_manager=manager,
+        )
+
+        await agent.aclose()
+
+        assert manager.close_calls == 0
 
     asyncio.run(scenario())
 

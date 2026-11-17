@@ -248,10 +248,22 @@ def assemble_llm_stream(pieces: Iterable[LLMOutput]) -> tuple[LLMOutput, list[st
 
 async def assemble_llm_async_stream(
     pieces: AsyncIterator[LLMOutput] | Iterator[LLMOutput],
+    *,
+    max_bytes: int | None = None,
 ) -> tuple[LLMOutput, list[str]]:
     """Fold synchronous or asynchronous streamed model pieces into one output."""
     accumulator = _LlmStreamAccumulator()
+    consumed_bytes = 0
     async for piece in iterate_maybe_async(pieces):
+        if not isinstance(piece, LLMOutput):
+            raise TypeError("infer did not return a model output")
+        if max_bytes is not None:
+            consumed_bytes += len(piece.model_dump_json(exclude_none=True).encode("utf-8"))
+            if consumed_bytes > max_bytes:
+                aclose = getattr(pieces, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+                raise OverflowError("model stream exceeds max_bytes")
         accumulator.add(piece)
     return accumulator.finish()
 

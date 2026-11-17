@@ -2,12 +2,13 @@
 
 import copy
 import json
+import math
 import os
 import tomllib
 from pathlib import Path
 from typing import Any, Mapping, MutableMapping
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 _ENV_FILE_NAME = ".env"
 _CONFIG_FILE_NAMES = ("config.toml", "config.json")
@@ -15,6 +16,14 @@ _CONFIG_FILE_VARIABLE = "HARNESS_CONFIG_FILE"
 _ENV_FILE_VARIABLE = "HARNESS_ENV_FILE"
 _DEFAULT_MAX_STEPS = 10
 _DEFAULT_MAX_SECONDS = 60 * 30
+_DEFAULT_MODEL_TIMEOUT_SECONDS = 90
+_DEFAULT_TOOL_TIMEOUT_SECONDS = 30
+_DEFAULT_MAX_MODEL_OUTPUT_BYTES = 1_048_576
+_DEFAULT_MAX_TOOL_RESULT_BYTES = 1_048_576
+_DEFAULT_MAX_EVENT_BYTES = 1_048_576
+_DEFAULT_MAX_TASK_SNAPSHOT_BYTES = 8_388_608
+_DEFAULT_MAX_PENDING_SUBMISSIONS = 0
+_DEFAULT_CLOSE_TIMEOUT_SECONDS = 30
 
 
 class ConfigError(Exception):
@@ -122,6 +131,49 @@ class Config(BaseModel):
     llm_api_base: str | None = None
     max_steps: int = _DEFAULT_MAX_STEPS
     max_seconds: int = _DEFAULT_MAX_SECONDS
+    model_timeout_seconds: float = _DEFAULT_MODEL_TIMEOUT_SECONDS
+    tool_timeout_seconds: float = _DEFAULT_TOOL_TIMEOUT_SECONDS
+    max_model_output_bytes: int = _DEFAULT_MAX_MODEL_OUTPUT_BYTES
+    max_tool_result_bytes: int = _DEFAULT_MAX_TOOL_RESULT_BYTES
+    max_event_bytes: int = _DEFAULT_MAX_EVENT_BYTES
+    max_task_snapshot_bytes: int = _DEFAULT_MAX_TASK_SNAPSHOT_BYTES
+    max_pending_submissions: int = _DEFAULT_MAX_PENDING_SUBMISSIONS
+    close_timeout_seconds: float = _DEFAULT_CLOSE_TIMEOUT_SECONDS
+
+    @field_validator(
+        "model_timeout_seconds", "tool_timeout_seconds", "close_timeout_seconds", mode="before"
+    )
+    @classmethod
+    def validate_positive_seconds(cls, value: Any, info) -> float:
+        if isinstance(value, bool):
+            raise ValueError(f"{info.field_name} must be a positive finite number")
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{info.field_name} must be a positive finite number") from None
+        if not math.isfinite(number) or number <= 0:
+            raise ValueError(f"{info.field_name} must be a positive finite number")
+        return number
+
+    @field_validator(
+        "max_model_output_bytes",
+        "max_tool_result_bytes",
+        "max_event_bytes",
+        "max_task_snapshot_bytes",
+        mode="before",
+    )
+    @classmethod
+    def validate_positive_bytes(cls, value: Any, info) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{info.field_name} must be a positive integer")
+        return value
+
+    @field_validator("max_pending_submissions", mode="before")
+    @classmethod
+    def validate_pending_limit(cls, value: Any) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("max_pending_submissions must be a non-negative integer")
+        return value
 
     @classmethod
     def load(cls, **kwargs) -> "Config":
@@ -158,6 +210,46 @@ class Config(BaseModel):
             max_seconds=_pick_positive_int(
                 settings, ("MAX_SECONDS", "max_seconds"), _DEFAULT_MAX_SECONDS
             ),
+            model_timeout_seconds=_pick_positive_float(
+                settings,
+                ("MODEL_TIMEOUT_SECONDS", "model_timeout_seconds"),
+                _DEFAULT_MODEL_TIMEOUT_SECONDS,
+            ),
+            tool_timeout_seconds=_pick_positive_float(
+                settings,
+                ("TOOL_TIMEOUT_SECONDS", "tool_timeout_seconds"),
+                _DEFAULT_TOOL_TIMEOUT_SECONDS,
+            ),
+            max_model_output_bytes=_pick_positive_int(
+                settings,
+                ("MAX_MODEL_OUTPUT_BYTES", "max_model_output_bytes"),
+                _DEFAULT_MAX_MODEL_OUTPUT_BYTES,
+            ),
+            max_tool_result_bytes=_pick_positive_int(
+                settings,
+                ("MAX_TOOL_RESULT_BYTES", "max_tool_result_bytes"),
+                _DEFAULT_MAX_TOOL_RESULT_BYTES,
+            ),
+            max_event_bytes=_pick_positive_int(
+                settings,
+                ("MAX_EVENT_BYTES", "max_event_bytes"),
+                _DEFAULT_MAX_EVENT_BYTES,
+            ),
+            max_task_snapshot_bytes=_pick_positive_int(
+                settings,
+                ("MAX_TASK_SNAPSHOT_BYTES", "max_task_snapshot_bytes"),
+                _DEFAULT_MAX_TASK_SNAPSHOT_BYTES,
+            ),
+            max_pending_submissions=_pick_nonnegative_int(
+                settings,
+                ("MAX_PENDING_SUBMISSIONS", "max_pending_submissions"),
+                _DEFAULT_MAX_PENDING_SUBMISSIONS,
+            ),
+            close_timeout_seconds=_pick_positive_float(
+                settings,
+                ("CLOSE_TIMEOUT_SECONDS", "close_timeout_seconds"),
+                _DEFAULT_CLOSE_TIMEOUT_SECONDS,
+            ),
         )
 
 
@@ -188,6 +280,44 @@ def _pick_positive_int(settings: Settings, keys: tuple[str, ...], default: int) 
             raise ConfigError(f"invalid integer config: {key}")
         return number
     return default
+
+
+def _pick_nonnegative_int(settings: Settings, keys: tuple[str, ...], default: int) -> int:
+    for key in keys:
+        if key not in settings:
+            continue
+        value = settings.get(key)
+        if isinstance(value, str):
+            value = value.strip()
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            raise ConfigError(f"invalid integer config: {key}")
+        try:
+            number = int(value)
+        except ValueError:
+            raise ConfigError(f"invalid integer config: {key}") from None
+        if number < 0:
+            raise ConfigError(f"invalid integer config: {key}")
+        return number
+    return default
+
+
+def _pick_positive_float(settings: Settings, keys: tuple[str, ...], default: float) -> float:
+    for key in keys:
+        if key not in settings:
+            continue
+        value = settings.get(key)
+        if isinstance(value, str):
+            value = value.strip()
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise ConfigError(f"invalid number config: {key}")
+        try:
+            number = float(value)
+        except ValueError:
+            raise ConfigError(f"invalid number config: {key}") from None
+        if not math.isfinite(number) or number <= 0:
+            raise ConfigError(f"invalid number config: {key}")
+        return number
+    return float(default)
 
 
 def _resolve_env_file(env_file: Path | str | None, environ: Mapping[str, str]) -> Path | None:

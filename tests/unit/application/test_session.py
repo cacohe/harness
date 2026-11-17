@@ -1,12 +1,16 @@
 import asyncio
 import threading
+import unicodedata
 
 import pytest
-from src.application.session import AgentSession
+from src.application.session import AgentSession, message_digest
 from src.core.cancellation import CancellationToken
 from src.core.memory import MemoryManager
+from src.core.persistence import SubmissionConflictError
 from src.memory.retriever import HybridRetriever
 from src.memory.store import InMemoryStore
+from src.persistence import SQLiteTaskRepository
+from src.persistence.in_memory import InMemoryTaskRepository
 from src.schema.task import (
     TaskFailReason,
     TaskPauseReason,
@@ -65,6 +69,186 @@ class PausingHarness:
         return task.result
 
 
+@pytest.mark.parametrize(
+    "left,right",
+    [
+        ("é", unicodedata.normalize("NFD", "é")),
+        ("line\r\n", "line\n"),
+        (" leading", "leading"),
+        ("", "\n"),
+    ],
+)
+def test_message_digest_uses_exact_raw_utf8(left, right):
+    left_algorithm, left_digest = message_digest(left)
+    right_algorithm, right_digest = message_digest(right)
+
+    assert left_algorithm == right_algorithm == "sha256-raw-utf8-v1"
+    assert left_digest != right_digest
+
+
+def test_retry_with_same_message_id_returns_stored_task_without_rerunning_harness():
+    harness = CompletingHarness()
+    repository = InMemoryTaskRepository()
+    session = AgentSession(harness, repository, lambda: None, session_id="session-1")
+
+    first = session.chat("same", message_id="message-1")
+    second = session.chat("same", message_id="message-1")
+
+    assert second.id == first.id
+    assert len(harness.inputs) == 1
+
+
+def test_retry_with_same_message_id_and_different_content_conflicts():
+    session = AgentSession(
+        CompletingHarness(),
+        InMemoryTaskRepository(),
+        lambda: None,
+        session_id="session-1",
+    )
+    session.chat("first", message_id="message-1")
+
+    with pytest.raises(SubmissionConflictError):
+        session.chat("different", message_id="message-1")
+
+
+def test_concurrent_sessions_with_shared_sqlite_execute_identical_submission_once(tmp_path):
+    class BlockingHarness(CompletingHarness):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def arun(self, task, cancellation_token=None, execution_context=None):
+            self.started.set()
+            await self.release.wait()
+            return await super().arun(task, cancellation_token=cancellation_token)
+
+    async def scenario():
+        repository = SQLiteTaskRepository(tmp_path / "shared.db")
+        harness = BlockingHarness()
+        first_session = AgentSession(
+            harness, repository, lambda: None, session_id="shared", execution_store=repository
+        )
+        second_session = AgentSession(
+            harness, repository, lambda: None, session_id="shared", execution_store=repository
+        )
+        first = asyncio.create_task(first_session.achat("same", message_id="message-1"))
+        await harness.started.wait()
+        second = asyncio.create_task(second_session.achat("same", message_id="message-1"))
+        await asyncio.sleep(0.03)
+        harness.release.set()
+        return harness, await first, await second
+
+    harness, first, second = asyncio.run(scenario())
+
+    assert first.id == second.id
+    assert len(harness.inputs) == 1
+
+
+def test_concurrent_shared_sqlite_conflicting_submission_has_one_winner(tmp_path):
+    class BlockingHarness(CompletingHarness):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def arun(self, task, cancellation_token=None, execution_context=None):
+            self.started.set()
+            await self.release.wait()
+            return await super().arun(task, cancellation_token=cancellation_token)
+
+    async def scenario():
+        repository = SQLiteTaskRepository(tmp_path / "conflict.db")
+        harness = BlockingHarness()
+        first_session = AgentSession(
+            harness, repository, lambda: None, session_id="shared", execution_store=repository
+        )
+        second_session = AgentSession(
+            harness, repository, lambda: None, session_id="shared", execution_store=repository
+        )
+        first = asyncio.create_task(first_session.achat("first", message_id="message-1"))
+        await harness.started.wait()
+        with pytest.raises(SubmissionConflictError):
+            await second_session.achat("second", message_id="message-1")
+        harness.release.set()
+        return harness, await first
+
+    harness, winner = asyncio.run(scenario())
+
+    assert winner.is_completed()
+    assert len(harness.inputs) == 1
+
+
+def test_concurrent_shared_sqlite_rejects_a_different_open_submission(tmp_path):
+    class BlockingHarness(CompletingHarness):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def arun(self, task, cancellation_token=None, execution_context=None):
+            self.started.set()
+            await self.release.wait()
+            return await super().arun(task, cancellation_token=cancellation_token)
+
+    async def scenario():
+        repository = SQLiteTaskRepository(tmp_path / "ownership.db")
+        harness = BlockingHarness()
+        first_session = AgentSession(
+            harness, repository, lambda: None, session_id="shared", execution_store=repository
+        )
+        second_session = AgentSession(
+            harness, repository, lambda: None, session_id="shared", execution_store=repository
+        )
+        first = asyncio.create_task(first_session.achat("first", message_id="message-1"))
+        await harness.started.wait()
+        with pytest.raises(RuntimeError, match="already in progress"):
+            await second_session.achat("second", message_id="message-2")
+        assert repository.submission("shared", "message-2") is None
+        harness.release.set()
+        await first
+
+    asyncio.run(scenario())
+
+
+def test_bounded_queue_rejects_overflow_and_cancelled_waiter_writes_no_submission():
+    class BlockingHarness(CompletingHarness):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def arun(self, task, cancellation_token=None, execution_context=None):
+            self.started.set()
+            await self.release.wait()
+            return await super().arun(task, cancellation_token=cancellation_token)
+
+    async def scenario():
+        repository = InMemoryTaskRepository()
+        harness = BlockingHarness()
+        session = AgentSession(
+            harness,
+            repository,
+            lambda: None,
+            session_id="queued",
+            max_pending_submissions=1,
+        )
+        first = asyncio.create_task(session.achat("one", message_id="message-1"))
+        await harness.started.wait()
+        waiting = asyncio.create_task(session.achat("two", message_id="message-2"))
+        await asyncio.sleep(0)
+        with pytest.raises(RuntimeError, match="queue is full"):
+            await session.achat("three", message_id="message-3")
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        assert repository.submission("queued", "message-2") is None
+        harness.release.set()
+        await first
+
+    asyncio.run(scenario())
+
+
 def test_session_completed_turns_use_only_their_own_transcript():
     harness = CompletingHarness()
     session = AgentSession(harness, RecordingRepository(), lambda: None)
@@ -104,6 +288,35 @@ def test_session_owns_paused_run_approval_and_resume():
     assert completed.result.output == "resumed"
     assert session.pending_run is None
     assert session.transcript == [("user", "run it"), ("assistant", "resumed")]
+
+
+def test_retry_of_same_paused_submission_returns_the_paused_task():
+    harness = PausingHarness()
+    session = AgentSession(harness, InMemoryTaskRepository(), lambda: None, session_id="paused")
+
+    first = session.chat("run it", message_id="message-1")
+    retried = session.chat("run it", message_id="message-1")
+
+    assert retried.id == first.id
+    assert retried.is_paused()
+    assert harness.calls == 1
+
+
+def test_async_operation_registration_ends_when_chat_returns():
+    registered = []
+    unregistered = []
+    session = AgentSession(
+        CompletingHarness(),
+        InMemoryTaskRepository(),
+        lambda: None,
+        operation_registrar=registered.append,
+        operation_unregistrar=unregistered.append,
+    )
+
+    asyncio.run(session.achat("one", message_id="message-1"))
+
+    assert registered == unregistered
+    assert len(registered) == 1
 
 
 def test_replacing_paused_task_preserves_its_original_message():

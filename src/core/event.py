@@ -43,10 +43,18 @@ def _tracing_line(event: Event) -> str:
     else:
         stamp = str(timestamp)
     fields = [f"id={event.id}", f"type={event.type.value}"]
-    if event.task_id:
-        fields.append(f"task_id={event.task_id}")
-    if event.step_id:
-        fields.append(f"step_id={event.step_id}")
+    for name in (
+        "task_id",
+        "session_id",
+        "execution_id",
+        "turn_id",
+        "step_id",
+        "attempt_id",
+        "tool_call_id",
+    ):
+        value = getattr(event, name)
+        if value:
+            fields.append(f"{name}={value}")
     for key, value in asdict(event.payload).items():
         if value is None or key == "task_id":
             continue

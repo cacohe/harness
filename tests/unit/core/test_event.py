@@ -97,3 +97,39 @@ def test_emitter_errors_are_logged(caplog):
 
     assert "event emitter failed" in caplog.text
     assert "RuntimeError: down" in caplog.text
+
+
+def test_event_accepts_optional_execution_correlation_fields(capsys):
+    event = Event(
+        id="event-1",
+        type=EventType.LLM_STARTED,
+        payload=LlmEventPayload(phase="infer"),
+        task_id="task-1",
+        session_id="session-1",
+        execution_id="execution-1",
+        turn_id="turn-1",
+        step_id="step-1",
+        attempt_id="attempt-1",
+        tool_call_id="tool-1",
+    )
+
+    assert (
+        event.session_id,
+        event.execution_id,
+        event.turn_id,
+        event.step_id,
+        event.attempt_id,
+        event.tool_call_id,
+    ) == ("session-1", "execution-1", "turn-1", "step-1", "attempt-1", "tool-1")
+
+    EventHandler().emit(event, EventChannel.TRACING)
+    output = capsys.readouterr().out
+    for expected in (
+        "session_id=session-1",
+        "execution_id=execution-1",
+        "turn_id=turn-1",
+        "step_id=step-1",
+        "attempt_id=attempt-1",
+        "tool_call_id=tool-1",
+    ):
+        assert expected in output

@@ -6,9 +6,16 @@ from threading import Event, current_thread
 
 import pytest
 import src.persistence.sqlite as sqlite_module
+from src.core.persistence import ExecutionCommitError, SequenceConflictError
 from src.core.task import Task
 from src.persistence import SQLiteTaskRepository, TaskRepositoryError
 from src.schema.context import Message
+from src.schema.execution import (
+    PendingSessionEvent,
+    SessionEventType,
+    SubmissionRecord,
+    SubmissionState,
+)
 from src.schema.tool import ToolExecutionResult, ToolExecutionState
 
 
@@ -27,26 +34,94 @@ def _table_names(path) -> set[str]:
         }
 
 
-def test_constructor_creates_parent_version_and_tasks_table(tmp_path):
+def _create_v1_database(path, tasks=()):
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                snapshot TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        for task in tasks:
+            connection.execute(
+                "INSERT INTO tasks (id, snapshot) VALUES (?, ?)",
+                (task.id, json.dumps(task.to_dict(), ensure_ascii=False)),
+            )
+        connection.execute("PRAGMA user_version = 1")
+
+
+def _execution_event(event_id="event-1"):
+    return PendingSessionEvent(
+        event_id=event_id,
+        session_id="session-1",
+        type=SessionEventType.TURN_STARTED,
+        task_id="task-1",
+        execution_id="execution-1",
+        turn_id="turn-1",
+        payload={},
+    )
+
+
+def _execution_task(text="work"):
+    return Task(
+        text,
+        id="task-1",
+        session_id="session-1",
+        message_id="message-1",
+        turn_id="turn-1",
+    )
+
+
+def _submission(digest="a" * 64):
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    return SubmissionRecord(
+        session_id="session-1",
+        message_id="message-1",
+        digest_algorithm="sha256-raw-utf8-v1",
+        message_digest=digest,
+        task_id="task-1",
+        turn_id="turn-1",
+        state=SubmissionState.ACCEPTED,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def test_constructor_creates_parent_version_and_v2_tables(tmp_path):
     path = tmp_path / "nested" / "tasks.db"
 
     repository = SQLiteTaskRepository(path)
 
     assert repository.path == path.resolve()
     assert path.is_file()
-    assert _database_version(path) == 1
-    assert _table_names(path) == {"tasks"}
+    assert _database_version(path) == 2
+    assert _table_names(path) == {
+        "tasks",
+        "session_streams",
+        "session_events",
+        "submissions",
+    }
 
 
-def test_constructor_is_idempotent_for_an_existing_version_one_database(tmp_path):
+def test_constructor_is_idempotent_for_an_existing_version_two_database(tmp_path):
     path = tmp_path / "tasks.db"
 
     first = SQLiteTaskRepository(path)
     second = SQLiteTaskRepository(path)
 
     assert first.path == second.path
-    assert _database_version(path) == 1
-    assert _table_names(path) == {"tasks"}
+    assert _database_version(path) == 2
+    assert _table_names(path) == {
+        "tasks",
+        "session_streams",
+        "session_events",
+        "submissions",
+    }
 
 
 def test_concurrent_first_time_instances_initialize_one_database(tmp_path):
@@ -56,8 +131,13 @@ def test_concurrent_first_time_instances_initialize_one_database(tmp_path):
         repositories = list(pool.map(lambda _index: SQLiteTaskRepository(path), range(16)))
 
     assert {repository.path for repository in repositories} == {path.resolve()}
-    assert _database_version(path) == 1
-    assert _table_names(path) == {"tasks"}
+    assert _database_version(path) == 2
+    assert _table_names(path) == {
+        "tasks",
+        "session_streams",
+        "session_events",
+        "submissions",
+    }
 
 
 def test_concurrent_initialization_reads_version_and_tables_from_one_snapshot(
@@ -90,8 +170,13 @@ def test_concurrent_initialization_reads_version_and_tables_from_one_snapshot(
         first = delayed.result(timeout=5)
 
     assert first.path == immediate.path
-    assert _database_version(path) == 1
-    assert _table_names(path) == {"tasks"}
+    assert _database_version(path) == 2
+    assert _table_names(path) == {
+        "tasks",
+        "session_streams",
+        "session_events",
+        "submissions",
+    }
 
 
 @pytest.mark.parametrize("path", [":memory:", "file::memory:?cache=shared"])
@@ -116,7 +201,7 @@ def test_constructor_wraps_invalid_database_path_without_leaking_it(tmp_path):
     assert str(path) not in str(caught.value)
 
 
-@pytest.mark.parametrize("version", [2, 99])
+@pytest.mark.parametrize("version", [3, 99])
 def test_constructor_rejects_unsupported_version_without_modifying_database(tmp_path, version):
     path = tmp_path / "future.db"
     with sqlite3.connect(path) as connection:
@@ -153,6 +238,122 @@ def test_constructor_rejects_version_one_with_an_invalid_tasks_schema(tmp_path, 
         SQLiteTaskRepository(path)
 
     assert str(path) not in str(caught.value)
+
+
+@pytest.mark.parametrize("tasks", [[], [Task("first", id="task-1"), Task("second", id="task-2")]])
+def test_constructor_migrates_v1_tasks_to_v2_without_fabricating_events(tmp_path, tasks):
+    path = tmp_path / "v1.db"
+    _create_v1_database(path, tasks)
+
+    repository = SQLiteTaskRepository(path)
+
+    assert _database_version(path) == 2
+    assert [repository.get(task.id) for task in tasks] == tasks
+    assert repository.events("legacy") == []
+
+
+def test_failed_v1_migration_rolls_back_every_schema_change(tmp_path, monkeypatch):
+    path = tmp_path / "v1.db"
+    _create_v1_database(path, [Task("keep", id="task-1")])
+    monkeypatch.setattr(sqlite_module, "_CREATE_SUBMISSIONS", "CREATE TABL broken", raising=False)
+
+    with pytest.raises(TaskRepositoryError, match="initialize"):
+        SQLiteTaskRepository(path)
+
+    assert _database_version(path) == 1
+    assert _table_names(path) == {"tasks"}
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+
+
+def test_constructor_rejects_version_two_with_missing_execution_tables(tmp_path):
+    path = tmp_path / "invalid-v2.db"
+    _create_v1_database(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA user_version = 2")
+
+    with pytest.raises(TaskRepositoryError, match="schema"):
+        SQLiteTaskRepository(path)
+
+
+def test_v2_schema_has_expected_foreign_keys(tmp_path):
+    path = tmp_path / "tasks.db"
+    SQLiteTaskRepository(path)
+
+    with sqlite3.connect(path) as connection:
+        event_foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(session_events)"
+        ).fetchall()
+        submission_foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(submissions)"
+        ).fetchall()
+
+    assert [(row[2], row[3], row[4]) for row in event_foreign_keys] == [("tasks", "task_id", "id")]
+    assert [(row[2], row[3], row[4]) for row in submission_foreign_keys] == [
+        ("tasks", "task_id", "id")
+    ]
+
+
+def test_events_reject_corrupt_stored_payload(tmp_path):
+    path = tmp_path / "tasks.db"
+    repository = SQLiteTaskRepository(path)
+    repository.commit(_execution_task(), [_execution_event()], expected_sequence=0)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE session_events SET payload = ? WHERE event_id = ?",
+            ("{not-json", "event-1"),
+        )
+
+    with pytest.raises(ExecutionCommitError, match="stored execution event is invalid"):
+        repository.events("session-1")
+
+
+def test_execution_commit_reopens_with_snapshot_events_and_submission(tmp_path):
+    path = tmp_path / "tasks.db"
+    SQLiteTaskRepository(path).commit(
+        _execution_task(),
+        [_execution_event()],
+        expected_sequence=0,
+        submission=_submission(),
+    )
+
+    reopened = SQLiteTaskRepository(path)
+
+    assert reopened.get("task-1").last_sequence == 1
+    assert [event.event_id for event in reopened.events("session-1")] == ["event-1"]
+    assert reopened.submission("session-1", "message-1").message_digest == "a" * 64
+
+
+def test_two_sqlite_writers_cannot_commit_the_same_expected_sequence(tmp_path):
+    path = tmp_path / "tasks.db"
+    first = SQLiteTaskRepository(path, timeout=10)
+    second = SQLiteTaskRepository(path, timeout=10)
+
+    def commit(repository, event_id):
+        return repository.commit(
+            _execution_task(event_id),
+            [_execution_event(event_id)],
+            expected_sequence=0,
+            submission=_submission(),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(commit, first, "event-1"), pool.submit(commit, second, "event-2")]
+    results = []
+    errors = []
+    for future in futures:
+        try:
+            results.append(future.result())
+        except Exception as error:
+            errors.append(error)
+
+    assert len(results) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], SequenceConflictError)
+    stored = SQLiteTaskRepository(path)
+    assert len(stored.events("session-1")) == 1
+    assert stored.get("task-1").original_input in {"event-1", "event-2"}
+    assert stored.submission("session-1", "message-1") is not None
 
 
 def test_failed_connection_configuration_closes_the_opened_connection(tmp_path, monkeypatch):

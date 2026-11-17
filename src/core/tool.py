@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
@@ -22,6 +23,13 @@ class RemoteToolError(Exception):
     def __init__(self, output: Any):
         self.output = output
         super().__init__(str(output))
+
+
+def _public_tool_error(error: BaseException, operation: str) -> str:
+    public_message = getattr(error, "public_message", None)
+    if isinstance(public_message, str) and public_message:
+        return public_message[:1000]
+    return f"{type(error).__name__}: {operation} failed"
 
 
 @runtime_checkable
@@ -98,11 +106,17 @@ class ToolExecutor:
     def _execute(self, tool: Tool, inputs: dict) -> ToolExecutionResult:
         return run_sync(lambda: self._aexecute(tool, inputs), async_name="aexecute")
 
-    async def _aexecute(self, tool: Tool, inputs: dict) -> ToolExecutionResult:
+    async def _aexecute(
+        self,
+        tool: Tool,
+        inputs: dict,
+        *,
+        before_execute: Callable[[], None] | None = None,
+    ) -> ToolExecutionResult:
         try:
             decision = self.approval_policy.decide(tool, inputs)
         except Exception as error:
-            return self._failed(tool, output=f"{type(error).__name__}: {error}")
+            return self._failed(tool, output=_public_tool_error(error, "approval"))
         if decision is None:
             return ToolExecutionResult(
                 tool_id=tool.id,
@@ -115,6 +129,8 @@ class ToolExecutor:
             return self._failed(tool, ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_TIMEOUT)
         if decision is not ApprovalDecision.APPROVAL_DECISION_APPROVED:
             return self._failed(tool)
+        if before_execute is not None:
+            before_execute()
         return await self._arun_approved(tool, inputs)
 
     def execute_approved(self, tool: Tool, inputs: dict) -> ToolExecutionResult:
@@ -165,20 +181,20 @@ class ToolExecutor:
                     tool,
                     inputs,
                 )
-        except TimeoutError as error:
+        except TimeoutError:
             return self._failed(
                 tool,
                 ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_TIMEOUT,
-                output=f"TimeoutError: {error}",
+                output="TimeoutError: tool execution timed out",
             )
-        except RemoteToolError as error:
+        except RemoteToolError:
             return self._failed(
                 tool,
                 ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_REMOTE_ERROR,
-                output=error.output,
+                output="RemoteToolError: remote tool failed",
             )
         except Exception as error:
-            return self._failed(tool, output=f"{type(error).__name__}: {error}")
+            return self._failed(tool, output=_public_tool_error(error, "tool execution"))
         return ToolExecutionResult(
             tool_id=tool.id,
             tool_name=tool.name,
@@ -206,15 +222,19 @@ class ToolExecutor:
         tool_calls: list[LlmToolCall],
         *,
         before_call: Callable[[LlmToolCall], None] | None = None,
+        before_execute: Callable[[LlmToolCall], None] | None = None,
         after_call: Callable[[LlmToolCall, ToolExecutionResult], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        timeout_seconds: float | None = None,
     ) -> ToolCallResult:
         return run_sync(
             lambda: self.aexecute_tool_calls(
                 tool_calls,
                 before_call=before_call,
+                before_execute=before_execute,
                 after_call=after_call,
                 should_cancel=should_cancel,
+                timeout_seconds=timeout_seconds,
             ),
             async_name="aexecute_tool_calls",
         )
@@ -224,8 +244,10 @@ class ToolExecutor:
         tool_calls: list[LlmToolCall],
         *,
         before_call: Callable[[LlmToolCall], None] | None = None,
+        before_execute: Callable[[LlmToolCall], None] | None = None,
         after_call: Callable[[LlmToolCall, ToolExecutionResult], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        timeout_seconds: float | None = None,
     ) -> ToolCallResult:
         pending_tools: list[ToolExecutionResult] = []
         completed_tools: list[ToolExecutionResult] = []
@@ -250,7 +272,28 @@ class ToolExecutor:
                 failed_tools.append(result)
                 ordered_tools.append(result)
                 continue
-            result = await self._aexecute_tool_call_compat(call, hold=bool(pending_tools))
+            try:
+                if timeout_seconds is None:
+                    result = await self._aexecute_tool_call_compat(
+                        call,
+                        hold=bool(pending_tools),
+                        before_execute=before_execute,
+                    )
+                else:
+                    async with asyncio.timeout(timeout_seconds):
+                        result = await self._aexecute_tool_call_compat(
+                            call,
+                            hold=bool(pending_tools),
+                            before_execute=before_execute,
+                        )
+            except TimeoutError:
+                result = ToolExecutionResult(
+                    tool_id=call.id,
+                    tool_name=call.name,
+                    state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
+                    output="TimeoutError: tool call timed out",
+                    fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_TIMEOUT,
+                )
             if after_call is not None:
                 after_call(call, result)
             if result.is_completed():
@@ -269,15 +312,31 @@ class ToolExecutor:
         )
 
     async def _aexecute_tool_call_compat(
-        self, call: LlmToolCall, *, approved: bool = False, hold: bool = False
+        self,
+        call: LlmToolCall,
+        *,
+        approved: bool = False,
+        hold: bool = False,
+        before_execute: Callable[[LlmToolCall], None] | None = None,
     ) -> ToolExecutionResult:
         sync_override = type(self).execute_tool_call is not ToolExecutor.execute_tool_call
         async_override = type(self).aexecute_tool_call is not ToolExecutor.aexecute_tool_call
         if sync_override and not async_override:
+            if before_execute is not None:
+                before_execute(call)
             return await call_maybe_async(
                 None, self.execute_tool_call, call, approved=approved, hold=hold
             )
-        return await self.aexecute_tool_call(call, approved=approved, hold=hold)
+        if async_override:
+            if before_execute is not None:
+                before_execute(call)
+            return await self.aexecute_tool_call(call, approved=approved, hold=hold)
+        return await self.aexecute_tool_call(
+            call,
+            approved=approved,
+            hold=hold,
+            before_execute=before_execute,
+        )
 
     def execute_tool_call(
         self, call: LlmToolCall, approved: bool = False, hold: bool = False
@@ -288,7 +347,12 @@ class ToolExecutor:
         )
 
     async def aexecute_tool_call(
-        self, call: LlmToolCall, approved: bool = False, hold: bool = False
+        self,
+        call: LlmToolCall,
+        approved: bool = False,
+        hold: bool = False,
+        *,
+        before_execute: Callable[[LlmToolCall], None] | None = None,
     ) -> ToolExecutionResult:
         """Run one model tool call, or hold it until an earlier approval is resolved."""
         try:
@@ -320,7 +384,7 @@ class ToolExecutor:
             try:
                 decision = self.approval_policy.decide(tool, validated)
             except Exception as error:
-                result = self._failed(tool, output=f"{type(error).__name__}: {error}")
+                result = self._failed(tool, output=_public_tool_error(error, "tool execution"))
                 result.tool_id = call.id
                 return result
             return ToolExecutionResult(
@@ -333,11 +397,13 @@ class ToolExecutor:
                 workspace_id=self._workspace_id(tool),
                 approval_scope=tool.approval_scope,
             )
-        result = (
-            await self._arun_approved(tool, validated)
-            if approved
-            else await self._aexecute(tool, validated)
-        )
+        if approved:
+            if before_execute is not None:
+                before_execute(call)
+            result = await self._arun_approved(tool, validated)
+        else:
+            callback = None if before_execute is None else lambda: before_execute(call)
+            result = await self._aexecute(tool, validated, before_execute=callback)
         result.tool_id = call.id
         if result.is_pending():
             result.arguments = self._encoded_arguments(validated)
@@ -346,12 +412,26 @@ class ToolExecutor:
             result.approval_scope = tool.approval_scope
         return result
 
-    def execute_held_tool_call(self, held: ToolExecutionResult) -> ToolExecutionResult:
+    def execute_held_tool_call(
+        self,
+        held: ToolExecutionResult,
+        *,
+        before_execute: Callable[[LlmToolCall], None] | None = None,
+    ) -> ToolExecutionResult:
         return run_sync(
-            lambda: self.aexecute_held_tool_call(held), async_name="aexecute_held_tool_call"
+            lambda: self.aexecute_held_tool_call(
+                held,
+                before_execute=before_execute,
+            ),
+            async_name="aexecute_held_tool_call",
         )
 
-    async def aexecute_held_tool_call(self, held: ToolExecutionResult) -> ToolExecutionResult:
+    async def aexecute_held_tool_call(
+        self,
+        held: ToolExecutionResult,
+        *,
+        before_execute: Callable[[LlmToolCall], None] | None = None,
+    ) -> ToolExecutionResult:
         """Run or reject a held tool call after the user decides."""
         call = LlmToolCall(held.tool_id, held.tool_name, held.arguments or "")
         decision = held.approval
@@ -373,7 +453,11 @@ class ToolExecutor:
                 )
                 result.tool_id = call.id
                 return result
-            return await self._aexecute_tool_call_compat(call, approved=True)
+            return await self._aexecute_tool_call_compat(
+                call,
+                approved=True,
+                before_execute=before_execute,
+            )
         if decision == ApprovalDecision.APPROVAL_DECISION_TIMEOUT:
             reason = ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_TIMEOUT
             output = "The approval timed out."
@@ -405,7 +489,7 @@ class ToolExecutor:
                 output=f"WorkspaceViolation: {error}",
             )
         except Exception as error:
-            return None, self._failed(tool, output=f"{type(error).__name__}: {error}")
+            return None, self._failed(tool, output=_public_tool_error(error, "input validation"))
 
     @staticmethod
     def _workspace_id(tool: Tool) -> str | None:

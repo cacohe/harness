@@ -150,3 +150,22 @@ def test_async_stream_assembly_folds_a_reused_mutable_chunk_on_arrival():
 
     assert output.content == "hello world"
     assert parts == ["hello ", "world"]
+
+
+def test_async_stream_stops_consuming_when_byte_budget_is_exceeded():
+    consumed = []
+    closed = []
+
+    async def pieces():
+        try:
+            for index in range(100):
+                consumed.append(index)
+                yield _piece("x" * 50)
+        finally:
+            closed.append(True)
+
+    with pytest.raises(OverflowError, match="max_bytes"):
+        asyncio.run(assemble_llm_async_stream(pieces(), max_bytes=120))
+
+    assert len(consumed) < 100
+    assert closed == [True]

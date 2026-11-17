@@ -24,12 +24,13 @@ def _task(event_type, task_id="task-1"):
     )
 
 
-def _llm(event_type, *, task_id="task-1", phase="infer", usage=None):
+def _llm(event_type, *, task_id="task-1", phase="infer", usage=None, attempt_id=None):
     return Event(
         id=f"{event_type.value}-{task_id}-{phase}",
         type=event_type,
         payload=LlmEventPayload(phase=phase, usage=usage),
         task_id=task_id,
+        attempt_id=attempt_id,
     )
 
 
@@ -88,6 +89,24 @@ def test_orphan_terminal_events_count_without_inventing_latency():
     snapshot = metrics.snapshot()
     assert snapshot["task_outcomes"] == {"failed": 1}
     assert all(summary["count"] == 0 for summary in snapshot["durations"].values())
+
+
+def test_metrics_keep_multiple_attempts_in_one_step_distinct():
+    ticks = iter([0.0, 1.0, 3.0, 5.0])
+    metrics = MetricsEventSink(clock=lambda: next(ticks))
+
+    metrics.emit(_llm(EventType.LLM_STARTED, attempt_id="attempt-1"))
+    metrics.emit(_llm(EventType.LLM_STARTED, attempt_id="attempt-2"))
+    metrics.emit(_llm(EventType.LLM_FAILED, attempt_id="attempt-1"))
+    metrics.emit(_llm(EventType.LLM_COMPLETED, attempt_id="attempt-2"))
+
+    snapshot = metrics.snapshot()
+    assert snapshot["in_flight"]["llm"] == 0
+    assert snapshot["durations"]["llm"] == {
+        "count": 2,
+        "total_seconds": 7.0,
+        "max_seconds": 4.0,
+    }
 
 
 def test_task_terminal_reconciles_orphaned_child_operations():

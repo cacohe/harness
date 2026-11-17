@@ -6,19 +6,23 @@ import pytest
 from src.context.context_builder import DefaultContextBuilder
 from src.core.cancellation import CancellationToken
 from src.core.context import HELD_TOOL_MESSAGE, PENDING_TOOL_MESSAGE
+from src.core.execution import PayloadLimitError
 from src.core.guard import NoOpGuard
 from src.core.hook import HarnessHook
+from src.core.llm import LlmCallError
 from src.core.loop import (
     DEFAULT_LLM_ATTEMPT_DELAY_SECONDS,
     DEFAULT_MAX_SECONDS,
     DEFAULT_MAX_STEPS,
     Harness,
 )
+from src.core.persistence import ExecutionCommitError
 from src.core.task import Task
 from src.core.tool import ToolExecutor
 from src.persistence.in_memory import InMemoryTaskRepository
 from src.schema.context import Context
 from src.schema.event import EventType
+from src.schema.execution import SessionEventType
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
 from src.schema.task import (
     TaskFailReason,
@@ -113,6 +117,7 @@ def _harness(
     tools=None,
     executor=None,
     repository=None,
+    **harness_options,
 ) -> Harness:
     return Harness(
         "Be brief.",
@@ -126,6 +131,7 @@ def _harness(
         task_repository=repository,
         max_steps=max_steps,
         max_seconds=max_seconds,
+        **harness_options,
     )
 
 
@@ -305,6 +311,48 @@ def test_update_plan_mixed_batch_preserves_partial_legacy_cancellation():
     assert executed == ["first"]
 
 
+def test_update_plan_observer_cancellation_settles_returned_external_tool():
+    token = CancellationToken()
+    repository = InMemoryTaskRepository()
+
+    class CancellingSink(RecordingOutput):
+        def emit(self, event):
+            super().emit(event)
+            if event.type is EventType.TASK_PLANNED:
+                token.cancel()
+
+    gateway = ScriptedGateway(
+        [
+            _model(
+                FinishReason.TOOL_CALLS,
+                calls=[
+                    LlmToolCall(
+                        "plan-1",
+                        "update_plan",
+                        '{"goal":["inspect"],"current":"read","remaining":[],"completed":[]}',
+                    ),
+                    LlmToolCall("read-1", "read_file", "{}"),
+                ],
+            )
+        ]
+    )
+    task = _task()
+
+    result = _harness(
+        gateway,
+        tools=[Tool("read_file", "read_file", "Read.", {}, lambda _inputs: "read")],
+        repository=repository,
+        event_handler=CancellingSink(),
+    ).run(task, cancellation_token=token)
+
+    assert result == TaskResult(output="Task cancelled.")
+    facts = repository.events(task.session_id)
+    requested = [fact for fact in facts if fact.type is SessionEventType.TOOL_CALL_REQUESTED]
+    settled = [fact for fact in facts if fact.type is SessionEventType.TOOL_CALL_SETTLED]
+    assert len(requested) == len(settled) == 2
+    assert facts[-1].type is SessionEventType.EXECUTION_SETTLED
+
+
 def test_invalid_update_plan_is_reported_to_the_next_infer_call():
     gateway = ScriptedGateway(
         [
@@ -346,7 +394,7 @@ def test_external_update_plan_name_is_rejected_as_reserved():
 
     assert task.state is TaskState.TASK_FAILED
     assert task.state_reason is TaskFailReason.TASK_FAILED_CONTEXT_BUILD_ERROR
-    assert result.output == "An unexpected error occurred: 'update_plan' is reserved by Harness"
+    assert result.output == "ContextBuilderError: operation failed"
 
 
 class CountingExecutor(Executor):
@@ -382,6 +430,211 @@ def test_run_sends_a_new_task_directly_to_infer_and_returns_the_answer():
 
     assert len(gateway.infer_calls) == 1
     assert gateway.infer_calls[0][1:] == (True, None)
+
+
+def test_completed_run_records_balanced_model_and_turn_facts():
+    repository = InMemoryTaskRepository()
+    task = _task()
+
+    _harness(Gateway(), repository=repository).run(task)
+
+    facts = repository.events(task.session_id)
+    types = [fact.type for fact in facts]
+    assert types[:4] == [
+        SessionEventType.SESSION_STARTED,
+        SessionEventType.SUBMISSION_ACCEPTED,
+        SessionEventType.EXECUTION_STARTED,
+        SessionEventType.TURN_STARTED,
+    ]
+    assert types.count(SessionEventType.MODEL_ATTEMPT_STARTED) == 1
+    assert types.count(SessionEventType.MODEL_ATTEMPT_SETTLED) == 1
+    assert types.count(SessionEventType.ASSISTANT_SETTLED) == 1
+    assert types[-3:] == [
+        SessionEventType.TURN_SETTLED,
+        SessionEventType.SUBMISSION_SETTLED,
+        SessionEventType.EXECUTION_SETTLED,
+    ]
+    for started in [
+        index
+        for index, event_type in enumerate(types)
+        if event_type is SessionEventType.MODEL_ATTEMPT_STARTED
+    ]:
+        settled = types.index(SessionEventType.MODEL_ATTEMPT_SETTLED, started + 1)
+        assistant = types.index(SessionEventType.ASSISTANT_SETTLED, settled + 1)
+        assert started < settled < assistant
+    assert all(fact.type is not SessionEventType.USER_MESSAGE for fact in facts)
+
+
+def test_durable_model_facts_precede_matching_observations():
+    repository = InMemoryTaskRepository()
+    observed = []
+
+    class InspectingSink:
+        def emit(self, event):
+            if event.type in {EventType.LLM_STARTED, EventType.LLM_COMPLETED}:
+                durable = repository.events(event.session_id)
+                observed.append((event.type, [fact.type for fact in durable]))
+
+    task = _task()
+    _harness(Gateway(), repository=repository, event_handler=InspectingSink()).run(task)
+
+    for event_type, durable_types in observed:
+        if event_type is EventType.LLM_STARTED:
+            assert durable_types[-1] is SessionEventType.MODEL_ATTEMPT_STARTED
+        else:
+            assert durable_types[-2:] == [
+                SessionEventType.MODEL_ATTEMPT_SETTLED,
+                SessionEventType.ASSISTANT_SETTLED,
+            ]
+
+
+def test_observation_failure_does_not_rollback_already_committed_model_fact():
+    repository = InMemoryTaskRepository()
+
+    class FailingSink:
+        def emit(self, event):
+            if event.type is EventType.LLM_STARTED:
+                raise RuntimeError("observer offline")
+
+    task = _task()
+    harness = _harness(Gateway(), repository=repository, event_handler=FailingSink())
+    result = harness.run(task)
+
+    assert result.output == "bought"
+    assert harness.observation_failure_count == 1
+    assert repository.get(task.id).is_completed()
+
+
+def test_inference_failure_settles_attempt_before_upper_lifecycles():
+    class FailingInference(Gateway):
+        def infer(self, context, stream=True, response_format=None):
+            raise LlmCallError("invalid inference")
+
+    repository = InMemoryTaskRepository()
+    task = _task()
+
+    result = _harness(FailingInference(), repository=repository).run(task)
+
+    assert result.output == "LlmCallError: operation failed"
+    types = [fact.type for fact in repository.events(task.session_id)]
+    attempt_settled = types.index(SessionEventType.MODEL_ATTEMPT_SETTLED)
+    assert types[attempt_settled + 1 :] == [
+        SessionEventType.STEP_SETTLED,
+        SessionEventType.TURN_SETTLED,
+        SessionEventType.SUBMISSION_SETTLED,
+        SessionEventType.EXECUTION_SETTLED,
+    ]
+
+
+def test_caller_cancellation_settles_one_attempt_without_assistant_fact():
+    async def scenario():
+        infer_started = asyncio.Event()
+
+        class BlockingGateway(Gateway):
+            async def ainfer(self, context, stream=True, response_format=None):
+                infer_started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+        repository = InMemoryTaskRepository()
+        task = _task()
+        running = asyncio.create_task(_harness(BlockingGateway(), repository=repository).arun(task))
+        await infer_started.wait()
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        return repository, task
+
+    repository, task = asyncio.run(scenario())
+    facts = repository.events(task.session_id)
+    types = [fact.type for fact in facts]
+    assert types.count(SessionEventType.MODEL_ATTEMPT_SETTLED) == 1
+    assert types.count(SessionEventType.ASSISTANT_SETTLED) == 0
+    infer_settlements = [
+        fact
+        for fact in facts
+        if fact.type is SessionEventType.MODEL_ATTEMPT_SETTLED
+        and fact.payload.get("phase") == "infer"
+    ]
+    assert len(infer_settlements) == 1
+    assert infer_settlements[0].payload["outcome"] == "cancelled"
+    assert facts[-1].type is SessionEventType.EXECUTION_SETTLED
+    assert facts[-1].payload["outcome"] == "cancelled"
+
+
+def test_model_output_byte_budget_accepts_exact_boundary_and_rejects_one_less():
+    output = _model(FinishReason.STOP, "你好")
+    probe = _harness(ScriptedGateway([output]))
+    boundary = probe._strict_json_size(output.model_dump(mode="json", exclude_none=True))
+
+    accepted = _harness(
+        ScriptedGateway([output]),
+        max_model_output_bytes=boundary,
+    ).infer(Context(), _task())
+
+    assert accepted.content == "你好"
+    with pytest.raises(LlmCallError, match="max_model_output_bytes"):
+        _harness(
+            ScriptedGateway([output]),
+            max_model_output_bytes=boundary - 1,
+        ).infer(Context(), _task())
+
+
+def test_model_deadline_is_distinct_from_provider_retry_timeout():
+    class SlowGateway(Gateway):
+        async def ainfer(self, context, stream=True, response_format=None):
+            await asyncio.sleep(1)
+            return _model(FinishReason.STOP, "late")
+
+    with pytest.raises(LlmCallError, match="timed out"):
+        asyncio.run(_harness(SlowGateway(), model_timeout_seconds=0.01).ainfer(Context(), _task()))
+
+
+def test_tool_result_byte_budget_accepts_exact_boundary_and_rejects_one_less():
+    result = ToolExecutionResult(
+        tool_id="call-1",
+        tool_name="tool",
+        state=ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED,
+        output={"text": "你好"},
+    )
+    probe = _harness(Gateway())
+    boundary = probe._strict_json_size(result.model_dump(mode="json", exclude_none=True))
+
+    probe.max_tool_result_bytes = boundary
+    probe._enforce_tool_result(result)
+    probe.max_tool_result_bytes = boundary - 1
+    with pytest.raises(PayloadLimitError, match="max_tool_result_bytes"):
+        probe._enforce_tool_result(result)
+
+
+def test_tool_timeout_suppresses_late_thread_result_observation():
+    finished = threading.Event()
+    sink = RecordingOutput()
+
+    def slow(_inputs):
+        import time
+
+        time.sleep(0.1)
+        finished.set()
+        return "late"
+
+    tool = Tool("slow", "slow", "Slow.", {}, slow)
+    gateway = ScriptedGateway(
+        [_model(FinishReason.TOOL_CALLS, calls=[LlmToolCall("call-1", "slow", "{}")])]
+    )
+    task = _task()
+
+    result = _harness(
+        gateway,
+        tools=[tool],
+        event_handler=sink,
+        tool_timeout_seconds=0.01,
+    ).run(task)
+    terminal_count = len(sink.events)
+    finished.wait(0.2)
+
+    assert "timed out" in result.output.lower() or "timeout" in result.output.lower()
+    assert len(sink.events) == terminal_count
 
 
 def test_run_saves_state_changes_through_the_repository():
@@ -799,6 +1052,116 @@ def test_shell_call_pauses_without_running_or_a_closing_call():
     assert [event.payload.tool_call_id for event in paused] == ["call_1"]
 
 
+def test_approval_pause_and_resume_preserve_turn_and_settle_tool_once():
+    called = []
+    repository = InMemoryTaskRepository()
+    task = _task()
+    harness = _harness(
+        ScriptedGateway([_shell_call(), _model(FinishReason.STOP, "done")]),
+        executor=_recording_executor(called, "shell"),
+        repository=repository,
+    )
+
+    harness.run(task)
+    paused_facts = repository.events(task.session_id)
+
+    assert [fact.type for fact in paused_facts].count(SessionEventType.TOOL_CALL_REQUESTED) == 1
+    assert SessionEventType.TOOL_CALL_STARTED not in [fact.type for fact in paused_facts]
+    assert [fact.type for fact in paused_facts][-4:] == [
+        SessionEventType.STEP_PAUSED,
+        SessionEventType.TURN_PAUSED,
+        SessionEventType.SUBMISSION_PAUSED,
+        SessionEventType.EXECUTION_SETTLED,
+    ]
+    first_execution = paused_facts[-1].execution_id
+    turn_id = paused_facts[-1].turn_id
+
+    task.decide_tool_call("call_1", approved=True)
+    result = harness.run(task)
+
+    facts = repository.events(task.session_id)
+    assert result.output == "done"
+    assert called == [("shell", {"command": "git status"})]
+    assert [fact.type for fact in facts].count(SessionEventType.TOOL_CALL_STARTED) == 1
+    assert [fact.type for fact in facts].count(SessionEventType.TOOL_CALL_SETTLED) == 1
+    resumed = [fact for fact in facts if fact.type is SessionEventType.STEP_RESUMED]
+    assert len(resumed) == 1
+    assert resumed[0].turn_id == turn_id
+    assert resumed[0].execution_id != first_execution
+    assert facts[-1].type is SessionEventType.EXECUTION_SETTLED
+    assert facts[-1].payload["outcome"] == "completed"
+
+
+def test_rejected_approval_settles_requested_tool_without_started_fact():
+    repository = InMemoryTaskRepository()
+    task = _task()
+    harness = _harness(
+        ScriptedGateway([_shell_call(), _model(FinishReason.STOP, "continued")]),
+        executor=_recording_executor([], "shell"),
+        repository=repository,
+    )
+    harness.run(task)
+    task.decide_tool_call("call_1", approved=False)
+
+    harness.run(task)
+
+    facts = repository.events(task.session_id)
+    assert SessionEventType.TOOL_CALL_STARTED not in [fact.type for fact in facts]
+    settled = [fact for fact in facts if fact.type is SessionEventType.TOOL_CALL_SETTLED]
+    assert len(settled) == 1
+    assert settled[0].payload["outcome"] == "rejected"
+
+
+def test_tool_settlement_persistence_failure_stops_later_side_effects_and_compensates():
+    class FailFirstToolSettlement(InMemoryTaskRepository):
+        def __init__(self):
+            super().__init__()
+            self.failed = False
+
+        def commit(self, task, events, *, expected_sequence, submission=None):
+            if not self.failed and any(
+                event.type is SessionEventType.TOOL_CALL_SETTLED for event in events
+            ):
+                self.failed = True
+                raise ExecutionCommitError("settlement unavailable")
+            return super().commit(
+                task,
+                events,
+                expected_sequence=expected_sequence,
+                submission=submission,
+            )
+
+    executed = []
+    repository = FailFirstToolSettlement()
+    gateway = ScriptedGateway(
+        [
+            _model(
+                FinishReason.TOOL_CALLS,
+                calls=[
+                    LlmToolCall("call-1", "first", "{}"),
+                    LlmToolCall("call-2", "second", "{}"),
+                ],
+            )
+        ]
+    )
+    task = _task()
+
+    with pytest.raises(ExecutionCommitError, match="settlement unavailable"):
+        _harness(
+            gateway,
+            executor=_recording_executor(executed, "first", "second"),
+            repository=repository,
+        ).run(task)
+
+    assert executed == [("first", {})]
+    facts = repository.events(task.session_id)
+    started = [fact for fact in facts if fact.type is SessionEventType.TOOL_CALL_STARTED]
+    settled = [fact for fact in facts if fact.type is SessionEventType.TOOL_CALL_SETTLED]
+    assert len(started) == 1
+    assert len(settled) == 1
+    assert settled[0].payload["outcome"] == "failed"
+
+
 def test_precancelled_created_task_does_no_gateway_work():
     gateway = Gateway()
     repository = InMemoryTaskRepository()
@@ -852,6 +1215,11 @@ def test_precancelled_paused_task_cancels_held_calls_in_order():
         EventType.TASK_FAILED,
     ]
     assert repository.get(task.id) == task
+    facts = repository.events(task.session_id)
+    requested = [fact for fact in facts if fact.type is SessionEventType.TOOL_CALL_REQUESTED]
+    settled = [fact for fact in facts if fact.type is SessionEventType.TOOL_CALL_SETTLED]
+    assert len(requested) == len(settled) == 1
+    assert facts[-1].type is SessionEventType.EXECUTION_SETTLED
 
 
 def test_cancel_between_held_calls_stops_the_remaining_calls():
@@ -1263,7 +1631,7 @@ def test_repository_failure_while_cancelling_still_propagates():
         _harness(Gateway(), repository=FailingRepository()).run(_task(), cancellation_token=token)
 
 
-def test_event_failure_while_cancelling_still_propagates():
+def test_event_failure_while_cancelling_is_best_effort():
     class FailingSink(RecordingOutput):
         def emit(self, event):
             super().emit(event)
@@ -1273,8 +1641,11 @@ def test_event_failure_while_cancelling_still_propagates():
     token = CancellationToken()
     token.cancel()
 
-    with pytest.raises(RuntimeError, match="cancel observer failed"):
-        _harness(Gateway(), event_handler=FailingSink()).run(_task(), cancellation_token=token)
+    harness = _harness(Gateway(), event_handler=FailingSink())
+    result = harness.run(_task(), cancellation_token=token)
+
+    assert result.output == "Task cancelled."
+    assert harness.observation_failure_count == 1
 
 
 def test_finished_task_ignores_a_cancelled_token():
@@ -1488,7 +1859,7 @@ def test_unexpected_error_persists_the_returned_result():
     restored = repository.get(task.id)
 
     assert result is task.result
-    assert result.output == "An unexpected error occurred: bad request"
+    assert result.output == "LlmCallError: operation failed"
     assert restored is not None
     assert restored.result == result
     llm_events = [event for event in output.events if event.type.name.startswith("LLM_")]
@@ -1518,7 +1889,7 @@ def test_finalization_error_replaces_the_empty_failed_result():
     restored = repository.get(task.id)
 
     assert result is task.result
-    assert result.output == "An unexpected error occurred: closing failed"
+    assert result.output == "LlmCallError: operation failed"
     assert task.state is TaskState.TASK_FAILED
     assert task.state_reason is TaskFailReason.TASK_FAILED_MAX_STEPS
     assert restored is not None
@@ -1562,8 +1933,8 @@ def test_terminal_event_error_preserves_the_committed_result():
     repository = InMemoryTaskRepository()
     task = _task()
 
-    with pytest.raises(RuntimeError, match="completed observer failed"):
-        _harness(Gateway(), event_handler=FailingCompletedSink(), repository=repository).run(task)
+    harness = _harness(Gateway(), event_handler=FailingCompletedSink(), repository=repository)
+    result = harness.run(task)
 
     stored = repository.get(task.id)
     assert task.state is TaskState.TASK_COMPLETED
@@ -1571,9 +1942,11 @@ def test_terminal_event_error_preserves_the_committed_result():
     assert stored is not None
     assert stored.state is TaskState.TASK_COMPLETED
     assert stored.result == TaskResult(output="bought")
+    assert result.output == "bought"
+    assert harness.observation_failure_count == 1
 
 
-def test_infer_completion_event_error_escapes_retry_handling():
+def test_infer_completion_event_error_is_best_effort():
     class FailingInferSink(RecordingOutput):
         def emit(self, event):
             super().emit(event)
@@ -1582,14 +1955,15 @@ def test_infer_completion_event_error_escapes_retry_handling():
 
     task = _task()
 
-    with pytest.raises(RuntimeError, match="infer observer failed"):
-        _harness(Gateway(), event_handler=FailingInferSink()).run(task)
+    harness = _harness(Gateway(), event_handler=FailingInferSink())
+    result = harness.run(task)
 
-    assert task.state is TaskState.TASK_RUNNING
-    assert task.result is None
+    assert task.state is TaskState.TASK_COMPLETED
+    assert result.output == "bought"
+    assert harness.observation_failure_count == 1
 
 
-def test_inference_delta_event_error_escapes_retry_handling():
+def test_inference_delta_event_error_is_best_effort():
     class FailingDeltaSink(RecordingOutput):
         def emit(self, event):
             super().emit(event)
@@ -1598,11 +1972,12 @@ def test_inference_delta_event_error_escapes_retry_handling():
 
     task = _task()
 
-    with pytest.raises(RuntimeError, match="delta observer failed"):
-        _harness(Gateway(), event_handler=FailingDeltaSink()).run(task)
+    harness = _harness(Gateway(), event_handler=FailingDeltaSink())
+    result = harness.run(task)
 
-    assert task.state is TaskState.TASK_RUNNING
-    assert task.result is None
+    assert task.state is TaskState.TASK_COMPLETED
+    assert result.output == "bought"
+    assert harness.observation_failure_count >= 1
 
 
 def test_error_snapshot_failure_preserves_the_repository_exception():
@@ -1622,7 +1997,7 @@ def test_error_snapshot_failure_preserves_the_repository_exception():
         _harness(BrokenInference(), repository=FailingFailureRepository()).run(task)
 
     assert task.state is TaskState.TASK_FAILED
-    assert task.result == TaskResult(output="An unexpected error occurred: bad request")
+    assert task.result == TaskResult(output="LlmCallError: operation failed")
 
 
 def test_failed_event_never_exposes_an_empty_terminal_snapshot():
@@ -2242,13 +2617,37 @@ def test_resumed_tool_executor_error_emits_a_matching_failure():
 
     result = harness.run(task)
 
-    assert result.output == "An unexpected error occurred: resume crashed"
+    assert result.output == "RuntimeError: operation failed"
     tool_events = [event for event in sink.events if event.type.name.startswith("TOOL_")]
     assert [event.type for event in tool_events[-2:]] == [
         EventType.TOOL_EXECUTION_RESUMED,
         EventType.TOOL_EXECUTION_FAILED,
     ]
     assert tool_events[-1].payload.reason == "unknown"
+
+
+def test_resumed_tool_call_uses_the_per_call_deadline():
+    class SlowHeldExecutor(DefaultToolExecutor):
+        async def aexecute_held_tool_call(self, held, *, before_execute=None):
+            call = LlmToolCall(held.tool_id, held.tool_name, held.arguments or "")
+            if before_execute is not None:
+                before_execute(call)
+            await asyncio.sleep(1)
+
+    registry = DefaultToolRegistry()
+    registry.register(Tool("shell", "shell", "Shell.", {}, lambda inputs: "unused"))
+    harness = _harness(
+        ScriptedGateway([_shell_call()]),
+        executor=SlowHeldExecutor(registry),
+        tool_timeout_seconds=0.01,
+    )
+    task = _task()
+    harness.run(task)
+    task.decide_tool_call("call_1", approved=True)
+
+    result = harness.run(task)
+
+    assert result.output == "TimeoutError: operation failed"
 
 
 def test_caller_cancellation_during_resume_keeps_completed_and_settles_remaining_calls():

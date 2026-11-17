@@ -35,6 +35,11 @@ MAX_SECONDS=1800
 
 `LLM_MODEL` 必填。`LLM_API_KEY` 与 `LLM_API_BASE` 按所选模型填写。进程环境变量优先于 `.env`，`.env` 优先于 `config.toml` / `config.json`。也可用 `HARNESS_ENV_FILE`、`HARNESS_CONFIG_FILE` 指定配置文件路径。
 
+模型/工具 deadline、输出/事实/快照字节预算、有界 Session inbox 与关闭 deadline 也在
+`.env.example` 中配置。持久事实、SQLite v2 迁移与备份、幂等重试、恢复及 shutdown 的生产
+约束见 [Reliable runtime operations](docs/reliable-runtime.md)。SQLite v1 数据库首次升级前必须
+备份；v2 数据库不能再由 v1 代码写入。
+
 ## 组装方式
 
 `Agent` 是默认 composition root。普通调用方可以让它按配置创建 LiteLLM、上下文构建器、

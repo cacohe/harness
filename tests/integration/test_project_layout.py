@@ -1,4 +1,5 @@
 import ast
+import importlib.util
 import tomllib
 from pathlib import Path
 
@@ -48,6 +49,148 @@ def _schema_core_violations(root: Path) -> list[str]:
                 if module == "src.core" or module.startswith("src.core."):
                     violations.append(f"{path.relative_to(root)}:{node.lineno}:{module}")
     return violations
+
+
+FORBIDDEN_IMPORTS = {
+    "schema": (
+        "src.core",
+        "src.persistence",
+        "src.demo",
+        "src.llm",
+        "src.mcp",
+        "src.sandbox",
+        "fastmcp",
+        "litellm",
+        "docker",
+    ),
+    "core": (
+        "src.persistence",
+        "src.demo",
+        "src.llm.litellm",
+        "src.mcp",
+        "src.sandbox",
+        "fastmcp",
+        "litellm",
+        "docker",
+    ),
+}
+
+# Every exception must explain why dependency inversion cannot represent it.
+ARCHITECTURE_ALLOWLIST: dict[tuple[str, str], str] = {}
+
+
+def _resolved_imports(path: Path, root: Path) -> list[tuple[int, str]]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    relative = path.relative_to(root).with_suffix("")
+    package = ".".join(relative.parts[:-1])
+    imports: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.extend((node.lineno, alias.name) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                name = "." * node.level + (node.module or "")
+                try:
+                    module = importlib.util.resolve_name(name, package)
+                except (ImportError, ValueError):
+                    module = name
+            else:
+                module = node.module or ""
+            imports.append((node.lineno, module))
+            imports.extend(
+                (node.lineno, f"{module}.{alias.name}") for alias in node.names if alias.name != "*"
+            )
+        elif (
+            isinstance(node, ast.Call)
+            and len(node.args) >= 1
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and (
+                (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "importlib"
+                    and node.func.attr == "import_module"
+                )
+                or (isinstance(node.func, ast.Name) and node.func.id == "import_module")
+            )
+        ):
+            imports.append((node.lineno, node.args[0].value))
+    return imports
+
+
+def _architecture_violations(root: Path) -> list[str]:
+    violations = []
+    for layer, prefixes in FORBIDDEN_IMPORTS.items():
+        for path in (root / "src" / layer).rglob("*.py"):
+            for line, module in _resolved_imports(path, root):
+                forbidden = next(
+                    (
+                        prefix
+                        for prefix in prefixes
+                        if module == prefix or module.startswith(f"{prefix}.")
+                    ),
+                    None,
+                )
+                if forbidden is None:
+                    continue
+                key = (str(path.relative_to(root)).replace("\\", "/"), module)
+                if key in ARCHITECTURE_ALLOWLIST:
+                    assert ARCHITECTURE_ALLOWLIST[key].strip()
+                    continue
+                violations.append(f"{key[0]}:{line}:{module}")
+    return violations
+
+
+@pytest.mark.architecture
+def test_schema_and_core_dependency_direction_is_enforced():
+    assert _architecture_violations(ROOT) == []
+
+
+@pytest.mark.parametrize(
+    "layer,statement",
+    [
+        ("schema", "import src.core.task"),
+        ("schema", "from ..core import task"),
+        ("schema", "importlib.import_module('src.persistence.sqlite')"),
+        ("core", "import src.persistence.sqlite"),
+        ("core", "from ..persistence import sqlite"),
+        ("core", "from src.llm import litellm"),
+        ("core", "import fastmcp"),
+        ("core", "import docker"),
+        ("core", "importlib.import_module('src.demo.agent')"),
+    ],
+)
+@pytest.mark.architecture
+def test_architecture_gate_rejects_concrete_dependency_bypasses(
+    tmp_path: Path, layer: str, statement: str
+):
+    target = tmp_path / "src" / layer
+    target.mkdir(parents=True)
+    source = "import importlib\n" if "importlib." in statement else ""
+    (target / "probe.py").write_text(f"{source}{statement}\n", encoding="utf-8")
+
+    assert _architecture_violations(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "layer,statement",
+    [
+        ("schema", "from pydantic import BaseModel"),
+        ("core", "from src.schema.execution import SessionEvent"),
+        ("core", "from typing import Protocol"),
+        ("demo", "from src.persistence.sqlite import SqliteExecutionStore"),
+    ],
+)
+@pytest.mark.architecture
+def test_architecture_gate_allows_schema_values_and_core_ports(
+    tmp_path: Path, layer: str, statement: str
+):
+    target = tmp_path / "src" / layer
+    target.mkdir(parents=True)
+    (target / "probe.py").write_text(f"{statement}\n", encoding="utf-8")
+
+    assert _architecture_violations(tmp_path) == []
 
 
 def test_schema_layer_does_not_depend_on_core_runtime():
