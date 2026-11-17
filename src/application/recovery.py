@@ -51,6 +51,12 @@ class RecoveryService:
         missing = await self._has_dangling_ref(refs)
         if state.status.terminal:
             if missing:
+                if (
+                    state.status is RunStatus.FAILED
+                    and state.failure is not None
+                    and state.failure.code is RunErrorCode.ARTIFACT_FAILED
+                ):
+                    return RecoveryOutcome(state, False)
                 raise RecoveryCorruption(RunErrorCode.ARTIFACT_FAILED)
             return RecoveryOutcome(state, False)
         if state.status is RunStatus.WAITING_APPROVAL and not missing:
@@ -81,14 +87,16 @@ class RecoveryService:
     async def _has_dangling_ref(self, refs: tuple[ArtifactRef, ...]) -> bool:
         seen: set[str] = set()
         for ref in refs:
-            if ref.artifact_id in seen:
-                continue
-            seen.add(ref.artifact_id)
             try:
                 expected = snapshot_artifact_ref(ref)
+                if expected.artifact_id in seen:
+                    continue
+                seen.add(expected.artifact_id)
                 current = await self._artifacts.stat(expected.artifact_id)
-                actual = None if current is None else snapshot_artifact_ref(current)
-            except (AttributeError, TypeError, ValueError):
+                if current is None or type(current) is not ArtifactRef:
+                    return True
+                actual = snapshot_artifact_ref(current)
+            except Exception:
                 return True
             if actual != expected:
                 return True

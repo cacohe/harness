@@ -58,7 +58,7 @@ def test_event_storage_and_index_use_the_same_canonical_copy() -> None:
         asyncio.run(journal.commit(repeated, expected_version=1))
     assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
     assert asyncio.run(journal.load_session(batch.state.session_id)) == stored
-    available = acceptance("second", event_id="alternate")
+    available = replace(acceptance("second", event_id="alternate"), summary=None)
     assert asyncio.run(journal.commit(available, expected_version=1)).version == 2
 
 
@@ -71,12 +71,13 @@ def test_unhashable_checkpoint_identity_rejects_every_commit_member() -> None:
 
     journal = InMemoryRunJournal()
     first = acceptance("first")
-    pending = acceptance("next")
+    pending = replace(acceptance("next"), summary=None)
     session_id = first.state.session_id
-    assert pending.summary is not None
+    summary = acceptance("next").summary
+    assert summary is not None
     asyncio.run(journal.commit(first, expected_version=0))
     before = asyncio.run(journal.load_session(session_id))
-    malformed = replace(pending.summary)
+    malformed = replace(summary)
     object.__setattr__(malformed, "session_id", UnhashableSession(session_id.value))
 
     with pytest.raises((TypeError, JournalError)) as error:

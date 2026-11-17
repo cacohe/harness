@@ -29,6 +29,9 @@ from src.core.state import (
 )
 
 _MAX_DOCUMENT_BYTES = 16 * 1_048_576
+_MAX_JSON_DEPTH = 64
+_MAX_CONTAINER_ITEMS = 4_096
+_MAX_TREE_ITEMS = 100_000
 _T = TypeVar("_T")
 _RECORDS: dict[str, type[Any]] = {
     cls.__name__: cls
@@ -63,9 +66,7 @@ def encode(value: object) -> str:
 def decode(encoded: object, expected: type[_T]) -> _T:
     if type(encoded) is not str or len(encoded.encode("utf-8")) > _MAX_DOCUMENT_BYTES:
         raise ValueError("SQLite journal document is invalid")
-    document = json.loads(
-        encoded, object_pairs_hook=_unique_object, parse_constant=_reject_constant
-    )
+    document = _loads_bounded(encoded)
     if type(document) is not dict or set(document) != {"codec", "value"} or document["codec"] != 1:
         raise ValueError("SQLite journal codec version is invalid")
     value = _unpack(document["value"])
@@ -183,9 +184,7 @@ def _unpack(value: object) -> object:
     if tag == "DomainEvent":
         _keys(value, {"$", "event_id", "type", "run_id", "session_id", "timestamp", "payload"})
         payload_text = _text(value["payload"])
-        payload = json.loads(
-            payload_text, object_pairs_hook=_unique_object, parse_constant=_reject_constant
-        )
+        payload = _loads_bounded(payload_text)
         if type(payload) is not dict:
             raise ValueError("SQLite event payload is invalid")
         event = DomainEvent(
@@ -202,9 +201,7 @@ def _unpack(value: object) -> object:
     if tag == "ArtifactRef":
         _keys(value, {"$", "artifact_id", "media_type", "size_bytes", "sha256", "name", "metadata"})
         metadata_text = _text(value["metadata"])
-        metadata = json.loads(
-            metadata_text, object_pairs_hook=_unique_object, parse_constant=_reject_constant
-        )
+        metadata = _loads_bounded(metadata_text)
         if type(metadata) is not dict:
             raise ValueError("SQLite artifact metadata is invalid")
         ref = ArtifactRef(
@@ -228,9 +225,7 @@ def _unpack(value: object) -> object:
         elif _text(value["media_type"]) == "application/json" or _text(
             value["media_type"]
         ).endswith("+json"):
-            content = json.loads(
-                encoded, object_pairs_hook=_unique_object, parse_constant=_reject_constant
-            )
+            content = _loads_bounded(encoded.decode("utf-8"))
         else:
             content = encoded.decode("utf-8")
         return InlineContent(content, _text(value["media_type"]))
@@ -267,6 +262,8 @@ def _keys(value: dict[str, Any], expected: set[str]) -> None:
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    if len(pairs) > _MAX_CONTAINER_ITEMS:
+        raise ValueError("SQLite journal object is too wide")
     result: dict[str, object] = {}
     for key, value in pairs:
         if key in result:
@@ -297,6 +294,75 @@ def _int(value: object) -> int:
 
 
 def _list(value: object) -> list[object]:
-    if type(value) is not list:
+    if type(value) is not list or len(value) > _MAX_CONTAINER_ITEMS:
         raise ValueError("SQLite journal list is invalid")
     return value
+
+
+def _loads_bounded(encoded: str) -> object:
+    _preflight_json(encoded)
+    try:
+        value = json.loads(
+            encoded,
+            object_pairs_hook=_unique_object,
+            parse_constant=_reject_constant,
+        )
+    except (MemoryError, RecursionError, UnicodeError):
+        raise ValueError("SQLite journal JSON exceeds structural limits") from None
+    _validate_tree(value)
+    return value
+
+
+def _preflight_json(encoded: str) -> None:
+    depth = 0
+    structural = 0
+    item_counts: list[int] = []
+    in_string = False
+    escaped = False
+    for character in encoded:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            structural += 1
+            item_counts.append(1)
+            if depth > _MAX_JSON_DEPTH or structural > _MAX_TREE_ITEMS:
+                raise ValueError("SQLite journal JSON exceeds structural limits")
+        elif character in "]}":
+            depth -= 1
+            if depth < 0 or not item_counts:
+                raise ValueError("SQLite journal JSON is unbalanced")
+            item_counts.pop()
+        elif character == "," and item_counts:
+            item_counts[-1] += 1
+            structural += 1
+            if item_counts[-1] > _MAX_CONTAINER_ITEMS or structural > _MAX_TREE_ITEMS:
+                raise ValueError("SQLite journal JSON exceeds structural limits")
+    if in_string or depth != 0 or item_counts:
+        raise ValueError("SQLite journal JSON is unbalanced")
+
+
+def _validate_tree(value: object) -> None:
+    stack: list[tuple[object, int]] = [(value, 0)]
+    visited = 0
+    while stack:
+        item, depth = stack.pop()
+        visited += 1
+        if visited > _MAX_TREE_ITEMS or depth > _MAX_JSON_DEPTH:
+            raise ValueError("SQLite journal JSON exceeds structural limits")
+        if type(item) is list:
+            if len(item) > _MAX_CONTAINER_ITEMS:
+                raise ValueError("SQLite journal array is too wide")
+            stack.extend((child, depth + 1) for child in item)
+        elif type(item) is dict:
+            if len(item) > _MAX_CONTAINER_ITEMS:
+                raise ValueError("SQLite journal object is too wide")
+            stack.extend((child, depth + 1) for child in item.values())

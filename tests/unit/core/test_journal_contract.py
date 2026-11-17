@@ -179,7 +179,7 @@ def test_session_head_returns_only_current_projection_and_counters(journal: RunJ
 
 def test_expected_version_conflict_leaves_prior_snapshot_intact(journal: RunJournal) -> None:
     initial = acceptance("first")
-    pending = acceptance("pending")
+    pending = replace(acceptance("pending"), summary=None)
     asyncio.run(journal.commit(initial, expected_version=0))
     before = asyncio.run(journal.load_session(initial.state.session_id))
 
@@ -287,7 +287,7 @@ def test_submission_retry_returns_original_commit_receipt(journal: RunJournal) -
             expected_version=1,
         )
     )
-    asyncio.run(journal.commit(acceptance("next"), expected_version=2))
+    asyncio.run(journal.commit(replace(acceptance("next"), summary=None), expected_version=2))
 
     retry = asyncio.run(journal.commit(acceptance("first"), expected_version=0))
 
@@ -460,6 +460,22 @@ def test_summary_checkpoints_use_all_key_components(journal: RunJournal) -> None
     assert set(summaries) == {first, *variations}
     assert first.key == (state.session_id, 2, "v1", state.profile_id)
     assert asyncio.run(journal.load_session(other.state.session_id)).summaries == (other.summary,)
+
+
+def test_summary_checkpoint_full_key_is_immutable(journal: RunJournal) -> None:
+    initial = acceptance("first")
+    assert initial.summary is not None
+    asyncio.run(journal.commit(initial, 0))
+    same = JournalCommit(initial.state, summary=initial.summary)
+    asyncio.run(journal.commit(same, 1))
+    before = asyncio.run(journal.load_session(initial.state.session_id))
+
+    changed = replace(initial.summary, summary="changed")
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(journal.commit(JournalCommit(initial.state, summary=changed), 2))
+
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    assert asyncio.run(journal.load_session(initial.state.session_id)) == before
 
 
 def test_summary_artifact_refs_are_structural_and_copy_isolated(journal: RunJournal) -> None:

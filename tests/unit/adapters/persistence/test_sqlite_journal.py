@@ -6,10 +6,12 @@ from pathlib import Path
 from threading import Barrier
 
 import pytest
+import src.adapters.persistence.sqlite as sqlite_module
 from src.adapters.persistence.sqlite import SQLiteRunJournal
+from src.adapters.persistence.sqlite_codec import encode
 from src.core.errors import RunErrorCode
-from src.core.ids import SessionId
-from src.core.journal import JournalError, JournalSnapshot
+from src.core.ids import EventId, SessionId
+from src.core.journal import JournalError, JournalEvent, JournalSnapshot
 from tests.unit.core.test_journal_contract import acceptance
 
 
@@ -141,3 +143,125 @@ def test_corrupt_codec_version_is_rejected_without_rewriting_storage(tmp_path: P
         assert connection.execute("SELECT state_json FROM sessions").fetchone()[0] == (
             '{"codec":2,"value":null}'
         )
+
+
+@pytest.mark.parametrize(
+    "changed_ddl",
+    [
+        sqlite_module._DDL.replace("version INTEGER NOT NULL", "version INTEGER", 1),
+        sqlite_module._DDL.replace("session_id TEXT PRIMARY KEY", "session_id TEXT", 1),
+        sqlite_module._DDL.replace("ON DELETE CASCADE", "ON DELETE RESTRICT", 1),
+        sqlite_module._DDL.replace(
+            "runs_active_by_session ON runs(session_id, status)",
+            "runs_active_by_session ON runs(status, session_id)",
+            1,
+        ),
+        sqlite_module._DDL + "CREATE VIEW unexpected_view AS SELECT 1;",
+        sqlite_module._DDL
+        + "CREATE TRIGGER unexpected_trigger AFTER INSERT ON sessions BEGIN SELECT 1; END;",
+    ],
+)
+def test_schema_definition_drift_is_rejected(tmp_path: Path, changed_ddl: str) -> None:
+    path = (tmp_path / "drift.sqlite3").resolve()
+    with sqlite3.connect(path) as connection:
+        connection.executescript(changed_ddl)
+        connection.execute("PRAGMA user_version=3")
+    with pytest.raises(ValueError, match="schema v3"):
+        SQLiteRunJournal(path)
+
+
+def test_failed_initialization_leaves_no_partial_application_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = (tmp_path / "partial.sqlite3").resolve()
+    monkeypatch.setattr(sqlite_module, "_DDL", sqlite_module._DDL + "INVALID SQL;")
+    with pytest.raises(sqlite3.Error):
+        SQLiteRunJournal(path)
+    with sqlite3.connect(path) as connection:
+        assert not {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "value", "operation"),
+    [
+        ("sessions", "sequence", 99, "session"),
+        ("runs", "status", "failed", "head"),
+        ("runs", "state_version", 99, "head"),
+        ("events", "sequence", 99, "session"),
+        ("events", "event_id", "wrong", "session"),
+        ("events", "run_id", "wrong", "session"),
+        ("transcript", "run_id", "wrong", "session"),
+        ("transcript", "content", "wrong", "session"),
+        ("summary_checkpoints", "covered_from_sequence", 2, "session"),
+        ("summary_checkpoints", "profile_id", "wrong", "session"),
+        ("submissions", "digest", "wrong", "submission"),
+        ("submissions", "acceptance_version", 99, "submission"),
+    ],
+)
+def test_redundant_index_columns_must_match_payload(
+    tmp_path: Path, table: str, column: str, value: object, operation: str
+) -> None:
+    journal = make_journal(tmp_path)
+    batch = acceptance("first")
+    asyncio.run(journal.commit(batch, 0))
+    with sqlite3.connect(journal.path) as connection:
+        connection.execute(f"UPDATE {table} SET {column} = ?", (value,))
+    with pytest.raises(JournalError) as caught:
+        if operation == "head":
+            asyncio.run(journal.load_head(batch.state.session_id))
+        elif operation == "submission":
+            asyncio.run(journal.find_submission(batch.state.session_id, batch.state.submission_id))
+        else:
+            asyncio.run(journal.load_session(batch.state.session_id))
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+def test_event_payload_identity_must_match_index_columns(tmp_path: Path) -> None:
+    journal = make_journal(tmp_path)
+    batch = acceptance("first")
+    receipt = asyncio.run(journal.commit(batch, 0))
+    source = receipt.events[0]
+    forged_event = type(source.event)(
+        EventId("forged"),
+        source.event.type,
+        source.event.run_id,
+        source.event.session_id,
+        source.event.timestamp,
+        source.event.payload,
+    )
+    forged = JournalEvent(source.sequence, forged_event)
+    with sqlite3.connect(journal.path) as connection:
+        connection.execute("UPDATE events SET event_json = ?", (encode(forged),))
+    with pytest.raises(JournalError):
+        asyncio.run(journal.load_session(batch.state.session_id))
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "[" * 2_000 + "0" + "]" * 2_000,
+        '{"codec":1,"value":{"$":"tuple","items":['
+        + ",".join("null" for _ in range(4_097))
+        + "]}}",
+        '{"codec":1,"value":NaN}',
+        '{"codec":1,"codec":1,"value":null}',
+        '{"codec":1,"value":{"$":"unknown"}}',
+        '{"codec":1,"value":' + '{"$":"tuple","items":[' * 70 + "null" + "]}" * 70 + "}",
+    ],
+)
+def test_codec_structural_attacks_map_to_stable_journal_failure(
+    tmp_path: Path, malformed: str
+) -> None:
+    journal = make_journal(tmp_path)
+    batch = acceptance("first")
+    asyncio.run(journal.commit(batch, 0))
+    with sqlite3.connect(journal.path) as connection:
+        connection.execute("UPDATE sessions SET state_json = ?", (malformed,))
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(journal.load_head(batch.state.session_id))
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION

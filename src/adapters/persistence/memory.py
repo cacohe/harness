@@ -157,7 +157,11 @@ class InMemoryRunJournal:
                     summary.policy_version,
                     summary.profile_id.value,
                 )
-                summaries = {**summaries, summary_key: summary}
+                existing_summary = summaries.get(summary_key)
+                if existing_summary is not None and existing_summary != summary:
+                    raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+                if existing_summary is None:
+                    summaries = {**summaries, summary_key: summary}
             submissions = session.submissions
             if intent is not None:
                 submissions = {**submissions, submission_key: (intent, receipt)}

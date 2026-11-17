@@ -2,11 +2,13 @@ import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 import pytest
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.application.recovery import RecoveryCorruption, RecoveryService
+from src.core.artifacts import ArtifactRef, ArtifactRepository
 from src.core.commands import RunLimits
 from src.core.errors import RunErrorCode
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
@@ -121,6 +123,70 @@ def test_terminal_dangling_artifact_is_repository_corruption(tmp_path: Path) -> 
     )
     asyncio.run(journal.commit(JournalCommit(terminal), 0))
 
+    with pytest.raises(RecoveryCorruption) as caught:
+        asyncio.run(recovery.recover_session(terminal.session_id))
+    assert caught.value.failure.code is RunErrorCode.ARTIFACT_FAILED
+
+
+def test_active_dangling_artifact_settles_once_then_is_idempotent(tmp_path: Path) -> None:
+    journal, recovery = service(tmp_path / "active-corrupt.sqlite3")
+    batch = acceptance("artifact-active")
+    asyncio.run(journal.commit(batch, 0))
+
+    first = asyncio.run(recovery.recover_session(batch.state.session_id))
+    second = asyncio.run(recovery.recover_session(batch.state.session_id))
+
+    assert first.changed and first.state is not None
+    assert first.state.failure is not None
+    assert first.state.failure.code is RunErrorCode.ARTIFACT_FAILED
+    assert second == replace(first, changed=False)
+    snapshot = asyncio.run(journal.load_session(batch.state.session_id))
+    assert [event.event.type.value for event in snapshot.events].count("run.failed") == 1
+
+
+@pytest.mark.parametrize("mode", ["object", "raises", "wrong", "tampered"])
+def test_untrusted_artifact_stat_maps_to_stable_corruption(tmp_path: Path, mode: str) -> None:
+    journal = SQLiteRunJournal((tmp_path / f"stat-{mode}.sqlite3").resolve())
+    batch = acceptance(f"stat-{mode}")
+    assert batch.summary is not None
+    terminal = replace(
+        batch.state,
+        version=2,
+        status=RunStatus.COMPLETED,
+        final_text="summary",
+        final_artifacts=batch.summary.artifacts,
+    )
+    asyncio.run(journal.commit(JournalCommit(terminal), 0))
+    expected = terminal.final_artifacts[0]
+
+    class BadRepository:
+        async def stat(self, artifact_id: str):
+            if mode == "raises":
+                raise RuntimeError("host detail")
+            if mode == "object":
+                return object()
+            if mode == "wrong":
+                return ArtifactRef(
+                    expected.artifact_id,
+                    "text/plain",
+                    expected.size_bytes,
+                    expected.sha256,
+                )
+            result = ArtifactRef(
+                expected.artifact_id,
+                expected.media_type,
+                expected.size_bytes,
+                expected.sha256,
+            )
+            object.__setattr__(result, "size_bytes", 99)
+            return result
+
+    recovery = RecoveryService(
+        journal=journal,
+        artifacts=cast(ArtifactRepository, BadRepository()),
+        clock=FixedClock(),
+        ids=RecoveryIds(),
+    )
     with pytest.raises(RecoveryCorruption) as caught:
         asyncio.run(recovery.recover_session(terminal.session_id))
     assert caught.value.failure.code is RunErrorCode.ARTIFACT_FAILED
