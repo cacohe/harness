@@ -8,7 +8,7 @@ from io import StringIO
 from typing import NoReturn, Protocol, TypeAlias, TypeVar, cast
 from unicodedata import category
 
-from src.core.events import JsonValue, _contains_host_path
+from src.core.events import JsonValue
 
 MAX_ARTIFACT_SIZE_BYTES = (1 << 63) - 1
 MAX_INLINE_CONTENT_BYTES = 1_048_576
@@ -21,23 +21,14 @@ _MAX_NAME_BYTES = 256
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _MEDIA_TOKEN = r"[a-z0-9][a-z0-9!#$&^_.+-]{0,126}"
 _MEDIA_TYPE_PATTERN = re.compile(rf"{_MEDIA_TOKEN}/{_MEDIA_TOKEN}")
-_METADATA_LOCATION = re.compile(
-    r"(?i)(?:(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://|"
-    r"(?:^|[\s,;|])(?:[a-z]:\S|(?:file|data|mailto|urn):)|"
-    r"[,;|](?:~|\.{1,2})?[/\\]\S)"
+_METADATA_URL = re.compile(
+    r"(?i)(?<![a-z0-9+.-])(?:[a-z][a-z0-9+.-]*://|(?:file|data|mailto|urn):)"
 )
-_CREDENTIAL_FIELDS = frozenset(
-    {
-        "bucket_access_key",
-        "bucket_secret_key",
-        "aws_access_key_id",
-        "aws_secret_access_key",
-        "secret_access_key",
-        "presigned_url",
-        "signed_url",
-        "credentials",
-    }
+_METADATA_PATH = re.compile(
+    r"(?i)(?:\A\s*(?:~|\.{1,2})?[/\\]|"
+    r"(?<![\w./\\~+-])(?:(?:~|\.{1,2})?[/\\](?=\S|$)|[a-z]:\S))"
 )
+_CREDENTIAL_TOKEN = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[^A-Za-z]|$)|[A-Z]?[a-z]+")
 
 ArtifactContent: TypeAlias = "JsonValue | bytes"
 _JsonRootObserver: TypeAlias = Callable[[Sequence[str] | int], None]
@@ -85,6 +76,16 @@ def _validate_size(size: int, *, minimum: int = 0) -> None:
         raise ValueError("Artifact size or write limit is outside its supported range")
 
 
+def _is_credential_field(key: str) -> bool:
+    tokens = {token.lower() for token in _CREDENTIAL_TOKEN.findall(key)}
+    return (
+        bool({"credential", "credentials"} & tokens)
+        or ("key" in tokens and bool({"secret", "access"} & tokens))
+        or {"session", "token"} <= tokens
+        or ("url" in tokens and bool({"signed", "presigned"} & tokens))
+    )
+
+
 def _json_fragments(
     value: object,
     depth: int,
@@ -109,7 +110,7 @@ def _json_fragments(
             if index:
                 yield ","
             yield from _json_fragments(key, depth + 1, max_bytes, reject_locations=reject_locations)
-            if reject_locations and key.casefold().replace("-", "_") in _CREDENTIAL_FIELDS:
+            if reject_locations and _is_credential_field(key):
                 raise ValueError("Artifact metadata must not contain credential fields")
             yield ":"
             yield from _json_fragments(
@@ -136,7 +137,7 @@ def _json_fragments(
     elif type(value) is str:
         if len(value) > max_bytes:
             raise ValueError("Artifact JSON exceeds its byte limit")
-        if reject_locations and (_METADATA_LOCATION.search(value) or _contains_host_path(value)):
+        if reject_locations and (_METADATA_URL.search(value) or _METADATA_PATH.search(value)):
             raise ValueError("Artifact metadata must not contain host paths or URLs")
         yield json.dumps(value, ensure_ascii=False)
     elif value is None or value_type is bool or value_type is int or value_type is float:

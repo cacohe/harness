@@ -42,9 +42,17 @@ def test_metadata_at_the_exact_encoded_size_limit_is_accepted():
         "source;/private/secret",
         "source,C:\\private\\secret",
         "source|file:secret",
+        "src]/private/secret",
+        "src]~/private/secret",
+        "src]../private/secret",
+        "src]C:\\private\\secret",
+        "src]\\\\server\\share",
+        "/",
+        " / folder/file",
+        "src]/",
     ],
 )
-def test_metadata_rejects_host_locations_after_punctuation(location):
+def test_metadata_rejects_host_locations_at_token_boundaries(location):
     with pytest.raises(ValueError):
         ArtifactRef(ARTIFACT_ID, "text/plain", 0, DIGEST, metadata={"source": location})
 
@@ -60,6 +68,14 @@ def test_metadata_rejects_host_locations_after_punctuation(location):
         "presigned_url",
         "signed-url",
         "credentials",
+        "aws_session_token",
+        "awsAccessKeyId",
+        "AWSAccessKeyID",
+        "access_key",
+        "secret_key",
+        "sessionToken",
+        "presignedDownloadURL",
+        "storageCredentialsVersion",
     ],
 )
 def test_metadata_rejects_credential_fields_at_any_depth(key):
@@ -74,14 +90,21 @@ def test_metadata_rejects_credential_fields_at_any_depth(key):
 
 
 def test_metadata_preserves_ordinary_statistics_fields():
+    metadata = {"token_count": 3, "key_count": 2, "tokenCount": 3, "keyCount": 2}
     ref = ArtifactRef(
         ARTIFACT_ID,
         "text/plain",
         0,
         DIGEST,
-        metadata={"token_count": 3, "key_count": 2},
+        metadata=metadata,
     )
-    assert ref.metadata == {"token_count": 3, "key_count": 2}
+    assert ref.metadata == metadata
+
+
+@pytest.mark.parametrize("value", ["foo/bar", "1/2", "folder/subfolder/item", "比例1/2"])
+def test_metadata_accepts_slashes_within_non_host_tokens(value):
+    ref = ArtifactRef(ARTIFACT_ID, "text/plain", 0, DIGEST, metadata={"source": value})
+    assert ref.metadata["source"] == value
 
 
 @pytest.mark.parametrize(

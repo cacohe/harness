@@ -29,13 +29,13 @@ class InMemoryArtifactRepository:
         self._lock = Lock()
 
     async def put(self, request: ArtifactWrite) -> ArtifactRef:
+        # Deliver queued cancellation before the iterator can intercept it.
+        await sleep(0)
         task = current_task()
-        cancellation_count = task.cancelling() if task is not None else 0
-        if cancellation_count:
-            raise CancelledError
+        baseline_cancelling = task.cancelling() if task is not None else 0
 
         def check_cancellation() -> None:
-            if task is not None and task.cancelling() > cancellation_count:
+            if task is not None and task.cancelling() > baseline_cancelling:
                 raise CancelledError
 
         request = _validated_write(request)

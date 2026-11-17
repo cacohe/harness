@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import sys
 
 import pytest
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
@@ -245,6 +246,51 @@ def test_put_honors_cancellation_even_when_the_stream_swallows_it(yield_after_ca
         with pytest.raises(asyncio.CancelledError):
             await pending
         assert await repo.stat(_address(b"ab")) is None
+        assert await repo.stat(_address(b"abc")) is None
+
+    asyncio.run(scenario())
+
+
+def test_put_after_caught_cancellation_can_publish_with_historical_count():
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+        task = asyncio.current_task()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.sleep(0)
+        assert task.cancelling() == 1
+
+        ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
+
+        assert await _read(repo, ref.artifact_id) == b"abc"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(
+    sys.version_info >= (3, 13),
+    reason="Requires cancellation delivery pending after uncancel()",
+)
+def test_queued_cancellation_is_delivered_before_the_stream_can_swallow_it():
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+        entered = False
+
+        async def stream():
+            nonlocal entered
+            entered = True
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                pass
+            yield b"abc"
+
+        task = asyncio.current_task()
+        task.cancel()
+        assert task.uncancel() == 0
+        with pytest.raises(asyncio.CancelledError):
+            await repo.put(ArtifactWrite(stream(), "text/plain"))
+        assert not entered
         assert await repo.stat(_address(b"abc")) is None
 
     asyncio.run(scenario())
