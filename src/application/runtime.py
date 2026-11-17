@@ -5,13 +5,13 @@ import inspect
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from src.application.submissions import AcceptedRun, SubmissionService
 from src.core.commands import AdvanceRun, CommandContext, DecideToolCall, ResumeRun
 from src.core.ids import Clock, IdGenerator, ProfileId, RunId, SessionId, SubmissionId
 from src.core.journal import JournalHead, RunJournal
-from src.core.receipt_snapshot import snapshot_journal_snapshot, snapshot_run_state
+from src.core.receipt_snapshot import snapshot_run_state, snapshot_transcript
 from src.core.run import RunCoordinator, RunOutcome
 from src.core.state import RunState, RunStatus
 
@@ -103,7 +103,7 @@ class _Gate:
                     waiter.set_exception(ApplicationClosedError("Session is closed"))
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class _SessionSlot:
     gate: _Gate
 
@@ -147,7 +147,7 @@ class RuntimeCoordinator:
         self._sessions: dict[str, _SessionSlot] = {}
         self._registry_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
-        self._active: dict[asyncio.Task[object], str] = {}
+        self._active: dict[asyncio.Task[object], _SessionSlot] = {}
         self._closing = False
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
@@ -158,16 +158,26 @@ class RuntimeCoordinator:
             raise ApplicationClosedError("Runtime is closed")
 
     async def open_session(self, session_id: SessionId) -> None:
+        session_id = _canonical_id(session_id, SessionId, "Session identity is invalid")
         await self._slot(session_id)
 
     async def close_session(self, session_id: SessionId) -> None:
-        key = _session_key(session_id)
+        session_id = _canonical_id(session_id, SessionId, "Session identity is invalid")
+        key = _id_value(session_id)
         async with self._registry_lock:
             slot = self._sessions.pop(key, None)
+            if slot is not None:
+                async with self._lifecycle_lock:
+                    current = asyncio.current_task()
+                    tasks = tuple(
+                        task
+                        for task, active_slot in self._active.items()
+                        if active_slot is slot and task is not current
+                    )
         if slot is None:
             return
         await slot.gate.close()
-        await self._cancel_tasks(key)
+        await _cancel_and_wait(tasks)
 
     async def submit(
         self,
@@ -176,10 +186,12 @@ class RuntimeCoordinator:
         message: str,
         submission_id: SubmissionId,
     ) -> RunState:
-        _validate_submit(session_id, profile_id, message, submission_id)
+        session_id, profile_id, submission_id = _validate_submit(
+            session_id, profile_id, message, submission_id
+        )
         slot = await self._slot(session_id)
         async with slot.gate.enter():
-            async with self._operation(session_id):
+            async with self._operation(session_id, slot):
                 accepted = await self._submissions.accept(
                     session_id, message, submission_id, profile_id
                 )
@@ -193,16 +205,13 @@ class RuntimeCoordinator:
         tool_call_id: str,
         approved: bool,
     ) -> RunState:
-        if (
-            type(run_id) is not RunId
-            or type(tool_call_id) is not str
-            or not tool_call_id
-            or type(approved) is not bool
-        ):
+        session_id = _canonical_id(session_id, SessionId, "Approval identity is invalid")
+        run_id = _canonical_id(run_id, RunId, "Approval identity is invalid")
+        if type(tool_call_id) is not str or not tool_call_id or type(approved) is not bool:
             raise SessionOwnershipError("Approval identity is invalid")
         slot = await self._slot(session_id)
         async with slot.gate.enter():
-            async with self._operation(session_id):
+            async with self._operation(session_id, slot):
                 state = await self._head_state(session_id)
                 call_id = _pending_call(state, session_id, run_id)
                 if call_id != tool_call_id:
@@ -247,11 +256,9 @@ class RuntimeCoordinator:
                 self._sessions.clear()
             await asyncio.gather(*(slot.gate.close() for slot in slots))
             current = asyncio.current_task()
-            tasks = tuple(task for task in self._active if task is not current)
-            for task in tasks:
-                task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            async with self._lifecycle_lock:
+                tasks = tuple(task for task in self._active if task is not current)
+            await _cancel_and_wait(tasks)
             for resource in reversed(self._owned_resources):
                 try:
                     await _close_resource(resource)
@@ -265,7 +272,7 @@ class RuntimeCoordinator:
             raise failure
 
     async def _slot(self, session_id: SessionId) -> _SessionSlot:
-        key = _session_key(session_id)
+        key = _id_value(session_id)
         async with self._registry_lock:
             if self._closing or self._closed:
                 raise ApplicationClosedError("Runtime is closed")
@@ -278,32 +285,21 @@ class RuntimeCoordinator:
             return slot
 
     @asynccontextmanager
-    async def _operation(self, session_id: SessionId):
+    async def _operation(self, session_id: SessionId, slot: _SessionSlot):
         task = asyncio.current_task()
         if task is None:
             raise RuntimeError("Application operation requires an asyncio Task")
-        async with self._lifecycle_lock:
-            if self._closing or self._closed:
-                raise ApplicationClosedError("Runtime is closed")
-            self._active[task] = session_id.value
+        key = _id_value(session_id)
+        async with self._registry_lock:
+            async with self._lifecycle_lock:
+                if self._closing or self._closed or self._sessions.get(key) is not slot:
+                    raise ApplicationClosedError("Session is closed")
+                self._active[task] = slot
         try:
             yield
         finally:
             async with self._lifecycle_lock:
                 self._active.pop(task, None)
-
-    async def _cancel_tasks(self, session_key: str) -> None:
-        current = asyncio.current_task()
-        async with self._lifecycle_lock:
-            tasks = tuple(
-                task
-                for task, key in self._active.items()
-                if key == session_key and task is not current
-            )
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _accepted_head(self, accepted: AcceptedRun) -> RunState:
         if type(accepted) is not AcceptedRun:
@@ -320,29 +316,24 @@ class RuntimeCoordinator:
         return state
 
     async def _user_input(self, state: RunState) -> str:
-        value = await self._journal.load_session(state.session_id)
-        try:
-            snapshot = snapshot_journal_snapshot(value)
-        except (AttributeError, TypeError, ValueError):
-            raise SessionOwnershipError("Session transcript is invalid")
-        if (
-            snapshot.session_id != state.session_id
-            or snapshot.version != state.journal_version
-            or snapshot.sequence != state.journal_sequence
-            or snapshot.state is None
-            or snapshot.state.run_id != state.run_id
-        ):
-            raise SessionOwnershipError("Session transcript is not the durable Run head")
-        matches = [
-            entry.content
-            for entry in snapshot.transcript
-            if entry.run_id == state.run_id
-            and entry.submission_id == state.submission_id
-            and entry.role == "user"
-        ]
-        if len(matches) != 1:
+        value = await self._journal.find_run_input(
+            state.session_id, state.run_id, state.submission_id
+        )
+        if value is None:
             raise SessionOwnershipError("Run does not have one durable user input")
-        return matches[0]
+        try:
+            entry = snapshot_transcript(value)
+        except (AttributeError, TypeError, ValueError):
+            raise SessionOwnershipError("Run input is invalid") from None
+        if (
+            entry.session_id != state.session_id
+            or entry.run_id != state.run_id
+            or entry.submission_id != state.submission_id
+            or entry.role != "user"
+            or entry.sequence < 1
+        ):
+            raise SessionOwnershipError("Run input is not owned by the durable Run")
+        return entry.content
 
     async def _drive(self, state: RunState, message: str) -> RunState:
         for _ in range(self._max_advances):
@@ -367,10 +358,25 @@ class RuntimeCoordinator:
         return CommandContext(self._clock.now(), state.elapsed_seconds, (self._ids.event(),))
 
 
-def _session_key(session_id: SessionId) -> str:
-    if type(session_id) is not SessionId or type(session_id.value) is not str:
-        raise SessionOwnershipError("Session identity is invalid")
-    return SessionId(session_id.value).value
+_IdT = TypeVar("_IdT", SessionId, RunId, SubmissionId, ProfileId)
+
+
+def _canonical_id(value: object, expected: type[_IdT], message: str) -> _IdT:
+    try:
+        if type(value) is not expected:
+            raise ValueError
+        raw = object.__getattribute__(value, "value")
+        if type(raw) is not str:
+            raise ValueError
+        return expected(raw)
+    except (AttributeError, TypeError, ValueError):
+        raise SessionOwnershipError(message) from None
+
+
+def _id_value(value: SessionId | RunId | SubmissionId | ProfileId) -> str:
+    raw = object.__getattribute__(value, "value")
+    assert type(raw) is str
+    return raw
 
 
 def _validate_submit(
@@ -378,16 +384,21 @@ def _validate_submit(
     profile_id: ProfileId,
     message: str,
     submission_id: SubmissionId,
-) -> None:
-    if (
-        type(profile_id) is not ProfileId
-        or type(submission_id) is not SubmissionId
-        or type(message) is not str
-    ):
+) -> tuple[SessionId, ProfileId, SubmissionId]:
+    if type(message) is not str:
         raise ValueError("Submission arguments are invalid")
-    _session_key(session_id)
-    ProfileId(profile_id.value)
-    SubmissionId(submission_id.value)
+    return (
+        _canonical_id(session_id, SessionId, "Submission arguments are invalid"),
+        _canonical_id(profile_id, ProfileId, "Submission arguments are invalid"),
+        _canonical_id(submission_id, SubmissionId, "Submission arguments are invalid"),
+    )
+
+
+async def _cancel_and_wait(tasks: tuple[asyncio.Task[object], ...]) -> None:
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _head(value: object, session_id: SessionId) -> RunState:

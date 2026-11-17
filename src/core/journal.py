@@ -173,3 +173,19 @@ class RunJournal(Protocol):
         detected corruption raises INVARIANT_VIOLATION.
         """
         ...
+
+    def find_run_input(
+        self,
+        session_id: SessionId,
+        run_id: RunId,
+        submission_id: SubmissionId,
+    ) -> Awaitable[TranscriptEntry | None]:
+        """Read at most one durable user input by its complete Run identity.
+
+        This is a bounded point lookup and must not materialize Session history.
+        Missing input returns None. Multiple matching user entries or a malformed
+        persisted record raise JournalError with INVARIANT_VIOLATION.
+        Durable adapters validate the selected physical row and its bounded ledger
+        anchor; this operation does not certify unrelated history.
+        """
+        ...

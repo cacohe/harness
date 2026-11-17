@@ -10,7 +10,7 @@ import src.adapters.persistence.sqlite as sqlite_module
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.adapters.persistence.sqlite_codec import decode, encode
 from src.core.errors import RunErrorCode
-from src.core.ids import EventId, SessionId
+from src.core.ids import EventId, RunId, SessionId
 from src.core.journal import (
     JournalCommit,
     JournalError,
@@ -822,6 +822,64 @@ def test_corrupt_existing_summary_key_blocks_commit_without_writes(tmp_path: Pat
             tuple(connection.execute("SELECT version, sequence, state_json FROM sessions"))
             == before
         )
+
+
+@pytest.mark.parametrize("corruption", ["row", "payload", "identity"])
+def test_find_run_input_uses_identity_index_and_rejects_tampered_row(
+    tmp_path: Path, corruption: str
+) -> None:
+    journal = make_journal(tmp_path)
+    batch = acceptance("run-input")
+    asyncio.run(journal.commit(batch, 0))
+    with sqlite3.connect(journal.path) as connection:
+        plan = tuple(
+            connection.execute(
+                "EXPLAIN QUERY PLAN SELECT session_id, sequence, run_id, submission_id, role, "
+                "content, entry_json FROM transcript WHERE session_id=? AND run_id=? "
+                "AND submission_id=? AND role='user' ORDER BY sequence LIMIT 2",
+                (
+                    batch.state.session_id.value,
+                    batch.state.run_id.value,
+                    batch.state.submission_id.value,
+                ),
+            )
+        )
+        assert any("transcript_run_input" in str(row[3]) for row in plan)
+        identity = (
+            batch.state.session_id.value,
+            batch.state.run_id.value,
+            batch.state.submission_id.value,
+        )
+        if corruption == "row":
+            connection.execute(
+                "UPDATE transcript SET content='tampered' WHERE session_id=? AND run_id=? "
+                "AND submission_id=? AND role='user'",
+                identity,
+            )
+        elif corruption == "payload":
+            changed = replace(batch.transcript[0], content="tampered", sequence=2)
+            connection.execute(
+                "UPDATE transcript SET content=?, entry_json=? WHERE session_id=? AND run_id=? "
+                "AND submission_id=? AND role='user'",
+                (changed.content, encode(changed), *identity),
+            )
+        else:
+            changed = replace(batch.transcript[0], run_id=RunId("other"), sequence=2)
+            connection.execute(
+                "UPDATE transcript SET entry_json=? WHERE session_id=? AND run_id=? "
+                "AND submission_id=? AND role='user'",
+                (encode(changed), *identity),
+            )
+
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(
+            journal.find_run_input(
+                batch.state.session_id,
+                batch.state.run_id,
+                batch.state.submission_id,
+            )
+        )
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
 
 
 @pytest.mark.parametrize(

@@ -13,7 +13,7 @@ from src.adapters.persistence.memory import _canonical_copy, _validate_members
 from src.adapters.persistence.sqlite_codec import decode, encode
 from src.adapters.persistence.sqlite_integrity import genesis_hash, record_hash, validate_hash
 from src.core.errors import RunErrorCode
-from src.core.ids import SessionId, SubmissionId
+from src.core.ids import RunId, SessionId, SubmissionId
 from src.core.journal import (
     ConversationSummaryCheckpoint,
     JournalCommit,
@@ -29,6 +29,7 @@ from src.core.state import RunState
 
 _SCHEMA_VERSION = 3
 _T = TypeVar("_T")
+_IdT = TypeVar("_IdT", SessionId, RunId, SubmissionId)
 
 _DDL = """
 CREATE TABLE sessions (
@@ -78,6 +79,7 @@ CREATE TABLE transcript (
   PRIMARY KEY(session_id, sequence)
 ) STRICT;
 CREATE INDEX transcript_by_session_sequence ON transcript(session_id, sequence);
+CREATE INDEX transcript_run_input ON transcript(session_id, run_id, submission_id, role, sequence);
 CREATE TABLE summary_checkpoints (
   session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
   covered_from_sequence INTEGER NOT NULL,
@@ -146,8 +148,28 @@ _EXPECTED_INDEXES = {
     "runs_active_by_session": ("session_id", "status"),
     "events_by_session_sequence": ("session_id", "sequence"),
     "transcript_by_session_sequence": ("session_id", "sequence"),
+    "transcript_run_input": (
+        "session_id",
+        "run_id",
+        "submission_id",
+        "role",
+        "sequence",
+    ),
     "submissions_by_identity": ("session_id", "submission_id", "digest"),
 }
+
+
+def _typed_id_key(value: object, expected: type[_IdT]) -> str:
+    try:
+        if type(value) is not expected:
+            raise ValueError
+        raw = object.__getattribute__(value, "value")
+        if type(raw) is not str:
+            raise ValueError
+        canonical = expected(raw)
+        return object.__getattribute__(canonical, "value")
+    except (AttributeError, TypeError, ValueError):
+        raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
 
 
 class SQLiteRunJournal:
@@ -200,14 +222,22 @@ class SQLiteRunJournal:
         self, session_id: SessionId, submission_id: SubmissionId
     ) -> SubmissionAcceptance | None:
         session_key = self._session_key(session_id)
-        if type(submission_id) is not SubmissionId:
-            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
-        try:
-            submission_key = SubmissionId(object.__getattribute__(submission_id, "value")).value
-        except (AttributeError, TypeError, ValueError):
-            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        submission_key = _typed_id_key(submission_id, SubmissionId)
         return await self._run(
             lambda _cancelled: self._find_submission_sync(session_key, submission_key)
+        )
+
+    async def find_run_input(
+        self,
+        session_id: SessionId,
+        run_id: RunId,
+        submission_id: SubmissionId,
+    ) -> TranscriptEntry | None:
+        session_key = self._session_key(session_id)
+        run_key = _typed_id_key(run_id, RunId)
+        submission_key = _typed_id_key(submission_id, SubmissionId)
+        return await self._run(
+            lambda _cancelled: self._find_run_input_sync(session_key, run_key, submission_key)
         )
 
     async def _run(self, operation: Callable[[Event], _T]) -> _T:
@@ -563,14 +593,52 @@ class SQLiteRunJournal:
         finally:
             connection.close()
 
+    def _find_run_input_sync(
+        self, session_key: str, run_key: str, submission_key: str
+    ) -> TranscriptEntry | None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            rows = tuple(
+                connection.execute(
+                    "SELECT session_id, sequence, run_id, submission_id, role, content, "
+                    "entry_json FROM transcript WHERE session_id=? AND run_id=? "
+                    "AND submission_id=? AND role='user' ORDER BY sequence LIMIT 2",
+                    (session_key, run_key, submission_key),
+                )
+            )
+            if len(rows) > 1:
+                raise ValueError("SQLite Run has duplicate user inputs")
+            if not rows:
+                return None
+            entry = _decode_transcript_row(rows[0], session_key)
+            if (
+                entry.run_id.value != run_key
+                or entry.submission_id.value != submission_key
+                or entry.role != "user"
+            ):
+                raise ValueError("SQLite Run input identity disagrees")
+            run_row = connection.execute(
+                "SELECT session_id, run_id, submission_id, profile_id, status, state_version, "
+                "state_json FROM runs WHERE session_id=? AND run_id=?",
+                (session_key, run_key),
+            ).fetchone()
+            if run_row is None:
+                raise ValueError("SQLite Run input has no Run projection")
+            state = decode(run_row["state_json"], RunState)
+            _validate_run_row(run_row, state)
+            if state.submission_id.value != submission_key:
+                raise ValueError("SQLite Run input disagrees with Run projection")
+            _verify_point_anchor(connection, session_key, entry.sequence)
+            return entry
+        except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        finally:
+            connection.close()
+
     @staticmethod
     def _session_key(session_id: SessionId) -> str:
-        if type(session_id) is not SessionId:
-            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
-        try:
-            return SessionId(object.__getattribute__(session_id, "value")).value
-        except (AttributeError, TypeError, ValueError):
-            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        return _typed_id_key(session_id, SessionId)
 
     @staticmethod
     def _application_objects(connection: sqlite3.Connection) -> set[tuple[str, str]]:
@@ -713,6 +781,32 @@ def _verify_ledger_tail(
     ).fetchone()
     if anchor is None or _verify_anchor(anchor, session_key, previous_hash) != root:
         raise ValueError("SQLite ledger tail disagrees with its Session root")
+
+
+def _verify_point_anchor(connection: sqlite3.Connection, session_key: str, sequence: int) -> None:
+    """Authenticate one indexed record and its immediate ledger boundary in O(1)."""
+    session = connection.execute(
+        "SELECT sequence, ledger_hash FROM sessions WHERE session_id=?", (session_key,)
+    ).fetchone()
+    if session is None or type(session["sequence"]) is not int or sequence > session["sequence"]:
+        raise ValueError("SQLite point anchor is outside its Session")
+    previous_hash = genesis_hash(session_key)
+    if sequence > 1:
+        previous = connection.execute(
+            "SELECT record_hash FROM journal_entries WHERE session_id=? AND sequence=?",
+            (session_key, sequence - 1),
+        ).fetchone()
+        if previous is None:
+            raise ValueError("SQLite point anchor predecessor is missing")
+        previous_hash = validate_hash(previous["record_hash"])
+    anchor = connection.execute(
+        _CHAIN_ROWS + " WHERE j.session_id=? AND j.sequence=?", (session_key, sequence)
+    ).fetchone()
+    if anchor is None:
+        raise ValueError("SQLite point anchor is missing")
+    digest = _verify_anchor(anchor, session_key, previous_hash)
+    if sequence == session["sequence"] and digest != validate_hash(session["ledger_hash"]):
+        raise ValueError("SQLite point anchor disagrees with Session root")
 
 
 def _preflight_existing_ledger(

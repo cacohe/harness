@@ -19,8 +19,8 @@ class AgentSession:
     ) -> None:
         self._runtime = runtime
         self._ids = ids
-        self.session_id = SessionId(session_id.value)
-        self.profile_id = ProfileId(profile_id.value)
+        self.session_id = _canonical_id(session_id, SessionId)
+        self.profile_id = _canonical_id(profile_id, ProfileId)
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
 
@@ -64,15 +64,11 @@ class Agent:
         *,
         default_session_id: SessionId | None = None,
     ) -> None:
-        if type(profile_id) is not ProfileId or (
-            default_session_id is not None and type(default_session_id) is not SessionId
-        ):
-            raise ValueError("Agent identities are invalid")
         self._runtime = runtime
         self._ids = ids
-        self.profile_id = ProfileId(profile_id.value)
+        self.profile_id = _canonical_id(profile_id, ProfileId)
         self._default_session_id = (
-            SessionId(default_session_id.value) if default_session_id is not None else None
+            _canonical_id(default_session_id, SessionId) if default_session_id is not None else None
         )
         self._default_session: AgentSession | None = None
         self._default_lock = asyncio.Lock()
@@ -87,8 +83,8 @@ class Agent:
         self._ensure_open()
         identifier = self._ids.session() if session_id is None else session_id
         profile = self.profile_id if profile_id is None else profile_id
-        if type(identifier) is not SessionId or type(profile) is not ProfileId:
-            raise ValueError("Agent Session identities are invalid")
+        identifier = _canonical_id(identifier, SessionId)
+        profile = _canonical_id(profile, ProfileId)
         await self._runtime.open_session(identifier)
         return AgentSession(self._runtime, self._ids, identifier, profile)
 
@@ -117,3 +113,15 @@ class Agent:
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("Agent is closed")
+
+
+def _canonical_id(value, expected):
+    try:
+        if type(value) is not expected:
+            raise ValueError
+        raw = object.__getattribute__(value, "value")
+        if type(raw) is not str:
+            raise ValueError
+        return expected(raw)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("Agent identities are invalid") from None

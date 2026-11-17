@@ -197,6 +197,88 @@ def test_session_sequence_orders_events_before_transcript(journal: RunJournal) -
     assert (independent.version, independent.sequence) == (1, 2)
 
 
+def test_find_run_input_is_bounded_to_one_canonical_user_entry(journal: RunJournal) -> None:
+    batch = acceptance("bounded-input")
+    asyncio.run(journal.commit(batch, 0))
+    filler_count = 10_000
+    sequence = 2
+    for commit_index in range(10):
+        filler = tuple(
+            TranscriptEntry(
+                batch.state.session_id,
+                batch.state.run_id,
+                batch.state.submission_id,
+                "assistant",
+                f"history-{commit_index * 1_000 + index}",
+            )
+            for index in range(1_000)
+        )
+        sequence += len(filler)
+        advanced = replace(
+            batch.state,
+            version=commit_index + 2,
+            journal_version=commit_index + 2,
+            journal_sequence=sequence,
+        )
+        asyncio.run(
+            journal.commit(
+                JournalCommit(advanced, transcript=filler),
+                commit_index + 1,
+            )
+        )
+    assert sequence == 2 + filler_count
+
+    found = asyncio.run(
+        journal.find_run_input(
+            batch.state.session_id,
+            batch.state.run_id,
+            batch.state.submission_id,
+        )
+    )
+
+    assert found == replace(batch.transcript[0], sequence=2)
+    assert (
+        asyncio.run(
+            journal.find_run_input(
+                batch.state.session_id,
+                RunId("missing-run"),
+                batch.state.submission_id,
+            )
+        )
+        is None
+    )
+
+
+def test_find_run_input_rejects_duplicate_user_entries(journal: RunJournal) -> None:
+    batch = acceptance("duplicate-input")
+    asyncio.run(journal.commit(batch, 0))
+    duplicate = TranscriptEntry(
+        batch.state.session_id,
+        batch.state.run_id,
+        batch.state.submission_id,
+        "user",
+        "duplicate",
+    )
+    advanced = replace(
+        batch.state,
+        version=2,
+        journal_version=2,
+        journal_sequence=3,
+    )
+    asyncio.run(journal.commit(JournalCommit(advanced, transcript=(duplicate,)), 1))
+
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(
+            journal.find_run_input(
+                batch.state.session_id,
+                batch.state.run_id,
+                batch.state.submission_id,
+            )
+        )
+
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
 def test_empty_ledger_can_advance_to_records_after_state_only_commits(journal: RunJournal) -> None:
     batch = acceptance("empty-ledger")
     initial = replace(batch.state, journal_sequence=0)

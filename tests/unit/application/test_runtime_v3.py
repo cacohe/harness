@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from functools import wraps
@@ -134,6 +135,19 @@ class Journal:
             0 if current is None else current.journal_sequence,
             current,
             transcript=transcript,
+        )
+
+    async def find_run_input(self, session_id, run_id, submission_id):
+        current = self.heads.get(session_id.value)
+        if current is None or current.run_id != run_id or current.submission_id != submission_id:
+            return None
+        return TranscriptEntry(
+            current.session_id,
+            current.run_id,
+            current.submission_id,
+            "user",
+            self.messages[current.run_id.value],
+            2,
         )
 
 
@@ -546,3 +560,220 @@ async def test_session_registry_is_bounded_and_explicit_close_reclaims_capacity(
         await runtime.open_session(SessionId("two"))
     await runtime.close_session(SessionId("one"))
     await runtime.open_session(SessionId("two"))
+
+
+@async_test
+async def test_public_id_boundaries_reject_subclasses_and_corrupt_exact_ids_without_hooks():
+    from src.application.runtime import RuntimeCoordinator, SessionOwnershipError
+
+    class HostileSessionId(SessionId):
+        @property
+        def value(self):
+            raise AssertionError("hostile value descriptor executed")
+
+    hostile_session = object.__new__(HostileSessionId)
+
+    class HostileText(str):
+        def __eq__(self, _other):
+            raise AssertionError("hostile equality executed")
+
+        def __hash__(self):
+            raise AssertionError("hostile hash executed")
+
+    corrupt_run = RunId("run")
+    object.__setattr__(corrupt_run, "value", HostileText("run"))
+    corrupt_profile = ProfileId("profile")
+    object.__setattr__(corrupt_profile, "value", object())
+    corrupt_submission = SubmissionId("submission")
+    object.__setattr__(corrupt_submission, "value", object())
+    journal = Journal()
+    runtime = RuntimeCoordinator(
+        submissions=Submissions(journal),
+        journal=journal,
+        coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, []),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=0,
+    )
+
+    for operation in (
+        runtime.open_session(hostile_session),  # type: ignore[arg-type]
+        runtime.close_session(hostile_session),  # type: ignore[arg-type]
+        runtime.submit(
+            SessionId("session"),
+            corrupt_profile,
+            "message",
+            corrupt_submission,
+        ),
+        runtime.decide_tool_call(SessionId("session"), corrupt_run, "call", True),
+    ):
+        with pytest.raises((SessionOwnershipError, ValueError)):
+            await operation
+
+
+@async_test
+async def test_close_and_reopen_invalidates_owner_before_operation_registration():
+    from src.application.runtime import ApplicationClosedError, RuntimeCoordinator
+
+    journal = Journal()
+    submissions = Submissions(journal)
+    runtime = RuntimeCoordinator(
+        submissions=submissions,
+        journal=journal,
+        coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, []),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=1,
+    )
+    reached = asyncio.Event()
+    release = asyncio.Event()
+    original = runtime._operation
+
+    @asynccontextmanager
+    async def blocked_registration(*args):
+        reached.set()
+        await release.wait()
+        async with original(*args):
+            yield
+
+    runtime._operation = blocked_registration  # type: ignore[method-assign]
+    old = asyncio.create_task(
+        runtime.submit(SessionId("same"), ProfileId("profile"), "old", SubmissionId("old"))
+    )
+    await reached.wait()
+    await runtime.close_session(SessionId("same"))
+    await runtime.open_session(SessionId("same"))
+    release.set()
+    with pytest.raises(ApplicationClosedError):
+        await old
+    assert submissions.calls == 0
+
+
+@async_test
+async def test_cancelled_pre_registration_owner_releases_gate_without_deadlock():
+    from src.application.runtime import RuntimeCoordinator
+
+    journal = Journal()
+    runtime = RuntimeCoordinator(
+        submissions=Submissions(journal),
+        journal=journal,
+        coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, []),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=1,
+    )
+    reached = asyncio.Event()
+    release = asyncio.Event()
+    original = runtime._operation
+
+    @asynccontextmanager
+    async def blocked_registration(*args):
+        reached.set()
+        await release.wait()
+        async with original(*args):
+            yield
+
+    runtime._operation = blocked_registration  # type: ignore[method-assign]
+    cancelled = asyncio.create_task(
+        runtime.submit(SessionId("same"), ProfileId("profile"), "old", SubmissionId("old"))
+    )
+    await reached.wait()
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    release.set()
+    runtime._operation = original  # type: ignore[method-assign]
+    result = await asyncio.wait_for(
+        runtime.submit(SessionId("same"), ProfileId("profile"), "new", SubmissionId("new")),
+        timeout=1,
+    )
+    assert result.status is RunStatus.COMPLETED
+
+
+@async_test
+async def test_close_session_cancels_active_rejects_queue_and_allows_clean_reopen():
+    from src.application.runtime import ApplicationClosedError, RuntimeCoordinator
+
+    journal = Journal()
+    blocker = asyncio.Event()
+    runtime = RuntimeCoordinator(
+        submissions=Submissions(journal),
+        journal=journal,
+        coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, [], blocker),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=1,
+    )
+    active = asyncio.create_task(
+        runtime.submit(SessionId("same"), ProfileId("profile"), "active", SubmissionId("active"))
+    )
+    await asyncio.sleep(0)
+    queued = asyncio.create_task(
+        runtime.submit(SessionId("same"), ProfileId("profile"), "queued", SubmissionId("queued"))
+    )
+    await asyncio.sleep(0)
+
+    await runtime.close_session(SessionId("same"))
+
+    with pytest.raises(asyncio.CancelledError):
+        await active
+    with pytest.raises(ApplicationClosedError):
+        await queued
+    blocker.set()
+    reopened = await asyncio.wait_for(
+        runtime.submit(SessionId("same"), ProfileId("profile"), "new", SubmissionId("new")),
+        timeout=1,
+    )
+    assert reopened.status is RunStatus.COMPLETED
+
+
+@async_test
+async def test_approval_uses_bounded_run_input_lookup_not_full_session_history():
+    from src.application.runtime import RuntimeCoordinator
+
+    class BoundedJournal(Journal):
+        async def load_session(self, *_args, **_kwargs):
+            raise AssertionError("approval must not materialize Session history")
+
+    journal = BoundedJournal()
+    current = waiting_state(SessionId("a"), SubmissionId("submission"))
+    journal.heads["a"] = current
+    journal.messages[current.run_id.value] = "hello"
+
+    class StopsAfterDecision:
+        async def advance(self, run, command):
+            if isinstance(command, DecideToolCall):
+                step = run.current_step
+                assert step is not None
+                tool = replace(
+                    step.tool_calls[0],
+                    approval=replace(step.tool_calls[0].approval, approved=False),
+                )
+                next_state = replace(run, current_step=replace(step, tool_calls=(tool,)))
+            else:
+                next_state = replace(
+                    run, status=RunStatus.COMPLETED, current_step=None, final_text="denied"
+                )
+            next_state = replace(
+                next_state,
+                version=run.version + 1,
+                journal_version=run.journal_version + 1,
+            )
+            journal.heads["a"] = next_state
+            return RunOutcome(next_state, next_state.journal_version, next_state.journal_sequence)
+
+    runtime = RuntimeCoordinator(
+        submissions=Submissions(journal),
+        journal=journal,
+        coordinator_factory=lambda _run, _message: StopsAfterDecision(),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=1,
+    )
+    result = await runtime.decide_tool_call(SessionId("a"), current.run_id, "tool-call", False)
+    assert result.status is RunStatus.COMPLETED

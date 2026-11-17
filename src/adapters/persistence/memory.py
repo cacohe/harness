@@ -60,6 +60,7 @@ class _Session:
     runs: Mapping[str, RunState] = field(default_factory=dict)
     events: tuple[JournalEvent, ...] = ()
     transcript: tuple[TranscriptEntry, ...] = ()
+    run_inputs: Mapping[tuple[str, str], tuple[TranscriptEntry, ...]] = field(default_factory=dict)
     summaries: Mapping[tuple[str, int, str, str], ConversationSummaryCheckpoint] = field(
         default_factory=dict
     )
@@ -165,6 +166,15 @@ class InMemoryRunJournal:
             submissions = session.submissions
             if intent is not None:
                 submissions = {**submissions, submission_key: (intent, receipt)}
+            run_inputs = session.run_inputs
+            for entry in transcript:
+                if entry.role != "user":
+                    continue
+                input_key = (entry.run_id.value, entry.submission_id.value)
+                run_inputs = {
+                    **run_inputs,
+                    input_key: (*run_inputs.get(input_key, ()), entry),
+                }
             next_session = _Session(
                 version=receipt.version,
                 sequence=receipt.sequence,
@@ -172,6 +182,7 @@ class InMemoryRunJournal:
                 runs={**session.runs, run_key: state},
                 events=session.events + events,
                 transcript=session.transcript + transcript,
+                run_inputs=run_inputs,
                 summaries=summaries,
                 submissions=submissions,
             )
@@ -240,6 +251,32 @@ class InMemoryRunJournal:
         return SubmissionAcceptance(
             _canonical_copy(receipt.submission), _canonical_copy(receipt.state), receipt.version
         )
+
+    async def find_run_input(
+        self,
+        session_id: SessionId,
+        run_id: RunId,
+        submission_id: SubmissionId,
+    ) -> TranscriptEntry | None:
+        if (
+            type(session_id) is not SessionId
+            or type(run_id) is not RunId
+            or type(submission_id) is not SubmissionId
+        ):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        session_id = _canonical_copy(session_id)
+        run_id = _canonical_copy(run_id)
+        submission_id = _canonical_copy(submission_id)
+        with self._lock:
+            session = self._store.sessions.get(session_id.value)
+            matches = (
+                ()
+                if session is None
+                else session.run_inputs.get((run_id.value, submission_id.value), ())
+            )
+        if len(matches) > 1:
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        return None if not matches else _canonical_copy(matches[0])
 
 
 _T = TypeVar("_T")

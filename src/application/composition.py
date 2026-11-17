@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +29,7 @@ from src.core.state import RunState
 from src.core.tools import ToolGateway
 
 ContextRequestFactory = Callable[[RunState, str], ContextRequest]
+_PATH_TYPE = type(Path())
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,32 +49,37 @@ class ApplicationConfig:
 
     def __post_init__(self) -> None:
         integers = (
-            self.max_sessions,
-            self.max_waiters_per_session,
-            self.max_advances_per_operation,
-            self.max_artifact_bytes,
-            self.max_inline_artifact_bytes,
-            self.max_artifact_summary_bytes,
+            object.__getattribute__(self, "max_sessions"),
+            object.__getattribute__(self, "max_waiters_per_session"),
+            object.__getattribute__(self, "max_advances_per_operation"),
+            object.__getattribute__(self, "max_artifact_bytes"),
+            object.__getattribute__(self, "max_inline_artifact_bytes"),
+            object.__getattribute__(self, "max_artifact_summary_bytes"),
         )
+        limits = _snapshot_limits(object.__getattribute__(self, "limits"))
+        context_budget = _snapshot_context_budget(object.__getattribute__(self, "context_budget"))
         if (
             any(type(value) is not int for value in integers)
-            or not 1 <= self.max_sessions <= 1_000_000
-            or not 0 <= self.max_waiters_per_session <= 1_000_000
-            or not 1 <= self.max_advances_per_operation <= 1_000_000
-            or not 1 <= self.max_artifact_bytes <= (1 << 63) - 1
-            or not 0 <= self.max_inline_artifact_bytes <= self.max_artifact_bytes
-            or not 1 <= self.max_artifact_summary_bytes <= 1_048_576
-            or type(self.limits) is not RunLimits
-            or type(self.context_budget) is not ContextBudget
+            or not 1 <= integers[0] <= 1_000_000
+            or not 0 <= integers[1] <= 1_000_000
+            or not 1 <= integers[2] <= 1_000_000
+            or not 1 <= integers[3] <= (1 << 63) - 1
+            or not 0 <= integers[4] <= integers[3]
+            or not 1 <= integers[5] <= 1_048_576
         ):
             raise ValueError("Application configuration limits are invalid")
+        object.__setattr__(self, "limits", limits)
+        object.__setattr__(self, "context_budget", context_budget)
         for name in ("sqlite_path", "artifact_root"):
             value = object.__getattribute__(self, name)
             if value is None:
                 continue
-            if not isinstance(value, Path) or not value.is_absolute():
+            if type(value) is not _PATH_TYPE:
                 raise ValueError("Production paths must be explicit absolute paths")
-            object.__setattr__(self, name, Path(value))
+            rebuilt = _PATH_TYPE(str(value))
+            if not rebuilt.is_absolute():
+                raise ValueError("Production paths must be explicit absolute paths")
+            object.__setattr__(self, name, rebuilt)
 
 
 def create_development_agent(
@@ -87,13 +96,7 @@ def create_development_agent(
     artifacts: ArtifactExternalizer | None = None,
     owned_resources: tuple[object, ...] = (),
 ) -> Agent:
-    _validate_composition_inputs(config, profile_id, owned_resources)
-    selected_journal = journal or InMemoryRunJournal()
-    selected_artifacts = artifacts
-    if selected_artifacts is None:
-        repository = InMemoryArtifactRepository(config.max_artifact_bytes)
-        selected_artifacts = PolicyArtifactExternalizer(repository, _artifact_policy(config))
-    return _compose(
+    config, profile_id = _validate_composition_inputs(
         config,
         model=model,
         tools=tools,
@@ -102,10 +105,40 @@ def create_development_agent(
         ids=ids,
         clock=clock,
         profile_id=profile_id,
-        journal=selected_journal,
-        artifacts=selected_artifacts,
+        journal=journal,
+        artifacts=artifacts,
         owned_resources=owned_resources,
     )
+    created: list[object] = []
+    try:
+        selected_journal = journal
+        if selected_journal is None:
+            selected_journal = InMemoryRunJournal()
+            created.append(selected_journal)
+        selected_artifacts = artifacts
+        if selected_artifacts is None:
+            repository = InMemoryArtifactRepository(config.max_artifact_bytes)
+            created.append(repository)
+            selected_artifacts = PolicyArtifactExternalizer(repository, _artifact_policy(config))
+            created.append(selected_artifacts)
+        _require_methods(selected_journal, _JOURNAL_METHODS)
+        _require_methods(selected_artifacts, ("externalize",))
+        return _compose(
+            config,
+            model=model,
+            tools=tools,
+            context=context,
+            context_request_factory=context_request_factory,
+            ids=ids,
+            clock=clock,
+            profile_id=profile_id,
+            journal=selected_journal,
+            artifacts=selected_artifacts,
+            owned_resources=(*owned_resources, *created),
+        )
+    except BaseException:
+        _close_constructed(created)
+        raise
 
 
 def create_production_agent(
@@ -122,26 +155,7 @@ def create_production_agent(
     artifacts: ArtifactExternalizer | None = None,
     owned_resources: tuple[object, ...] = (),
 ) -> Agent:
-    _validate_composition_inputs(config, profile_id, owned_resources)
-    selected_journal: RunJournal
-    if journal is None:
-        if config.sqlite_path is None:
-            raise ValueError("Production composition requires an absolute SQLite path")
-        selected_journal = SQLiteRunJournal(config.sqlite_path)
-    else:
-        selected_journal = journal
-    selected_artifacts: ArtifactExternalizer
-    if artifacts is None:
-        if config.artifact_root is None:
-            raise ValueError("Production composition requires an absolute Artifact root")
-        repository = FilesystemArtifactRepository(
-            config.artifact_root,
-            config.max_artifact_bytes,
-        )
-        selected_artifacts = PolicyArtifactExternalizer(repository, _artifact_policy(config))
-    else:
-        selected_artifacts = artifacts
-    return _compose(
+    config, profile_id = _validate_composition_inputs(
         config,
         model=model,
         tools=tools,
@@ -150,10 +164,53 @@ def create_production_agent(
         ids=ids,
         clock=clock,
         profile_id=profile_id,
-        journal=selected_journal,
-        artifacts=selected_artifacts,
+        journal=journal,
+        artifacts=artifacts,
         owned_resources=owned_resources,
     )
+    if journal is None and config.sqlite_path is None:
+        raise ValueError("Production composition requires an absolute SQLite path")
+    if artifacts is None and config.artifact_root is None:
+        raise ValueError("Production composition requires an absolute Artifact root")
+    created: list[object] = []
+    try:
+        selected_journal: RunJournal
+        if journal is None:
+            assert config.sqlite_path is not None
+            selected_journal = SQLiteRunJournal(config.sqlite_path)
+            created.append(selected_journal)
+        else:
+            selected_journal = journal
+        selected_artifacts: ArtifactExternalizer
+        if artifacts is None:
+            assert config.artifact_root is not None
+            repository = FilesystemArtifactRepository(
+                config.artifact_root,
+                config.max_artifact_bytes,
+            )
+            created.append(repository)
+            selected_artifacts = PolicyArtifactExternalizer(repository, _artifact_policy(config))
+            created.append(selected_artifacts)
+        else:
+            selected_artifacts = artifacts
+        _require_methods(selected_journal, _JOURNAL_METHODS)
+        _require_methods(selected_artifacts, ("externalize",))
+        return _compose(
+            config,
+            model=model,
+            tools=tools,
+            context=context,
+            context_request_factory=context_request_factory,
+            ids=ids,
+            clock=clock,
+            profile_id=profile_id,
+            journal=selected_journal,
+            artifacts=selected_artifacts,
+            owned_resources=(*owned_resources, *created),
+        )
+    except BaseException:
+        _close_constructed(created)
+        raise
 
 
 def _compose(
@@ -204,16 +261,165 @@ def _compose(
 
 def _validate_composition_inputs(
     config: ApplicationConfig,
+    *,
+    model: ModelGateway,
+    tools: ToolGateway,
+    context: ContextProvider,
+    context_request_factory: ContextRequestFactory,
+    ids: IdGenerator,
+    clock: Clock,
     profile_id: ProfileId,
+    journal: RunJournal | None,
+    artifacts: ArtifactExternalizer | None,
     owned_resources: tuple[object, ...],
-) -> None:
+) -> tuple[ApplicationConfig, ProfileId]:
     if (
         type(config) is not ApplicationConfig
-        or type(profile_id) is not ProfileId
         or type(owned_resources) is not tuple
         or len({id(resource) for resource in owned_resources}) != len(owned_resources)
     ):
         raise ValueError("Composition inputs are invalid")
+    config = _snapshot_application_config(config)
+    profile = _snapshot_profile_id(profile_id)
+    _require_methods(model, ("complete",))
+    _require_methods(tools, ("execute",))
+    _require_methods(context, ("build",))
+    _require_callable(context_request_factory)
+    _require_methods(
+        ids, ("run", "session", "submission", "profile", "event", "step", "model_call")
+    )
+    _require_methods(clock, ("now", "monotonic"))
+    if journal is not None:
+        _require_methods(journal, _JOURNAL_METHODS)
+    if artifacts is not None:
+        _require_methods(artifacts, ("externalize",))
+    return config, profile
+
+
+_JOURNAL_METHODS = (
+    "commit",
+    "load_head",
+    "load_session",
+    "find_submission",
+    "find_run_input",
+)
+
+
+def _require_methods(value: object, names: tuple[str, ...]) -> None:
+    for name in names:
+        try:
+            member = inspect.getattr_static(value, name)
+        except (AttributeError, TypeError):
+            raise ValueError("Composition dependency ports are invalid") from None
+        if isinstance(member, (classmethod, staticmethod)):
+            member = member.__func__
+        if not callable(member):
+            raise ValueError("Composition dependency ports are invalid")
+
+
+def _require_callable(value: object) -> None:
+    try:
+        member = inspect.getattr_static(value, "__call__")
+    except (AttributeError, TypeError):
+        raise ValueError("Composition dependency ports are invalid") from None
+    if not callable(member):
+        raise ValueError("Composition dependency ports are invalid")
+
+
+def _snapshot_profile_id(value: object) -> ProfileId:
+    try:
+        if type(value) is not ProfileId:
+            raise ValueError
+        raw = object.__getattribute__(value, "value")
+        if type(raw) is not str:
+            raise ValueError
+        return ProfileId(raw)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("Composition inputs are invalid") from None
+
+
+def _snapshot_application_config(value: object) -> ApplicationConfig:
+    try:
+        if type(value) is not ApplicationConfig:
+            raise ValueError
+        return ApplicationConfig(
+            max_sessions=object.__getattribute__(value, "max_sessions"),
+            max_waiters_per_session=object.__getattribute__(value, "max_waiters_per_session"),
+            max_advances_per_operation=object.__getattribute__(value, "max_advances_per_operation"),
+            limits=object.__getattribute__(value, "limits"),
+            context_budget=object.__getattribute__(value, "context_budget"),
+            max_artifact_bytes=object.__getattribute__(value, "max_artifact_bytes"),
+            max_inline_artifact_bytes=object.__getattribute__(value, "max_inline_artifact_bytes"),
+            max_artifact_summary_bytes=object.__getattribute__(value, "max_artifact_summary_bytes"),
+            sqlite_path=object.__getattribute__(value, "sqlite_path"),
+            artifact_root=object.__getattribute__(value, "artifact_root"),
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("Composition inputs are invalid") from None
+
+
+def _snapshot_limits(value: object) -> RunLimits:
+    try:
+        if type(value) is not RunLimits:
+            raise ValueError
+        steps = object.__getattribute__(value, "max_steps")
+        elapsed = object.__getattribute__(value, "max_elapsed_seconds")
+        inline = object.__getattribute__(value, "max_inline_result_bytes")
+        if type(steps) is not int or type(elapsed) not in (int, float) or type(inline) is not int:
+            raise ValueError
+        return RunLimits(steps, elapsed, inline)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("Application configuration limits are invalid") from None
+
+
+def _snapshot_context_budget(value: object) -> ContextBudget:
+    try:
+        if type(value) is not ContextBudget:
+            raise ValueError
+        window = object.__getattribute__(value, "context_window_tokens")
+        output = object.__getattribute__(value, "reserved_output_tokens")
+        margin = object.__getattribute__(value, "safety_margin_tokens")
+        if any(type(item) is not int for item in (window, output, margin)):
+            raise ValueError
+        return ContextBudget(window, output, margin)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("Application configuration limits are invalid") from None
+
+
+def _close_constructed(resources: list[object]) -> None:
+    for resource in reversed(resources):
+        closer = getattr(resource, "aclose", None)
+        if closer is None:
+            closer = getattr(resource, "close", None)
+        if closer is None:
+            continue
+        try:
+            result = closer()
+            if inspect.isawaitable(result):
+                _await_cleanup(result)
+        except BaseException:
+            continue
+
+
+def _await_cleanup(awaitable) -> None:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(awaitable)
+        return
+    failure: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            asyncio.run(awaitable)
+        except BaseException as error:
+            failure.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join()
+    if failure:
+        raise failure[0]
 
 
 def _artifact_policy(config: ApplicationConfig) -> ArtifactPolicy:
