@@ -51,6 +51,14 @@ def same_file(current: os.stat_result, expected: os.stat_result) -> None:
         raise ArtifactRepositoryError("Artifact file changed")
 
 
+def write_bytes(fd: int, content: memoryview) -> None:
+    while content:
+        written = os.write(fd, content)
+        if not written:
+            raise OSError(errno.EIO, "Incomplete artifact write")
+        content = content[written:]
+
+
 if sys.platform == "win32":
 
     def _windows_open(path: Path, flags: int, *, directory: bool = False) -> int:
@@ -168,6 +176,14 @@ class Directory:
 
     def rename(self, source: str, target: str) -> None:
         os.rename(
+            self._leaf(source),
+            self._leaf(target),
+            src_dir_fd=self._relative,
+            dst_dir_fd=self._relative,
+        )
+
+    def replace(self, source: str, target: str) -> None:
+        os.replace(
             self._leaf(source),
             self._leaf(target),
             src_dir_fd=self._relative,

@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from src.adapters.artifacts.filesystem import ArtifactRepositoryError, FilesystemArtifactRepository
+from src.adapters.artifacts.filesystem_platform import Directory
 from src.core.artifacts import ArtifactWrite
 
 
@@ -22,7 +23,7 @@ def _object(root, artifact_id):
 
 
 def _contents(root):
-    return {path for path in root.iterdir() if path.name != ".locks"}
+    return {path for path in root.iterdir() if path.name not in {".locks", ".retire-intents"}}
 
 
 async def _chunks(*chunks):
@@ -592,12 +593,15 @@ def test_tombstone_cleanup_is_retryable(tmp_path, monkeypatch, recovery):
                 await repo.delete(ref.artifact_id)
         assert await repo.stat(ref.artifact_id) is None
         assert list(tmp_path.glob(".delete-*"))
+        assert list((tmp_path / ".retire-intents").glob("*.json"))
 
+        repo = FilesystemArtifactRepository(tmp_path, 3)
         if recovery == "gc":
             assert await repo.collect_orphans([], datetime.now(timezone.utc)) == 1
         else:
             await repo.delete(ref.artifact_id)
         assert not list(tmp_path.glob(".delete-*"))
+        assert not list((tmp_path / ".retire-intents").iterdir())
 
     asyncio.run(scenario())
 
@@ -839,5 +843,232 @@ asyncio.run(main())
                 if process.poll() is None:
                     process.kill()
                 process.communicate()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("recovery", ["delete", "gc"])
+def test_forged_retired_member_cannot_authorize_cleanup_after_failed_rollback(
+    tmp_path, monkeypatch, recovery
+):
+    async def scenario():
+        repo = FilesystemArtifactRepository(tmp_path, 3)
+        ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
+        final = _object(tmp_path, ref.artifact_id)
+        original_rename = os.rename
+
+        def insert_marker(source, target, *args, **kwargs):
+            if os.path.basename(source) == final.name:
+                (final / ".retired").touch()
+            elif os.path.basename(source).startswith(".delete-"):
+                raise PermissionError(errno.EACCES, "injected rollback failure")
+            return original_rename(source, target, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "rename", insert_marker)
+            with pytest.raises(ArtifactRepositoryError):
+                await repo.delete(ref.artifact_id)
+        (tombstone,) = tmp_path.glob(".delete-*")
+
+        restarted = FilesystemArtifactRepository(tmp_path, 3)
+        if recovery == "gc":
+            assert await restarted.collect_orphans([], datetime.now(timezone.utc)) == 0
+        else:
+            with pytest.raises(ArtifactRepositoryError):
+                await restarted.delete(ref.artifact_id)
+        assert (tombstone / ".retired").is_file()
+        assert (tombstone / "data").read_bytes() == b"abc"
+        assert (tombstone / "descriptor.json").is_file()
+        assert list((tmp_path / ".retire-intents").glob("*.json"))
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("operation", ["delete", "gc"])
+def test_retirement_record_write_failure_leaves_the_live_object_untouched(
+    tmp_path, monkeypatch, operation
+):
+    async def scenario():
+        repo = FilesystemArtifactRepository(tmp_path, 3)
+        ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
+        original_open = Directory.open
+
+        def fail_intent_write(directory, name, flags):
+            if flags & os.O_CREAT and (
+                directory.path.name == ".retire-intents" or name == ".retired"
+            ):
+                raise PermissionError(errno.EACCES, "injected retirement record failure")
+            return original_open(directory, name, flags)
+
+        cutoff = datetime.now(timezone.utc) + timedelta(days=1)
+        with monkeypatch.context() as patch:
+            patch.setattr(Directory, "open", fail_intent_write)
+            if operation == "delete":
+                with pytest.raises(ArtifactRepositoryError):
+                    await repo.delete(ref.artifact_id)
+            else:
+                assert await repo.collect_orphans([], cutoff) == 0
+        assert await repo.stat(ref.artifact_id) == ref
+        assert await _read(repo, ref.artifact_id) == b"abc"
+        assert not list(tmp_path.glob(".delete-*"))
+
+        restarted = FilesystemArtifactRepository(tmp_path, 3)
+        if operation == "delete":
+            await restarted.delete(ref.artifact_id)
+        else:
+            assert await restarted.collect_orphans([], cutoff) == 1
+        assert await restarted.stat(ref.artifact_id) is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("damage", ["malformed", "reparse"])
+def test_restart_does_not_clean_tombstone_if_its_intent_is_untrusted(tmp_path, monkeypatch, damage):
+    async def scenario():
+        root = tmp_path / "repository"
+        repo = FilesystemArtifactRepository(root, 3)
+        ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
+        original_unlink = os.unlink
+
+        def fail_cleanup(path, *args, **kwargs):
+            if os.path.basename(path) == "data":
+                raise PermissionError(errno.EACCES, "injected cleanup failure")
+            return original_unlink(path, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "unlink", fail_cleanup)
+            with pytest.raises(ArtifactRepositoryError):
+                await repo.delete(ref.artifact_id)
+        (tombstone,) = root.glob(".delete-*")
+        (intent,) = (root / ".retire-intents").glob("*.json")
+        if damage == "malformed":
+            os.chmod(intent, stat.S_IWRITE)
+            intent.write_bytes(b'{"unexpected":1}')
+        else:
+            outside = tmp_path / "outside"
+            outside.mkdir()
+            intent.rename(outside / "original")
+            _junction(intent, outside)
+
+        restarted = FilesystemArtifactRepository(root, 3)
+        assert await restarted.collect_orphans([], datetime.now(timezone.utc)) == 0
+        with pytest.raises(ArtifactRepositoryError) as caught:
+            await restarted.delete(ref.artifact_id)
+        assert str(root) not in str(caught.value)
+        assert (tombstone / "data").read_bytes() == b"abc"
+        assert (tombstone / "descriptor.json").is_file()
+
+    asyncio.run(scenario())
+
+
+def test_restart_rechecks_the_captured_gc_lease_before_cleanup(tmp_path, monkeypatch):
+    async def scenario():
+        repo = FilesystemArtifactRepository(tmp_path, 3)
+        ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
+        cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+        old = int((cutoff - timedelta(days=1)).timestamp())
+        final = _object(tmp_path, ref.artifact_id)
+        os.utime(final, (old, old))
+        original_sync = Directory.sync
+        error_injected = False
+
+        def fail_capture_sync(directory):
+            nonlocal error_injected
+            if directory.path == tmp_path and list(tmp_path.glob(".delete-*")):
+                error_injected = True
+                raise OSError(errno.EIO, "simulated interrupted capture")
+            return original_sync(directory)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Directory, "sync", fail_capture_sync)
+            assert await repo.collect_orphans([], cutoff) == 0
+        assert error_injected
+        (tombstone,) = tmp_path.glob(".delete-*")
+        os.utime(tombstone, None)
+
+        restarted = FilesystemArtifactRepository(tmp_path, 3)
+        assert await restarted.collect_orphans([], cutoff) == 0
+        assert await restarted.stat(ref.artifact_id) == ref
+        assert not list(tmp_path.glob(".delete-*"))
+        assert not list((tmp_path / ".retire-intents").iterdir())
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("final_identity", ["original", "replacement", "missing"])
+def test_failed_rename_intent_is_cleared_only_for_the_same_live_object(
+    tmp_path, monkeypatch, final_identity
+):
+    async def scenario():
+        root = tmp_path / "repository"
+        repo = FilesystemArtifactRepository(root, 3)
+        ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="first"))
+        final = _object(root, ref.artifact_id)
+        real_rename = os.rename
+
+        def fail_final_rename(source, target, *args, **kwargs):
+            if os.path.basename(source) == final.name:
+                raise OSError(errno.EIO, "injected capture failure")
+            return real_rename(source, target, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "rename", fail_final_rename)
+            with pytest.raises(ArtifactRepositoryError):
+                await repo.delete(ref.artifact_id)
+        assert not list(root.glob(".delete-*"))
+        (intent,) = (root / ".retire-intents").glob("*.json")
+
+        expected = ref
+        if final_identity != "original":
+            final.rename(tmp_path / "original")
+            expected = None
+            if final_identity == "replacement":
+                other_root = tmp_path / "other"
+                other = FilesystemArtifactRepository(other_root, 3)
+                expected = await other.put(
+                    ArtifactWrite(_chunks(b"abc"), "text/plain", name="replacement")
+                )
+                _object(other_root, ref.artifact_id).rename(final)
+
+        restarted = FilesystemArtifactRepository(root, 3)
+        assert await restarted.collect_orphans({ref.artifact_id}, datetime.now(timezone.utc)) == 0
+        assert intent.exists() == (final_identity != "original")
+        assert await restarted.stat(ref.artifact_id) == expected
+        if final_identity != "original":
+            with pytest.raises(ArtifactRepositoryError):
+                await restarted.delete(ref.artifact_id)
+            assert intent.exists()
+            assert await restarted.stat(ref.artifact_id) == expected
+
+    asyncio.run(scenario())
+
+
+def test_restart_recovers_when_persisting_cleanup_permission_fails(tmp_path, monkeypatch):
+    async def scenario():
+        repo = FilesystemArtifactRepository(tmp_path, 3)
+        ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
+        original_replace = Directory.replace
+        error_injected = False
+
+        def fail_intent_replace(directory, source, target):
+            nonlocal error_injected
+            if directory.path.name == ".retire-intents":
+                error_injected = True
+                raise OSError(errno.EIO, "injected intent update failure")
+            return original_replace(directory, source, target)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Directory, "replace", fail_intent_replace)
+            with pytest.raises(ArtifactRepositoryError):
+                await repo.delete(ref.artifact_id)
+        assert error_injected
+        (tombstone,) = tmp_path.glob(".delete-*")
+        assert (tombstone / "data").read_bytes() == b"abc"
+        assert (tombstone / "descriptor.json").is_file()
+
+        restarted = FilesystemArtifactRepository(tmp_path, 3)
+        await restarted.delete(ref.artifact_id)
+        assert not tombstone.exists()
+        assert not list((tmp_path / ".retire-intents").iterdir())
 
     asyncio.run(scenario())

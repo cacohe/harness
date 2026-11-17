@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import errno
 import json
 import os
-import re
 import stat
 from collections.abc import AsyncGenerator, Callable, Collection, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
@@ -27,6 +25,17 @@ from src.adapters.artifacts.filesystem_platform import (
     regular_file,
     same_entry,
     same_file,
+    write_bytes,
+)
+from src.adapters.artifacts.filesystem_retirement import (
+    RetirementIntent,
+    RetirementRecord,
+    directory_identity,
+    file_identity,
+    intent_digest,
+    read_record,
+    remove_record,
+    write_record,
 )
 from src.core.artifacts import (
     MAX_ARTIFACT_SIZE_BYTES,
@@ -41,10 +50,8 @@ _DESCRIPTOR_BYTES = 65_536 + 1024
 _DATA = "data"
 _DESCRIPTOR = "descriptor.json"
 _MEMBERS = {_DATA, _DESCRIPTOR}
-_RETIRED = ".retired"
-_RETIRED_MEMBERS = _MEMBERS | {_RETIRED}
 _LOCKS = ".locks"
-_TOMBSTONE = re.compile(r"\.delete-([0-9a-f]{64})-[0-9a-f]{32}")
+_INTENTS = ".retire-intents"
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _T = TypeVar("_T")
 
@@ -97,14 +104,6 @@ async def _finish_io(operation: Callable[[], _T], cancel: Event | None = None) -
         raise
 
 
-def _write_bytes(fd: int, content: memoryview) -> None:
-    while content:
-        written = os.write(fd, content)
-        if not written:
-            raise OSError(errno.EIO, "Incomplete artifact write")
-        content = content[written:]
-
-
 def _encode_descriptor(ref: ArtifactRef) -> bytes:
     return json.dumps(
         {
@@ -150,10 +149,10 @@ def _validated_write(request: ArtifactWrite) -> ArtifactWrite:
         raise ValueError("Invalid artifact write request") from None
 
 
-def _members(directory: Directory, allowed: set[str] = _MEMBERS) -> set[str]:
+def _members(directory: Directory) -> set[str]:
     with directory.entries() as entries:
-        members = {member.name for _, member in zip(range(len(allowed) + 1), entries)}
-    if not members <= allowed:
+        members = {member.name for _, member in zip(range(len(_MEMBERS) + 1), entries)}
+    if not members <= _MEMBERS:
         raise ArtifactRepositoryError("Invalid artifact object members")
     return members
 
@@ -218,26 +217,49 @@ def _remove_directory(
     root: Directory,
     name: str,
     info: os.stat_result,
-    *,
-    artifact_id: str | None = None,
 ) -> None:
     with root.child(name, info) as directory:
-        members = _members(directory, _RETIRED_MEMBERS if artifact_id is not None else _MEMBERS)
+        members = _members(directory)
         entries = {member: regular_file(directory.stat(member)) for member in members}
-        if artifact_id is not None and members:
-            marker = entries.get(_RETIRED)
-            if marker is None or marker.st_size != 0 or members == {_DATA, _RETIRED}:
-                raise ArtifactRepositoryError("Invalid artifact tombstone")
-            if _DESCRIPTOR in members:
-                ref = _descriptor(directory, entries[_DESCRIPTOR], artifact_id)
-                if _DATA in members and entries[_DATA].st_size != ref.size_bytes:
-                    raise ArtifactRepositoryError("Invalid artifact tombstone data")
-        for member in (_DATA, _DESCRIPTOR, _RETIRED):
+        for member in (_DATA, _DESCRIPTOR):
             if member in entries:
                 directory.unlink(member, entries[member])
+    _remove_empty_directory(root, name, info)
+
+
+def _remove_empty_directory(root: Directory, name: str, info: os.stat_result) -> None:
     same_entry(directory_info(root.stat(name)), info)
     root.rmdir(name)
     root.sync()
+
+
+def _original_matches(obj: _Object | None, intent: RetirementIntent) -> bool:
+    return (
+        obj is not None
+        and directory_identity(obj.directory) == intent.directory
+        and file_identity(obj.data) == intent.data
+        and file_identity(obj.descriptor) == intent.descriptor
+        and sha256(_encode_descriptor(obj.ref)).hexdigest() == intent.descriptor_sha256
+    )
+
+
+def _retired_members(directory: Directory, intent: RetirementIntent) -> dict[str, os.stat_result]:
+    if directory_identity(directory.info) != intent.directory:
+        raise ArtifactRepositoryError("Captured artifact directory changed")
+    members = _members(directory)
+    if members == {_DATA} or (intent.captured_mtime_ns is None and members != _MEMBERS):
+        raise ArtifactRepositoryError("Invalid artifact tombstone members")
+    entries = {member: regular_file(directory.stat(member)) for member in members}
+    if _DATA in entries and file_identity(entries[_DATA]) != intent.data:
+        raise ArtifactRepositoryError("Captured artifact data changed")
+    if _DESCRIPTOR in entries:
+        info = entries[_DESCRIPTOR]
+        if file_identity(info) != intent.descriptor:
+            raise ArtifactRepositoryError("Captured artifact descriptor changed")
+        ref = _descriptor(directory, info, artifact_id_from_sha256(intent.digest))
+        if sha256(_encode_descriptor(ref)).hexdigest() != intent.descriptor_sha256:
+            raise ArtifactRepositoryError("Captured artifact descriptor changed")
+    return entries
 
 
 class FilesystemArtifactRepository:
@@ -255,6 +277,7 @@ class FilesystemArtifactRepository:
         ):
             raise ValueError("Maximum artifact size must be a positive bounded integer")
         self._max_artifact_bytes = max_artifact_bytes
+        self._intents_info: os.stat_result | None = None
         with _repository_io():
             try:
                 self._root = root.resolve()
@@ -279,6 +302,20 @@ class FilesystemArtifactRepository:
         with root.child(_LOCKS, self._locks_info) as locks, object_lock(locks, digest):
             yield
 
+    @contextmanager
+    def _intents(self, root: Directory) -> Iterator[Directory]:
+        info = self._intents_info
+        if info is None:
+            try:
+                root.mkdir(_INTENTS)
+            except FileExistsError:
+                pass
+            info = directory_info(root.stat(_INTENTS))
+            root.sync()
+            self._intents_info = info
+        with root.child(_INTENTS, info) as control:
+            yield control
+
     def _start(self, stage: _Stage) -> int:
         with self._pinned_root() as root:
             root.mkdir(stage.name)
@@ -302,7 +339,7 @@ class FilesystemArtifactRepository:
             try:
                 content = memoryview(_encode_descriptor(ref))
                 for offset in range(0, len(content), _CHUNK_BYTES):
-                    _write_bytes(fd, content[offset : offset + _CHUNK_BYTES])
+                    write_bytes(fd, content[offset : offset + _CHUNK_BYTES])
                 directory.set_mode(_DESCRIPTOR, fd, stat.S_IRUSR)
                 os.fsync(fd)
                 return os.fstat(fd)
@@ -386,7 +423,7 @@ class FilesystemArtifactRepository:
                     for offset in range(0, len(chunk), _CHUNK_BYTES):
                         view = memoryview(chunk)[offset : offset + _CHUNK_BYTES]
                         digest.update(view)
-                        await _finish_io(lambda: _write_bytes(fd, view))
+                        await _finish_io(lambda: write_bytes(fd, view))
 
                 check_cancellation()
                 checksum = digest.hexdigest()
@@ -463,51 +500,103 @@ class FilesystemArtifactRepository:
             if offset != obj.ref.size_bytes or digest.hexdigest() != obj.ref.sha256:
                 raise ArtifactRepositoryError("Artifact content does not match its size or SHA-256")
 
-    def _delete_object(self, root: Directory, obj: _Object, cutoff_ns: int | None = None) -> bool:
-        digest = obj.ref.sha256
-        tombstone = f".delete-{digest}-{uuid4().hex}"
-        root.rename(digest, tombstone)
-        try:
-            current = _check_object(_load(root, tombstone, obj.ref.artifact_id), obj)
-        except (OSError, ArtifactRepositoryError):
-            _restore(root, tombstone, digest)
-            raise ArtifactRepositoryError("Captured artifact changed") from None
-        if cutoff_ns is not None and current.directory.st_mtime_ns >= cutoff_ns:
-            _restore(root, tombstone, digest)
-            return False
-        # Record approval inside the verified directory. An unapproved capture
-        # left by a failed rollback must never be treated as pending cleanup.
-        with root.child(tombstone, current.directory) as directory:
-            same_file(directory.stat(_DATA), current.data)
-            same_file(directory.stat(_DESCRIPTOR), current.descriptor)
-            fd = directory.open(_RETIRED, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            directory.sync()
+    def _delete_object(
+        self,
+        root: Directory,
+        control: Directory,
+        obj: _Object,
+        cutoff_ns: int | None = None,
+    ) -> bool:
+        intent = RetirementIntent(
+            digest=obj.ref.sha256,
+            nonce=uuid4().hex,
+            directory=directory_identity(obj.directory),
+            data=file_identity(obj.data),
+            descriptor=file_identity(obj.descriptor),
+            descriptor_sha256=sha256(_encode_descriptor(obj.ref)).hexdigest(),
+            original_mtime_ns=obj.directory.st_mtime_ns,
+            operation="delete" if cutoff_ns is None else "gc",
+            cutoff_ns=cutoff_ns,
+        )
+        record = write_record(control, intent)
+        root.rename(intent.digest, intent.tombstone)
         root.sync()
-        _remove_directory(root, tombstone, current.directory, artifact_id=obj.ref.artifact_id)
-        return True
+        return self._resume_retirement(root, control, record, just_captured=True)
 
-    def _recover(self, root: Directory, name: str, artifact_id: str) -> bool:
+    def _resume_retirement(
+        self,
+        root: Directory,
+        control: Directory,
+        record: RetirementRecord,
+        *,
+        referenced: bool = False,
+        just_captured: bool = False,
+    ) -> bool:
+        intent = record.intent
         try:
-            info = directory_info(root.stat(name))
+            info = root.stat(intent.tombstone)
         except FileNotFoundError:
+            final = _load(root, intent.digest, artifact_id_from_sha256(intent.digest))
+            if not _original_matches(final, intent):
+                raise ArtifactRepositoryError("Unresolved artifact retirement intent") from None
+            remove_record(control, record)
             return False
-        _remove_directory(root, name, info, artifact_id=artifact_id)
+
+        verified = False
+        try:
+            with root.child(intent.tombstone, directory_info(info)) as directory:
+                members = _retired_members(directory, intent)
+                verified = True
+                captured_mtime = directory.info.st_mtime_ns
+                restore = (
+                    len(members) == 2
+                    and intent.cutoff_ns is not None
+                    and (referenced or captured_mtime >= intent.cutoff_ns)
+                )
+                if not restore:
+                    if intent.captured_mtime_ns is None:
+                        record = write_record(
+                            control, replace(intent, captured_mtime_ns=captured_mtime), record
+                        )
+                    # Check the lease again after persisting permission to start unlinking.
+                    restore = (
+                        len(members) == 2
+                        and intent.cutoff_ns is not None
+                        and directory.info.st_mtime_ns >= intent.cutoff_ns
+                    )
+                    if not restore:
+                        for member in (_DATA, _DESCRIPTOR):
+                            if member in members:
+                                directory.unlink(member, members[member])
+                                directory.sync()
+        except (ArtifactRepositoryError, FileNotFoundError):
+            if just_captured and not verified:
+                _restore(root, intent.tombstone, intent.digest)
+            raise
+
+        if restore:
+            _restore(root, intent.tombstone, intent.digest)
+            remove_record(control, record)
+            return False
+        _remove_empty_directory(root, intent.tombstone, info)
+        remove_record(control, record)
         return True
 
     def _delete(self, digest: str, artifact_id: str) -> None:
-        with self._pinned_root() as root, self._locked(root, digest):
+        with (
+            self._pinned_root() as root,
+            self._locked(root, digest),
+            self._intents(root) as control,
+        ):
+            with control.entries() as entries:
+                names = [entry.name for entry in entries if intent_digest(entry.name) == digest]
+            for name in names:
+                record = read_record(control, name)
+                if record is not None:
+                    self._resume_retirement(root, control, record)
             obj = _load(root, digest, artifact_id)
             if obj is not None:
-                self._delete_object(root, obj)
-            with root.entries() as entries:
-                for entry in entries:
-                    tombstone = _TOMBSTONE.fullmatch(entry.name)
-                    if tombstone is not None and tombstone[1] == digest:
-                        self._recover(root, entry.name, artifact_id)
+                self._delete_object(root, control, obj)
 
     async def delete(self, artifact_id: str) -> None:
         validate_artifact_id(artifact_id)
@@ -532,25 +621,41 @@ class FilesystemArtifactRepository:
 
     def _collect(self, references: set[str], cutoff_ns: int) -> int:
         removed = 0
-        with self._pinned_root() as root, root.entries() as entries:
-            for entry in entries:
-                tombstone = _TOMBSTONE.fullmatch(entry.name)
-                digest = tombstone[1] if tombstone is not None else entry.name
-                try:
-                    artifact_id = artifact_id_from_sha256(digest)
-                except ValueError:
-                    continue
-                if tombstone is None and artifact_id in references:
-                    continue
-                try:
-                    with self._locked(root, digest):
-                        if tombstone is not None:
-                            removed += self._recover(root, entry.name, artifact_id)
-                            continue
-                        obj = _load(root, digest, artifact_id)
-                        if obj is not None and obj.directory.st_mtime_ns < cutoff_ns:
-                            removed += self._delete_object(root, obj, cutoff_ns)
-                except (OSError, ArtifactRepositoryError):
-                    # Corrupt, replaced, or busy entries are left for inspection or retry.
-                    continue
+        with self._pinned_root() as root, self._intents(root) as control:
+            unresolved = set()
+            with control.entries() as entries:
+                for entry in entries:
+                    digest = intent_digest(entry.name)
+                    if digest is None:
+                        continue
+                    try:
+                        with self._locked(root, digest):
+                            record = read_record(control, entry.name)
+                            if record is not None:
+                                removed += self._resume_retirement(
+                                    root,
+                                    control,
+                                    record,
+                                    referenced=artifact_id_from_sha256(digest) in references,
+                                )
+                    except (OSError, ArtifactRepositoryError):
+                        unresolved.add(digest)
+
+            with root.entries() as entries:
+                for entry in entries:
+                    digest = entry.name
+                    try:
+                        artifact_id = artifact_id_from_sha256(digest)
+                    except ValueError:
+                        continue
+                    if artifact_id in references or digest in unresolved:
+                        continue
+                    try:
+                        with self._locked(root, digest):
+                            obj = _load(root, digest, artifact_id)
+                            if obj is not None and obj.directory.st_mtime_ns < cutoff_ns:
+                                removed += self._delete_object(root, control, obj, cutoff_ns)
+                    except (OSError, ArtifactRepositoryError):
+                        # Corrupt, replaced, or busy entries are left for inspection or retry.
+                        continue
         return removed
