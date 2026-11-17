@@ -11,12 +11,16 @@ class _Id:
     value: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.value, str) or not self.value:
+        if not isinstance(self.value, str):
             raise ValueError("ID must be a non-empty string")
-        if any(category(character) == "Cc" for character in self.value):
+        value = str.__str__(self.value)
+        if not value:
+            raise ValueError("ID must be a non-empty string")
+        if any(category(character) == "Cc" for character in value):
             raise ValueError("ID must not contain control characters")
-        if len(self.value.encode("utf-8")) > _MAX_ID_BYTES:
+        if len(value.encode("utf-8")) > _MAX_ID_BYTES:
             raise ValueError(f"ID must not exceed {_MAX_ID_BYTES} UTF-8 bytes")
+        object.__setattr__(self, "value", value)
 
 
 @dataclass(frozen=True)

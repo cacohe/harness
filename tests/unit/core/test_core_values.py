@@ -34,6 +34,15 @@ def test_id_types_do_not_compare_equal_across_scopes():
     assert len({id_type("shared") for id_type in ID_TYPES}) == len(ID_TYPES)
 
 
+def test_id_validates_the_underlying_utf8_bytes_of_a_str_subclass():
+    class MisreportedEncoding(str):
+        def encode(self, *args, **kwargs):
+            return b"short"
+
+    with pytest.raises(ValueError, match="256 UTF-8 bytes"):
+        RunId(MisreportedEncoding("é" * 128 + "a"))
+
+
 @pytest.mark.parametrize("value", [0, -1, True, float("inf"), float("-inf"), float("nan")])
 @pytest.mark.parametrize("field", ["max_steps", "max_elapsed_seconds", "max_inline_result_bytes"])
 def test_limits_reject_non_positive_or_non_finite_values(field, value):
@@ -124,6 +133,22 @@ def _event(payload):
 )
 def test_event_rejects_non_json_values_and_host_paths(payload):
     with pytest.raises(ValueError):
+        _event(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"message": "Could not open /var/private/config.json"},
+        {"message": "Could not open 'C:\\private\\config.json'"},
+        {"message": "Could not open (file:///var/private/config.json)"},
+        {"path": "private/config.json"},
+        {"source_path": "config.json"},
+        {"details": {"sourcePaths": ["private\\config.json"]}},
+    ],
+)
+def test_event_rejects_paths_in_diagnostics_and_explicit_path_fields(payload):
+    with pytest.raises(ValueError, match="host paths"):
         _event(payload)
 
 

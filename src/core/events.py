@@ -13,7 +13,12 @@ from src.core.ids import EventId, RunId, SessionId
 
 _MAX_PAYLOAD_BYTES = 1_048_576
 _MAX_PAYLOAD_DEPTH = 16
-_HOST_PATH = re.compile(r"^(?:[a-z]:|(?:~|\.{1,2})?[\\/]|file:)", re.IGNORECASE)
+_HOST_PATH = re.compile(
+    r"""^(?:[a-z]:|(?:~|\.{1,2})?[\\/]|file:)"""
+    r"""|[\s"'`([{=<“‘](?:[a-z]:\S|(?:~|\.{1,2})?[\\/]\S|file:)""",
+    re.IGNORECASE,
+)
+_PATH_FIELD = re.compile(r"(?i:(?:^|[_.-])paths?$)|Paths?$")
 
 JsonValue: TypeAlias = "None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]"
 
@@ -28,7 +33,7 @@ class DomainEventType(StrEnum):
     TOOL_CALL_DECIDED = "tool.call.decided"
 
 
-def _json_fragments(value: object, depth: int) -> Iterator[str]:
+def _json_fragments(value: object, depth: int, *, path_value: bool = False) -> Iterator[str]:
     if isinstance(value, (dict, list)) and depth >= _MAX_PAYLOAD_DEPTH:
         raise ValueError("Event payload is nested too deeply")
 
@@ -41,20 +46,22 @@ def _json_fragments(value: object, depth: int) -> Iterator[str]:
                 yield ","
             yield from _json_fragments(key, depth + 1)
             yield ":"
-            yield from _json_fragments(value[key], depth + 1)
+            yield from _json_fragments(
+                value[key], depth + 1, path_value=path_value or bool(_PATH_FIELD.search(key))
+            )
         yield "}"
     elif type(value) is list:
         yield "["
         for index, item in enumerate(value):
             if index:
                 yield ","
-            yield from _json_fragments(item, depth + 1)
+            yield from _json_fragments(item, depth + 1, path_value=path_value)
         yield "]"
     elif value is None or type(value) in (bool, int, float, str):
         if isinstance(value, str):
             if len(value) > _MAX_PAYLOAD_BYTES:
                 raise ValueError("Event payload exceeds its UTF-8 byte limit")
-            if _HOST_PATH.match(value.lstrip()):
+            if (path_value and value) or _HOST_PATH.search(value.lstrip()):
                 raise ValueError("Event payload must not contain host paths")
         yield json.dumps(value, allow_nan=False, ensure_ascii=False)
     else:
