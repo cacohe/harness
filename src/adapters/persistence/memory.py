@@ -6,7 +6,7 @@ from datetime import datetime
 from threading import Lock
 from typing import Any, TypeAlias, TypeVar
 
-from src.core.artifacts import ArtifactRef, snapshot_artifact_ref
+from src.core.artifacts import ArtifactRef, ExternalizedContent, snapshot_artifact_ref
 from src.core.commands import RunLimits, ToolCallRequest
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.events import DomainEvent, DomainEventType, _is_canonical_timestamp
@@ -269,6 +269,8 @@ def _rebuild(value: object) -> Any:
             return snapshot_artifact_ref(value)
         except ValueError:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+    if type(value) is ExternalizedContent:
+        return ExternalizedContent(value.inline_content, value.artifacts, value.summary)
     if type(value) is tuple:
         return tuple(_rebuild(item) for item in value)
     if type(value) is frozenset and all(type(item) is str for item in value):
@@ -335,6 +337,24 @@ def _intent_value(value: object) -> _IntentValue:
                 ref.sha256,
                 ref.name,
                 object.__getattribute__(ref, "_metadata_json"),
+            ),
+        )
+    if type(value) is ExternalizedContent:
+        rebuilt = ExternalizedContent(value.inline_content, value.artifacts, value.summary)
+        inline = rebuilt.inline_content
+        return (
+            "externalized_content",
+            (
+                None
+                if inline is None
+                else (
+                    inline.media_type,
+                    inline.size_bytes,
+                    object.__getattribute__(inline, "_encoded"),
+                    object.__getattribute__(inline, "_is_binary"),
+                ),
+                _intent_value(rebuilt.artifacts),
+                rebuilt.summary,
             ),
         )
     if type(value) is RunStatus or type(value) is RunErrorCode or type(value) is DomainEventType:

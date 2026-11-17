@@ -59,6 +59,10 @@ class IdGenerator(Protocol):
 
     def event(self) -> EventId: ...
 
+    def step(self) -> str: ...
+
+    def model_call(self) -> str: ...
+
 
 class Clock(Protocol):
     def now(self) -> datetime:

@@ -211,7 +211,7 @@ def test_waiting_for_approval_reserves_the_session() -> None:
         )
         transition = TaskStateMachine.apply(
             transition.state,
-            FinishModelCall(*identity, "step", "model", "", request, context=context),
+            FinishModelCall(*identity, "step", "model", "", (request,), context=context),
         )
         transition = TaskStateMachine.apply(
             transition.state,

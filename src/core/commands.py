@@ -5,6 +5,7 @@ from typing import TypeAlias
 from unicodedata import category
 
 from src.core.approval import validate_approval_binding
+from src.core.artifacts import ArtifactRef, ExternalizedContent, snapshot_artifact_ref
 from src.core.errors import InvalidTransition, RunFailure
 from src.core.events import _contains_host_path
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
@@ -82,6 +83,11 @@ class ResumeRun(_RunCommand):
 
 
 @dataclass(frozen=True)
+class AdvanceRun(_RunCommand):
+    """Request one coordinator-owned model/tool step for a running Run."""
+
+
+@dataclass(frozen=True)
 class CancelRun(_RunCommand):
     pass
 
@@ -149,7 +155,18 @@ class FinishModelCall(_RunCommand):
     step_id: str
     model_call_id: str
     result: str
-    tool_request: ToolCallRequest | None = None
+    tool_requests: tuple[ToolCallRequest, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.tool_requests) is not tuple:
+            raise InvalidTransition
+        requests = self.tool_requests
+        if len(requests) > 64:
+            raise InvalidTransition
+        snapshots = tuple(snapshot_tool_call(request) for request in requests)
+        if len({request.tool_call_id for request in snapshots}) != len(snapshots):
+            raise InvalidTransition
+        object.__setattr__(self, "tool_requests", snapshots)
 
 
 @dataclass(frozen=True)
@@ -165,12 +182,26 @@ class FinishToolCall(_RunCommand):
     step_id: str
     model_call_id: str
     tool_call_id: str
-    result: str | RunFailure
+    result: ExternalizedContent | RunFailure
 
 
 @dataclass(frozen=True)
 class CompleteRun(_RunCommand):
     final_text: str
+    artifacts: tuple[ArtifactRef, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.artifacts) is not tuple
+            or len(self.artifacts) > 16
+            or any(type(ref) is not ArtifactRef for ref in self.artifacts)
+        ):
+            raise InvalidTransition
+        try:
+            snapshots = tuple(snapshot_artifact_ref(ref) for ref in self.artifacts)
+        except ValueError:
+            raise InvalidTransition from None
+        object.__setattr__(self, "artifacts", snapshots)
 
 
 @dataclass(frozen=True)
@@ -180,6 +211,7 @@ class FailRun(_RunCommand):
 
 CoreCommand: TypeAlias = (
     SubmitRun
+    | AdvanceRun
     | ResumeRun
     | CancelRun
     | DecideToolCall

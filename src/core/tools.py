@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
 
+from src.core.approval import validate_approval_binding
 from src.core.artifacts import ArtifactRef, ExternalizedContent, InlineContent
 from src.core.commands import ToolCallRequest, _check_child_id, snapshot_tool_call
 from src.core.errors import RunErrorCode, RunFailure
@@ -20,11 +21,17 @@ class ToolSpec:
     name: str
     description: str
     input_schema_json: str = field(repr=False)
+    requires_approval: bool = False
+    approval_scope: str = "execute"
+    workspace_id: str = "default"
 
     def __post_init__(self) -> None:
         _check_child_id(self.name)
         validate_bounded_text(self.description, _MAX_DESCRIPTION_BYTES)
         validate_json_text(self.input_schema_json, _MAX_SCHEMA_BYTES, allow_boolean_root=True)
+        if type(self.requires_approval) is not bool:
+            raise ValueError("Tool approval requirement must be explicit")
+        validate_approval_binding(self.approval_scope, self.workspace_id)
 
 
 class ToolApproval(StrEnum):

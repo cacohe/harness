@@ -5,6 +5,7 @@ from itertools import product
 
 import pytest
 from src.adapters.persistence.memory import InMemoryRunJournal
+from src.core.artifacts import ExternalizedContent, InlineContent
 from src.core.commands import (
     CancelRun,
     CommandContext,
@@ -73,7 +74,15 @@ def begin_step(
     return (
         StartStep(RUN, SESSION, step_id, context=context()),
         StartModelCall(RUN, SESSION, step_id, "model", context=context()),
-        FinishModelCall(RUN, SESSION, step_id, "model", "model result", request, context=context()),
+        FinishModelCall(
+            RUN,
+            SESSION,
+            step_id,
+            "model",
+            "model result",
+            (request,) if request is not None else (),
+            context=context(),
+        ),
     )
 
 
@@ -98,7 +107,15 @@ def resume() -> ResumeRun:
 
 
 def finish_tool(step_id: str = "step", tool_call_id: str = "tool") -> FinishToolCall:
-    return FinishToolCall(RUN, SESSION, step_id, "model", tool_call_id, "result", context=context())
+    return FinishToolCall(
+        RUN,
+        SESSION,
+        step_id,
+        "model",
+        tool_call_id,
+        ExternalizedContent(inline_content=InlineContent("result", "text/plain")),
+        context=context(),
+    )
 
 
 def finish_step(step_id: str = "step") -> FinishStep:
@@ -267,7 +284,7 @@ def test_child_lifecycles_require_the_current_step_and_matching_parent_call():
     settled = advance(tool_open, finish_tool())
     assert settled.current_step is not None
     assert settled.current_step.tool_call is not None
-    assert settled.current_step.tool_call.result == "result"
+    assert settled.current_step.tool_call.result.inline_content.value == "result"
     assert advance(settled, finish_step()).current_step is None
 
 
@@ -321,12 +338,24 @@ def test_elapsed_budget_uses_only_explicit_monotonic_time():
 def test_inline_result_budget_measures_utf8_bytes():
     running = advance(initial(RunLimits(2, 10, 12)), submit(), *begin_step())
     started = advance(running, replace(ask_approval(), requires_approval=False, context=context()))
-    at_limit = advance(started, replace(finish_tool(), result="é" * 6))
+    at_limit = advance(
+        started,
+        replace(
+            finish_tool(),
+            result=ExternalizedContent(inline_content=InlineContent("é" * 6, "text/plain")),
+        ),
+    )
     assert at_limit.current_step is not None
     assert at_limit.current_step.tool_call is not None
-    assert at_limit.current_step.tool_call.result == "é" * 6
+    assert at_limit.current_step.tool_call.result.inline_content.value == "é" * 6
     with pytest.raises(InvalidTransition):
-        advance(started, replace(finish_tool(), result="é" * 7))
+        advance(
+            started,
+            replace(
+                finish_tool(),
+                result=ExternalizedContent(inline_content=InlineContent("é" * 7, "text/plain")),
+            ),
+        )
 
 
 def test_event_metadata_must_cover_the_events_actually_emitted():
@@ -427,8 +456,8 @@ def test_event_pool_rejects_equal_ids_before_they_can_be_consumed():
         {"elapsed_seconds": 11},
         {"used_step_ids": frozenset({"a", "b", "c"})},
         {"used_step_ids": ["step", "step"]},
-        {"used_tool_call_ids": frozenset({"a", "b", "c"})},
-        {"used_tool_call_ids": frozenset({"unowned"})},
+        {"used_tool_call_ids": frozenset(f"tool-{index}" for index in range(129))},
+        {"used_tool_call_ids": ["unowned"]},
         {"final_text": "premature"},
         {"failure": FAILURE},
         {"status": "running"},
@@ -457,7 +486,14 @@ def test_snapshot_cannot_skip_resume_or_smuggle_result_while_waiting():
             approved,
             current_step=replace(
                 approved.current_step,
-                tool_call=replace(approved.current_step.tool_call, result="injected"),
+                tool_calls=(
+                    replace(
+                        approved.current_step.tool_call,
+                        result=ExternalizedContent(
+                            inline_content=InlineContent("injected", "text/plain")
+                        ),
+                    ),
+                ),
             ),
         )
     with pytest.raises(InvalidTransition):
@@ -486,7 +522,7 @@ def test_required_approval_cannot_be_erased_from_restored_tool(outcome):
         replace(
             snapshot,
             status=RunStatus.RUNNING,
-            current_step=replace(step, tool_call=replace(step.tool_call, approval=None)),
+            current_step=replace(step, tool_calls=(replace(step.tool_call, approval=None),)),
         )
 
 
@@ -503,7 +539,7 @@ def test_tool_without_required_approval_can_settle_but_cannot_gain_approval():
             running,
             current_step=replace(
                 step,
-                tool_call=replace(step.tool_call, approval=ApprovalState(True, resumed=True)),
+                tool_calls=(replace(step.tool_call, approval=ApprovalState(True, resumed=True)),),
             ),
         )
 
@@ -520,8 +556,11 @@ def test_snapshot_rejects_missing_or_mismatched_child_ownership():
         {
             "current_step": replace(
                 step,
-                tool_call=replace(
-                    step.tool_call, request=replace(step.tool_call.request, tool_call_id="other")
+                tool_calls=(
+                    replace(
+                        step.tool_call,
+                        request=replace(step.tool_call.request, tool_call_id="other"),
+                    ),
                 ),
             )
         },
@@ -551,8 +590,10 @@ def test_rejects_unsafe_ids_at_first_acceptance(kind, value):
         if kind == "tool":
             command = replace(
                 finish_model,
-                tool_request=ToolCallRequest(
-                    value, "lookup", "{}", approval_scope="read", workspace_id="work"
+                tool_requests=(
+                    ToolCallRequest(
+                        value, "lookup", "{}", approval_scope="read", workspace_id="work"
+                    ),
                 ),
             )
         TaskStateMachine.apply(state, command)
@@ -565,7 +606,11 @@ def test_approved_tool_request_can_be_restored_and_resumed():
     )
     start_step, start_model, finish_model = begin_step()
     model_done = advance(
-        initial(), submit(), start_step, start_model, replace(finish_model, tool_request=request)
+        initial(),
+        submit(),
+        start_step,
+        start_model,
+        replace(finish_model, tool_requests=(request,)),
     )
     step = model_done.current_step
     assert step is not None and step.model_call is not None
@@ -577,7 +622,9 @@ def test_approved_tool_request_can_be_restored_and_resumed():
     persisted_request = ToolCallRequest(**vars(request))
     restored = replace(
         transition.state,
-        current_step=replace(step, tool_call=replace(step.tool_call, request=persisted_request)),
+        current_step=replace(
+            step, tool_calls=(replace(step.tool_call, request=persisted_request),)
+        ),
     )
     ready = advance(restored, decide(), resume())
     assert ready.current_step is not None and ready.current_step.tool_call is not None
@@ -604,8 +651,10 @@ def test_rejects_invalid_or_oversized_tool_request_payload(arguments_json):
     with pytest.raises(InvalidTransition) as error:
         command = replace(
             finish_model,
-            tool_request=ToolCallRequest(
-                "tool", "lookup", arguments_json, approval_scope="read", workspace_id="work"
+            tool_requests=(
+                ToolCallRequest(
+                    "tool", "lookup", arguments_json, approval_scope="read", workspace_id="work"
+                ),
             ),
         )
         TaskStateMachine.apply(running, command)
@@ -656,7 +705,7 @@ def test_resumed_tool_request_uses_original_journaled_binding(decision):
     )
     start_step, start_model, finish_model = begin_step()
     running = advance(initial(), submit(), start_step, start_model)
-    waiting = advance(running, replace(finish_model, tool_request=request), ask_approval())
+    waiting = advance(running, replace(finish_model, tool_requests=(request,)), ask_approval())
     object.__setattr__(request, "approval_scope", "changed-after-capture")
 
     async def recover():
@@ -713,7 +762,7 @@ def test_tool_call_snapshots_use_trusted_fields(boundary, bad_field, fields_kind
         if boundary == "state":
             start_step, start_model, finish_model = begin_step()
             running = advance(initial(), submit(), start_step, start_model)
-            current = advance(running, replace(finish_model, tool_request=request)).current_step
+            current = advance(running, replace(finish_model, tool_requests=(request,))).current_step
             return current.model_call.tool_request
         if boundary == "tool":
             return ToolRequest(

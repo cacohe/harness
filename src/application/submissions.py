@@ -1,7 +1,7 @@
 import hashlib
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from src.core.commands import CommandContext, RunLimits, SubmitRun
 from src.core.errors import InvalidTransition, RunErrorCode
@@ -60,8 +60,13 @@ class SubmissionService:
             context=CommandContext(self._clock.now(), 0, (self._ids.event(),)),
         )
         transition = TaskStateMachine.apply(RunState.create(command, self._limits), command)
+        persisted_state = replace(
+            transition.state,
+            journal_version=head.version + 1,
+            journal_sequence=head.sequence + len(transition.events) + 1,
+        )
         batch = JournalCommit(
-            state=transition.state,
+            state=persisted_state,
             events=transition.events,
             submission=SubmissionRecord(session_id, run_id, submission_id, digest),
             transcript=(TranscriptEntry(session_id, run_id, submission_id, "user", message),),
@@ -75,7 +80,7 @@ class SubmissionService:
                 if accepted is not None:
                     return accepted
             raise
-        return AcceptedRun(transition.state, receipt.version)
+        return AcceptedRun(persisted_state, receipt.version)
 
     async def _replay(
         self,
@@ -175,7 +180,12 @@ def _initial_state(state: RunState | None) -> RunState:
             or state.used_tool_call_ids
             or state.current_step is not None
             or state.final_text is not None
+            or state.final_artifacts
             or state.failure is not None
+            or type(state.journal_version) is not int
+            or state.journal_version < 1
+            or type(state.journal_sequence) is not int
+            or state.journal_sequence < 2
         ):
             raise ValueError
         limits = state.limits
@@ -197,6 +207,8 @@ def _initial_state(state: RunState | None) -> RunState:
             version=1,
             status=RunStatus.RUNNING,
             elapsed_seconds=state.elapsed_seconds,
+            journal_version=state.journal_version,
+            journal_sequence=state.journal_sequence,
         )
     except (AttributeError, OverflowError, TypeError, ValueError):
         raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None

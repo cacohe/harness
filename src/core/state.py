@@ -1,9 +1,10 @@
-import math
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import TypeAlias, assert_never
 
+from src.core.artifacts import ArtifactRef, ExternalizedContent, snapshot_artifact_ref
 from src.core.commands import (
+    AdvanceRun,
     CancelRun,
     CompleteRun,
     CoreCommand,
@@ -52,7 +53,7 @@ class ToolCallState:
     request: ToolCallRequest
     requires_approval: bool
     approval: ApprovalState | None = None
-    result: str | RunFailure | None = None
+    result: ExternalizedContent | RunFailure | None = None
 
     @property
     def tool_call_id(self) -> str:
@@ -69,7 +70,11 @@ class ToolCallState:
 class ModelCallState:
     model_call_id: str
     result: str | None = None
-    tool_request: ToolCallRequest | None = None
+    tool_requests: tuple[ToolCallRequest, ...] = ()
+
+    @property
+    def tool_request(self) -> ToolCallRequest | None:
+        return self.tool_requests[0] if len(self.tool_requests) == 1 else None
 
     @property
     def tool_call_id(self) -> str | None:
@@ -80,7 +85,15 @@ class ModelCallState:
 class StepState:
     step_id: str
     model_call: ModelCallState | None = None
-    tool_call: ToolCallState | None = None
+    tool_calls: tuple[ToolCallState, ...] = ()
+    next_tool_index: int = 0
+
+    @property
+    def tool_call(self) -> ToolCallState | None:
+        if not self.tool_calls:
+            return None
+        index = min(self.next_tool_index, len(self.tool_calls) - 1)
+        return self.tool_calls[index]
 
 
 @dataclass(frozen=True)
@@ -97,10 +110,15 @@ class RunState:
     used_step_ids: frozenset[str] = frozenset()
     used_tool_call_ids: frozenset[str] = frozenset()
     final_text: str | None = None
+    final_artifacts: tuple[ArtifactRef, ...] = ()
     failure: RunFailure | None = None
+    journal_version: int = 0
+    journal_sequence: int = 0
 
     def __post_init__(self) -> None:
-        _validate_state(self)
+        from src.core.state_validation import validate_state
+
+        validate_state(self)
 
     @classmethod
     def create(cls, command: SubmitRun, limits: RunLimits, *, version: int = 0) -> "RunState":
@@ -190,7 +208,7 @@ def _advance(state: RunState, command: CoreCommand) -> tuple[RunState, _EventFac
         return _fail(state, command.failure)
     if state.status is RunStatus.WAITING_APPROVAL:
         return _approval(state, command)
-    if isinstance(command, (SubmitRun, DecideToolCall, ResumeRun)):
+    if isinstance(command, (SubmitRun, AdvanceRun, DecideToolCall, ResumeRun)):
         raise InvalidTransition
     return _advance_running(state, command)
 
@@ -212,7 +230,12 @@ def _advance_running(
             if state.current_step is not None:
                 raise InvalidTransition
             _check_text(state, command.final_text)
-            return _close(state, RunStatus.COMPLETED, final_text=command.final_text), (
+            return _close(
+                state,
+                RunStatus.COMPLETED,
+                final_text=command.final_text,
+                final_artifacts=command.artifacts,
+            ), (
                 DomainEventType.RUN_COMPLETED,
                 {},
             )
@@ -232,8 +255,8 @@ def _advance_running(
             model = step.model_call
             if model is None or model.result is None:
                 raise InvalidTransition
-            if model.tool_call_id is not None and (
-                step.tool_call is None or not step.tool_call.settled
+            if step.next_tool_index != len(model.tool_requests) or any(
+                not tool.settled for tool in step.tool_calls
             ):
                 raise InvalidTransition
             return replace(state, current_step=None), None
@@ -250,10 +273,8 @@ def _advance_running(
             if model.result is not None:
                 raise InvalidTransition
             _check_text(state, command.result)
-            request = command.tool_request
-            if request is not None:
-                request = snapshot_tool_call(request)
-            model = replace(model, result=command.result, tool_request=request)
+            requests = tuple(snapshot_tool_call(request) for request in command.tool_requests)
+            model = replace(model, result=command.result, tool_requests=requests)
             return replace(state, current_step=replace(step, model_call=model)), None
         case StartToolCall():
             return _start_tool(state, command)
@@ -261,15 +282,39 @@ def _advance_running(
             step = _step(state, command.step_id)
             _model(step, command.model_call_id)
             _check_child_id(command.tool_call_id)
-            tool = step.tool_call
+            if not 0 <= step.next_tool_index < len(step.tool_calls):
+                raise InvalidTransition
+            tool = step.tool_calls[step.next_tool_index]
             if tool is None or tool.tool_call_id != command.tool_call_id or tool.settled:
                 raise InvalidTransition
-            if isinstance(command.result, str):
-                _check_text(state, command.result)
-            elif not isinstance(command.result, RunFailure):
+            if type(command.result) is ExternalizedContent:
+                try:
+                    result: ExternalizedContent | RunFailure = ExternalizedContent(
+                        command.result.inline_content,
+                        command.result.artifacts,
+                        command.result.summary,
+                    )
+                except ValueError:
+                    raise InvalidTransition from None
+            elif type(command.result) is RunFailure:
+                try:
+                    result = RunFailure(command.result.code)
+                except ValueError:
+                    raise InvalidTransition from None
+            else:
                 raise InvalidTransition
-            tool = replace(tool, result=command.result)
-            return replace(state, current_step=replace(step, tool_call=tool)), None
+            tool = replace(tool, result=result)
+            tools = (
+                *step.tool_calls[: step.next_tool_index],
+                tool,
+                *step.tool_calls[step.next_tool_index + 1 :],
+            )
+            return replace(
+                state,
+                current_step=replace(
+                    step, tool_calls=tools, next_tool_index=step.next_tool_index + 1
+                ),
+            ), None
     assert_never(command)
 
 
@@ -277,11 +322,13 @@ def _start_tool(state: RunState, command: StartToolCall) -> tuple[RunState, _Eve
     step = _step(state, command.step_id)
     model = _model(step, command.model_call_id)
     _check_child_id(command.tool_call_id)
-    request = model.tool_request
+    if not 0 <= step.next_tool_index < len(model.tool_requests):
+        raise InvalidTransition
+    request = model.tool_requests[step.next_tool_index]
     if (
         request is None
         or request.tool_call_id != command.tool_call_id
-        or step.tool_call is not None
+        or len(step.tool_calls) != step.next_tool_index
     ):
         raise InvalidTransition
     if type(command.requires_approval) is not bool:
@@ -290,7 +337,7 @@ def _start_tool(state: RunState, command: StartToolCall) -> tuple[RunState, _Eve
     tool = ToolCallState(request, requires_approval=command.requires_approval, approval=approval)
     next_state = replace(
         state,
-        current_step=replace(step, tool_call=tool),
+        current_step=replace(step, tool_calls=(*step.tool_calls, tool)),
         used_tool_call_ids=state.used_tool_call_ids | {request.tool_call_id},
         status=RunStatus.RUNNING if approval is None else RunStatus.WAITING_APPROVAL,
     )
@@ -304,17 +351,25 @@ def _start_tool(state: RunState, command: StartToolCall) -> tuple[RunState, _Eve
 
 def _approval(state: RunState, command: CoreCommand) -> tuple[RunState, _EventFact]:
     step = state.current_step
-    if step is None or step.tool_call is None:
+    if step is None or not step.tool_calls or step.next_tool_index >= len(step.tool_calls):
         raise InvalidTransition
-    tool = step.tool_call
+    tool = step.tool_calls[step.next_tool_index]
     approval = tool.approval
     if approval is None:
         raise InvalidTransition
 
     if isinstance(command, ResumeRun) and approval.approved is not None:
         tool = replace(tool, approval=replace(approval, resumed=True))
+        next_index = step.next_tool_index + (approval.approved is False)
+        tools = (
+            *step.tool_calls[: step.next_tool_index],
+            tool,
+            *step.tool_calls[step.next_tool_index + 1 :],
+        )
         return replace(
-            state, status=RunStatus.RUNNING, current_step=replace(step, tool_call=tool)
+            state,
+            status=RunStatus.RUNNING,
+            current_step=replace(step, tool_calls=tools, next_tool_index=next_index),
         ), (DomainEventType.RUN_RESUMED, {})
     if isinstance(command, DecideToolCall):
         _check_child_id(command.tool_call_id)
@@ -325,7 +380,12 @@ def _approval(state: RunState, command: CoreCommand) -> tuple[RunState, _EventFa
         and type(command.approved) is bool
     ):
         tool = replace(tool, approval=ApprovalState(command.approved))
-        return replace(state, current_step=replace(step, tool_call=tool)), (
+        tools = (
+            *step.tool_calls[: step.next_tool_index],
+            tool,
+            *step.tool_calls[step.next_tool_index + 1 :],
+        )
+        return replace(state, current_step=replace(step, tool_calls=tools)), (
             DomainEventType.TOOL_CALL_DECIDED,
             {"tool_call_id": tool.tool_call_id, "approved": command.approved},
         )
@@ -352,129 +412,26 @@ def _check_text(state: RunState, text: object) -> None:
     _check_bounded_text(text, state.limits.max_inline_result_bytes)
 
 
-def _validate_state(state: RunState) -> None:
-    if (
-        type(state.run_id) is not RunId
-        or type(state.session_id) is not SessionId
-        or type(state.submission_id) is not SubmissionId
-        or type(state.profile_id) is not ProfileId
-        or type(state.limits) is not RunLimits
-        or type(state.status) is not RunStatus
-        or type(state.version) is not int
-        or state.version < 0
-        or type(state.used_step_ids) is not frozenset
-        or type(state.used_tool_call_ids) is not frozenset
-        or not len(state.used_tool_call_ids) <= state.steps_started <= state.limits.max_steps
-    ):
-        raise InvalidTransition
-    for identifiers in (state.used_step_ids, state.used_tool_call_ids):
-        for identifier in identifiers:
-            _check_child_id(identifier)
-
-    elapsed = state.elapsed_seconds
-    if type(elapsed) not in (int, float) or elapsed < 0:
-        raise InvalidTransition
-    try:
-        if not math.isfinite(elapsed):
-            raise InvalidTransition
-    except OverflowError:
-        raise InvalidTransition from None
-
-    status = state.status
-    if status is RunStatus.CREATED:
-        if elapsed != 0 or state.used_step_ids:
-            raise InvalidTransition
-    elif state.version <= state.steps_started:
-        raise InvalidTransition
-    if status in (RunStatus.FAILED, RunStatus.CANCELLED):
-        if type(state.failure) is not RunFailure or (
-            (state.failure.code is RunErrorCode.CANCELLED) != (status is RunStatus.CANCELLED)
-        ):
-            raise InvalidTransition
-    elif state.failure is not None or elapsed > state.limits.max_elapsed_seconds:
-        raise InvalidTransition
-    if status is RunStatus.COMPLETED:
-        _check_text(state, state.final_text)
-    elif state.final_text is not None:
-        raise InvalidTransition
-
-    if state.current_step is None:
-        if status is RunStatus.WAITING_APPROVAL:
-            raise InvalidTransition
-    elif status in (RunStatus.RUNNING, RunStatus.WAITING_APPROVAL):
-        _validate_step(state, state.current_step)
-    else:
-        raise InvalidTransition
-
-
-def _validate_step(state: RunState, step: StepState) -> None:
-    if type(step) is not StepState:
-        raise InvalidTransition
-    _check_child_id(step.step_id)
-    if step.step_id not in state.used_step_ids:
-        raise InvalidTransition
-
-    request = None
-    model = step.model_call
-    if model is not None:
-        if type(model) is not ModelCallState:
-            raise InvalidTransition
-        _check_child_id(model.model_call_id)
-        if model.result is not None:
-            _check_text(state, model.result)
-        request = model.tool_request
-        if request is not None:
-            if type(request) is not ToolCallRequest or model.result is None:
-                raise InvalidTransition
-
-    tool = step.tool_call
-    waiting = state.status is RunStatus.WAITING_APPROVAL
-    if tool is None:
-        if (
-            waiting
-            or len(state.used_tool_call_ids) >= state.steps_started
-            or (request is not None and request.tool_call_id in state.used_tool_call_ids)
-        ):
-            raise InvalidTransition
-        return
-    if (
-        type(tool) is not ToolCallState
-        or request is None
-        or type(tool.request) is not ToolCallRequest
-        or tool.request != request
-        or request.tool_call_id not in state.used_tool_call_ids
-        or type(tool.requires_approval) is not bool
-    ):
-        raise InvalidTransition
-
-    approval = tool.approval
-    if tool.requires_approval != (approval is not None):
-        raise InvalidTransition
-    if approval is not None:
-        if (
-            type(approval) is not ApprovalState
-            or type(approval.resumed) is not bool
-            or (approval.approved is not None and type(approval.approved) is not bool)
-            or (approval.resumed and approval.approved is None)
-        ):
-            raise InvalidTransition
-    if waiting != (approval is not None and not approval.resumed):
-        raise InvalidTransition
-    if tool.result is not None:
-        if waiting or (approval is not None and approval.approved is False):
-            raise InvalidTransition
-        if type(tool.result) is not RunFailure:
-            _check_text(state, tool.result)
-
-
 def _close(
     state: RunState,
     status: RunStatus,
     *,
     final_text: str | None = None,
+    final_artifacts: tuple[ArtifactRef, ...] = (),
     failure: RunFailure | None = None,
 ) -> RunState:
-    return replace(state, status=status, current_step=None, final_text=final_text, failure=failure)
+    try:
+        artifacts = tuple(snapshot_artifact_ref(ref) for ref in final_artifacts)
+    except ValueError:
+        raise InvalidTransition from None
+    return replace(
+        state,
+        status=status,
+        current_step=None,
+        final_text=final_text,
+        final_artifacts=artifacts,
+        failure=failure,
+    )
 
 
 def _fail(state: RunState, failure: RunFailure) -> tuple[RunState, _EventFact]:
