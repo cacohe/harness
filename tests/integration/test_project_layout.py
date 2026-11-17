@@ -64,6 +64,10 @@ FORBIDDEN_IMPORTS = {
         "docker",
     ),
     "core": (
+        "src.adapters",
+        "src.application",
+        "src.config",
+        "src.logger",
         "src.persistence",
         "src.demo",
         "src.llm.litellm",
@@ -75,8 +79,10 @@ FORBIDDEN_IMPORTS = {
     ),
 }
 
-# Every exception must explain why dependency inversion cannot represent it.
-ARCHITECTURE_ALLOWLIST: dict[tuple[str, str], str] = {}
+# Task 14 removes this exception with the legacy event emitter.
+ARCHITECTURE_ALLOWLIST = {
+    ("src/core/event.py", "src.logger.get_logger"): "Legacy emitter kept during the migration.",
+}
 
 
 def _resolved_imports(path: Path, root: Path) -> list[tuple[int, str]]:
@@ -96,10 +102,7 @@ def _resolved_imports(path: Path, root: Path) -> list[tuple[int, str]]:
                     module = name
             else:
                 module = node.module or ""
-            imports.append((node.lineno, module))
-            imports.extend(
-                (node.lineno, f"{module}.{alias.name}") for alias in node.names if alias.name != "*"
-            )
+            imports.extend((node.lineno, f"{module}.{alias.name}") for alias in node.names)
         elif (
             isinstance(node, ast.Call)
             and len(node.args) >= 1
@@ -159,6 +162,10 @@ def test_schema_and_core_dependency_direction_is_enforced():
         ("core", "import fastmcp"),
         ("core", "import docker"),
         ("core", "importlib.import_module('src.demo.agent')"),
+        ("core", "import src.adapters.tools as tools"),
+        ("core", "from src.application import runtime"),
+        ("core", "from src import config"),
+        ("core", "from .. import logger"),
     ],
 )
 @pytest.mark.architecture
@@ -171,6 +178,24 @@ def test_architecture_gate_rejects_concrete_dependency_bypasses(
     (target / "probe.py").write_text(f"{source}{statement}\n", encoding="utf-8")
 
     assert _architecture_violations(tmp_path)
+
+
+@pytest.mark.architecture
+def test_legacy_logger_exception_does_not_allow_new_core_dependencies(tmp_path: Path):
+    core = tmp_path / "src" / "core"
+    core.mkdir(parents=True)
+    (core / "events.py").write_text("from src.logger import get_logger\n", encoding="utf-8")
+    (core / "event.py").write_text(
+        "from src.logger import get_logger\nimport src.config\nimport src.logger\n",
+        encoding="utf-8",
+    )
+
+    violations = _architecture_violations(tmp_path)
+
+    assert all(not result.startswith("src/core/event.py:1:") for result in violations)
+    assert "src/core/event.py:2:src.config" in violations
+    assert "src/core/event.py:3:src.logger" in violations
+    assert "src/core/events.py:1:src.logger.get_logger" in violations
 
 
 @pytest.mark.parametrize(
