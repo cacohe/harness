@@ -19,6 +19,7 @@ from src.core.commands import (
     StartStep,
     StartToolCall,
     SubmitRun,
+    ToolCallRequest,
 )
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.events import DomainEventType
@@ -57,13 +58,14 @@ def advance(state: RunState, *commands: CoreCommand) -> RunState:
     return state
 
 
-def begin_step(step_id: str = "step", tool_call_id: str | None = "tool") -> tuple[CoreCommand, ...]:
+def begin_step(
+    step_id: str = "step", tool_call_id: str | None = "tool"
+) -> tuple[StartStep, StartModelCall, FinishModelCall]:
+    request = ToolCallRequest(tool_call_id, "lookup", "{}") if tool_call_id is not None else None
     return (
         StartStep(RUN, SESSION, step_id, context=context()),
         StartModelCall(RUN, SESSION, step_id, "model", context=context()),
-        FinishModelCall(
-            RUN, SESSION, step_id, "model", "model result", tool_call_id, context=context()
-        ),
+        FinishModelCall(RUN, SESSION, step_id, "model", "model result", request, context=context()),
     )
 
 
@@ -319,17 +321,9 @@ def test_inline_result_budget_measures_utf8_bytes():
         advance(started, replace(finish_tool(), result="é" * 7))
 
 
-def test_event_metadata_must_match_the_events_actually_emitted():
-    running = advance(initial(), submit())
+def test_event_metadata_must_cover_the_events_actually_emitted():
     with pytest.raises(InvalidTransition):
         advance(initial(), replace(submit(), context=context()))
-    with pytest.raises(InvalidTransition):
-        advance(running, StartStep(RUN, SESSION, "step", context=context("unexpected")))
-    with pytest.raises(InvalidTransition):
-        advance(
-            running,
-            replace(complete(), context=CommandContext(NOW, 0, (EventId("a"), EventId("b")))),
-        )
 
 
 def test_generated_sequences_preserve_state_machine_invariants():
@@ -384,3 +378,169 @@ def test_generated_sequences_preserve_state_machine_invariants():
         for command in (submit(), resume(), decide(), finish_tool()):
             with pytest.raises(InvalidTransition):
                 TaskStateMachine.apply(state, command)
+
+
+def test_normal_and_limited_start_accept_same_event_pool():
+    limits = RunLimits(1, 10, 32)
+    ready = advance(initial(limits), submit())
+    exhausted = advance(ready, *begin_step(tool_call_id=None), finish_step())
+    pool = (EventId("first"), EventId("second"))
+    command = StartStep(RUN, SESSION, "new", context=CommandContext(NOW, 0, pool))
+
+    normal = TaskStateMachine.apply(ready, command)
+    limited = TaskStateMachine.apply(exhausted, command)
+    assert normal.events == ()
+    assert normal.remaining_event_ids == pool
+    assert tuple(event.event_id for event in limited.events) == pool[:1]
+    assert limited.remaining_event_ids == pool[1:]
+    assert limited.state.failure == RunFailure(RunErrorCode.LIMIT_EXCEEDED)
+    with pytest.raises(InvalidTransition):
+        TaskStateMachine.apply(exhausted, replace(command, context=context()))
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"run_id": SessionId("run")},
+        {"session_id": "session"},
+        {"submission_id": ProfileId("submission")},
+        {"profile_id": SubmissionId("profile")},
+        {"version": True},
+        {"version": -1},
+        {"version": 0},
+        {"elapsed_seconds": float("nan")},
+        {"elapsed_seconds": 11},
+        {"used_step_ids": frozenset({"a", "b", "c"})},
+        {"used_step_ids": ["step", "step"]},
+        {"used_tool_call_ids": frozenset({"a", "b", "c"})},
+        {"used_tool_call_ids": frozenset({"unowned"})},
+        {"final_text": "premature"},
+        {"failure": FAILURE},
+        {"status": "running"},
+        {"status": RunStatus.WAITING_APPROVAL},
+        {"status": RunStatus.COMPLETED},
+    ],
+)
+def test_running_snapshot_rejects_invalid_direct_construction_and_replacement(changes):
+    running = advance(initial(), submit())
+    with pytest.raises(InvalidTransition):
+        replace(running, **changes)
+    with pytest.raises(InvalidTransition):
+        RunState(**{**vars(running), **changes})
+
+
+def test_snapshot_cannot_skip_resume_or_smuggle_result_while_waiting():
+    waiting = advance(initial(), submit(), *begin_step(), ask_approval())
+    approved = advance(waiting, decide())
+    for state in (waiting, approved):
+        with pytest.raises(InvalidTransition):
+            replace(state, status=RunStatus.RUNNING)
+    assert approved.current_step is not None
+    assert approved.current_step.tool_call is not None
+    with pytest.raises(InvalidTransition):
+        replace(
+            approved,
+            current_step=replace(
+                approved.current_step,
+                tool_call=replace(approved.current_step.tool_call, result="injected"),
+            ),
+        )
+    with pytest.raises(InvalidTransition):
+        replace(
+            waiting,
+            status=RunStatus.COMPLETED,
+            final_text="answer",
+        )
+
+
+def test_snapshot_rejects_missing_or_mismatched_child_ownership():
+    waiting = advance(initial(), submit(), *begin_step(), ask_approval())
+    step = waiting.current_step
+    assert step is not None
+    assert step.tool_call is not None
+    for changes in (
+        {"used_step_ids": frozenset({"other"})},
+        {"used_tool_call_ids": frozenset({"other"})},
+        {"current_step": replace(step, model_call=None)},
+        {
+            "current_step": replace(
+                step,
+                tool_call=replace(
+                    step.tool_call, request=replace(step.tool_call.request, tool_call_id="other")
+                ),
+            )
+        },
+    ):
+        with pytest.raises(InvalidTransition):
+            replace(waiting, **changes)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["/tool123", r"C:\tool123", "file:tool", "use file:secret", "\ud800", "a\nb", "é" * 129],
+)
+@pytest.mark.parametrize("kind", ["step", "model", "tool"])
+def test_rejects_unsafe_ids_at_first_acceptance(kind, value):
+    running = advance(initial(), submit())
+    start_step, start_model, finish_model = begin_step()
+    match kind:
+        case "step":
+            state, command = running, replace(start_step, step_id=value)
+        case "model":
+            state = advance(running, start_step)
+            command = replace(start_model, model_call_id=value)
+        case _:
+            state = advance(running, start_step, start_model)
+            command = finish_model
+    with pytest.raises(InvalidTransition) as error:
+        if kind == "tool":
+            command = replace(finish_model, tool_request=ToolCallRequest(value, "lookup", "{}"))
+        TaskStateMachine.apply(state, command)
+    assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+def test_approved_tool_request_can_be_restored_and_resumed():
+    request = ToolCallRequest("tool", "lookup", '{"query":"weather","city":"北京"}')
+    start_step, start_model, finish_model = begin_step()
+    model_done = advance(
+        initial(), submit(), start_step, start_model, replace(finish_model, tool_request=request)
+    )
+    step = model_done.current_step
+    assert step is not None and step.model_call is not None
+    assert step.model_call.tool_request == request
+    transition = TaskStateMachine.apply(RunState(**vars(model_done)), ask_approval())
+    assert transition.events[0].payload == {"tool_call_id": "tool"}
+    step = transition.state.current_step
+    assert step is not None and step.tool_call is not None
+    persisted_request = ToolCallRequest(**vars(request))
+    restored = replace(
+        transition.state,
+        current_step=replace(step, tool_call=replace(step.tool_call, request=persisted_request)),
+    )
+    ready = advance(restored, decide(), resume())
+    assert ready.current_step is not None and ready.current_step.tool_call is not None
+    assert ready.current_step.tool_call.request == request
+    assert advance(ready, finish_tool(), finish_step(), complete()).status is RunStatus.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "arguments_json",
+    [
+        '["not an object"]',
+        '{"n":NaN}',
+        '{"n":1,"n":2}',
+        '{"local":"C:\\\\temp\\\\host.txt"}',
+        '{"local":"\\u002ftmp\\u002fhost.txt"}',
+        '{"\\ud800":"value"}',
+        '{"text":"' + "é" * 8192 + '"}',
+    ],
+)
+def test_rejects_invalid_or_oversized_tool_request_payload(arguments_json):
+    start_step, start_model, finish_model = begin_step()
+    running = advance(initial(), submit(), start_step, start_model)
+    with pytest.raises(InvalidTransition) as error:
+        command = replace(
+            finish_model, tool_request=ToolCallRequest("tool", "lookup", arguments_json)
+        )
+        TaskStateMachine.apply(running, command)
+    assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION

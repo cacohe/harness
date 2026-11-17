@@ -81,6 +81,10 @@ def _text_outside_web_urls(value: str) -> str:
     return "".join(fragments)
 
 
+def _contains_host_path(value: str) -> bool:
+    return _HOST_PATH.search(_text_outside_web_urls(value.lstrip())) is not None
+
+
 def _json_fragments(value: object, depth: int, *, path_value: bool = False) -> Iterator[str]:
     if isinstance(value, (dict, list)) and depth >= _MAX_PAYLOAD_DEPTH:
         raise ValueError("Event payload is nested too deeply")
@@ -109,7 +113,7 @@ def _json_fragments(value: object, depth: int, *, path_value: bool = False) -> I
         if isinstance(value, str):
             if len(value) > _MAX_PAYLOAD_BYTES:
                 raise ValueError("Event payload exceeds its UTF-8 byte limit")
-            if (path_value and value) or _HOST_PATH.search(_text_outside_web_urls(value.lstrip())):
+            if (path_value and value) or _contains_host_path(value):
                 raise ValueError("Event payload must not contain host paths")
         yield json.dumps(value, allow_nan=False, ensure_ascii=False)
     else:

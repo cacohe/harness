@@ -36,3 +36,9 @@ class RunFailure:
         if not isinstance(self.code, RunErrorCode):
             raise ValueError("Run failure requires a stable error code")
         object.__setattr__(self, "message", _PUBLIC_MESSAGES[self.code])
+
+
+class InvalidTransition(ValueError):
+    def __init__(self) -> None:
+        self.failure = RunFailure(RunErrorCode.INVARIANT_VIOLATION)
+        super().__init__(self.failure.message)

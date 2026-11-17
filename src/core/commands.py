@@ -1,10 +1,16 @@
+import json
 import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TypeAlias
+from unicodedata import category
 
-from src.core.errors import RunFailure
+from src.core.errors import InvalidTransition, RunFailure
+from src.core.events import JsonValue, _contains_host_path, _encode_payload
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
+
+_MAX_CHILD_ID_BYTES = 256
+_MAX_TOOL_ARGUMENT_BYTES = 16_384
 
 
 @dataclass(frozen=True)
@@ -32,6 +38,8 @@ class RunLimits:
 
 @dataclass(frozen=True)
 class CommandContext:
+    """Explicit transition time and a pool of event IDs in allocation order."""
+
     timestamp: datetime
     elapsed_seconds: float
     event_ids: tuple[EventId, ...] = ()
@@ -99,11 +107,31 @@ class StartModelCall(_RunCommand):
 
 
 @dataclass(frozen=True)
+class ToolCallRequest:
+    """Provider-independent request with immutable JSON argument text."""
+
+    tool_call_id: str
+    name: str
+    arguments_json: str
+
+    def __post_init__(self) -> None:
+        _check_child_id(self.tool_call_id)
+        _check_child_id(self.name)
+        _check_bounded_text(self.arguments_json, _MAX_TOOL_ARGUMENT_BYTES)
+        try:
+            arguments = json.loads(self.arguments_json, object_pairs_hook=_unique_json_object)
+            # Reuse the domain JSON rules after decoding escapes and rejecting duplicate keys.
+            _encode_payload(arguments)
+        except (ValueError, RecursionError):
+            raise InvalidTransition from None
+
+
+@dataclass(frozen=True)
 class FinishModelCall(_RunCommand):
     step_id: str
     model_call_id: str
     result: str
-    tool_call_id: str | None = None
+    tool_request: ToolCallRequest | None = None
 
 
 @dataclass(frozen=True)
@@ -146,3 +174,37 @@ CoreCommand: TypeAlias = (
     | CompleteRun
     | FailRun
 )
+
+
+def _check_child_id(value: str) -> None:
+    _check_bounded_text(value, _MAX_CHILD_ID_BYTES)
+    stripped = value.strip()
+    if (
+        not stripped
+        or stripped in (".", "..")
+        or "/" in stripped
+        or "\\" in stripped
+        or _contains_host_path(stripped)
+        or any(category(character) == "Cc" for character in value)
+    ):
+        raise InvalidTransition
+    if len(stripped) > 1 and stripped[0].isascii() and stripped[0].isalpha() and stripped[1] == ":":
+        raise InvalidTransition
+
+
+def _check_bounded_text(text: object, limit: int) -> None:
+    if type(text) is not str or len(text) > limit:
+        raise InvalidTransition
+    try:
+        size = len(text.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise InvalidTransition from None
+    if size > limit:
+        raise InvalidTransition
+
+
+def _unique_json_object(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("Duplicate tool argument key")
+    return result
