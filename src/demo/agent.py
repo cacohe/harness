@@ -126,6 +126,7 @@ class Agent:
         memory_token_budget: int | None = None,
         event_sink: EventSink | None = None,
         owned_resources: list[object] | None = None,
+        profile: AgentProfile | None = None,
     ):
         """
         Create an agent with a model gateway, a context builder, and the local tools.
@@ -141,6 +142,7 @@ class Agent:
             event_sink: Optional destination for Harness lifecycle events.
         """
         self.config = config if config is not None else Config.load()
+        self._profile_override = profile
         self.workspace = (
             workspace
             if isinstance(workspace, Workspace)
@@ -220,6 +222,8 @@ class Agent:
 
     @property
     def profile(self) -> AgentProfile:
+        if self._profile_override is not None:
+            return self._profile_override
         public_settings = {
             "max_steps": self.config.max_steps,
             "max_seconds": self.config.max_seconds,
@@ -230,12 +234,25 @@ class Agent:
         }
         return build_agent_profile(
             system_prompt=self.harness.system_prompt,
-            model_identifier=self.config.llm,
+            model_identifier=getattr(self.llm_gateway, "model", self.config.llm),
             model_settings=public_settings,
             skills=self.skills,
             tools=self.tool_registry.get_all_tools(),
             memory_policy_version="memory-v1" if self.memory_manager is not None else "none-v1",
         )
+
+    def _capability_digest(self) -> str:
+        provider = getattr(self.tool_registry, "capability_digest", None)
+        if provider is not None:
+            return provider()
+        return build_agent_profile(
+            system_prompt="capability-only",
+            model_identifier="capability-only",
+            model_settings={},
+            skills=[],
+            tools=self.tool_registry.get_all_tools(),
+            memory_policy_version="capability-only",
+        ).tools_digest
 
     @classmethod
     def from_config(cls, config: Config, **dependencies) -> "Agent":
@@ -319,7 +336,9 @@ class Agent:
             self._ensure_open,
             ensure_started=self.runtime.start,
             operation_registrar=self.runtime.register_operation,
+            operation_unregistrar=self.runtime.unregister_operation,
             profile_provider=lambda: self.profile,
+            capability_digest_provider=self._capability_digest,
             session_id=session_id,
             execution_store=self.harness.execution_store,
             max_pending_submissions=getattr(self.config, "max_pending_submissions", 0),
@@ -397,7 +416,7 @@ class Agent:
         await self.runtime.aclose(getattr(self.config, "close_timeout_seconds", 30))
 
     async def __aenter__(self) -> "Agent":
-        self._ensure_open()
+        await self.runtime.start()
         return self
 
     async def __aexit__(self, *_args) -> None:

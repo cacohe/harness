@@ -36,12 +36,25 @@ class ExecutionContext:
     message_id: str | None = None
     expected_sequence: int = 0
     deadline: float | None = None
+    submission: SubmissionRecord | None = None
+    capability_digest: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("session_id", "task_id", "execution_id", "turn_id"):
             validate_execution_id(getattr(self, name), name)
         if self.message_id is not None:
             validate_execution_id(self.message_id, "message_id")
+        if self.capability_digest is not None:
+            validate_execution_id(self.capability_digest, "capability_digest")
+        if self.submission is not None:
+            if self.submission.session_id != self.session_id:
+                raise ValueError("submission session identity does not match execution context")
+            if self.submission.task_id != self.task_id:
+                raise ValueError("submission task identity does not match execution context")
+            if self.submission.turn_id != self.turn_id:
+                raise ValueError("submission turn identity does not match execution context")
+            if self.message_id is not None and self.submission.message_id != self.message_id:
+                raise ValueError("submission message identity does not match execution context")
         if (
             isinstance(self.expected_sequence, bool)
             or not isinstance(self.expected_sequence, int)
@@ -202,6 +215,7 @@ class LifecycleTracker:
             self._outcome(event, allow_paused=kind == "execution")
             if identity in self._paused[kind]:
                 raise LifecycleError(f"paused {kind} {identity} must resume before settlement")
+            self._require_closed_children(kind, identity)
             self._settled[kind].add(identity)
 
     def is_settled(self, kind: _Kind, identity: str) -> bool:
@@ -240,6 +254,30 @@ class LifecycleTracker:
         if identity not in self._started[kind]:
             raise LifecycleError(f"{kind} {identity} was not started")
 
+    def _require_closed_children(self, kind: _Kind, identity: str) -> None:
+        child_kinds: dict[_Kind, _Kind] = {
+            "submission": "turn",
+            "turn": "step",
+            "step": "attempt",
+        }
+        child_kind = child_kinds.get(kind)
+        if child_kind is None:
+            return
+        for (candidate_kind, candidate_id), hierarchy in self._parents.items():
+            if candidate_kind != child_kind or candidate_id in self._settled[child_kind]:
+                continue
+            if kind == "submission" and hierarchy[1] == self._parents[(kind, identity)][1]:
+                raise LifecycleError(f"{kind} {identity} has an open {child_kind}")
+            if kind == "turn" and hierarchy[-1] == identity:
+                raise LifecycleError(f"{kind} {identity} has an open {child_kind}")
+            if kind == "step" and hierarchy[-1] == identity:
+                raise LifecycleError(f"{kind} {identity} has an open {child_kind}")
+        if kind == "step":
+            for (candidate_kind, candidate_id), hierarchy in self._parents.items():
+                if candidate_kind == "tool" and candidate_id not in self._settled["tool"]:
+                    if hierarchy[-1] == identity:
+                        raise LifecycleError(f"{kind} {identity} has an open tool")
+
     def _require_open_parent(self, event: PendingSessionEvent | SessionEvent, kind: _Kind) -> None:
         if kind == "step":
             parent_kind: _Kind = "turn"
@@ -253,6 +291,10 @@ class LifecycleTracker:
             raise LifecycleError(f"{kind} parent {parent_kind} was not started")
         if parent_id in self._settled[parent_kind]:
             raise LifecycleError(f"{kind} cannot start under a settled {parent_kind}")
+        parent_hierarchy = self._parents[(parent_kind, parent_id)]
+        child_hierarchy = self._hierarchy(event, kind)
+        if child_hierarchy[: len(parent_hierarchy)] != parent_hierarchy:
+            raise LifecycleError(f"{kind} parent hierarchy does not match")
 
     @staticmethod
     def _outcome(event: PendingSessionEvent | SessionEvent, *, allow_paused: bool) -> str:

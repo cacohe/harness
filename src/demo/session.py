@@ -8,6 +8,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from src.core.async_utils import run_sync
@@ -99,7 +100,9 @@ class AgentSession:
         *,
         ensure_started: Callable[[], Any] | None = None,
         operation_registrar: Callable[[asyncio.Task], Any] | None = None,
+        operation_unregistrar: Callable[[asyncio.Task], Any] | None = None,
         profile_provider: Callable[[], AgentProfile] | None = None,
+        capability_digest_provider: Callable[[], str] | None = None,
         session_id: str | None = None,
         execution_store: ExecutionStore | None = None,
         id_factory: ExecutionIdFactory | None = None,
@@ -131,7 +134,9 @@ class AgentSession:
         self._ensure_open = ensure_open
         self._ensure_started = ensure_started
         self._operation_registrar = operation_registrar
+        self._operation_unregistrar = operation_unregistrar
         self._profile_provider = profile_provider
+        self._capability_digest_provider = capability_digest_provider
         self.memory_manager = memory_manager
         self.memory_top_k = self._positive_integer(memory_top_k, "memory_top_k")
         self.memory_token_budget = (
@@ -200,44 +205,41 @@ class AgentSession:
         *,
         message_id: str | None = None,
     ) -> Task:
+        effective_message_id = message_id or self.id_factory.message()
         await self._begin_operation_async()
         try:
             if self.pending_run is not None:
+                existing = self.execution_store.submission(self.id, effective_message_id)
+                if existing is not None:
+                    task, _, _ = await self._reuse_submission(
+                        existing, message_digest(message)[1], cancellation_token
+                    )
+                    return task
                 raise ValueError("session has a task waiting for approval")
             task, submission, owned = await self._accept_submission(
-                message, message_id or self.id_factory.message(), cancellation_token
+                message, effective_message_id, cancellation_token
             )
             if not owned:
                 return task
-            memories = await self._recall(message, cancellation_token)
-            task.original_input = self._with_context(message, memories)
-            context = ExecutionContext(
-                session_id=self.id,
-                task_id=task.id,
-                message_id=task.message_id,
-                execution_id=self.id_factory.execution(),
-                turn_id=task.turn_id or self.id_factory.turn(),
-                expected_sequence=task.last_sequence or 0,
-            )
             try:
+                memories = await self._recall(message, cancellation_token)
+                task.original_input = self._with_context(message, memories)
+                context = self._execution_context(task, submission)
                 await self._run_harness(task, cancellation_token, context)
-            except BaseException:
-                self._settle_submission(task, submission, SubmissionState.FAILED)
+            except BaseException as error:
+                if task.is_created():
+                    self._settle_before_execution(task, submission, error)
                 raise
+            self._settle_compatibility_submission(task, submission)
             if task.is_paused():
                 self.pending_run = TaskRun(task=task, message=message)
                 self._pending_message_hint = None
-                self._settle_submission(task, submission, SubmissionState.PAUSED)
             else:
-                self._settle_submission(
-                    task,
-                    submission,
-                    SubmissionState.COMPLETED if task.is_completed() else SubmissionState.FAILED,
-                )
                 await self._remember(message, task)
             return task
         finally:
             self._operation_lock.release()
+            self._unregister_current_operation()
 
     def approval_requests(self) -> list[ToolExecutionResult]:
         task = self.pending_task
@@ -250,7 +252,11 @@ class AgentSession:
             if task is None:
                 raise ValueError("nothing is waiting for approval")
             task.decide_tool_call(tool_id, approved)
-            self.task_repository.save(task)
+            recorder = getattr(self.harness, "fact_recorder", None)
+            if recorder is None:
+                self.task_repository.save(task)
+            else:
+                recorder.commit(task, [])
         finally:
             self._operation_lock.release()
 
@@ -267,18 +273,23 @@ class AgentSession:
             if run is None:
                 raise ValueError("nothing is waiting for approval")
             task = run.task
-            await self.harness.arun(task, cancellation_token=cancellation_token)
-            if not task.is_paused():
+            submission = (
+                None
+                if task.message_id is None
+                else self.execution_store.submission(self.id, task.message_id)
+            )
+            if submission is None:
                 if task.message_id is not None:
-                    submission = self.execution_store.submission(self.id, task.message_id)
-                    if submission is not None:
-                        self._settle_submission(
-                            task,
-                            submission,
-                            SubmissionState.COMPLETED
-                            if task.is_completed()
-                            else SubmissionState.FAILED,
-                        )
+                    raise RuntimeError("paused submission is unavailable")
+                await self.harness.arun(task, cancellation_token=cancellation_token)
+            else:
+                await self._run_harness(
+                    task,
+                    cancellation_token,
+                    self._execution_context(task, submission),
+                )
+                self._settle_compatibility_submission(task, submission)
+            if not task.is_paused():
                 await self._remember(run.message, task)
             return task
         finally:
@@ -286,6 +297,7 @@ class AgentSession:
                 self.pending_run = None
                 self._pending_message_hint = None
             self._operation_lock.release()
+            self._unregister_current_operation()
 
     def _begin_operation(self) -> None:
         self._ensure_open()
@@ -298,10 +310,8 @@ class AgentSession:
             started = self._ensure_started()
             if inspect.isawaitable(started):
                 await started
-        current = asyncio.current_task()
-        if current is not None and self._operation_registrar is not None:
-            self._operation_registrar(current)
         if self._operation_lock.acquire(blocking=False):
+            self._register_current_operation()
             return
         if self.max_pending_submissions == 0:
             raise RuntimeError("session operation already in progress")
@@ -317,6 +327,7 @@ class AgentSession:
                 if is_head and self._operation_lock.acquire(blocking=False):
                     with self._queue_lock:
                         self._waiting.pop(0)
+                    self._register_current_operation()
                     return
                 await asyncio.sleep(0)
         except BaseException:
@@ -324,6 +335,21 @@ class AgentSession:
                 if ticket in self._waiting:
                     self._waiting.remove(ticket)
             raise
+
+    def _register_current_operation(self) -> None:
+        current = asyncio.current_task()
+        if current is None or self._operation_registrar is None:
+            return
+        try:
+            self._operation_registrar(current)
+        except BaseException:
+            self._operation_lock.release()
+            raise
+
+    def _unregister_current_operation(self) -> None:
+        current = asyncio.current_task()
+        if current is not None and self._operation_unregistrar is not None:
+            self._operation_unregistrar(current)
 
     async def _accept_submission(
         self,
@@ -335,6 +361,8 @@ class AgentSession:
         existing = self.execution_store.submission(self.id, message_id)
         if existing is not None:
             return await self._reuse_submission(existing, digest, cancellation_token)
+        if self._has_open_submission(self.execution_store.events(self.id)):
+            raise RuntimeError("session operation already in progress")
         turn_id = self.id_factory.turn()
         task = Task(
             message,
@@ -343,8 +371,6 @@ class AgentSession:
             message_id=message_id,
             turn_id=turn_id,
         )
-        from datetime import datetime, timezone
-
         now = datetime.now(timezone.utc)
         submission = SubmissionRecord(
             session_id=self.id,
@@ -401,17 +427,29 @@ class AgentSession:
                 self._submission_event(task, SessionEventType.TURN_STARTED),
             ]
         )
+        capability_digest = (
+            None if self._capability_digest_provider is None else self._capability_digest_provider()
+        )
+        facts[-1] = self._submission_event(
+            task,
+            SessionEventType.TURN_STARTED,
+            payload={"capability_digest": capability_digest},
+        )
         try:
-            committed = self.execution_store.commit(
-                task,
-                facts,
-                expected_sequence=expected,
-                submission=submission,
-            )
+            recorder = getattr(self.harness, "fact_recorder", None)
+            if recorder is not None:
+                committed = recorder.commit(task, facts, submission)
+            else:
+                committed = self.execution_store.commit(
+                    task,
+                    facts,
+                    expected_sequence=expected,
+                    submission=submission,
+                )
         except SequenceConflictError:
             winner = self.execution_store.submission(self.id, message_id)
             if winner is None:
-                raise
+                raise RuntimeError("session operation already in progress") from None
             return await self._reuse_submission(winner, digest, cancellation_token)
         task.last_sequence = committed[-1].sequence
         return task, submission, True
@@ -431,6 +469,9 @@ class AgentSession:
             refreshed = self.execution_store.submission(self.id, submission.message_id)
             if refreshed is not None:
                 submission = refreshed
+            task = self.task_repository.get(submission.task_id)
+            if task is not None and task.is_finished():
+                submission = self._repair_terminal_submission(task, submission)
         task = self.task_repository.get(submission.task_id)
         if task is None:
             raise RuntimeError("accepted submission task is unavailable")
@@ -453,13 +494,70 @@ class AgentSession:
             payload=payload or {},
         )
 
-    def _settle_submission(
-        self, task: Task, original: SubmissionRecord, state: SubmissionState
-    ) -> None:
-        from datetime import datetime, timezone
+    def _execution_context(self, task: Task, submission: SubmissionRecord) -> ExecutionContext:
+        capability_digest = (
+            None if self._capability_digest_provider is None else self._capability_digest_provider()
+        )
+        return ExecutionContext(
+            session_id=self.id,
+            task_id=task.id,
+            message_id=task.message_id,
+            execution_id=self.id_factory.execution(),
+            turn_id=task.turn_id or self.id_factory.turn(),
+            expected_sequence=task.last_sequence or 0,
+            submission=submission,
+            capability_digest=capability_digest,
+        )
 
+    @staticmethod
+    def _has_open_submission(events) -> bool:
+        opened: set[str] = set()
+        for event in events:
+            if event.turn_id is None:
+                continue
+            if event.type is SessionEventType.SUBMISSION_ACCEPTED:
+                opened.add(event.turn_id)
+            elif event.type is SessionEventType.SUBMISSION_SETTLED:
+                opened.discard(event.turn_id)
+        return bool(opened)
+
+    def _settle_before_execution(
+        self, task: Task, submission: SubmissionRecord, error: BaseException
+    ) -> None:
+        from src.schema.task import TaskFailReason, TaskResult
+
+        cancelled = isinstance(error, asyncio.CancelledError)
+        task.set_result(TaskResult(output="Task cancelled." if cancelled else "Task failed."))
+        task.transition_to_failed(
+            TaskFailReason.TASK_FAILED_CANCEL if cancelled else TaskFailReason.TASK_FAILED_UNKNOWN
+        )
+        state = SubmissionState.CANCELLED if cancelled else SubmissionState.FAILED
         updated = SubmissionRecord.model_validate(
-            {**original.model_dump(), "state": state, "updated_at": datetime.now(timezone.utc)}
+            {**submission.model_dump(), "state": state, "updated_at": datetime.now(timezone.utc)}
+        )
+        outcome = "cancelled" if cancelled else "failed"
+        facts = [
+            self._submission_event(
+                task, SessionEventType.TURN_SETTLED, payload={"outcome": outcome}
+            ),
+            self._submission_event(
+                task, SessionEventType.SUBMISSION_SETTLED, payload={"outcome": outcome}
+            ),
+        ]
+        self.execution_store.commit(
+            task,
+            facts,
+            expected_sequence=task.last_sequence or 0,
+            submission=updated,
+        )
+        task.last_sequence = (task.last_sequence or 0) + len(facts)
+
+    def _repair_terminal_submission(
+        self, task: Task, submission: SubmissionRecord
+    ) -> SubmissionRecord:
+        state = SubmissionState.COMPLETED if task.is_completed() else SubmissionState.FAILED
+        updated = SubmissionRecord.model_validate(
+            {**submission.model_dump(), "state": state, "updated_at": datetime.now(timezone.utc)}
         )
         self.execution_store.commit(
             task,
@@ -467,6 +565,77 @@ class AgentSession:
             expected_sequence=task.last_sequence or 0,
             submission=updated,
         )
+        return updated
+
+    def _settle_compatibility_submission(self, task: Task, submission: SubmissionRecord) -> None:
+        if getattr(self.harness, "fact_recorder", None) is not None:
+            return
+        current = self.execution_store.submission(self.id, submission.message_id)
+        if current is None or current.state not in {
+            SubmissionState.ACCEPTED,
+            SubmissionState.PAUSED,
+        }:
+            return
+        facts: list[PendingSessionEvent] = []
+        if current.state is SubmissionState.PAUSED and not task.is_paused():
+            facts.extend(
+                [
+                    self._submission_event(task, SessionEventType.TURN_RESUMED),
+                    self._submission_event(task, SessionEventType.SUBMISSION_RESUMED),
+                ]
+            )
+        if task.is_paused():
+            state = SubmissionState.PAUSED
+            facts.extend(
+                [
+                    self._submission_event(task, SessionEventType.TURN_PAUSED),
+                    self._submission_event(task, SessionEventType.SUBMISSION_PAUSED),
+                ]
+            )
+        elif task.is_completed():
+            state = SubmissionState.COMPLETED
+            facts.extend(
+                [
+                    self._submission_event(
+                        task,
+                        SessionEventType.TURN_SETTLED,
+                        payload={"outcome": "completed"},
+                    ),
+                    self._submission_event(
+                        task,
+                        SessionEventType.SUBMISSION_SETTLED,
+                        payload={"outcome": "completed"},
+                    ),
+                ]
+            )
+        elif task.is_failed():
+            state = SubmissionState.FAILED
+            facts.extend(
+                [
+                    self._submission_event(
+                        task,
+                        SessionEventType.TURN_SETTLED,
+                        payload={"outcome": "failed"},
+                    ),
+                    self._submission_event(
+                        task,
+                        SessionEventType.SUBMISSION_SETTLED,
+                        payload={"outcome": "failed"},
+                    ),
+                ]
+            )
+        else:
+            return
+        updated = SubmissionRecord.model_validate(
+            {**current.model_dump(), "state": state, "updated_at": datetime.now(timezone.utc)}
+        )
+        self.execution_store.commit(
+            task,
+            facts,
+            expected_sequence=task.last_sequence or 0,
+            submission=updated,
+        )
+        task.last_sequence = (task.last_sequence or 0) + len(facts)
 
     async def _run_harness(
         self,

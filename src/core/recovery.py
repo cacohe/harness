@@ -47,7 +47,8 @@ class ExecutionRecovery:
         history = self.store.events(session_id)
         self._validate_sequence(history)
         try:
-            LifecycleTracker().extend(history)
+            tracker = LifecycleTracker()
+            tracker.extend(history)
         except LifecycleError as error:
             raise RecoveryError("session lifecycle history is invalid") from error
 
@@ -57,6 +58,7 @@ class ExecutionRecovery:
         recovered: list[SessionEvent] = []
         for record in records:
             if record.task.state is TaskState.TASK_PAUSED:
+                self._validate_paused_boundary(record, history, tracker)
                 continue
             recovered.extend(self._recover_record(record, history))
             history = self.store.events(session_id)
@@ -64,9 +66,35 @@ class ExecutionRecovery:
 
     @staticmethod
     def _validate_sequence(events: Sequence[SessionEvent]) -> None:
+        event_ids: set[str] = set()
         for expected, event in enumerate(events, start=1):
             if event.sequence != expected:
                 raise RecoveryError("session event sequence contains a gap")
+            if event.event_id in event_ids:
+                raise RecoveryError("session event identities are not unique")
+            event_ids.add(event.event_id)
+
+    @staticmethod
+    def _validate_paused_boundary(
+        record: ExecutionRecord,
+        events: Sequence[SessionEvent],
+        tracker: LifecycleTracker,
+    ) -> None:
+        turn_id = record.task.turn_id
+        task_events = [event for event in events if event.task_id == record.task.id]
+        paused_steps = [
+            event.step_id
+            for event in task_events
+            if event.type is SessionEventType.STEP_PAUSED and event.step_id is not None
+        ]
+        if (
+            turn_id is None
+            or not tracker.is_paused("submission", turn_id)
+            or not tracker.is_paused("turn", turn_id)
+            or not paused_steps
+            or not tracker.is_paused("step", paused_steps[-1])
+        ):
+            raise RecoveryError("paused Task does not match a durable paused boundary")
 
     @staticmethod
     def _validate_task_identity(record: ExecutionRecord, events: Sequence[SessionEvent]) -> None:

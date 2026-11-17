@@ -112,3 +112,64 @@ def test_timeout_and_cancelled_waiter_do_not_cancel_shielded_cleanup():
     runtime, calls = asyncio.run(scenario())
     assert runtime.state == "closed"
     assert calls.count(("close", "slow")) == 1
+
+
+def test_close_waits_for_inflight_start_and_cannot_reopen_runtime():
+    async def scenario():
+        calls = []
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class SlowStart(Resource):
+            async def astart(self):
+                calls.append(("start", self.name))
+                entered.set()
+                await release.wait()
+
+        runtime = RuntimeCoordinator([SlowStart("slow", calls)])
+        starting = asyncio.create_task(runtime.start())
+        await entered.wait()
+        closing = asyncio.create_task(runtime.aclose(1))
+        await asyncio.sleep(0)
+        release.set()
+        await starting
+        await closing
+        return runtime, calls
+
+    runtime, calls = asyncio.run(scenario())
+
+    assert runtime.state == "closed"
+    assert calls == [("start", "slow"), ("flush", "slow"), ("close", "slow")]
+
+
+def test_cleanup_attempts_every_resource_after_flush_and_close_failures():
+    async def scenario():
+        calls = []
+
+        class Broken(Resource):
+            async def aflush(self):
+                calls.append(("flush", self.name))
+                if self.name == "two":
+                    raise RuntimeError("flush failed")
+
+            async def aclose(self):
+                calls.append(("close", self.name))
+                if self.name == "one":
+                    raise RuntimeError("close failed")
+
+        runtime = RuntimeCoordinator([Broken("one", calls), Broken("two", calls)])
+        await runtime.start()
+        with pytest.raises(BaseExceptionGroup) as captured:
+            await runtime.aclose(1)
+        return runtime, calls, captured.value
+
+    runtime, calls, error = asyncio.run(scenario())
+
+    assert runtime.state == "closed"
+    assert calls[-4:] == [
+        ("flush", "two"),
+        ("flush", "one"),
+        ("close", "two"),
+        ("close", "one"),
+    ]
+    assert len(error.exceptions) == 2

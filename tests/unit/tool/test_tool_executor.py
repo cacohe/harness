@@ -307,7 +307,7 @@ def test_sandbox_capability_error_fails_closed(tmp_path):
     )
 
     assert result.is_failed()
-    assert result.output == "RuntimeError: sandbox offline"
+    assert result.output == "RuntimeError: tool execution failed"
     assert runner.calls == []
 
 
@@ -354,7 +354,7 @@ def test_sandbox_timeout_is_classified_as_a_tool_timeout(tmp_path):
     )
 
     assert result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_TIMEOUT
-    assert result.output == "TimeoutError: sandbox command exceeded its timeout"
+    assert result.output == "TimeoutError: tool execution timed out"
 
 
 def test_regular_tool_uses_bound_runner_even_when_sandbox_supports_it():
@@ -466,7 +466,7 @@ def test_runner_exception_becomes_a_failed_result():
     )
 
     assert result.state is ToolExecutionState.TOOL_EXECUTION_STATE_FAILED
-    assert result.output == "RuntimeError: nope"
+    assert result.output == "RuntimeError: tool execution failed"
 
 
 def test_rejected_tool_does_not_run():
@@ -535,7 +535,7 @@ def test_approval_exception_fails_only_that_call_and_batch_continues():
 
     assert [item.tool_id for item in result.completed_tools] == ["call-1"]
     assert [item.tool_id for item in result.failed_tools] == ["call-2"]
-    assert result.failed_tools[0].output == "RuntimeError: approval offline"
+    assert result.failed_tools[0].output == "RuntimeError: approval failed"
     assert len(runner.calls) == 1
 
 
@@ -714,7 +714,7 @@ def test_failed_tool_message_keeps_the_model_call_id():
     message = build_tool_messages(result)[0]
     assert message.tool_call_id == "call_0_abc"
     assert message.name == "read_file"
-    assert message.content == "RuntimeError: nope"
+    assert message.content == "RuntimeError: tool execution failed"
 
 
 @pytest.mark.parametrize("name", ["shell", "write_file", "edit_file"])
@@ -880,7 +880,7 @@ def test_async_executor_classifies_a_native_async_runner_error():
     )
 
     assert result.is_failed()
-    assert result.output == "RuntimeError: remote failed"
+    assert result.output == "RuntimeError: tool execution failed"
 
 
 def test_async_executor_offloads_a_legacy_runner_without_blocking_the_loop():
@@ -1067,7 +1067,7 @@ def test_remote_tool_error_becomes_a_remote_failure_with_structured_output():
 
     assert result.is_failed()
     assert result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_REMOTE_ERROR
-    assert result.output == output
+    assert result.output == "RemoteToolError: remote tool failed"
 
 
 def test_approved_remote_call_rejects_a_replacement_tool_generation():

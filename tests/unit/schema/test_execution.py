@@ -71,6 +71,14 @@ def test_session_event_requires_a_positive_sequence_and_forbids_extra_fields():
     assert event.sequence == 1
 
 
+def test_execution_facts_reject_future_schema_versions():
+    values = _pending().model_dump()
+    values["schema_version"] = 2
+
+    with pytest.raises(ValidationError, match="schema_version"):
+        PendingSessionEvent.model_validate(values)
+
+
 @pytest.mark.parametrize("value", ["", "line\nbreak", "null\x00byte", "x" * 257])
 def test_execution_ids_reject_empty_control_or_oversized_values(value):
     with pytest.raises(ValueError, match="event_id"):

@@ -4,7 +4,7 @@ import math
 import re
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -94,7 +94,7 @@ def _utc(value: datetime, name: str) -> datetime:
 class PendingSessionEvent(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
-    schema_version: int = Field(default=1, ge=1)
+    schema_version: Literal[1] = 1
     event_id: str
     session_id: str
     type: SessionEventType
@@ -206,7 +206,7 @@ class AgentProfile(BaseModel):
     skills_digest: str
     tools_digest: str
     memory_policy_version: str
-    fact_schema_version: int = Field(ge=1)
+    fact_schema_version: Literal[1]
 
     @field_validator("id", "version", "model_identifier", "memory_policy_version")
     @classmethod

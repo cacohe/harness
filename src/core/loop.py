@@ -8,7 +8,8 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import NoReturn, TypedDict, cast
+from datetime import datetime, timezone
+from typing import Any, NoReturn, TypedDict, cast
 
 from src.core.async_utils import call_maybe_async, run_sync
 from src.core.cancellation import CancellationToken
@@ -39,7 +40,12 @@ from src.core.task import Task
 from src.core.tool import ToolExecutor
 from src.schema.context import Context
 from src.schema.event import Event, EventType, LlmEventPayload, TaskEventPayload, ToolEventPayload
-from src.schema.execution import PendingSessionEvent, SessionEventType
+from src.schema.execution import (
+    PendingSessionEvent,
+    SessionEventType,
+    SubmissionRecord,
+    SubmissionState,
+)
 from src.schema.harness import StepResult
 from src.schema.llm import (
     FinishReason,
@@ -99,10 +105,14 @@ class _FactState:
     step_open: bool = False
     tool_ids: dict[str, str] | None = None
     started_tools: set[str] | None = None
+    settled_tools: set[str] | None = None
+    submission: SubmissionRecord | None = None
 
     def __post_init__(self) -> None:
         self.tool_ids = {}
         self.started_tools = set()
+        self.settled_tools = set()
+        self.submission = self.context.submission
 
 
 class _Correlation(TypedDict):
@@ -172,6 +182,7 @@ class Harness:
         self.tool_timeout_seconds = float(tool_timeout_seconds)
         self.max_model_output_bytes = max_model_output_bytes
         self.max_tool_result_bytes = max_tool_result_bytes
+        self.observation_failure_count = 0
 
     @staticmethod
     def _strict_json_size(value) -> int:
@@ -228,11 +239,25 @@ class Harness:
         self,
         task: Task,
         facts: list[PendingSessionEvent | None],
+        *,
+        submission_state: SubmissionState | None = None,
     ) -> None:
         pending = [fact for fact in facts if fact is not None]
-        if pending:
+        state = _FACT_STATE.get()
+        submission = None if state is None else state.submission
+        if submission is not None and submission_state is not None:
+            submission = SubmissionRecord.model_validate(
+                {
+                    **submission.model_dump(),
+                    "state": submission_state,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            )
+        if pending or submission is not None:
             try:
-                self.fact_recorder.commit(task, pending)
+                self.fact_recorder.commit(task, pending, submission)
+                if state is not None and submission is not None:
+                    state.submission = submission
                 if self._legacy_execution_store:
                     self.task_repository.save(task)
             except Exception as error:
@@ -270,7 +295,10 @@ class Harness:
         open_steps: dict[str, bool] = {}
         assert state.tool_ids is not None
         assert state.started_tools is not None
+        assert state.settled_tools is not None
         for event in existing:
+            if event.task_id != task.id or event.turn_id not in {None, state.context.turn_id}:
+                continue
             if event.type is SessionEventType.STEP_STARTED and event.step_id is not None:
                 open_steps[event.step_id] = True
             elif event.type is SessionEventType.STEP_SETTLED and event.step_id is not None:
@@ -285,6 +313,10 @@ class Harness:
                 event.type is SessionEventType.TOOL_CALL_STARTED and event.tool_call_id is not None
             ):
                 state.started_tools.add(event.tool_call_id)
+            elif (
+                event.type is SessionEventType.TOOL_CALL_SETTLED and event.tool_call_id is not None
+            ):
+                state.settled_tools.add(event.tool_call_id)
         for step_id, is_open in reversed(list(open_steps.items())):
             if is_open:
                 state.step_id = step_id
@@ -315,6 +347,7 @@ class Harness:
                 self._fact_event(task, SessionEventType.TURN_RESUMED),
                 self._fact_event(task, SessionEventType.SUBMISSION_RESUMED),
             ],
+            submission_state=SubmissionState.ACCEPTED,
         )
 
     def _record_paused(self, task: Task) -> None:
@@ -334,6 +367,7 @@ class Harness:
                     payload={"outcome": "paused"},
                 ),
             ],
+            submission_state=SubmissionState.PAUSED,
         )
 
     def _begin_step(self, task: Task, *, phase: str) -> str | None:
@@ -521,6 +555,8 @@ class Harness:
                 )
             ],
         )
+        assert state.settled_tools is not None
+        state.settled_tools.add(durable_id)
 
     def _record_terminal(self, task: Task, outcome: str) -> None:
         state = _FACT_STATE.get()
@@ -528,6 +564,38 @@ class Harness:
             self._save_task(task)
             return
         facts: list[PendingSessionEvent | None] = []
+        if not state.attempt_settled and state.attempt_id is not None:
+            facts.append(
+                self._fact_event(
+                    task,
+                    SessionEventType.MODEL_ATTEMPT_SETTLED,
+                    step_id=state.step_id,
+                    attempt_id=state.attempt_id,
+                    payload={"outcome": outcome, "error_type": "execution_terminated"},
+                )
+            )
+            state.attempt_settled = True
+        assert state.tool_ids is not None
+        assert state.started_tools is not None
+        assert state.settled_tools is not None
+        for external_id, durable_id in state.tool_ids.items():
+            if durable_id in state.settled_tools:
+                continue
+            started = durable_id in state.started_tools
+            facts.append(
+                self._fact_event(
+                    task,
+                    SessionEventType.TOOL_CALL_SETTLED,
+                    step_id=state.step_id,
+                    tool_call_id=durable_id,
+                    payload={
+                        "outcome": "interrupted" if started else "rejected",
+                        "external_tool_call_id": external_id,
+                        "result": "unknown" if started else "not_started",
+                    },
+                )
+            )
+            state.settled_tools.add(durable_id)
         if state.step_open and state.step_id is not None:
             facts.append(
                 self._fact_event(
@@ -552,7 +620,12 @@ class Harness:
                 ),
             ]
         )
-        self._record_facts(task, facts)
+        submission_state = {
+            "completed": SubmissionState.COMPLETED,
+            "cancelled": SubmissionState.CANCELLED,
+            "interrupted": SubmissionState.INTERRUPTED,
+        }.get(outcome, SubmissionState.FAILED)
+        self._record_facts(task, facts, submission_state=submission_state)
         state.step_open = False
 
     @staticmethod
@@ -585,7 +658,10 @@ class Harness:
             _TaskPersistenceError: The task could not be saved.
         """
         try:
-            self.task_repository.save(task)
+            if self._legacy_execution_store or _FACT_STATE.get() is None:
+                self.task_repository.save(task)
+            else:
+                self.fact_recorder.commit(task, [])
         except Exception as error:
             raise _TaskPersistenceError from error
 
@@ -599,8 +675,8 @@ class Harness:
         """
         try:
             self.event_handler.emit(event)
-        except Exception as error:
-            raise _EventSinkError from error
+        except Exception:
+            self.observation_failure_count += 1
 
     @staticmethod
     def _raise_boundary_cause(error: _TaskPersistenceError | _EventSinkError) -> NoReturn:
@@ -970,7 +1046,7 @@ class Harness:
             tool_id=item.tool_id,
             tool_name=item.tool_name,
             state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
-            output=f"{type(error).__name__}: {error}",
+            output=f"{type(error).__name__}: tool execution failed",
             fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_UNKNOWN,
         )
 
@@ -1020,21 +1096,22 @@ class Harness:
                     supports_before_execute = (
                         "before_execute" in inspect.signature(selected).parameters
                     )
-                    if supports_before_execute:
-                        result = await call_maybe_async(
-                            async_method,
-                            self.tool_executor.execute_held_tool_call,
-                            item,
-                            before_execute=before_execute,
-                        )
-                    else:
-                        if item.can_run():
-                            before_execute(call)
-                        result = await call_maybe_async(
-                            async_method,
-                            self.tool_executor.execute_held_tool_call,
-                            item,
-                        )
+                    async with asyncio.timeout(self.tool_timeout_seconds):
+                        if supports_before_execute:
+                            result = await call_maybe_async(
+                                async_method,
+                                self.tool_executor.execute_held_tool_call,
+                                item,
+                                before_execute=before_execute,
+                            )
+                        else:
+                            if item.can_run():
+                                before_execute(call)
+                            result = await call_maybe_async(
+                                async_method,
+                                self.tool_executor.execute_held_tool_call,
+                                item,
+                            )
                 except asyncio.CancelledError:
                     if cancellation_token is not None:
                         cancellation_token.cancel()
@@ -1232,7 +1309,11 @@ class Harness:
         if isinstance(produced, LLMOutput):
             return produced, [produced.content] if produced.content else []
         try:
-            output, parts = await assemble_llm_async_stream(produced)
+            output, parts = await assemble_llm_async_stream(
+                produced, max_bytes=self.max_model_output_bytes
+            )
+        except OverflowError as error:
+            raise PayloadLimitError("model output exceeds max_model_output_bytes") from error
         except TypeError as error:
             raise LlmCallError(str(error)) from error
         return output, parts
@@ -1294,7 +1375,7 @@ class Harness:
                 tool_id=call.id,
                 tool_name=call.name,
                 state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
-                output=f"{type(error).__name__}: {error}",
+                output=f"{type(error).__name__}: tool execution failed",
                 fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_UNKNOWN,
             )
 
@@ -1405,9 +1486,13 @@ class Harness:
             parameter.name == "before_execute" or parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters
         )
+        supports_timeout = any(
+            parameter.name == "timeout_seconds" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
 
         async def invoke_batch():
-            callback_arguments = {
+            callback_arguments: dict[str, Any] = {
                 "before_call": before_call,
                 "after_call": after_call,
             }
@@ -1415,6 +1500,8 @@ class Harness:
                 callback_arguments["before_execute"] = before_execute
             if cancellation_token is not None and supports_cancellation:
                 callback_arguments["should_cancel"] = cancellation_token.is_cancelled
+            if supports_timeout:
+                callback_arguments["timeout_seconds"] = self.tool_timeout_seconds
             return await call_maybe_async(
                 async_batch,
                 self.tool_executor.execute_tool_calls,
@@ -1423,8 +1510,17 @@ class Harness:
             )
 
         try:
-            async with asyncio.timeout(self.tool_timeout_seconds):
-                return await invoke_batch()
+            if supports_timeout:
+                batch_result = await invoke_batch()
+            else:
+                async with asyncio.timeout(self.tool_timeout_seconds):
+                    batch_result = await invoke_batch()
+            if any(
+                result.fail_reason is ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_TIMEOUT
+                for result in batch_result.failed_tools
+            ):
+                raise TimeoutError("tool call timed out")
+            return batch_result
         except _ToolBatchCancelled:
             ordered = [observed_results.get(call.id, cancelled_result(call)) for call in tool_calls]
             return ToolCallResult(
@@ -1631,7 +1727,7 @@ class Harness:
             raise
         except Exception as error:
             task.set_progress(step_count, time.monotonic() - start_time)
-            result = TaskResult(output=f"An unexpected error occurred: {str(error)}")
+            result = TaskResult(output=f"{type(error).__name__}: operation failed")
             task.set_result(result)
             task.transition_to_failed(failed_reason)
             self._record_terminal(task, "failed")
@@ -1639,7 +1735,7 @@ class Harness:
                 EventType.TASK_FAILED,
                 task,
                 reason=failed_reason.value,
-                content=str(error),
+                content=type(error).__name__,
                 step_id=str(step_count),
             )
             return result
@@ -1808,9 +1904,9 @@ class Harness:
                     return self._ask_clarification(task, question, start_time, token)
 
             if task.is_paused():
+                task.transition_to_running(TaskRunningReason.TASK_RUNNING_RESUME)
                 self._record_resumed(task)
                 self._emit_task_event(EventType.TASK_RESUMED, task)
-                task.transition_to_running(TaskRunningReason.TASK_RUNNING_RESUME)
                 await self._afinish_pending_tool_calls(task, token)
                 self._settle_step(task, "completed")
                 self._save_task(task)
@@ -1833,7 +1929,7 @@ class Harness:
         except Exception as error:
             if task.is_finished() or task.is_paused():
                 raise
-            result = TaskResult(output=f"An unexpected error occurred: {str(error)}")
+            result = TaskResult(output=f"{type(error).__name__}: operation failed")
             task.set_progress(task.step_count, time.monotonic() - start_time)
             if isinstance(error, GuardError):
                 reason = TaskFailReason.TASK_FAILED_GUARD_ERROR
@@ -1853,7 +1949,7 @@ class Harness:
                     EventType.TASK_FAILED,
                     task,
                     reason=fail_reason,
-                    content=str(error),
+                    content=type(error).__name__,
                 )
             except (_TaskPersistenceError, _EventSinkError) as boundary_error:
                 self._raise_boundary_cause(boundary_error)

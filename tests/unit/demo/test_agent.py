@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from src.config import Config
 from src.core.cancellation import CancellationToken
+from src.core.execution import PayloadLimitError
 from src.core.loop import Harness
 from src.core.memory import MemoryManager
 from src.core.task import Task
@@ -15,7 +16,7 @@ from src.memory.store import InMemoryStore
 from src.observability import MetricsEventSink
 from src.persistence import SQLiteTaskRepository
 from src.persistence.in_memory import InMemoryTaskRepository
-from src.schema.execution import SessionEventType
+from src.schema.execution import AgentProfile, SessionEventType, SubmissionState
 from src.schema.llm import FinishReason, LLMOutput, LlmToolCall
 from src.schema.skills import Skill
 from src.schema.task import TaskPauseReason, TaskPlan, TaskResult, TaskRunningReason, TaskState
@@ -377,6 +378,93 @@ def test_session_records_initial_profile_and_one_change_before_next_submission()
         and event.payload.get("message") == "two"
     )
     assert changes[0].sequence < second_acceptance
+    turn_starts = [event for event in events if event.type is SessionEventType.TURN_STARTED]
+    assert all(event.payload["capability_digest"] for event in turn_starts)
+    assert repository.submission("profile-session", "message-2").state is (
+        SubmissionState.COMPLETED
+    )
+
+
+def test_agent_accepts_an_explicit_audit_profile():
+    explicit = AgentProfile(
+        id="profile-override",
+        version="1",
+        system_prompt_digest="a" * 64,
+        model_identifier="injected-model",
+        model_settings_digest="b" * 64,
+        skills_digest="c" * 64,
+        tools_digest="d" * 64,
+        memory_policy_version="custom-v1",
+        fact_schema_version=1,
+    )
+
+    agent = Agent(
+        config=Config(llm="configured-model"),
+        llm_gateway=ChatGateway(["done"]),
+        profile=explicit,
+    )
+
+    assert agent.profile is explicit
+
+
+def test_automatic_profile_uses_the_injected_gateway_model_identifier():
+    gateway = ChatGateway(["done"])
+    gateway.model = "actual-gateway-model"
+    agent = Agent(
+        config=Config(llm="configured-placeholder"),
+        llm_gateway=gateway,
+    )
+
+    assert agent.profile.model_identifier == "actual-gateway-model"
+
+
+def test_submission_acceptance_enforces_durable_event_budget_before_write():
+    repository = InMemoryTaskRepository()
+    agent = Agent(
+        config=Config(llm="test-model", max_event_bytes=200),
+        llm_gateway=ChatGateway(["unused"]),
+        task_repository=repository,
+    )
+
+    with pytest.raises(PayloadLimitError, match="max_event_bytes"):
+        agent.new_session("bounded").chat("x" * 1000, message_id="message-1")
+
+    assert repository.events("bounded") == []
+    assert repository.submission("bounded", "message-1") is None
+
+
+def test_terminal_submission_state_is_committed_with_terminal_facts():
+    class RecordingStore(InMemoryTaskRepository):
+        def __init__(self):
+            super().__init__()
+            self.commits = []
+
+        def commit(self, task, events, *, expected_sequence, submission=None):
+            self.commits.append(
+                ([event.type for event in events], None if submission is None else submission.state)
+            )
+            return super().commit(
+                task,
+                events,
+                expected_sequence=expected_sequence,
+                submission=submission,
+            )
+
+    repository = RecordingStore()
+    agent = Agent(
+        config=Config(llm="test-model"),
+        llm_gateway=ChatGateway(["done"]),
+        task_repository=repository,
+    )
+
+    agent.new_session("atomic").chat("one", message_id="message-1")
+
+    terminal = next(
+        (types, state)
+        for types, state in repository.commits
+        if SessionEventType.SUBMISSION_SETTLED in types
+    )
+    assert terminal[1] is SubmissionState.COMPLETED
 
 
 def test_reopen_appends_profile_change_once_and_unchanged_reopen_adds_none(tmp_path):

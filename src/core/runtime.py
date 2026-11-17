@@ -43,11 +43,20 @@ class RuntimeCoordinator:
                 for resource in self.resources:
                     await self._invoke(resource, "astart", "start")
                     self._started.append(resource)
-            except BaseException:
+            except BaseException as start_error:
+                cleanup_errors: list[BaseException] = []
                 for resource in reversed(self._started):
-                    await self._invoke(resource, "aclose", "close")
+                    try:
+                        await self._invoke(resource, "aclose", "close")
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
                 self._started.clear()
                 self.state = "closed"
+                if cleanup_errors:
+                    start_error.add_note(
+                        "startup rollback also failed: "
+                        + ", ".join(type(error).__name__ for error in cleanup_errors)
+                    )
                 raise
             self.state = "started"
 
@@ -61,15 +70,19 @@ class RuntimeCoordinator:
         task.add_done_callback(self._operations.discard)
         return task
 
+    def unregister_operation(self, task: asyncio.Task) -> None:
+        self._operations.discard(task)
+
     async def aclose(self, timeout_seconds: float) -> None:
         caller = asyncio.current_task()
         if caller is not None:
             self._operations.discard(caller)
-        if self._cleanup_task is None:
-            if self.state == "new":
-                self._started = list(self.resources)
-            self.state = "closing"
-            self._cleanup_task = asyncio.create_task(self._cleanup())
+        async with self._start_lock:
+            if self._cleanup_task is None:
+                if self.state == "new":
+                    self._started = list(self.resources)
+                self.state = "closing"
+                self._cleanup_task = asyncio.create_task(self._cleanup())
         try:
             async with asyncio.timeout(timeout_seconds):
                 await asyncio.shield(self._cleanup_task)
@@ -83,12 +96,21 @@ class RuntimeCoordinator:
             task.cancel()
         if operations:
             await asyncio.gather(*operations, return_exceptions=True)
+        errors: list[BaseException] = []
         for resource in reversed(self._started):
-            await self._invoke(resource, "aflush", "flush")
+            try:
+                await self._invoke(resource, "aflush", "flush")
+            except BaseException as error:
+                errors.append(error)
         for resource in reversed(self._started):
-            await self._invoke(resource, "aclose", "close")
+            try:
+                await self._invoke(resource, "aclose", "close")
+            except BaseException as error:
+                errors.append(error)
         self._started.clear()
         self.state = "closed"
+        if errors:
+            raise BaseExceptionGroup("runtime cleanup failed", errors)
 
     @staticmethod
     async def _invoke(resource: object, async_name: str, sync_name: str) -> None:

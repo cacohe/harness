@@ -112,6 +112,26 @@ def test_recovery_rejects_sequence_gap_without_modifying_storage():
     assert len(base.events("session-1")) == 5
 
 
+def test_recovery_rejects_duplicate_event_ids_without_modifying_storage():
+    class DuplicateIdStore(InMemoryTaskRepository):
+        def events(self, session_id, *, after_sequence=0):
+            events = super().events(session_id, after_sequence=after_sequence)
+            if len(events) > 1:
+                events[1] = events[1].model_copy(update={"event_id": events[0].event_id})
+            return events
+
+    base = _interrupted_store()
+    store = DuplicateIdStore()
+    store._tasks = base._tasks
+    store._events = base._events
+    store._event_ids = base._event_ids
+
+    with pytest.raises(RecoveryError, match="event id"):
+        ExecutionRecovery(store).recover_session("session-1")
+
+    assert len(base.events("session-1")) == 5
+
+
 def test_recovery_rejects_task_turn_disagreement_without_writes():
     store = _interrupted_store()
     stored = store.get("task-1")

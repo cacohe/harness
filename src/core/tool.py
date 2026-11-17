@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
@@ -22,6 +23,13 @@ class RemoteToolError(Exception):
     def __init__(self, output: Any):
         self.output = output
         super().__init__(str(output))
+
+
+def _public_tool_error(error: BaseException, operation: str) -> str:
+    public_message = getattr(error, "public_message", None)
+    if isinstance(public_message, str) and public_message:
+        return public_message[:1000]
+    return f"{type(error).__name__}: {operation} failed"
 
 
 @runtime_checkable
@@ -108,7 +116,7 @@ class ToolExecutor:
         try:
             decision = self.approval_policy.decide(tool, inputs)
         except Exception as error:
-            return self._failed(tool, output=f"{type(error).__name__}: {error}")
+            return self._failed(tool, output=_public_tool_error(error, "approval"))
         if decision is None:
             return ToolExecutionResult(
                 tool_id=tool.id,
@@ -173,20 +181,20 @@ class ToolExecutor:
                     tool,
                     inputs,
                 )
-        except TimeoutError as error:
+        except TimeoutError:
             return self._failed(
                 tool,
                 ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_TIMEOUT,
-                output=f"TimeoutError: {error}",
+                output="TimeoutError: tool execution timed out",
             )
-        except RemoteToolError as error:
+        except RemoteToolError:
             return self._failed(
                 tool,
                 ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_REMOTE_ERROR,
-                output=error.output,
+                output="RemoteToolError: remote tool failed",
             )
         except Exception as error:
-            return self._failed(tool, output=f"{type(error).__name__}: {error}")
+            return self._failed(tool, output=_public_tool_error(error, "tool execution"))
         return ToolExecutionResult(
             tool_id=tool.id,
             tool_name=tool.name,
@@ -217,6 +225,7 @@ class ToolExecutor:
         before_execute: Callable[[LlmToolCall], None] | None = None,
         after_call: Callable[[LlmToolCall, ToolExecutionResult], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        timeout_seconds: float | None = None,
     ) -> ToolCallResult:
         return run_sync(
             lambda: self.aexecute_tool_calls(
@@ -225,6 +234,7 @@ class ToolExecutor:
                 before_execute=before_execute,
                 after_call=after_call,
                 should_cancel=should_cancel,
+                timeout_seconds=timeout_seconds,
             ),
             async_name="aexecute_tool_calls",
         )
@@ -237,6 +247,7 @@ class ToolExecutor:
         before_execute: Callable[[LlmToolCall], None] | None = None,
         after_call: Callable[[LlmToolCall, ToolExecutionResult], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        timeout_seconds: float | None = None,
     ) -> ToolCallResult:
         pending_tools: list[ToolExecutionResult] = []
         completed_tools: list[ToolExecutionResult] = []
@@ -261,11 +272,28 @@ class ToolExecutor:
                 failed_tools.append(result)
                 ordered_tools.append(result)
                 continue
-            result = await self._aexecute_tool_call_compat(
-                call,
-                hold=bool(pending_tools),
-                before_execute=before_execute,
-            )
+            try:
+                if timeout_seconds is None:
+                    result = await self._aexecute_tool_call_compat(
+                        call,
+                        hold=bool(pending_tools),
+                        before_execute=before_execute,
+                    )
+                else:
+                    async with asyncio.timeout(timeout_seconds):
+                        result = await self._aexecute_tool_call_compat(
+                            call,
+                            hold=bool(pending_tools),
+                            before_execute=before_execute,
+                        )
+            except TimeoutError:
+                result = ToolExecutionResult(
+                    tool_id=call.id,
+                    tool_name=call.name,
+                    state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
+                    output="TimeoutError: tool call timed out",
+                    fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_TIMEOUT,
+                )
             if after_call is not None:
                 after_call(call, result)
             if result.is_completed():
@@ -356,7 +384,7 @@ class ToolExecutor:
             try:
                 decision = self.approval_policy.decide(tool, validated)
             except Exception as error:
-                result = self._failed(tool, output=f"{type(error).__name__}: {error}")
+                result = self._failed(tool, output=_public_tool_error(error, "tool execution"))
                 result.tool_id = call.id
                 return result
             return ToolExecutionResult(
@@ -461,7 +489,7 @@ class ToolExecutor:
                 output=f"WorkspaceViolation: {error}",
             )
         except Exception as error:
-            return None, self._failed(tool, output=f"{type(error).__name__}: {error}")
+            return None, self._failed(tool, output=_public_tool_error(error, "input validation"))
 
     @staticmethod
     def _workspace_id(tool: Tool) -> str | None:

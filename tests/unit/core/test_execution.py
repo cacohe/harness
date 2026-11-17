@@ -83,6 +83,14 @@ def test_lifecycle_accepts_balanced_terminal_histories(outcome):
     assert tracker.is_settled("attempt", "attempt-1")
 
 
+def test_lifecycle_rejects_parent_settlement_with_an_open_child():
+    history = _completed_history()
+    history.pop(5)
+
+    with pytest.raises(LifecycleError, match="open attempt"):
+        LifecycleTracker().extend(history)
+
+
 def test_lifecycle_accepts_pause_and_resume_with_a_new_execution():
     tracker = LifecycleTracker()
     tracker.extend(

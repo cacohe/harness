@@ -14,6 +14,10 @@ _MAX_OUTPUT_CHARS = 20000
 class LocalToolIOError(RuntimeError):
     """A local I/O failure whose message contains only workspace-relative context."""
 
+    @property
+    def public_message(self) -> str:
+        return f"LocalToolIOError: {self}"
+
 
 def _sanitize_io_errors(function):
     function_signature = inspect.signature(function)
