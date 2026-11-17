@@ -1,15 +1,33 @@
 import asyncio
+from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from itertools import count
+from typing import cast
 
 import pytest
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.application.submissions import AcceptedRun, SubmissionService
-from src.core.commands import CommandContext, CompleteRun, RunLimits
+from src.core.commands import (
+    CommandContext,
+    CompleteRun,
+    FinishModelCall,
+    RunLimits,
+    StartModelCall,
+    StartStep,
+    StartToolCall,
+    ToolCallRequest,
+)
 from src.core.errors import InvalidTransition, RunErrorCode
 from src.core.events import DomainEvent, DomainEventType
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import JournalCommit, JournalError, JournalSnapshot, RunJournal
+from src.core.journal import (
+    JournalCommit,
+    JournalError,
+    JournalSnapshot,
+    RunJournal,
+    SubmissionAcceptance,
+)
 from src.core.state import RunStatus, TaskStateMachine
 
 SESSION = SessionId("session")
@@ -45,11 +63,14 @@ class SequenceIds:
 class FixedClock:
     def __init__(self, timestamp: datetime) -> None:
         self.timestamp = timestamp
+        self.readings = 0
 
     def now(self) -> datetime:
+        self.readings += 1
         return self.timestamp
 
     def monotonic(self) -> float:
+        self.readings += 1
         return 42.0
 
 
@@ -168,6 +189,144 @@ def test_new_submission_is_rejected_while_run_is_active() -> None:
     assert asyncio.run(journal.find_submission(SESSION, SECOND)) is None
 
 
+def test_waiting_for_approval_reserves_the_session() -> None:
+    async def scenario() -> None:
+        journal = InMemoryRunJournal()
+        submissions = service(journal)
+        accepted = await submissions.accept(SESSION, "first", FIRST, PROFILE)
+        state = accepted.state
+        identity = (state.run_id, SESSION)
+        context = CommandContext(NOW, 1, (EventId("waiting"),))
+        request = ToolCallRequest("tool-call", "test-tool", "{}")
+        transition = TaskStateMachine.apply(state, StartStep(*identity, "step", context=context))
+        transition = TaskStateMachine.apply(
+            transition.state, StartModelCall(*identity, "step", "model", context=context)
+        )
+        transition = TaskStateMachine.apply(
+            transition.state,
+            FinishModelCall(*identity, "step", "model", "", request, context=context),
+        )
+        transition = TaskStateMachine.apply(
+            transition.state,
+            StartToolCall(*identity, "step", "model", "tool-call", True, context=context),
+        )
+        assert transition.state.status is RunStatus.WAITING_APPROVAL
+        await journal.commit(JournalCommit(transition.state, transition.events), accepted.version)
+        before = await journal.load_session(SESSION)
+
+        with pytest.raises(JournalError) as error:
+            await submissions.accept(SESSION, "next", SECOND, PROFILE)
+
+        assert error.value.failure.code is RunErrorCode.JOURNAL_CONFLICT
+        assert await journal.load_session(SESSION) == before
+        assert await journal.find_submission(SESSION, SECOND) is None
+
+    asyncio.run(scenario())
+
+
+class HeadOnlyJournal(InMemoryRunJournal):
+    async def load_session(self, session_id: SessionId, after_sequence: int = 0) -> JournalSnapshot:
+        pytest.fail("acceptance must not read Session history")
+
+
+def test_initial_acceptance_and_replay_need_only_the_head_and_receipt() -> None:
+    journal = HeadOnlyJournal()
+    original = asyncio.run(service(journal).accept(SESSION, "hello", FIRST, PROFILE))
+    ids = SequenceIds("recreated")
+    clock = FixedClock(NOW)
+    recreated = SubmissionService(journal, ids, clock, LIMITS)
+
+    assert asyncio.run(recreated.accept(SESSION, "hello", FIRST, PROFILE)) == original
+    assert (next(ids.runs), next(ids.events), clock.readings) == (1, 1, 0)
+
+
+class StringSubclass(str):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("session", "message", "submission", "profile"),
+    [
+        (RunId("session"), "hello", FIRST, PROFILE),
+        (SESSION, StringSubclass("hello"), FIRST, PROFILE),
+        (SESSION, "\ud800", FIRST, PROFILE),
+        (SESSION, "hello", RunId("first"), PROFILE),
+        (SESSION, "hello", FIRST, RunId("default")),
+        (SESSION, "hello", FIRST, None),
+    ],
+)
+def test_invalid_input_is_rejected_before_using_ports(
+    session: object, message: object, submission: object, profile: object
+) -> None:
+    with pytest.raises(InvalidTransition) as error:
+        asyncio.run(
+            service(cast(RunJournal, object())).accept(
+                cast(SessionId, session),
+                cast(str, message),
+                cast(SubmissionId, submission),
+                cast(ProfileId, profile),
+            )
+        )
+    assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+class CorruptReceiptJournal(InMemoryRunJournal):
+    corrupt: Callable[[SubmissionAcceptance], SubmissionAcceptance] | None = None
+
+    async def find_submission(
+        self, session_id: SessionId, submission_id: SubmissionId
+    ) -> SubmissionAcceptance | None:
+        receipt = await super().find_submission(session_id, submission_id)
+        return (
+            self.corrupt(receipt) if receipt is not None and self.corrupt is not None else receipt
+        )
+
+
+def corrupt_identity_value(receipt: SubmissionAcceptance) -> SubmissionAcceptance:
+    object.__setattr__(receipt.state.run_id, "value", StringSubclass(receipt.state.run_id.value))
+    return receipt
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        lambda r: replace(r, submission=replace(r.submission, session_id=SessionId("other"))),
+        lambda r: replace(r, submission=replace(r.submission, submission_id=SECOND)),
+        lambda r: replace(r, submission=replace(r.submission, run_id=RunId("other"))),
+        lambda r: replace(r, state=replace(r.state, session_id=SessionId("other"))),
+        lambda r: replace(r, state=replace(r.state, submission_id=SECOND)),
+        lambda r: replace(r, state=replace(r.state, profile_id=ProfileId("other"))),
+        lambda r: replace(r, state=replace(r.state, status=RunStatus.CREATED)),
+        lambda r: replace(r, state=replace(r.state, version=2)),
+        lambda r: replace(r, state=replace(r.state, elapsed_seconds=1)),
+        lambda r: replace(r, state=replace(r.state, limits=corrupt_limits())),
+        lambda r: replace(r, version=True),
+        lambda r: replace(r, version=0),
+        corrupt_identity_value,
+    ],
+)
+def test_replay_rejects_corrupt_acceptance(
+    corrupt: Callable[[SubmissionAcceptance], SubmissionAcceptance],
+) -> None:
+    journal = CorruptReceiptJournal()
+    submissions = service(journal)
+    asyncio.run(submissions.accept(SESSION, "hello", FIRST, PROFILE))
+    before = asyncio.run(journal.load_session(SESSION))
+    journal.corrupt = corrupt
+
+    with pytest.raises(JournalError) as error:
+        asyncio.run(submissions.accept(SESSION, "hello", FIRST, PROFILE))
+
+    assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    assert asyncio.run(journal.load_session(SESSION)) == before
+
+
+def corrupt_limits() -> RunLimits:
+    limits = replace(LIMITS)
+    object.__setattr__(limits, "max_steps", 0)
+    return limits
+
+
 class CompetingJournal(InMemoryRunJournal):
     def synchronize_next_two_commits(self) -> None:
         self.barrier = asyncio.Barrier(2)
@@ -183,9 +342,12 @@ class CompetingJournal(InMemoryRunJournal):
 
 
 @pytest.mark.parametrize("starts_terminal", [False, True])
-@pytest.mark.parametrize("second_submission", [FIRST, SECOND])
+@pytest.mark.parametrize(
+    ("second_submission", "second_message"),
+    [(FIRST, "hello"), (FIRST, "changed"), (SECOND, "hello")],
+)
 def test_competing_submissions_resolve_one_atomic_cas(
-    starts_terminal: bool, second_submission: SubmissionId
+    starts_terminal: bool, second_submission: SubmissionId, second_message: str
 ) -> None:
     async def scenario() -> None:
         journal = CompetingJournal()
@@ -199,7 +361,7 @@ def test_competing_submissions_resolve_one_atomic_cas(
 
         first, second = await asyncio.gather(
             service(journal, "one").accept(SESSION, "hello", FIRST, PROFILE),
-            service(journal, "two").accept(SESSION, "hello", second_submission, PROFILE),
+            service(journal, "two").accept(SESSION, second_message, second_submission, PROFILE),
             return_exceptions=True,
         )
 
@@ -207,7 +369,7 @@ def test_competing_submissions_resolve_one_atomic_cas(
         assert snapshot.version == before.version + 1
         assert snapshot.sequence == before.sequence + 2
         assert len(snapshot.events) == len(snapshot.transcript) == 1
-        if second_submission == FIRST:
+        if second_submission == FIRST and second_message == "hello":
             assert isinstance(first, AcceptedRun)
             assert second == first
             assert snapshot.state == first.state
@@ -217,8 +379,12 @@ def test_competing_submissions_resolve_one_atomic_cas(
             assert isinstance(loser, JournalError)
             assert loser.failure.code is RunErrorCode.JOURNAL_CONFLICT
             assert snapshot.state == winner.state
-            loser_id = SECOND if winner.state.submission_id == FIRST else FIRST
-            assert await journal.find_submission(SESSION, loser_id) is None
+            if second_submission == FIRST:
+                expected = "hello" if winner is first else second_message
+                assert snapshot.transcript[0].content == expected
+            else:
+                loser_id = SECOND if winner.state.submission_id == FIRST else FIRST
+                assert await journal.find_submission(SESSION, loser_id) is None
 
     asyncio.run(scenario())
 

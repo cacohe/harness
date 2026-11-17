@@ -15,6 +15,7 @@ from src.core.journal import (
     JournalCommit,
     JournalError,
     JournalEvent,
+    JournalHead,
     JournalSnapshot,
     SubmissionAcceptance,
     SubmissionRecord,
@@ -174,6 +175,16 @@ class InMemoryRunJournal:
                 event_ids=store.event_ids.union(event_ids),
             )
             return result
+
+    async def load_head(self, session_id: SessionId) -> JournalHead:
+        if type(session_id) is not SessionId:
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        session_id = _canonical_copy(session_id)
+        with self._lock:
+            session = self._store.sessions.get(session_id.value)
+        if session is None:
+            return JournalHead(0, 0)
+        return JournalHead(session.version, session.sequence, _canonical_copy(session.state))
 
     async def load_session(self, session_id: SessionId, after_sequence: int = 0) -> JournalSnapshot:
         if (

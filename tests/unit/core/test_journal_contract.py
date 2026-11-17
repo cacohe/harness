@@ -147,6 +147,22 @@ def test_session_sequence_orders_events_before_transcript(journal: RunJournal) -
     assert (independent.version, independent.sequence) == (1, 2)
 
 
+def test_session_head_returns_only_current_projection_and_counters(journal: RunJournal) -> None:
+    batch = acceptance("head")
+    session_id = batch.state.session_id
+    empty = asyncio.run(journal.load_head(session_id))
+    assert vars(empty) == {"version": 0, "sequence": 0, "state": None}
+    asyncio.run(journal.commit(batch, expected_version=0))
+    latest = replace(batch.state, version=4)
+    asyncio.run(journal.commit(JournalCommit(latest), expected_version=1))
+
+    head = asyncio.run(journal.load_head(session_id))
+    assert vars(head) == {"version": 2, "sequence": 2, "state": latest}
+    assert head.state is not None
+    object.__setattr__(head.state.run_id, "value", "tampered")
+    assert asyncio.run(journal.load_head(session_id)).state == latest
+
+
 def test_expected_version_conflict_leaves_prior_snapshot_intact(journal: RunJournal) -> None:
     initial = acceptance("first")
     pending = acceptance("pending")
@@ -386,6 +402,9 @@ def test_lookup_rejects_malformed_identifiers(journal: RunJournal) -> None:
     session_id = SessionId("first")
     submission_id = SubmissionId("first")
     object.__delattr__(session_id, "value")
+    with pytest.raises(JournalError) as error:
+        asyncio.run(journal.load_head(session_id))
+    assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
     with pytest.raises(JournalError) as error:
         asyncio.run(journal.load_session(session_id))
     assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION

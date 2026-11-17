@@ -73,6 +73,13 @@ class JournalEvent:
 
 
 @dataclass(frozen=True)
+class JournalHead:
+    version: int
+    sequence: int
+    state: RunState | None = None
+
+
+@dataclass(frozen=True)
 class JournalSnapshot:
     session_id: SessionId
     version: int
@@ -98,6 +105,13 @@ class RunJournal(Protocol):
         Invalid members and duplicate event IDs raise INVARIANT_VIOLATION.
         Event timestamps must be plain UTC datetimes with fold zero.
         A rejected or replayed batch makes no writes.
+        """
+        ...
+
+    def load_head(self, session_id: SessionId) -> Awaitable[JournalHead]:
+        """Read the current projection and CAS counters without reading Session history.
+
+        A missing Session has version and sequence zero and no state.
         """
         ...
 
