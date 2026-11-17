@@ -87,6 +87,7 @@ class RunJournal(Protocol):
         original receipt even after the Session advances. A changed digest or
         acceptance batch and a stale CAS raise JournalError with JOURNAL_CONFLICT.
         Invalid members and duplicate event IDs raise INVARIANT_VIOLATION.
+        Event timestamps must be plain UTC datetimes with fold zero.
         A rejected or replayed batch makes no writes.
         """
         ...

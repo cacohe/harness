@@ -1,6 +1,6 @@
 import asyncio
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 
 import pytest
 from src.adapters.persistence.memory import InMemoryRunJournal
@@ -181,10 +181,9 @@ def test_invalid_commit_member_leaves_the_session_empty(
     }
     if invalid_field in malformed_event:
         run_id, session_id, timestamp = malformed_event[invalid_field]
-        batch = replace(
-            valid,
-            events=(DomainEvent(event.event_id, event.type, run_id, session_id, timestamp, {}),),
-        )
+        bad_event = DomainEvent(event.event_id, event.type, run_id, session_id, NOW, {})
+        object.__setattr__(bad_event, "timestamp", timestamp)
+        batch = replace(valid, events=(bad_event,))
     else:
         batch = replace(valid, **malformed[invalid_field])
 
@@ -214,7 +213,15 @@ def test_submission_retry_returns_original_commit_receipt(journal: RunJournal) -
     assert asyncio.run(journal.load_session(session)).version == 2
 
 
-@pytest.mark.parametrize("change", ["digest", "state", "events", "transcript", "summary"])
+def _event_with_timestamp(event: DomainEvent, timestamp: datetime) -> DomainEvent:
+    return DomainEvent(
+        event.event_id, event.type, event.run_id, event.session_id, timestamp, event.payload
+    )
+
+
+@pytest.mark.parametrize(
+    "change", ["digest", "state", "events", "timestamp", "transcript", "summary"]
+)
 def test_reused_submission_id_with_changed_intent_conflicts(
     journal: RunJournal, change: str
 ) -> None:
@@ -227,6 +234,9 @@ def test_reused_submission_id_with_changed_intent_conflicts(
         "digest": {"submission": replace(original.submission, digest="changed")},
         "state": {"state": replace(state, version=2)},
         "events": {"events": ()},
+        "timestamp": {
+            "events": (_event_with_timestamp(original.events[0], NOW + timedelta(seconds=1)),)
+        },
         "transcript": {"transcript": ()},
         "summary": {"summary": None},
     }
@@ -236,6 +246,32 @@ def test_reused_submission_id_with_changed_intent_conflicts(
 
     assert error.value.failure.code is RunErrorCode.JOURNAL_CONFLICT
     assert asyncio.run(journal.load_session(state.session_id)) == before
+
+
+class MutableFoldTimezone(tzinfo):
+    offset = -4
+
+    def utcoffset(self, dt):
+        return timedelta(hours=self.offset - dt.fold)
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+@pytest.mark.parametrize("fold", [0, 1])
+def test_acceptance_replay_rejects_untrusted_timezone(journal: RunJournal, fold: int) -> None:
+    original = acceptance("first")
+    receipt = asyncio.run(journal.commit(original, expected_version=0))
+    template = original.events[0]
+    invalid = _event_with_timestamp(template, NOW)
+    local_timestamp = datetime(2026, 11, 1, 1, 30, tzinfo=MutableFoldTimezone(), fold=fold)
+    object.__setattr__(invalid, "timestamp", local_timestamp)
+
+    with pytest.raises(JournalError) as error:
+        asyncio.run(journal.commit(replace(original, events=(invalid,)), expected_version=0))
+
+    assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    assert asyncio.run(journal.commit(acceptance("first"), expected_version=0)) == receipt
 
 
 def test_same_submission_id_is_independent_between_sessions(journal: RunJournal) -> None:

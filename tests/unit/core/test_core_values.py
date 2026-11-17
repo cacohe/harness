@@ -1,6 +1,6 @@
 import json
 from dataclasses import FrozenInstanceError, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import PureWindowsPath
 
 import pytest
@@ -12,7 +12,7 @@ from src.core.commands import (
     RunLimits,
     SubmitRun,
 )
-from src.core.errors import RunErrorCode, RunFailure
+from src.core.errors import InvalidTransition, RunErrorCode, RunFailure
 from src.core.events import DomainEvent, DomainEventType, _text_outside_web_urls
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 
@@ -120,15 +120,40 @@ def test_failure_serializes_only_stable_public_details():
         RunFailure(RuntimeError("adapter secret"))
 
 
-def _event(payload):
+def _event(payload, *, timestamp=datetime(2026, 11, 17, tzinfo=timezone.utc)):
     return DomainEvent(
         event_id=EventId("event"),
         type=DomainEventType.RUN_STARTED,
         run_id=RunId("run"),
         session_id=SessionId("session"),
-        timestamp=datetime(2026, 11, 17, tzinfo=timezone.utc),
+        timestamp=timestamp,
         payload=payload,
     )
+
+
+class UntrustedTimezone(tzinfo):
+    def utcoffset(self, dt):
+        raise RuntimeError("timezone behavior must stay outside the journal")
+
+
+class CustomDateTime(datetime):
+    pass
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        datetime(2026, 11, 1),
+        datetime(2026, 11, 1, tzinfo=timezone(timedelta(hours=-4))),
+        datetime(2026, 11, 1, tzinfo=UntrustedTimezone()),
+        datetime(2026, 11, 1, tzinfo=timezone.utc, fold=1),
+        CustomDateTime(2026, 11, 1, tzinfo=timezone.utc),
+    ],
+)
+def test_event_rejects_noncanonical_timestamps(timestamp):
+    with pytest.raises(InvalidTransition) as error:
+        _event({}, timestamp=timestamp)
+    assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
 
 
 @pytest.mark.parametrize(

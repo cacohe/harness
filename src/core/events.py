@@ -4,11 +4,12 @@ import json
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import StrEnum
 from io import StringIO
 from typing import TypeAlias, cast
 
+from src.core.errors import InvalidTransition
 from src.core.ids import EventId, RunId, SessionId
 
 _MAX_PAYLOAD_BYTES = 1_048_576
@@ -133,6 +134,10 @@ def _encode_payload(payload: dict[str, JsonValue]) -> str:
     return encoded.getvalue()
 
 
+def _is_canonical_timestamp(value: object) -> bool:
+    return type(value) is datetime and value.tzinfo is timezone.utc and value.fold == 0
+
+
 @dataclass(frozen=True, init=False)
 class DomainEvent:
     event_id: EventId
@@ -151,6 +156,8 @@ class DomainEvent:
         timestamp: datetime,
         payload: dict[str, JsonValue],
     ) -> None:
+        if not _is_canonical_timestamp(timestamp):
+            raise InvalidTransition
         object.__setattr__(self, "event_id", event_id)
         object.__setattr__(self, "type", type)
         object.__setattr__(self, "run_id", run_id)

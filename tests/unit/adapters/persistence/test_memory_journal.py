@@ -8,8 +8,37 @@ import pytest
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.core.errors import RunErrorCode
 from src.core.events import DomainEvent, JsonValue
+from src.core.ids import SessionId
 from src.core.journal import JournalCommit, JournalError, JournalSnapshot
 from tests.unit.core.test_journal_contract import acceptance
+
+
+def test_unhashable_checkpoint_identity_rejects_every_commit_member() -> None:
+    class UnhashableSession(SessionId):
+        def __eq__(self, other: object) -> bool:
+            return isinstance(other, SessionId) and self.value == other.value
+
+        __hash__ = None
+
+    journal = InMemoryRunJournal()
+    first = acceptance("first")
+    pending = acceptance("next")
+    session_id = first.state.session_id
+    assert pending.summary is not None
+    asyncio.run(journal.commit(first, expected_version=0))
+    before = asyncio.run(journal.load_session(session_id))
+    malformed = replace(pending.summary, session_id=UnhashableSession(session_id.value))
+
+    with pytest.raises((TypeError, JournalError)) as error:
+        asyncio.run(journal.commit(replace(pending, summary=malformed), expected_version=1))
+
+    assert asyncio.run(journal.load_session(session_id)) == before
+    assert asyncio.run(journal.find_submission(session_id, pending.state.submission_id)) is None
+    assert isinstance(error.value, JournalError)
+    assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    committed = asyncio.run(journal.commit(pending, expected_version=1))
+    assert (committed.version, committed.sequence) == (2, 4)
+    assert committed.events[0].event.event_id == pending.events[0].event_id
 
 
 @pytest.mark.parametrize("session", ["session", "another"])
