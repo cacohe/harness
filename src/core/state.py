@@ -331,7 +331,10 @@ def _start_tool(state: RunState, command: StartToolCall) -> tuple[RunState, _Eve
         or len(step.tool_calls) != step.next_tool_index
     ):
         raise InvalidTransition
-    if type(command.requires_approval) is not bool:
+    if (
+        type(command.requires_approval) is not bool
+        or command.requires_approval is not request.requires_approval
+    ):
         raise InvalidTransition
     approval = ApprovalState() if command.requires_approval else None
     tool = ToolCallState(request, requires_approval=command.requires_approval, approval=approval)

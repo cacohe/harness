@@ -203,3 +203,25 @@ def _message_size(message: ModelMessage) -> int:
 
 class ModelGateway(Protocol):
     def complete(self, request: ModelRequest) -> Awaitable[ModelResponse]: ...
+
+
+def snapshot_model_response(value: object) -> ModelResponse:
+    """Rebuild an untrusted gateway response through the trusted wire-neutral schema."""
+    if type(value) is not ModelResponse:
+        raise ValueError("Model gateway returned an invalid response")
+    try:
+        text = object.__getattribute__(value, "text")
+        calls = object.__getattribute__(value, "tool_calls")
+        usage = object.__getattribute__(value, "usage")
+        if (
+            text is not None
+            and type(text) is not str
+            or type(calls) is not tuple
+            or any(type(call) is not ModelToolCall for call in calls)
+            or usage is not None
+            and type(usage) is not ModelUsage
+        ):
+            raise ValueError
+        return ModelResponse(text, calls, replace(usage) if usage is not None else None)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        raise ValueError("Model gateway returned an invalid response") from None

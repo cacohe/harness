@@ -202,6 +202,7 @@ def test_waiting_for_approval_reserves_the_session() -> None:
             "tool-call",
             "test-tool",
             "{}",
+            requires_approval=True,
             approval_scope="test-scope",
             workspace_id="test-workspace",
         )

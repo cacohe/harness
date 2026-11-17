@@ -47,6 +47,7 @@ def _request(**overrides):
         "step_id": "step-1",
         "approval_scope": "workspace-read",
         "workspace_id": "workspace-1",
+        "approval_required": True,
         "approval": ToolApproval.UNDECIDED,
     }
     fields.update(overrides)
@@ -57,6 +58,7 @@ def _request(**overrides):
                 fields["tool_call_id"],
                 fields["name"],
                 fields["arguments_json"],
+                requires_approval=fields["approval_required"],
                 approval_scope=fields["approval_scope"],
                 workspace_id=fields["workspace_id"],
             ),
@@ -249,6 +251,22 @@ def test_tool_request_keeps_scope_workspace_and_explicit_approval(approval):
     assert request.approval is approval
     assert request.approval_scope == "workspace-read"
     assert request.workspace_id == "workspace-1"
+    assert request.approval_required is True
+
+
+def test_tool_request_idempotency_key_is_stable_and_binds_original_identity():
+    request = _request(approval=ToolApproval.APPROVED)
+    restored = _request(approval=ToolApproval.APPROVED)
+    assert request.idempotency_key == restored.idempotency_key
+    assert len(request.idempotency_key) == 64
+    assert _request(arguments_json='{"path":"other"}').idempotency_key != request.idempotency_key
+    assert _request(approval_scope="workspace-write").idempotency_key != request.idempotency_key
+
+
+@pytest.mark.parametrize("approval_required", [1, 0, "true", None])
+def test_tool_request_requires_an_exact_frozen_approval_policy(approval_required):
+    with pytest.raises(ValueError):
+        _request(approval_required=approval_required)
 
 
 @pytest.mark.parametrize(
@@ -316,6 +334,18 @@ def test_tool_result_accepts_explicit_inline_json_null():
         ToolResultStatus.SUCCESS, inline_content=InlineContent(None, "application/json")
     )
     assert result.inline_content.value is None
+
+
+def test_tool_result_accepts_only_a_canonical_execution_key():
+    inline = InlineContent(None, "application/json")
+    key = "a" * 64
+    assert (
+        ToolResult(ToolResultStatus.SUCCESS, inline_content=inline, execution_key=key).execution_key
+        == key
+    )
+    for invalid in ("A" * 64, "a" * 63, StringSubclass(key), object()):
+        with pytest.raises(ValueError):
+            ToolResult(ToolResultStatus.SUCCESS, inline_content=inline, execution_key=invalid)
 
 
 def test_tool_result_success_requires_exactly_one_usable_content_variant():

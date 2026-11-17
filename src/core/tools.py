@@ -1,3 +1,6 @@
+import hashlib
+import json
+import re
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -12,6 +15,7 @@ from src.core.json_values import validate_bounded_text, validate_json_text
 
 _MAX_SCHEMA_BYTES = 65_536
 _MAX_DESCRIPTION_BYTES = 16_384
+_EXECUTION_KEY = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +57,7 @@ class ToolRequest:
     step_id: str
     approval_scope: str
     workspace_id: str
+    approval_required: bool
     approval: ToolApproval
     original_call: ToolCallRequest | None = field(default=None, kw_only=True, repr=False)
 
@@ -62,11 +67,14 @@ class ToolRequest:
             raise ValueError("Tool request requires typed run and session IDs")
         if type(self.approval) is not ToolApproval:
             raise ValueError("Tool request requires an explicit approval decision")
+        if type(self.approval_required) is not bool:
+            raise ValueError("Tool request requires the frozen approval policy")
 
         call = ToolCallRequest(
             self.tool_call_id,
             self.name,
             self.arguments_json,
+            requires_approval=self.approval_required,
             approval_scope=self.approval_scope,
             workspace_id=self.workspace_id,
         )
@@ -103,6 +111,7 @@ class ToolRequest:
             step_id=step_id,
             approval_scope=call.approval_scope,
             workspace_id=call.workspace_id,
+            approval_required=call.requires_approval,
             approval=approval,
             original_call=call,
         )
@@ -116,6 +125,24 @@ class ToolRequest:
     def requires_approval(self) -> bool:
         """Whether a decision is still required before execution."""
         return self.approval is ToolApproval.UNDECIDED
+
+    @property
+    def idempotency_key(self) -> str:
+        payload = json.dumps(
+            [
+                self.session_id.value,
+                self.run_id.value,
+                self.tool_call_id,
+                self.name,
+                self.arguments_json,
+                self.approval_required,
+                self.approval_scope,
+                self.workspace_id,
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
 
 
 class ToolResultStatus(StrEnum):
@@ -141,6 +168,7 @@ class ToolResult:
     status: ToolResultStatus
     _content: ExternalizedContent | None = field(repr=False)
     _failure_code: RunErrorCode | None
+    execution_key: str | None
 
     def __init__(
         self,
@@ -150,11 +178,16 @@ class ToolResult:
         artifacts: tuple[ArtifactRef, ...] = (),
         summary: str | None = None,
         failure: RunFailure | None = None,
+        execution_key: str | None = None,
     ) -> None:
         if type(status) is not ToolResultStatus:
             raise ValueError("Tool result requires a stable status")
         if type(artifacts) is not tuple:
             raise ValueError("Tool result artifacts must be a tuple")
+        if execution_key is not None and (
+            type(execution_key) is not str or not _EXECUTION_KEY.fullmatch(execution_key)
+        ):
+            raise ValueError("Tool result execution key is invalid")
 
         content = None
         failure_code = None
@@ -183,6 +216,7 @@ class ToolResult:
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "_content", content)
         object.__setattr__(self, "_failure_code", failure_code)
+        object.__setattr__(self, "execution_key", execution_key)
 
     @property
     def inline_content(self) -> InlineContent | None:
@@ -205,8 +239,47 @@ class ToolGateway(Protocol):
     def execute(self, request: ToolRequest) -> Awaitable[ToolResult]:
         """Revalidate the current approval policy, scope, and workspace before any side effect.
 
+        Execution is idempotent for `request.idempotency_key`: retries must return
+        the same stable ToolResult without repeating side effects, including after
+        a journal conflict. Return a result carrying that exact execution key.
+
         Return PENDING_APPROVAL for UNDECIDED and DENIED for a denied or stale
         approval without invoking the tool. Dispatch only executable requests
         whose original binding still matches the active tool and workspace.
         """
         ...
+
+
+def snapshot_tool_result(value: object) -> ToolResult:
+    """Rebuild an untrusted gateway value from the trusted result schema."""
+    if type(value) is not ToolResult:
+        raise ValueError("Tool gateway returned an invalid result")
+    try:
+        status = object.__getattribute__(value, "status")
+        content = object.__getattribute__(value, "_content")
+        failure_code = object.__getattribute__(value, "_failure_code")
+        execution_key = object.__getattribute__(value, "execution_key")
+        if (
+            type(status) is not ToolResultStatus
+            or content is not None
+            and type(content) is not ExternalizedContent
+            or failure_code is not None
+            and type(failure_code) is not RunErrorCode
+            or execution_key is not None
+            and type(execution_key) is not str
+        ):
+            raise ValueError
+        inline = content.inline_content if content is not None else None
+        artifacts = content.artifacts if content is not None else ()
+        summary = content.summary if content is not None else None
+        failure = RunFailure(failure_code) if failure_code is not None else None
+        return ToolResult(
+            status,
+            inline_content=inline,
+            artifacts=artifacts,
+            summary=summary,
+            failure=failure,
+            execution_key=execution_key,
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        raise ValueError("Tool gateway returned an invalid result") from None

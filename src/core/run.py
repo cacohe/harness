@@ -19,7 +19,6 @@ from src.core.commands import (
     StartStep,
     StartToolCall,
     SubmitRun,
-    ToolCallRequest,
 )
 from src.core.context import ContextBudget, ContextBudgetExceeded, ContextProvider, ContextRequest
 from src.core.errors import InvalidTransition, RunErrorCode, RunFailure
@@ -31,16 +30,17 @@ from src.core.journal import (
     RunJournal,
     TranscriptEntry,
 )
-from src.core.model import ModelGateway, ModelRequest, ModelResponse
-from src.core.run_content import externalize_final_text
-from src.core.run_projection import tool_failure, tool_transcript
+from src.core.model import ModelGateway, ModelRequest, snapshot_model_response
+from src.core.run_content import externalize_final_text, externalize_tool_result
+from src.core.run_projection import model_tool_requests, tool_failure, tool_transcript
+from src.core.run_receipt import validate_commit_receipt
 from src.core.state import RunState, RunStatus, StateTransition, TaskStateMachine, ToolCallState
 from src.core.tools import (
     ToolApproval,
     ToolGateway,
     ToolRequest,
     ToolResultStatus,
-    ToolSpec,
+    snapshot_tool_result,
 )
 
 
@@ -93,8 +93,10 @@ class RunCoordinator:
 
         driver = _Driver(self, state, command.context)
         if isinstance(command, AdvanceRun):
-            if state.status is not RunStatus.RUNNING or state.current_step is not None:
+            if state.status is not RunStatus.RUNNING:
                 raise InvalidTransition
+            if state.current_step is not None:
+                return await self._continue_tools(driver)
         else:
             driver.apply(command)
             if driver.state.status.terminal:
@@ -131,12 +133,14 @@ class RunCoordinator:
         except Exception:
             return await driver.fail(RunErrorCode.INVARIANT_VIOLATION)
         try:
-            response = await self._model.complete(ModelRequest(window.messages, window.tools))
+            response = snapshot_model_response(
+                await self._model.complete(ModelRequest(window.messages, window.tools))
+            )
         except Exception:
             return await driver.fail(RunErrorCode.MODEL_FAILED)
         try:
-            requests = self._tool_requests(response, window.tools)
-        except InvalidTransition:
+            requests = model_tool_requests(response, window.tools)
+        except (InvalidTransition, ValueError):
             return await driver.fail(RunErrorCode.MODEL_FAILED)
         model_text = response.text or ""
         final_artifacts: tuple[ArtifactRef, ...] = ()
@@ -166,7 +170,7 @@ class RunCoordinator:
             return await driver.commit()
         driver.checkpoint = window.new_checkpoint
         if requests:
-            return await self._continue_tools(driver)
+            return await driver.commit()
         if driver.apply(
             FinishStep(driver.run_id, driver.session_id, step_id, context=driver.context())
         ):
@@ -183,40 +187,16 @@ class RunCoordinator:
         driver.transcript = (driver.entry("assistant", model_text),)
         return await driver.commit()
 
-    def _tool_requests(
-        self, response: ModelResponse, specs: tuple[ToolSpec, ...]
-    ) -> tuple[ToolCallRequest, ...]:
-        catalog = {spec.name: spec for spec in specs}
-        requests = []
-        for call in response.tool_calls:
-            spec = catalog.get(call.name)
-            if spec is None:
-                raise InvalidTransition
-            requests.append(
-                ToolCallRequest(
-                    call.tool_call_id,
-                    call.name,
-                    call.arguments_json,
-                    approval_scope=spec.approval_scope,
-                    workspace_id=spec.workspace_id,
-                )
-            )
-        return tuple(requests)
-
     async def _continue_tools(self, driver: _Driver) -> RunOutcome:
         step = driver.state.current_step
         if step is None or step.model_call is None:
             raise InvalidTransition
         step_id = step.step_id
         model_call_id = step.model_call.model_call_id
-        specs = {spec.name: spec for spec in self._request.tools}
         while step.next_tool_index < len(step.model_call.tool_requests):
             index = step.next_tool_index
             request = step.model_call.tool_requests[index]
             current = step.tool_calls[index] if index < len(step.tool_calls) else None
-            spec = specs.get(request.name)
-            if spec is None:
-                return await driver.fail(RunErrorCode.INVARIANT_VIOLATION)
             if current is None:
                 if driver.apply(
                     StartToolCall(
@@ -225,7 +205,7 @@ class RunCoordinator:
                         step_id,
                         model_call_id,
                         request.tool_call_id,
-                        spec.requires_approval,
+                        request.requires_approval,
                         context=driver.context(),
                     )
                 ):
@@ -276,7 +256,9 @@ class RunCoordinator:
             approval=approval,
         )
         try:
-            result = await self._tools.execute(request)
+            result = snapshot_tool_result(await self._tools.execute(request))
+            if result.execution_key != request.idempotency_key:
+                raise ValueError
         except Exception:
             driver.checkpoint = None
             return RunFailure(RunErrorCode.TOOL_FAILED)
@@ -284,24 +266,9 @@ class RunCoordinator:
             driver.checkpoint = None
             return tool_failure(result)
         try:
-            content = ExternalizedContent(result.inline_content, result.artifacts, result.summary)
-            inline = content.inline_content
-            if (
-                inline is not None
-                and inline.size_bytes > driver.state.limits.max_inline_result_bytes
-            ):
-                content = await self._artifacts.externalize(inline.value, inline.media_type)
-            externalized_inline = content.inline_content
-            if (
-                externalized_inline is not None
-                and externalized_inline.size_bytes > driver.state.limits.max_inline_result_bytes
-            ):
-                raise ValueError
-            if content.summary is not None and (
-                len(content.summary.encode("utf-8")) > driver.state.limits.max_inline_result_bytes
-            ):
-                raise ValueError
-            return content
+            return await externalize_tool_result(
+                result, driver.state.limits.max_inline_result_bytes, self._artifacts
+            )
         except Exception:
             driver.checkpoint = None
             return RunFailure(RunErrorCode.ARTIFACT_FAILED)
@@ -362,6 +329,15 @@ class _Driver:
             ),
             expected,
         )
-        if receipt.state != persisted:
-            raise InvalidTransition
+        receipt = validate_commit_receipt(
+            receipt,
+            JournalCommit(
+                persisted,
+                events=tuple(self.events),
+                transcript=self.transcript,
+                summary=self.checkpoint,
+            ),
+            expected_version=expected,
+            previous_sequence=self.state.journal_sequence,
+        )
         return RunOutcome(persisted, receipt.version, receipt.sequence, tuple(self.events))

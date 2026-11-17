@@ -1,10 +1,34 @@
 import json
 
 from src.core.artifacts import ExternalizedContent
+from src.core.commands import ToolCallRequest
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.journal import TranscriptEntry
+from src.core.model import ModelResponse
 from src.core.state import RunState, ToolCallState
-from src.core.tools import ToolResult, ToolResultStatus
+from src.core.tools import ToolResult, ToolResultStatus, ToolSpec
+
+
+def model_tool_requests(
+    response: ModelResponse, specs: tuple[ToolSpec, ...]
+) -> tuple[ToolCallRequest, ...]:
+    catalog = {spec.name: spec for spec in specs}
+    requests = []
+    for call in response.tool_calls:
+        spec = catalog.get(call.name)
+        if spec is None:
+            raise ValueError
+        requests.append(
+            ToolCallRequest(
+                call.tool_call_id,
+                call.name,
+                call.arguments_json,
+                requires_approval=spec.requires_approval,
+                approval_scope=spec.approval_scope,
+                workspace_id=spec.workspace_id,
+            )
+        )
+    return tuple(requests)
 
 
 def tool_failure(result: ToolResult) -> RunFailure:

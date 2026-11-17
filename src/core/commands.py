@@ -121,12 +121,15 @@ class ToolCallRequest:
     tool_call_id: str
     name: str
     arguments_json: str = field(repr=False)
+    requires_approval: bool = field(kw_only=True)
     approval_scope: str = field(kw_only=True)
     workspace_id: str = field(kw_only=True)
 
     def __post_init__(self) -> None:
         _check_child_id(self.tool_call_id)
         _check_child_id(self.name)
+        if type(self.requires_approval) is not bool:
+            raise InvalidTransition
         try:
             validate_approval_binding(self.approval_scope, self.workspace_id)
             validate_json_text(self.arguments_json, MAX_TOOL_ARGUMENT_BYTES)
@@ -143,6 +146,7 @@ def snapshot_tool_call(request: object) -> ToolCallRequest:
             object.__getattribute__(request, "tool_call_id"),
             object.__getattribute__(request, "name"),
             object.__getattribute__(request, "arguments_json"),
+            requires_approval=object.__getattribute__(request, "requires_approval"),
             approval_scope=object.__getattribute__(request, "approval_scope"),
             workspace_id=object.__getattribute__(request, "workspace_id"),
         )

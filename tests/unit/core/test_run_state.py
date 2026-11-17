@@ -64,10 +64,20 @@ def advance(state: RunState, *commands: CoreCommand) -> RunState:
 
 
 def begin_step(
-    step_id: str = "step", tool_call_id: str | None = "tool"
+    step_id: str = "step",
+    tool_call_id: str | None = "tool",
+    *,
+    requires_approval: bool = True,
 ) -> tuple[StartStep, StartModelCall, FinishModelCall]:
     request = (
-        ToolCallRequest(tool_call_id, "lookup", "{}", approval_scope="read", workspace_id="work")
+        ToolCallRequest(
+            tool_call_id,
+            "lookup",
+            "{}",
+            requires_approval=requires_approval,
+            approval_scope="read",
+            workspace_id="work",
+        )
         if tool_call_id is not None
         else None
     )
@@ -253,7 +263,7 @@ def test_cancel_waiting_closes_child_lifecycles_without_a_tool_result():
 
 def test_child_lifecycles_require_the_current_step_and_matching_parent_call():
     running = advance(initial(), submit())
-    start_step, start_model, finish_model = begin_step()
+    start_step, start_model, finish_model = begin_step(requires_approval=False)
     start_tool = replace(ask_approval(), requires_approval=False, context=context())
     step_open = advance(running, start_step)
     model_open = advance(step_open, start_model)
@@ -336,7 +346,11 @@ def test_elapsed_budget_uses_only_explicit_monotonic_time():
 
 
 def test_inline_result_budget_measures_utf8_bytes():
-    running = advance(initial(RunLimits(2, 10, 12)), submit(), *begin_step())
+    running = advance(
+        initial(RunLimits(2, 10, 12)),
+        submit(),
+        *begin_step(requires_approval=False),
+    )
     started = advance(running, replace(ask_approval(), requires_approval=False, context=context()))
     at_limit = advance(
         started,
@@ -367,7 +381,7 @@ def test_generated_sequences_preserve_state_machine_invariants():
     # Toggle an invalid command independently at nine lifecycle boundaries.
     # Both terminal outcomes are exercised with every combination of invalid insertions.
     first_step = begin_step()
-    second_step = begin_step("second", "another-tool")
+    second_step = begin_step("second", "another-tool", requires_approval=False)
     second_tool = replace(
         ask_approval("second", "another-tool"), requires_approval=False, context=context()
     )
@@ -528,7 +542,7 @@ def test_required_approval_cannot_be_erased_from_restored_tool(outcome):
 
 def test_tool_without_required_approval_can_settle_but_cannot_gain_approval():
     command = replace(ask_approval(), requires_approval=False, context=context())
-    running = advance(initial(), submit(), *begin_step(), command)
+    running = advance(initial(), submit(), *begin_step(requires_approval=False), command)
     step = running.current_step
     assert running.status is RunStatus.RUNNING
     assert step is not None and step.tool_call is not None
@@ -592,7 +606,12 @@ def test_rejects_unsafe_ids_at_first_acceptance(kind, value):
                 finish_model,
                 tool_requests=(
                     ToolCallRequest(
-                        value, "lookup", "{}", approval_scope="read", workspace_id="work"
+                        value,
+                        "lookup",
+                        "{}",
+                        requires_approval=True,
+                        approval_scope="read",
+                        workspace_id="work",
                     ),
                 ),
             )
@@ -602,7 +621,12 @@ def test_rejects_unsafe_ids_at_first_acceptance(kind, value):
 
 def test_approved_tool_request_can_be_restored_and_resumed():
     request = ToolCallRequest(
-        "tool", "read_file", '{"path":"README.md"}', approval_scope="read", workspace_id="work"
+        "tool",
+        "read_file",
+        '{"path":"README.md"}',
+        requires_approval=True,
+        approval_scope="read",
+        workspace_id="work",
     )
     start_step, start_model, finish_model = begin_step()
     model_done = advance(
@@ -653,7 +677,12 @@ def test_rejects_invalid_or_oversized_tool_request_payload(arguments_json):
             finish_model,
             tool_requests=(
                 ToolCallRequest(
-                    "tool", "lookup", arguments_json, approval_scope="read", workspace_id="work"
+                    "tool",
+                    "lookup",
+                    arguments_json,
+                    requires_approval=True,
+                    approval_scope="read",
+                    workspace_id="work",
                 ),
             ),
         )
@@ -674,7 +703,12 @@ def test_rejects_invalid_or_oversized_tool_request_payload(arguments_json):
 )
 def test_tool_request_retains_path_and_exact_boundaries_for_tool_adapter(arguments_json):
     request = ToolCallRequest(
-        "tool", "read_file", arguments_json, approval_scope="read", workspace_id="work"
+        "tool",
+        "read_file",
+        arguments_json,
+        requires_approval=True,
+        approval_scope="read",
+        workspace_id="work",
     )
     assert request.arguments_json == arguments_json
 
@@ -700,6 +734,7 @@ def test_resumed_tool_request_uses_original_journaled_binding(decision):
         "tool",
         "read_file",
         ' {"number":1e-999}',
+        requires_approval=True,
         approval_scope="read-v1",
         workspace_id="checkout-1",
     )
@@ -723,7 +758,11 @@ def test_resumed_tool_request_uses_original_journaled_binding(decision):
         step_id=ready.current_step.step_id,
         approval=decision,
     )
-    assert (tool.approval_scope, tool.workspace_id) == ("read-v1", "checkout-1")
+    assert (tool.approval_required, tool.approval_scope, tool.workspace_id) == (
+        True,
+        "read-v1",
+        "checkout-1",
+    )
     assert tool.arguments_json == ' {"number":1e-999}'
     for changes in (
         {"approval_scope": "read-v2"},
@@ -731,6 +770,7 @@ def test_resumed_tool_request_uses_original_journaled_binding(decision):
         {"tool_call_id": "other"},
         {"name": "write_file"},
         {"arguments_json": '{"number":1e-999}'},
+        {"approval_required": False},
         {"original_call": None},
     ):
         with pytest.raises(ValueError):
@@ -738,7 +778,7 @@ def test_resumed_tool_request_uses_original_journaled_binding(decision):
 
 
 @pytest.mark.parametrize("fields_kind", ["trapping", "empty"])
-@pytest.mark.parametrize("bad_field", [None, "invalid", "missing"])
+@pytest.mark.parametrize("bad_field", [None, "approval", "invalid", "missing"])
 @pytest.mark.parametrize("boundary", ["state", "tool", "from_call"])
 def test_tool_call_snapshots_use_trusted_fields(boundary, bad_field, fields_kind):
     field_reads = []
@@ -748,13 +788,22 @@ def test_tool_call_snapshots_use_trusted_fields(boundary, bad_field, fields_kind
             field_reads.append("values")
             raise AssertionError("Instance dataclass metadata was read")
 
-    request = ToolCallRequest("tool", "lookup", "{}", approval_scope="read", workspace_id="work")
+    request = ToolCallRequest(
+        "tool",
+        "lookup",
+        "{}",
+        requires_approval=True,
+        approval_scope="read",
+        workspace_id="work",
+    )
     expected = replace(request)
     object.__setattr__(
         request, "__dataclass_fields__", TrappingFields() if fields_kind == "trapping" else {}
     )
     if bad_field == "missing":
         object.__delattr__(request, "name")
+    elif bad_field == "approval":
+        object.__setattr__(request, "requires_approval", 1)
     elif bad_field == "invalid":
         object.__setattr__(request, "workspace_id", "/host")
 
@@ -774,6 +823,7 @@ def test_tool_call_snapshots_use_trusted_fields(boundary, bad_field, fields_kind
                 "step",
                 expected.approval_scope,
                 expected.workspace_id,
+                expected.requires_approval,
                 ToolApproval.APPROVED,
                 original_call=request,
             ).original_call
