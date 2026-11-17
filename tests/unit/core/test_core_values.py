@@ -193,6 +193,33 @@ def test_event_rejects_a_host_path_after_a_quoted_https_url():
         _event({"message": message})
 
 
+@pytest.mark.parametrize(
+    ("opening", "closing"),
+    [("'", "'"), ('"', '"'), ("<", ">"), ("“", "”"), ("‘", "’")],
+)
+@pytest.mark.parametrize("host_path", ["/var/private/config.json", "C:/private/config.json"])
+def test_event_rejects_host_paths_outside_url_delimiters(opening, closing, host_path):
+    message = f"See {opening}https://example.org/releases/v1:/artifact{closing}:{host_path}"
+
+    with pytest.raises(ValueError, match="host paths"):
+        _event({"message": message})
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "https://example.org/o'brien/v1:/artifact",
+        'See "https://example.org/o\'brien/v1:/artifact"',
+        "See 'https://example.org/releases/v1:/artifact'",
+        "See <https://example.org/releases/v1:/artifact>",
+        "See “https://example.org/releases/v1:/artifact”",
+        "See ‘https://example.org/releases/v1:/artifact’",
+    ],
+)
+def test_event_preserves_url_apostrophes_and_delimiters(message):
+    assert _event({"message": message}).payload == {"message": message}
+
+
 def test_event_bounds_utf8_payload_size():
     # The compact JSON object framing takes 8 bytes.
     payload = {"v": "é" * ((1_048_576 - 8) // 2)}

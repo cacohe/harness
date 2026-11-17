@@ -13,9 +13,8 @@ from src.core.ids import EventId, RunId, SessionId
 
 _MAX_PAYLOAD_BYTES = 1_048_576
 _MAX_PAYLOAD_DEPTH = 16
-_WEB_URL = re.compile(
-    r"""(?<![\w+.-])https?://[^/?#\s<>"'`\\][^\s<>"'`\\]*""", re.IGNORECASE
-)
+_WEB_URL_START = re.compile(r"(?<![\w+.-])https?://", re.IGNORECASE)
+_WEB_URL_DELIMITERS = frozenset('<>"`\\“”‘’')
 # A URI's "://" separator does not introduce a local path.
 _HOST_PATH = re.compile(
     r"""^(?:[a-z]:[\\/]|(?:~|\.{1,2})?[\\/]|file:)"""
@@ -35,6 +34,32 @@ class DomainEventType(StrEnum):
     RUN_FAILED = "run.failed"
     RUN_CANCELLED = "run.cancelled"
     TOOL_CALL_DECIDED = "tool.call.decided"
+
+
+def _text_outside_web_urls(value: str) -> str:
+    """Skip URL tokens while retaining their delimiters for host-path checks."""
+    fragments: list[str] = []
+    cursor = 0
+    for match in _WEB_URL_START.finditer(value):
+        if match.start() < cursor:
+            continue
+        # An apostrophe is URL data unless the URL starts inside single quotes.
+        single_quoted = match.start() > 0 and value[match.start() - 1] == "'"
+        end = match.end()
+        while end < len(value):
+            character = value[end]
+            if character.isspace() or character in _WEB_URL_DELIMITERS:
+                break
+            if single_quoted and character == "'":
+                break
+            end += 1
+        # Do not exempt a scheme without a host-like first character.
+        if end == match.end() or value[match.end()] in "/?#'":
+            continue
+        fragments.extend((value[cursor : match.start()], " "))
+        cursor = end
+    fragments.append(value[cursor:])
+    return "".join(fragments)
 
 
 def _json_fragments(value: object, depth: int, *, path_value: bool = False) -> Iterator[str]:
@@ -65,7 +90,7 @@ def _json_fragments(value: object, depth: int, *, path_value: bool = False) -> I
         if isinstance(value, str):
             if len(value) > _MAX_PAYLOAD_BYTES:
                 raise ValueError("Event payload exceeds its UTF-8 byte limit")
-            if (path_value and value) or _HOST_PATH.search(_WEB_URL.sub(" ", value.lstrip())):
+            if (path_value and value) or _HOST_PATH.search(_text_outside_web_urls(value.lstrip())):
                 raise ValueError("Event payload must not contain host paths")
         yield json.dumps(value, allow_nan=False, ensure_ascii=False)
     else:
