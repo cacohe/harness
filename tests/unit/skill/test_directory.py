@@ -1,9 +1,9 @@
 from pathlib import Path
 
 import pytest
-from src.core.workspace import Workspace, WorkspaceViolation
 from src.schema.tool import SandboxKind
 from src.skill.directory import SkillDirectory, SkillDocumentError
+from src.workspace import Workspace, WorkspaceViolation
 
 
 def _skill_dir(tmp_path: Path, document: bytes | str | None) -> Path:
@@ -162,6 +162,23 @@ def test_optional_shell_tool_is_sandbox_required_and_scoped_to_skill(tmp_path):
     assert "skill__script_runner__shell" in skill.content
     with pytest.raises(RuntimeError, match="sandbox"):
         shell.executer({"command": "bash scripts/check.sh"})
+
+
+def test_load_bundle_uses_one_document_version_for_skill_and_tools(tmp_path, monkeypatch):
+    root = _skill_dir(tmp_path, "---\nname: ignored\ndescription: Ignored.\n---\nbody")
+    documents = iter(
+        [
+            "---\nname: first\ndescription: First.\n---\nbody",
+            "---\nname: second\ndescription: Second.\n---\nbody",
+        ]
+    )
+    monkeypatch.setattr(SkillDirectory, "_read_document", lambda _self: next(documents))
+
+    skill, tools = SkillDirectory(root).load_bundle()
+
+    assert skill.name == "first"
+    assert [tool.name for tool in tools] == ["skill__first__read_file"]
+    assert "skill__first__read_file" in skill.content
 
 
 @pytest.mark.parametrize("attribute", ["workspace", "_workspace"])

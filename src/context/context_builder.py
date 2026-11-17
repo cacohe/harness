@@ -1,48 +1,29 @@
 from typing import Any
 
-from src.core.context import (
-    DEFAULT_SYSTEM_PROMPT_FOR_FINAL,
-    DEFAULT_SYSTEM_PROMPT_FOR_INFER,
-    DEFAULT_SYSTEM_PROMPT_FOR_PLANNING,
-    ContextBuilderError,
-)
+from src.core.context import ContextBuilderError
 from src.core.task import Task
 from src.schema.context import Context, Message
 from src.schema.skills import Skill
 from src.schema.task import TaskPlan
 from src.schema.tool import Tool
 
+DEFAULT_SYSTEM_PROMPT_FOR_INFER = """
+Decide how to handle the request in this model call.
+
+- Answer directly when no external action is needed.
+- Call tools immediately when the next action is clear.
+- Ask one concise clarification question when required information is missing.
+- For genuinely multi-step work, call update_plan before or alongside execution.
+- Do not create a plan for simple questions or one obvious action.
+- A plan is not user authorization. Tool approval and sandbox rules always apply.
+"""
+DEFAULT_SYSTEM_PROMPT_FOR_FINAL = """
+Answer the original goal from the results above. Do not call tools. Based on the current task state, explain the execution status: what was done, what remains, and why it was not completed.
+"""
+
 
 class DefaultContextBuilder:
-    """Build the planning prompt and the execution transcript."""
-
-    def build_planning_context(
-        self, system_prompt: str, task: Task, tools: list[Tool] | None = None, **kwargs
-    ) -> Context:
-        """
-        Build the context for planning.
-        Args:
-            system_prompt: Extra instructions from the harness.
-            task: The task to plan.
-            tools: Tools the execution loop can call. Their names are listed for the planner.
-            **kwargs: Unused. Accepted so callers can pass the same arguments as inference.
-        Returns:
-            A system instruction that names the available tools, the original request,
-            and no callable tools.
-        """
-        try:
-            return Context(
-                messages=[
-                    Message(
-                        role="system",
-                        content=_planning_system_prompt(system_prompt, tools),
-                    ),
-                    Message(role="user", content=task.original_input),
-                ],
-                tools=[],
-            )
-        except Exception as error:
-            raise ContextBuilderError(f"Failed to build planning context: {error}") from error
+    """Build the unified inference prompt and execution transcript."""
 
     def build_infer_context(
         self,
@@ -103,23 +84,6 @@ def _with_extra_prompt(base: str, extra: str) -> str:
     if not addition:
         return text
     return f"{text}\n\n{addition}"
-
-
-def _planning_system_prompt(system_prompt: str, tools: list[Tool] | None) -> str:
-    text = _with_extra_prompt(DEFAULT_SYSTEM_PROMPT_FOR_PLANNING, system_prompt)
-    catalog = _format_tools(tools)
-    if not catalog:
-        return text
-    return f"{text}\n\n{catalog}"
-
-
-def _format_tools(tools: list[Tool] | None) -> str:
-    if not tools:
-        return ""
-    lines = ["Available tools:"]
-    for tool in tools:
-        lines.append(f"- {tool.name}: {tool.description}")
-    return "\n".join(lines)
 
 
 def _infer_system_prompt(system_prompt: str, skills: list[Skill]) -> str:

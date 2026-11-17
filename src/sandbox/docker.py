@@ -10,8 +10,8 @@ import uuid
 from pathlib import Path
 from typing import IO
 
-from src.core.workspace import Workspace, WorkspaceViolation
 from src.schema.tool import SandboxKind, Tool
+from src.workspace import Workspace, WorkspaceViolation
 
 _DIGEST_IMAGE = re.compile(r"^[^\s\x00-\x1f]+@sha256:[0-9a-fA-F]{64}$")
 _NON_ROOT_USER = re.compile(r"^[1-9][0-9]*:[1-9][0-9]*$")

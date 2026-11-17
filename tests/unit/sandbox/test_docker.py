@@ -8,10 +8,10 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from src.core.workspace import Workspace, WorkspaceViolation
 from src.sandbox import DockerSandboxError, DockerSandboxRunner
 from src.schema.tool import SandboxKind
 from src.tool.local_tools import LocalToolSuite
+from src.workspace import Workspace, WorkspaceViolation
 
 _IMAGE = "agent-runtime@sha256:" + "a" * 64
 _EXECUTABLE = Path(sys.executable).resolve()

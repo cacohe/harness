@@ -10,17 +10,6 @@ HELD_TOOL_MESSAGE = (
     "The tool was not executed because an earlier tool call is waiting for approval."
 )
 
-DEFAULT_SYSTEM_PROMPT_FOR_PLANNING = """
-You are an expert in task management, skilled at converting inputs into clear task objectives and designing reasonable execution steps based on those objectives.
-You decide whether this input needs a plan. Write the goal and steps when you plan. Use clarification when you need to ask the user something instead.
-"""
-DEFAULT_SYSTEM_PROMPT_FOR_INFER = """
-You are an expert in task execution, skilled at executing tasks based on the given task objectives and execution steps.
-"""
-DEFAULT_SYSTEM_PROMPT_FOR_FINAL = """
-Answer the original goal from the results above. Do not call tools. Based on the current task state, explain the execution status: what was done, what remains, and why it was not completed.
-"""
-
 
 class ContextBuilderError(Exception):
     def __init__(self, message: str):
@@ -30,18 +19,6 @@ class ContextBuilderError(Exception):
 
 @runtime_checkable
 class ContextBuilder(Protocol):
-    def build_planning_context(self, system_prompt: str, task: Task, **kwargs) -> Context:
-        """
-        Build the context for the planning.
-        Args:
-            system_prompt: The system prompt of the harness.
-            task: The task for the step.
-            **kwargs: Additional keyword arguments.
-        Returns:
-            Messages for one planning call, and an empty tool catalog.
-        """
-        ...
-
     def build_infer_context(
         self, system_prompt: str, task: Task, tools: list, skills: list, **kwargs
     ) -> Context:

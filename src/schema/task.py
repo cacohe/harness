@@ -53,13 +53,6 @@ class TaskPlan(BaseModel):
     completed: list[str] = Field(default_factory=list)
     current: str | None = None
     remaining: list[str] = Field(default_factory=list)
-    clarification: str | None = Field(
-        default=None,
-        description=(
-            "A question for the user when you decide not to plan yet. "
-            "Leave empty when you provide a plan."
-        ),
-    )
 
     def to_dict(self) -> dict:
         """

@@ -5,10 +5,10 @@ from typing import Any
 import litellm
 from pydantic import BaseModel
 
-from src.core.async_utils import iterate_maybe_async
 from src.schema.context import Context
 from src.schema.llm import ROLE_TOOL, FinishReason, LLMOutput, LlmToolCall, LlmUsage
 from src.schema.tool import Tool
+from src.utils.async_utils import iterate_maybe_async
 
 
 def _is_deepseek(model: str, api_base: str | None) -> bool:
@@ -112,32 +112,6 @@ class LiteLLMGateway:
         self.api_key = api_key
         self.api_base = api_base
         self.options = options
-
-    def planning(
-        self,
-        context: Context,
-        stream: bool = True,
-        response_format: type[BaseModel] | dict[str, Any] | None = None,
-    ) -> LLMOutput | Iterator[LLMOutput]:
-        """
-        Plan one task through LiteLLM.
-        Args:
-            context: System text, user text, prior assistant text, and available tools.
-            stream: True yields each streamed piece. False returns the finished output.
-            response_format: Pydantic model or JSON schema dict the assistant text must follow.
-        Returns:
-            The same output as infer, including output.structured when a format is set.
-        """
-        return self.infer(context, stream=stream, response_format=response_format)
-
-    async def aplanning(
-        self,
-        context: Context,
-        stream: bool = True,
-        response_format: type[BaseModel] | dict[str, Any] | None = None,
-    ) -> LLMOutput | AsyncIterator[LLMOutput]:
-        """Plan one task through LiteLLM's native asynchronous API."""
-        return await self.ainfer(context, stream=stream, response_format=response_format)
 
     async def ainfer(
         self,

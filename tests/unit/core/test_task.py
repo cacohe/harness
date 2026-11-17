@@ -38,7 +38,7 @@ def test_new_tasks_have_independent_identity_and_collections():
     assert second.pending_tool_calls == []
 
 
-def test_new_task_can_be_serialized_before_planning():
+def test_new_task_can_be_serialized_before_inference():
     task = Task(original_input="inspect project")
 
     serialized = task.to_dict()

@@ -1,4 +1,4 @@
-"""Run a task by planning once, then alternating model calls and tool calls."""
+"""Run a task by alternating unified model decisions and tool calls."""
 
 import asyncio
 import contextvars
@@ -74,6 +74,30 @@ DEFAULT_MODEL_TIMEOUT_SECONDS = 90.0
 DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_MODEL_OUTPUT_BYTES = 1_048_576
 DEFAULT_MAX_TOOL_RESULT_BYTES = 1_048_576
+UPDATE_PLAN_TOOL_NAME = "update_plan"
+
+
+def _unreachable_plan_executor(_inputs):
+    raise RuntimeError("update_plan is handled internally by Harness")
+
+
+def _update_plan_schema() -> dict:
+    schema = TaskPlan.model_json_schema()
+    schema["additionalProperties"] = False
+    return schema
+
+
+UPDATE_PLAN_TOOL = Tool(
+    id="__harness_update_plan__",
+    name=UPDATE_PLAN_TOOL_NAME,
+    description=(
+        "Create or update the execution plan for genuinely multi-step work. "
+        "Do not use this for simple questions or one obvious action. "
+        "This records progress only and does not authorize external actions."
+    ),
+    input_schema=_update_plan_schema(),
+    executer=_unreachable_plan_executor,
+)
 
 
 class _TaskPersistenceError(Exception):
@@ -130,7 +154,7 @@ _FACT_STATE: contextvars.ContextVar[_FactState | None] = contextvars.ContextVar(
 
 
 class Harness:
-    """Run one task from planning through tool use until the model answers or a limit is hit."""
+    """Run one task through model decisions and tool use until it reaches a terminal state."""
 
     def __init__(
         self,
@@ -528,6 +552,9 @@ class Harness:
             return
         self._enforce_tool_result(result)
         assert state.started_tools is not None
+        assert state.settled_tools is not None
+        if durable_id in state.settled_tools:
+            return
         if durable_id in state.started_tools:
             if result.is_completed():
                 outcome = "completed"
@@ -555,7 +582,6 @@ class Harness:
                 )
             ],
         )
-        assert state.settled_tools is not None
         state.settled_tools.add(durable_id)
 
     def _record_terminal(self, task: Task, outcome: str) -> None:
@@ -698,6 +724,12 @@ class Harness:
             The available tools.
         """
         return self.tool_executor.get_all_tools()
+
+    def _infer_tools(self) -> list[Tool]:
+        tools = self._available_tools()
+        if any(tool.name == UPDATE_PLAN_TOOL_NAME for tool in tools):
+            raise ContextBuilderError(f"{UPDATE_PLAN_TOOL_NAME!r} is reserved by Harness")
+        return [UPDATE_PLAN_TOOL, *tools]
 
     def _emit_task_event(
         self,
@@ -864,161 +896,6 @@ class Harness:
         if self.harness_guard is not None:
             self.harness_guard.guard_input(task)
 
-    def build_planning_context(self, task: Task) -> Context:
-        """
-        Build the context for the one planning call.
-        Args:
-            task: The task to plan.
-        Returns:
-            The planning context.
-        Raises:
-            ContextBuilderError: The builder failed.
-        """
-        try:
-            return self.context_builder.build_planning_context(
-                self.system_prompt, task, tools=self._available_tools()
-            )
-        except ContextBuilderError:
-            raise
-        except Exception as error:
-            raise ContextBuilderError(str(error)) from error
-
-    def planning(
-        self,
-        context: Context,
-        task: Task,
-        cancellation_token: CancellationToken | None = None,
-    ) -> TaskPlan:
-        return run_sync(
-            lambda: self.aplanning(context, task, cancellation_token),
-            async_name="aplanning",
-        )
-
-    async def aplanning(
-        self,
-        context: Context,
-        task: Task,
-        cancellation_token: CancellationToken | None = None,
-    ) -> TaskPlan:
-        """
-        Ask the model for one structured task plan.
-        Args:
-            context: The planning context.
-            task: The task being planned. Retry events are emitted for this task.
-        Returns:
-            The task plan.
-        Raises:
-            LlmCallError: The model call failed with a permanent error, the plan is missing,
-                or the retries ran out. Invalid structured output is retried.
-        """
-        token = cancellation_token if cancellation_token is not None else CancellationToken()
-        for attempt in range(1, DEFAULT_MAX_LLM_ATTEMPTS + 1):
-            if token.is_cancelled():
-                raise _CancellationRequested
-            self._begin_model_attempt(task, "planning", attempt)
-            self._emit_llm_event(task, EventType.LLM_STARTED, phase="planning")
-            if token.is_cancelled():
-                self._cancel_llm_attempt(task, "planning")
-            try:
-                deadline = asyncio.timeout(self.model_timeout_seconds)
-                try:
-                    async with deadline:
-                        output = await call_maybe_async(
-                            getattr(self.llm_gateway, "aplanning", None),
-                            getattr(self.llm_gateway, "planning", None),
-                            context,
-                            stream=False,
-                            response_format=TaskPlan,
-                        )
-                except TimeoutError as error:
-                    if deadline.expired():
-                        raise _ModelDeadlineExceeded from error
-                    raise
-                if token.is_cancelled():
-                    self._cancel_llm_attempt(task, "planning")
-                if not isinstance(output, LLMOutput):
-                    raise LlmCallError("planning did not return a complete model output")
-
-                if not isinstance(output.structured, TaskPlan):
-                    raise LlmCallError("planning did not return a task plan")
-                self._enforce_model_output(output)
-
-                self._settle_model_attempt(task, "completed", phase="planning", output=output)
-                self._emit_llm_event(
-                    task,
-                    EventType.LLM_COMPLETED,
-                    phase="planning",
-                    usage=output.usage,
-                )
-                if token.is_cancelled():
-                    raise _CancellationRequested
-                return output.structured
-
-            except (_TaskPersistenceError, _EventSinkError):
-                raise
-
-            except asyncio.CancelledError:
-                token.cancel()
-                try:
-                    self._fail_llm_attempt(
-                        task, "planning", TaskFailReason.TASK_FAILED_CANCEL.value
-                    )
-                except _EventSinkError:
-                    pass
-                raise
-
-            except _CancellationRequested:
-                raise
-
-            except _ModelDeadlineExceeded as error:
-                self._fail_llm_attempt(task, "planning", "model_timeout")
-                raise LlmCallError("model call timed out") from error
-
-            except LlmCallError as error:
-                if token.is_cancelled():
-                    self._cancel_llm_attempt(task, "planning")
-                self._fail_llm_attempt(task, "planning", type(error).__name__)
-                if token.is_cancelled():
-                    raise _CancellationRequested
-                raise
-
-            except Exception as error:
-                if token.is_cancelled():
-                    self._cancel_llm_attempt(task, "planning")
-                self._fail_llm_attempt(task, "planning", type(error).__name__)
-                if token.is_cancelled():
-                    raise _CancellationRequested
-                if attempt == DEFAULT_MAX_LLM_ATTEMPTS or not is_transient_llm_error(error):
-                    raise LlmCallError(str(error)) from error
-                self._emit_llm_event(
-                    task,
-                    EventType.LLM_RETRYING,
-                    phase="planning",
-                    reason=type(error).__name__,
-                    attempt=attempt,
-                )
-                if await token.await_cancelled(DEFAULT_LLM_ATTEMPT_DELAY_SECONDS):
-                    raise _CancellationRequested
-        raise LlmCallError("planning retries exhausted")
-
-    def _ask_clarification(
-        self,
-        task: Task,
-        question: str,
-        start_time: float,
-        cancellation_token: CancellationToken | None = None,
-    ) -> TaskResult:
-        if cancellation_token is not None and cancellation_token.is_cancelled():
-            raise _CancellationRequested
-        result = TaskResult(output=question)
-        task.set_progress(task.step_count, time.monotonic() - start_time)
-        task.set_result(result)
-        task.transition_to_completed()
-        self._record_terminal(task, "completed")
-        self._emit_llm_event(task, EventType.LLM_DELTA, phase="planning", content=question)
-        self._emit_task_event(EventType.TASK_COMPLETED, task, content=question)
-        return result
-
     @staticmethod
     def _cancelled_tool_result(item: ToolExecutionResult) -> ToolExecutionResult:
         return ToolExecutionResult(
@@ -1169,7 +1046,7 @@ class Harness:
         """
         try:
             return self.context_builder.build_infer_context(
-                self.system_prompt, task, self._available_tools(), self.skills
+                self.system_prompt, task, self._infer_tools(), self.skills
             )
         except ContextBuilderError:
             raise
@@ -1345,8 +1222,109 @@ class Harness:
         task: Task,
         cancellation_token: CancellationToken | None = None,
     ) -> ToolCallResult:
+        plan_calls = [call for call in tool_calls if call.name == UPDATE_PLAN_TOOL_NAME]
+        if not plan_calls:
+            return await self._aexecute_external_tool_calls(tool_calls, task, cancellation_token)
+
+        plan_results = {
+            call.id: self._execute_plan_update(call, task, cancellation_token)
+            for call in plan_calls
+        }
+        external_calls = [call for call in tool_calls if call.name != UPDATE_PLAN_TOOL_NAME]
+        external_result = (
+            await self._aexecute_external_tool_calls(external_calls, task, cancellation_token)
+            if external_calls
+            else ToolCallResult()
+        )
+        external_items = external_result.ordered_tools or [
+            *external_result.completed_tools,
+            *external_result.failed_tools,
+            *external_result.pending_tools,
+        ]
+        external_by_id = {item.tool_id: item for item in external_items}
+        ordered = []
+        for call in tool_calls:
+            item = (
+                plan_results[call.id]
+                if call.name == UPDATE_PLAN_TOOL_NAME
+                else external_by_id.get(call.id)
+            )
+            if item is not None:
+                ordered.append(item)
+                continue
+            if cancellation_token is None or not cancellation_token.is_cancelled():
+                raise KeyError(call.id)
+        return ToolCallResult(
+            pending_tools=[item for item in ordered if item.is_pending()],
+            completed_tools=[item for item in ordered if item.is_completed()],
+            failed_tools=[item for item in ordered if item.is_failed()],
+            ordered_tools=ordered,
+        )
+
+    def _execute_plan_update(
+        self,
+        call: LlmToolCall,
+        task: Task,
+        cancellation_token: CancellationToken | None,
+    ) -> ToolExecutionResult:
+        self._record_tool_started(task, call)
+        self._emit_tool_event(EventType.TOOL_EXECUTION_STARTED, task, call)
+        if cancellation_token is not None and cancellation_token.is_cancelled():
+            result = ToolExecutionResult(
+                tool_id=call.id,
+                tool_name=call.name,
+                state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
+                output=TOOL_CALL_CANCELLED_OUTPUT,
+                fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_CANCELLED,
+            )
+            self._record_tool_settled(task, call, result)
+            self._emit_tool_result(task, call, result)
+            return result
+
+        try:
+            arguments = json.loads(call.arguments) if call.arguments else {}
+            if not isinstance(arguments, dict):
+                raise ValueError("plan arguments must be a JSON object")
+            allowed = {"goal", "completed", "current", "remaining"}
+            unexpected = sorted(set(arguments) - allowed)
+            if unexpected:
+                raise ValueError(f"unexpected plan fields: {', '.join(unexpected)}")
+            plan = TaskPlan.model_validate(arguments)
+            task.set_plan(plan)
+            self._save_task(task)
+        except (_TaskPersistenceError, _EventSinkError):
+            raise
+        except Exception as error:
+            result = ToolExecutionResult(
+                tool_id=call.id,
+                tool_name=call.name,
+                state=ToolExecutionState.TOOL_EXECUTION_STATE_FAILED,
+                output=f"Invalid plan: {error}",
+                fail_reason=ToolExecutionFailReason.TOOL_EXECUTION_FAIL_REASON_UNKNOWN,
+            )
+            self._record_tool_settled(task, call, result)
+            self._emit_tool_result(task, call, result)
+            return result
+
+        result = ToolExecutionResult(
+            tool_id=call.id,
+            tool_name=call.name,
+            state=ToolExecutionState.TOOL_EXECUTION_STATE_COMPLETED,
+            output="Plan updated.",
+        )
+        self._record_tool_settled(task, call, result)
+        self._emit_tool_result(task, call, result)
+        self._emit_task_event(EventType.TASK_PLANNED, task, goal=list(plan.goal))
+        return result
+
+    async def _aexecute_external_tool_calls(
+        self,
+        tool_calls: list[LlmToolCall],
+        task: Task,
+        cancellation_token: CancellationToken | None = None,
+    ) -> ToolCallResult:
         """
-        Execute tool calls.
+        Execute non-control tool calls.
         Args:
             tool_calls: Tool calls from the model, in order.
             task: The task whose id is attached to the tool events.
@@ -1520,6 +1498,27 @@ class Harness:
                 for result in batch_result.failed_tools
             ):
                 raise TimeoutError("tool call timed out")
+            if cancellation_token is not None and cancellation_token.is_cancelled():
+                items = batch_result.ordered_tools or [
+                    *batch_result.completed_tools,
+                    *batch_result.failed_tools,
+                    *batch_result.pending_tools,
+                ]
+                by_id = {item.tool_id: item for item in items}
+                for call in tool_calls:
+                    result = by_id.get(call.id)
+                    if result is None or result.is_pending():
+                        result = cancelled_result(call)
+                        by_id[call.id] = result
+                        self._emit_tool_result(task, call, result)
+                    self._record_tool_settled(task, call, result)
+                ordered = [by_id[call.id] for call in tool_calls]
+                return ToolCallResult(
+                    pending_tools=[result for result in ordered if result.is_pending()],
+                    completed_tools=[result for result in ordered if result.is_completed()],
+                    failed_tools=[result for result in ordered if result.is_failed()],
+                    ordered_tools=ordered,
+                )
             return batch_result
         except _ToolBatchCancelled:
             ordered = [observed_results.get(call.id, cancelled_result(call)) for call in tool_calls]
@@ -1853,7 +1852,7 @@ class Harness:
         execution_context: ExecutionContext | None = None,
     ) -> TaskResult:
         """
-        Plan a new task, then infer and execute tools until the model answers or a limit is hit.
+        Infer and execute tools until the model answers or a limit is hit.
         Args:
             task: The task to run.
             cancellation_token: The cancellation token.
@@ -1871,10 +1870,7 @@ class Harness:
                 assert task.result is not None
                 return task.result
 
-            if token.is_cancelled():
-                return self._handle_cancelled(task, start_time)
-
-            if task.is_paused() and task.approval_requests():
+            if task.is_paused() and task.approval_requests() and not token.is_cancelled():
                 raise ValueError("tool calls are waiting for approval")
 
             was_created = task.is_created()
@@ -1884,24 +1880,17 @@ class Harness:
             fact_token = _FACT_STATE.set(_FactState(context))
             self._start_execution_facts(task)
 
+            if token.is_cancelled():
+                if task.is_paused():
+                    task.transition_to_running(TaskRunningReason.TASK_RUNNING_RESUME)
+                    self._record_resumed(task)
+                return self._handle_cancelled(task, start_time)
+
             self._emit_task_event(EventType.TASK_STARTED, task)
 
             if was_created:
                 self._save_task(task)
                 self.guard_input(task)
-
-                self._emit_task_event(EventType.TASK_PLANNING, task)
-                self._begin_step(task, phase="planning")
-                plan = await self.aplanning(self.build_planning_context(task), task, token)
-                if token.is_cancelled():
-                    raise _CancellationRequested
-                task.set_plan(plan)
-                self._save_task(task)
-                self._settle_step(task, "completed")
-                self._emit_task_event(EventType.TASK_PLANNED, task, goal=list(plan.goal))
-                question = (plan.clarification or "").strip()
-                if question:
-                    return self._ask_clarification(task, question, start_time, token)
 
             if task.is_paused():
                 task.transition_to_running(TaskRunningReason.TASK_RUNNING_RESUME)

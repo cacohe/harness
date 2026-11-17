@@ -1,3 +1,4 @@
+from src.application.agent import Agent
 from src.core import event as core_event
 from src.core.context import ContextBuilder
 from src.core.guard import HarnessGuard
@@ -5,23 +6,19 @@ from src.core.llm import AsyncLlmGateway, LlmGateway
 from src.core.loop import Harness
 from src.core.memory import MemoryRetriever, MemoryStore
 from src.core.tool import AsyncToolRunner, ToolExecutor
-from src.demo.agent import Agent
 from src.tool.tool_executor import DefaultToolExecutor
 
 
 class DuckContextBuilder:
-    def build_planning_context(self, system_prompt, task, **kwargs): ...
     def build_infer_context(self, system_prompt, task, tools, skills, **kwargs): ...
     def build_final_context(self, system_prompt, task, **kwargs): ...
 
 
 class DuckLlmGateway:
-    def planning(self, context, stream=True, response_format=None): ...
     def infer(self, context, stream=True, response_format=None): ...
 
 
 class DuckAsyncLlmGateway:
-    async def aplanning(self, context, stream=True, response_format=None): ...
     async def ainfer(self, context, stream=True, response_format=None): ...
 
 

@@ -4,7 +4,6 @@ from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
 from src.core.async_utils import call_maybe_async, run_sync
-from src.core.workspace import Workspace, WorkspaceViolation
 from src.schema.llm import LlmToolCall
 from src.schema.tool import (
     TOOL_CALL_CANCELLED_OUTPUT,
@@ -15,6 +14,7 @@ from src.schema.tool import (
     ToolExecutionResult,
     ToolExecutionState,
 )
+from src.workspace import Workspace, WorkspaceViolation
 
 
 class RemoteToolError(Exception):

@@ -7,7 +7,6 @@ from src.schema.llm import LlmUsage
 
 class EventType(Enum):
     TASK_STARTED = "task_started"
-    TASK_PLANNING = "task_planning"
     TASK_PLANNED = "task_planned"
     TASK_PAUSED = "task_paused"
     TASK_RESUMED = "task_resumed"

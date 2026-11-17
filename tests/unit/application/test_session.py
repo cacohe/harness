@@ -3,10 +3,10 @@ import threading
 import unicodedata
 
 import pytest
+from src.application.session import AgentSession, message_digest
 from src.core.cancellation import CancellationToken
 from src.core.memory import MemoryManager
 from src.core.persistence import SubmissionConflictError
-from src.demo.session import AgentSession, message_digest
 from src.memory.retriever import HybridRetriever
 from src.memory.store import InMemoryStore
 from src.persistence import SQLiteTaskRepository

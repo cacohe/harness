@@ -354,7 +354,7 @@ def test_ainfer_stream_yields_deltas_and_usage_from_async_completion(monkeypatch
     assert pieces[1].usage.total_tokens == 2
 
 
-def test_aplanning_delegates_to_native_async_inference(monkeypatch):
+def test_ainfer_parses_native_async_structured_output(monkeypatch):
     class Message:
         content = '{"city": "Beijing"}'
         tool_calls = None
@@ -379,7 +379,7 @@ def test_aplanning_delegates_to_native_async_inference(monkeypatch):
     monkeypatch.setattr("src.llm.litellm.litellm.acompletion", fake_acompletion)
 
     output = asyncio.run(
-        LiteLLMGateway("m").aplanning(_context(), stream=False, response_format=Weather)
+        LiteLLMGateway("m").ainfer(_context(), stream=False, response_format=Weather)
     )
 
     assert output.structured == Weather(city="Beijing")

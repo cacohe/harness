@@ -13,23 +13,6 @@ class LlmCallError(Exception):
 class LlmGateway(Protocol):
     """LLM Gateway"""
 
-    def planning(
-        self,
-        context: Context,
-        stream: bool = True,
-        response_format: Any | None = None,
-    ) -> LLMOutput | Iterator[LLMOutput]:
-        """
-        Planning the task.
-        Args:
-            context: The context for the planning.
-            stream: Whether to stream the response.
-            response_format: Pydantic model or JSON schema dict the assistant text must follow.
-        Returns:
-            The planning output. When response_format is set, structured holds the parsed value.
-        """
-        ...
-
     def infer(
         self,
         context: Context,
@@ -51,13 +34,6 @@ class LlmGateway(Protocol):
 @runtime_checkable
 class AsyncLlmGateway(Protocol):
     """Native asynchronous LLM gateway."""
-
-    async def aplanning(
-        self,
-        context: Context,
-        stream: bool = True,
-        response_format: Any | None = None,
-    ) -> LLMOutput | AsyncIterator[LLMOutput]: ...
 
     async def ainfer(
         self,
