@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Protocol, TypeVar
 
+from src.application.observability import Observation, PostCommitObserver
 from src.application.submissions import AcceptedRun, SubmissionService
 from src.core.commands import AdvanceRun, CommandContext, DecideToolCall, ResumeRun
 from src.core.ids import Clock, IdGenerator, ProfileId, RunId, SessionId, SubmissionId
@@ -123,6 +124,7 @@ class RuntimeCoordinator:
         max_waiters_per_session: int,
         max_advances_per_operation: int = 1024,
         owned_resources: tuple[object, ...] = (),
+        observer: PostCommitObserver | None = None,
     ) -> None:
         if (
             type(max_sessions) is not int
@@ -144,6 +146,7 @@ class RuntimeCoordinator:
         self._max_waiters = max_waiters_per_session
         self._max_advances = max_advances_per_operation
         self._owned_resources = owned_resources
+        self._observer = observer
         self._sessions: dict[str, _SessionSlot] = {}
         self._registry_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
@@ -196,6 +199,7 @@ class RuntimeCoordinator:
                     session_id, message, submission_id, profile_id
                 )
                 state = await self._accepted_head(accepted)
+                await self._observe("submission.accepted", state)
                 return await self._drive(state, message)
 
     async def decide_tool_call(
@@ -229,6 +233,7 @@ class RuntimeCoordinator:
                     ),
                 )
                 decided = _outcome_state(outcome, state)
+                await self._observe("run.advanced", decided)
                 resumed = await self._coordinator_factory(decided, message).advance(
                     decided,
                     ResumeRun(
@@ -237,7 +242,9 @@ class RuntimeCoordinator:
                         context=self._context(decided),
                     ),
                 )
-                return await self._drive(_outcome_state(resumed, decided), message)
+                resumed_state = _outcome_state(resumed, decided)
+                await self._observe("run.advanced", resumed_state)
+                return await self._drive(resumed_state, message)
 
     async def close(self) -> None:
         async with self._lifecycle_lock:
@@ -349,10 +356,30 @@ class RuntimeCoordinator:
                 ),
             )
             next_state = _outcome_state(outcome, state)
+            await self._observe("run.advanced", next_state)
             if next_state.version <= state.version:
                 raise RuntimeError("Run coordinator did not advance the state")
             state = next_state
         raise RuntimeError("Application operation exceeded its advance limit")
+
+    async def _observe(self, kind: str, state: RunState) -> None:
+        observer = self._observer
+        if observer is None:
+            return
+        observation = Observation(
+            kind,
+            state.session_id.value,
+            state.run_id.value,
+            state.status.value,
+            state.journal_version,
+            state.journal_sequence,
+        )
+        try:
+            await observer.observe(observation)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
 
     def _context(self, state: RunState) -> CommandContext:
         return CommandContext(self._clock.now(), state.elapsed_seconds, (self._ids.event(),))

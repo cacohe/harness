@@ -16,6 +16,7 @@ from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.application.agent_v3 import Agent
+from src.application.observability import PostCommitObserver
 from src.application.runtime import RuntimeCoordinator, _close_resource
 from src.application.submissions import SubmissionService
 from src.core.artifacts import ArtifactExternalizer
@@ -95,6 +96,7 @@ async def create_development_agent(
     journal: RunJournal | None = None,
     artifacts: ArtifactExternalizer | None = None,
     owned_resources: tuple[object, ...] = (),
+    observer: PostCommitObserver | None = None,
 ) -> Agent:
     config, profile_id = _validate_composition_inputs(
         config,
@@ -108,6 +110,7 @@ async def create_development_agent(
         journal=journal,
         artifacts=artifacts,
         owned_resources=owned_resources,
+        observer=observer,
     )
     created: list[object] = []
     try:
@@ -135,6 +138,7 @@ async def create_development_agent(
             journal=selected_journal,
             artifacts=selected_artifacts,
             owned_resources=(*owned_resources, *created),
+            observer=observer,
         )
     except BaseException as error:
         await _cleanup_and_raise(error, created)
@@ -153,6 +157,7 @@ async def create_production_agent(
     journal: RunJournal | None = None,
     artifacts: ArtifactExternalizer | None = None,
     owned_resources: tuple[object, ...] = (),
+    observer: PostCommitObserver | None = None,
 ) -> Agent:
     config, profile_id = _validate_composition_inputs(
         config,
@@ -166,6 +171,7 @@ async def create_production_agent(
         journal=journal,
         artifacts=artifacts,
         owned_resources=owned_resources,
+        observer=observer,
     )
     if journal is None and config.sqlite_path is None:
         raise ValueError("Production composition requires an absolute SQLite path")
@@ -206,6 +212,7 @@ async def create_production_agent(
             journal=selected_journal,
             artifacts=selected_artifacts,
             owned_resources=(*owned_resources, *created),
+            observer=observer,
         )
     except BaseException as error:
         await _cleanup_and_raise(error, created)
@@ -224,6 +231,7 @@ def _compose(
     journal: RunJournal,
     artifacts: ArtifactExternalizer,
     owned_resources: tuple[object, ...],
+    observer: PostCommitObserver | None,
 ) -> Agent:
     submissions = SubmissionService(journal, ids, clock, config.limits)
 
@@ -253,6 +261,7 @@ def _compose(
         max_waiters_per_session=config.max_waiters_per_session,
         max_advances_per_operation=config.max_advances_per_operation,
         owned_resources=owned_resources,
+        observer=observer,
     )
     return Agent(runtime, ids, profile_id)
 
@@ -270,6 +279,7 @@ def _validate_composition_inputs(
     journal: RunJournal | None,
     artifacts: ArtifactExternalizer | None,
     owned_resources: tuple[object, ...],
+    observer: PostCommitObserver | None,
 ) -> tuple[ApplicationConfig, ProfileId]:
     if (
         type(config) is not ApplicationConfig
@@ -291,6 +301,8 @@ def _validate_composition_inputs(
         _require_methods(journal, _JOURNAL_METHODS)
     if artifacts is not None:
         _require_methods(artifacts, ("externalize",))
+    if observer is not None:
+        _require_methods(observer, ("observe",))
     return config, profile
 
 

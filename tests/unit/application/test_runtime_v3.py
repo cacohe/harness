@@ -173,6 +173,42 @@ class CompletingCoordinator:
         return RunOutcome(completed, completed.journal_version, completed.journal_sequence)
 
 
+@async_test
+async def test_post_commit_observer_runs_after_acceptance_and_advance_and_is_isolated():
+    from src.application.runtime import RuntimeCoordinator
+
+    journal = Journal()
+    observed = []
+
+    class Observer:
+        async def observe(self, observation):
+            head = await journal.load_head(SessionId(observation.session_id))
+            assert head.state is not None
+            assert head.version == observation.journal_version
+            observed.append((observation.kind, observation.status))
+            if observation.kind == "submission.accepted":
+                raise RuntimeError("observer failure must not affect durable work")
+
+    runtime = RuntimeCoordinator(
+        submissions=Submissions(journal),
+        journal=journal,
+        coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, []),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=0,
+        observer=Observer(),
+    )
+    result = await runtime.submit(
+        SessionId("observed"), ProfileId("profile"), "message", SubmissionId("submission")
+    )
+    assert result.status is RunStatus.COMPLETED
+    assert observed == [
+        ("submission.accepted", "running"),
+        ("run.advanced", "completed"),
+    ]
+
+
 def waiting_state(session: SessionId, submission: SubmissionId) -> RunState:
     current = state(session, submission)
     context = CommandContext(NOW, 0, (EventId("event"),))
