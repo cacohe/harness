@@ -4,7 +4,14 @@ from datetime import datetime, timezone
 from pathlib import PureWindowsPath
 
 import pytest
-from src.core.commands import CancelRun, DecideToolCall, ResumeRun, RunLimits, SubmitRun
+from src.core.commands import (
+    CancelRun,
+    CommandContext,
+    DecideToolCall,
+    ResumeRun,
+    RunLimits,
+    SubmitRun,
+)
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.events import DomainEvent, DomainEventType, _text_outside_web_urls
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
@@ -77,16 +84,25 @@ def test_limits_keep_explicit_budget_values():
 def test_commands_keep_run_and_session_correlation():
     run_id = RunId("run")
     session_id = SessionId("session")
+    context = CommandContext(datetime(2026, 11, 17, tzinfo=timezone.utc), 0, (EventId("event"),))
     commands = (
-        SubmitRun(run_id, session_id, SubmissionId("submission"), ProfileId("profile"), "hello"),
-        ResumeRun(run_id, session_id),
-        CancelRun(run_id, session_id),
-        DecideToolCall(run_id, session_id, "call", approved=True),
+        SubmitRun(
+            run_id,
+            session_id,
+            SubmissionId("submission"),
+            ProfileId("profile"),
+            "hello",
+            context=context,
+        ),
+        ResumeRun(run_id, session_id, context=context),
+        CancelRun(run_id, session_id, context=context),
+        DecideToolCall(run_id, session_id, "call", approved=True, context=context),
     )
 
     for command in commands:
         assert command.run_id == run_id
         assert command.session_id == session_id
+        assert command.context == context
         with pytest.raises(FrozenInstanceError):
             command.run_id = RunId("other")
 
