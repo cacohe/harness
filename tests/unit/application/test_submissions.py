@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from itertools import count
@@ -24,6 +24,7 @@ from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 from src.core.journal import (
     JournalCommit,
     JournalError,
+    JournalHead,
     JournalSnapshot,
     RunJournal,
     SubmissionAcceptance,
@@ -272,6 +273,11 @@ def test_invalid_input_is_rejected_before_using_ports(
 
 class CorruptReceiptJournal(InMemoryRunJournal):
     corrupt: Callable[[SubmissionAcceptance], SubmissionAcceptance] | None = None
+    head_reads = 0
+
+    async def load_head(self, session_id: SessionId) -> JournalHead:
+        self.head_reads += 1
+        return await super().load_head(session_id)
 
     async def find_submission(
         self, session_id: SessionId, submission_id: SubmissionId
@@ -327,7 +333,121 @@ def corrupt_limits() -> RunLimits:
     return limits
 
 
-class CompetingJournal(InMemoryRunJournal):
+class IntSubclass(int):
+    pass
+
+
+class ExplosiveFloat(float):
+    def __le__(self, other: object) -> bool:
+        raise RuntimeError("overloaded numeric comparison")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_steps", IntSubclass(LIMITS.max_steps)),
+        ("max_inline_result_bytes", IntSubclass(LIMITS.max_inline_result_bytes)),
+        ("max_elapsed_seconds", ExplosiveFloat(LIMITS.max_elapsed_seconds)),
+        ("max_elapsed_seconds", float("inf")),
+        ("max_elapsed_seconds", True),
+    ],
+)
+def test_replay_rejects_corrupt_limit_primitives(field: str, value: object) -> None:
+    journal = CorruptReceiptJournal()
+    submissions = service(journal)
+    asyncio.run(submissions.accept(SESSION, "hello", FIRST, PROFILE))
+
+    def corrupt(receipt: SubmissionAcceptance) -> SubmissionAcceptance:
+        object.__setattr__(receipt.state.limits, field, value)
+        return receipt
+
+    journal.corrupt = corrupt
+    with pytest.raises(JournalError) as error:
+        asyncio.run(submissions.accept(SESSION, "hello", FIRST, PROFILE))
+
+    assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+def future_version(receipt: SubmissionAcceptance) -> SubmissionAcceptance:
+    return replace(receipt, version=999)
+
+
+def other_state(receipt: SubmissionAcceptance) -> SubmissionAcceptance:
+    return replace(receipt, state=replace(receipt.state, limits=RunLimits(3, 10, 64)))
+
+
+def other_elapsed_type(receipt: SubmissionAcceptance) -> SubmissionAcceptance:
+    limits = replace(
+        receipt.state.limits,
+        max_elapsed_seconds=float(receipt.state.limits.max_elapsed_seconds),
+    )
+    return replace(receipt, state=replace(receipt.state, limits=limits))
+
+
+def other_elapsed_zero(receipt: SubmissionAcceptance) -> SubmissionAcceptance:
+    return replace(receipt, state=replace(receipt.state, elapsed_seconds=0.0))
+
+
+@pytest.mark.parametrize(
+    "corrupt", [future_version, other_state, other_elapsed_type, other_elapsed_zero]
+)
+def test_replay_cross_checks_receipt_against_session_head(
+    corrupt: Callable[[SubmissionAcceptance], SubmissionAcceptance],
+) -> None:
+    journal = CorruptReceiptJournal()
+    submissions = service(journal)
+    asyncio.run(submissions.accept(SESSION, "hello", FIRST, PROFILE))
+    journal.corrupt = corrupt
+    before = journal.head_reads
+
+    with pytest.raises(JournalError) as error:
+        asyncio.run(submissions.accept(SESSION, "hello", FIRST, PROFILE))
+
+    assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    assert journal.head_reads - before == (2 if corrupt is future_version else 1)
+
+
+class InterleavedJournal(CorruptReceiptJournal):
+    after_next_head: Callable[[], Awaitable[None]] | None = None
+
+    async def load_head(self, session_id: SessionId) -> JournalHead:
+        head = await super().load_head(session_id)
+        if self.after_next_head is not None:
+            action, self.after_next_head = self.after_next_head, None
+            await action()
+        return head
+
+
+@pytest.mark.parametrize("finish_before_lookup", [False, True])
+def test_replay_confirms_acceptance_committed_after_first_head(
+    finish_before_lookup: bool,
+) -> None:
+    async def scenario() -> None:
+        journal = InterleavedJournal()
+        winners: list[AcceptedRun] = []
+
+        async def concurrent_acceptance() -> None:
+            winner = await service(journal, "winner").accept(SESSION, "hello", FIRST, PROFILE)
+            winners.append(winner)
+            if finish_before_lookup:
+                await finish(journal, winner)
+
+        journal.after_next_head = concurrent_acceptance
+        ids = SequenceIds("replay")
+        clock = FixedClock(NOW)
+        replay = SubmissionService(journal, ids, clock, LIMITS)
+
+        accepted = await replay.accept(SESSION, "hello", FIRST, PROFILE)
+
+        assert winners == [accepted]
+        # The initial read, the winning request's read, and one confirming read.
+        assert journal.head_reads == 3
+        assert (next(ids.runs), next(ids.events), clock.readings) == (1, 1, 0)
+
+    asyncio.run(scenario())
+
+
+class CompetingJournal(CorruptReceiptJournal):
     def synchronize_next_two_commits(self) -> None:
         self.barrier = asyncio.Barrier(2)
 
@@ -339,6 +459,32 @@ class CompetingJournal(InMemoryRunJournal):
             await asyncio.wait_for(barrier.wait(), timeout=5)
             self.barrier = None
         return await super().commit(batch, expected_version)
+
+
+@pytest.mark.parametrize("corrupt", [future_version, other_state])
+def test_cas_loser_cross_checks_receipt_against_refreshed_head(
+    corrupt: Callable[[SubmissionAcceptance], SubmissionAcceptance],
+) -> None:
+    async def scenario() -> None:
+        journal = CompetingJournal()
+        journal.corrupt = corrupt
+        journal.synchronize_next_two_commits()
+
+        first, second = await asyncio.gather(
+            service(journal, "one").accept(SESSION, "hello", FIRST, PROFILE),
+            service(journal, "two").accept(SESSION, "hello", FIRST, PROFILE),
+            return_exceptions=True,
+        )
+
+        winner, loser = (first, second) if isinstance(first, AcceptedRun) else (second, first)
+        assert isinstance(winner, AcceptedRun)
+        assert isinstance(loser, JournalError)
+        assert loser.failure.code is RunErrorCode.INVARIANT_VIOLATION
+        assert journal.head_reads == 3
+        snapshot = await journal.load_session(SESSION)
+        assert (snapshot.version, snapshot.state, snapshot.sequence) == (1, winner.state, 2)
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("starts_terminal", [False, True])
@@ -373,6 +519,7 @@ def test_competing_submissions_resolve_one_atomic_cas(
             assert isinstance(first, AcceptedRun)
             assert second == first
             assert snapshot.state == first.state
+            assert journal.head_reads == (4 if starts_terminal else 3)
         else:
             winner, loser = (first, second) if isinstance(first, AcceptedRun) else (second, first)
             assert isinstance(winner, AcceptedRun)

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 
 from src.core.commands import CommandContext, RunLimits, SubmitRun
@@ -8,6 +9,7 @@ from src.core.ids import Clock, IdGenerator, ProfileId, RunId, SessionId, Submis
 from src.core.journal import (
     JournalCommit,
     JournalError,
+    JournalHead,
     RunJournal,
     SubmissionAcceptance,
     SubmissionRecord,
@@ -42,7 +44,7 @@ class SubmissionService:
     ) -> AcceptedRun:
         digest = _message_digest(session_id, submission_id, profile_id, message)
         head = await self._journal.load_head(session_id)
-        accepted = await self._replay(session_id, submission_id, profile_id, digest)
+        accepted = await self._replay(session_id, submission_id, profile_id, digest, head)
         if accepted is not None:
             return accepted
         if head.state is not None and not head.state.status.terminal:
@@ -69,7 +71,7 @@ class SubmissionService:
         except JournalError as error:
             if error.failure.code is RunErrorCode.JOURNAL_CONFLICT:
                 # Another writer may have accepted this submission after the lookup.
-                accepted = await self._replay(session_id, submission_id, profile_id, digest)
+                accepted = await self._replay(session_id, submission_id, profile_id, digest, head)
                 if accepted is not None:
                     return accepted
             raise
@@ -81,28 +83,46 @@ class SubmissionService:
         submission_id: SubmissionId,
         profile_id: ProfileId,
         digest: str,
+        head: JournalHead,
     ) -> AcceptedRun | None:
         accepted = await self._journal.find_submission(session_id, submission_id)
         if accepted is None:
             return None
-        state = _validate_acceptance(accepted, session_id, submission_id)
-        if accepted.submission.digest != digest:
+        state, version, saved_digest = _validate_acceptance(accepted, session_id, submission_id)
+        head_version = _head_version(head)
+        if version > head_version:
+            # A writer may have accepted the submission between the head and lookup reads.
+            head = await self._journal.load_head(session_id)
+            head_version = _head_version(head)
+        if version > head_version:
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        if version == head_version:
+            head_state = _initial_state(getattr(head, "state", None))
+            if not _same_initial_state(state, head_state):
+                raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        if saved_digest != digest:
             raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
         if state.profile_id != profile_id:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
-        return AcceptedRun(state, accepted.version)
+        return AcceptedRun(state, version)
+
+
+def _head_version(head: JournalHead) -> int:
+    version = getattr(head, "version", None) if type(head) is JournalHead else None
+    if type(version) is not int or version < 0:
+        raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+    return version
 
 
 def _validate_acceptance(
     receipt: SubmissionAcceptance, session_id: SessionId, submission_id: SubmissionId
-) -> RunState:
+) -> tuple[RunState, int, str]:
     try:
         if type(receipt) is not SubmissionAcceptance:
             raise ValueError
-        record, state, version = receipt.submission, receipt.state, receipt.version
+        record, version = receipt.submission, receipt.version
         if (
             type(record) is not SubmissionRecord
-            or type(state) is not RunState
             or type(version) is not int
             or version < 1
             or type(record.digest) is not str
@@ -116,46 +136,79 @@ def _validate_acceptance(
             or record.submission_id != submission_id
             or type(record.run_id) is not RunId
             or type(record.run_id.value) is not str
-            or type(state.profile_id) is not ProfileId
-            or type(state.profile_id.value) is not str
-            or type(state.limits) is not RunLimits
         ):
             raise ValueError
-        limits = RunLimits(
-            state.limits.max_steps,
-            state.limits.max_elapsed_seconds,
-            state.limits.max_inline_result_bytes,
-        )
-        original = RunState(
-            RunId(record.run_id.value),
-            session_id,
-            submission_id,
-            ProfileId(state.profile_id.value),
-            limits,
-            version=1,
-            status=RunStatus.RUNNING,
-        )
+        state = _initial_state(receipt.state)
         if (
-            type(state.session_id) is not SessionId
+            state.session_id != session_id
+            or state.submission_id != submission_id
+            or state.run_id != record.run_id
+        ):
+            raise ValueError
+        return state, version, record.digest
+    except (AttributeError, TypeError, ValueError):
+        raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+
+
+def _initial_state(state: RunState | None) -> RunState:
+    """Decode only the fields an acceptance commit can contain."""
+    try:
+        if (
+            type(state) is not RunState
+            or type(state.session_id) is not SessionId
             or type(state.session_id.value) is not str
             or type(state.submission_id) is not SubmissionId
             or type(state.submission_id.value) is not str
             or type(state.run_id) is not RunId
             or type(state.run_id.value) is not str
+            or type(state.profile_id) is not ProfileId
+            or type(state.profile_id.value) is not str
+            or type(state.limits) is not RunLimits
             or state.status is not RunStatus.RUNNING
             or type(state.version) is not int
+            or state.version != 1
             or type(state.elapsed_seconds) not in (int, float)
+            or state.elapsed_seconds != 0
             or type(state.used_step_ids) is not frozenset
+            or state.used_step_ids
             or type(state.used_tool_call_ids) is not frozenset
+            or state.used_tool_call_ids
             or state.current_step is not None
             or state.final_text is not None
             or state.failure is not None
-            or state != original
         ):
             raise ValueError
-        return original
-    except (AttributeError, TypeError, ValueError):
+        limits = state.limits
+        elapsed = limits.max_elapsed_seconds
+        if (
+            type(limits.max_steps) is not int
+            or type(limits.max_inline_result_bytes) is not int
+            or type(elapsed) not in (int, float)
+            or not math.isfinite(elapsed)
+            or elapsed <= 0
+        ):
+            raise ValueError
+        return RunState(
+            RunId(state.run_id.value),
+            SessionId(state.session_id.value),
+            SubmissionId(state.submission_id.value),
+            ProfileId(state.profile_id.value),
+            RunLimits(limits.max_steps, elapsed, limits.max_inline_result_bytes),
+            version=1,
+            status=RunStatus.RUNNING,
+            elapsed_seconds=state.elapsed_seconds,
+        )
+    except (AttributeError, OverflowError, TypeError, ValueError):
         raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+
+
+def _same_initial_state(left: RunState, right: RunState) -> bool:
+    # Both states have been decoded. Preserve the journal's distinction between numeric types.
+    return (
+        left == right
+        and type(left.limits.max_elapsed_seconds) is type(right.limits.max_elapsed_seconds)
+        and repr(left.elapsed_seconds) == repr(right.elapsed_seconds)
+    )
 
 
 def _message_digest(
