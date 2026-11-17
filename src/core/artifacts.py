@@ -25,7 +25,7 @@ _METADATA_URL = re.compile(
     r"(?i)(?<![a-z0-9+.-])(?:[a-z][a-z0-9+.-]*://|(?:file|data|mailto|urn):)"
 )
 _METADATA_PATH = re.compile(
-    r"(?i)(?:\A\s*(?:~|\.{1,2})?[/\\]|"
+    r"""(?i)(?:(?:\A|["'\x60()\[\]{}<>“”‘’:=,;|])\s*+(?:~|\.{1,2})?[/\\]|"""
     r"(?<![\w./\\~+-])(?:(?:~|\.{1,2})?[/\\](?=\S|$)|[a-z]:\S))"
 )
 _CREDENTIAL_TOKEN = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[^A-Za-z]|$)|[A-Z]?[a-z]+")

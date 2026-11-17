@@ -24,8 +24,9 @@ def test_ref_metadata_is_copy_isolated_and_ref_is_frozen():
         ref.name = "changed"
 
 
-def test_metadata_at_the_exact_encoded_size_limit_is_accepted():
-    metadata = {"x": "a" * 65_528}
+@pytest.mark.parametrize("value", ["a" * 65_528, "|" + " " * 65_526 + "a"])
+def test_metadata_at_the_exact_encoded_size_limit_is_accepted(value):
+    metadata = {"x": value}
     ref = ArtifactRef(ARTIFACT_ID, "text/plain", 0, DIGEST, metadata=metadata)
     assert ref.metadata == metadata
 
@@ -50,6 +51,16 @@ def test_metadata_at_the_exact_encoded_size_limit_is_accepted():
         "/",
         " / folder/file",
         "src]/",
+        "src]/ ",
+        'source: "/ folder/file"',
+        "source: / folder/file",
+        "source=/ folder/file",
+        "source,/ ",
+        "source;/ folder/file",
+        "source|/ folder/file",
+        "source)/ folder/file",
+        "source:'/ folder/file'",
+        "source: “/ folder/file”",
     ],
 )
 def test_metadata_rejects_host_locations_at_token_boundaries(location):
@@ -101,7 +112,18 @@ def test_metadata_preserves_ordinary_statistics_fields():
     assert ref.metadata == metadata
 
 
-@pytest.mark.parametrize("value", ["foo/bar", "1/2", "folder/subfolder/item", "比例1/2"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "foo/bar",
+        "1/2",
+        "1 / 2",
+        "ratio: 1 / 2",
+        "plain words with spaces",
+        "folder/subfolder/item",
+        "比例1/2",
+    ],
+)
 def test_metadata_accepts_slashes_within_non_host_tokens(value):
     ref = ArtifactRef(ARTIFACT_ID, "text/plain", 0, DIGEST, metadata={"source": value})
     assert ref.metadata["source"] == value
