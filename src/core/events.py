@@ -13,9 +13,10 @@ from src.core.ids import EventId, RunId, SessionId
 
 _MAX_PAYLOAD_BYTES = 1_048_576
 _MAX_PAYLOAD_DEPTH = 16
+# A URI's "://" separator does not introduce a local path.
 _HOST_PATH = re.compile(
-    r"""^(?:[a-z]:|(?:~|\.{1,2})?[\\/]|file:)"""
-    r"""|[\s"'`([{=<“‘](?:[a-z]:\S|(?:~|\.{1,2})?[\\/]\S|file:)""",
+    r"""^(?:[a-z]:[\\/]|(?:~|\.{1,2})?[\\/]|file:)"""
+    r"""|(?:[\s"'`([{=<“‘]|:(?!//))(?:[a-z]:[\\/]|(?:~|\.{1,2})?[\\/]\S|file:)""",
     re.IGNORECASE,
 )
 _PATH_FIELD = re.compile(r"(?i:(?:^|[_.-])paths?$)|Paths?$")

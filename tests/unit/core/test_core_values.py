@@ -152,6 +152,29 @@ def test_event_rejects_paths_in_diagnostics_and_explicit_path_fields(payload):
         _event(payload)
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Could not open:/var/private/config.json",
+        r"Could not open:C:\private\config.json",
+    ],
+)
+def test_event_rejects_paths_after_a_diagnostic_colon(message):
+    with pytest.raises(ValueError, match="host paths"):
+        _event({"message": message})
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Changed from x:1 to x:2",
+        "See:https://example.org/artifact",
+    ],
+)
+def test_event_preserves_non_path_diagnostic_text_with_colons(message):
+    assert _event({"message": message}).payload == {"message": message}
+
+
 def test_event_bounds_utf8_payload_size():
     # The compact JSON object framing takes 8 bytes.
     payload = {"v": "é" * ((1_048_576 - 8) // 2)}
