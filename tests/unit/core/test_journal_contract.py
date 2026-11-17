@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone, tzinfo
 
 import pytest
 from src.adapters.persistence.memory import InMemoryRunJournal
+from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.core.artifacts import ArtifactRef
 from src.core.commands import RunLimits
 from src.core.errors import RunErrorCode, RunFailure
@@ -28,9 +29,11 @@ def artifact_ref(seed: str = "a") -> ArtifactRef:
     return ArtifactRef(f"sha256:{digest}", "application/json", 2, digest)
 
 
-@pytest.fixture
-def journal() -> RunJournal:
-    return InMemoryRunJournal()
+@pytest.fixture(params=("memory", "sqlite"))
+def journal(request: pytest.FixtureRequest, tmp_path) -> RunJournal:
+    if request.param == "memory":
+        return InMemoryRunJournal()
+    return SQLiteRunJournal((tmp_path / "contract.sqlite3").resolve())
 
 
 def acceptance(
