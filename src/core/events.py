@@ -15,10 +15,11 @@ _MAX_PAYLOAD_BYTES = 1_048_576
 _MAX_PAYLOAD_DEPTH = 16
 _WEB_URL_START = re.compile(r"(?<![\w+.-])https?://", re.IGNORECASE)
 _WEB_URL_DELIMITERS = frozenset('<>"`\\“”‘’')
+_QUOTE_END = {"'": "'", '"': '"', "`": "`", "<": ">", "“": "”", "‘": "’"}
 # A URI's "://" separator does not introduce a local path.
 _HOST_PATH = re.compile(
     r"""^(?:[a-z]:[\\/]|(?:~|\.{1,2})?[\\/]|file:)"""
-    r"""|(?:[\s"'`([{=<“‘]|:(?!//))(?:[a-z]:[\\/]|(?:~|\.{1,2})?[\\/]\S|file:)""",
+    r"""|(?:[\s"'`([{=<>“”‘’]|:(?!//))(?:[a-z]:[\\/]|(?:~|\.{1,2})?[\\/]\S|file:)""",
     re.IGNORECASE,
 )
 _PATH_FIELD = re.compile(r"(?i:(?:^|[_.-])paths?$)|Paths?$")
@@ -37,28 +38,46 @@ class DomainEventType(StrEnum):
 
 
 def _text_outside_web_urls(value: str) -> str:
-    """Skip URL tokens while retaining their delimiters for host-path checks."""
+    """Mask URL tokens in one forward pass, retaining host-path boundaries."""
     fragments: list[str] = []
     cursor = 0
-    for match in _WEB_URL_START.finditer(value):
-        if match.start() < cursor:
+    retained = 0
+    closing_quote = ""
+    while cursor < len(value):
+        character = value[cursor]
+        # match() inspects only the fixed-size scheme at the current position.
+        match = _WEB_URL_START.match(value, cursor) if character in "hH" else None
+        if match is not None and match.end() < len(value):
+            first = value[match.end()]
+            # Reject a hostless prefix before scanning any of its suffix.
+            if not (first.isspace() or first in _WEB_URL_DELIMITERS or first in "/?#'"):
+                fragments.extend((value[retained:cursor], " "))
+                cursor = match.end()
+                while cursor < len(value):
+                    character = value[cursor]
+                    if character.isspace() or character in _WEB_URL_DELIMITERS:
+                        break
+                    if character == "'" and closing_quote == "'":
+                        break
+                    cursor += 1
+                retained = cursor
+                continue
+        # A word-internal apostrophe is prose, unless it directly quotes a URL.
+        if (
+            character == "'"
+            and 0 < cursor < len(value) - 1
+            and value[cursor - 1].isalnum()
+            and value[cursor + 1].isalnum()
+            and _WEB_URL_START.match(value, cursor + 1) is None
+        ):
+            cursor += 1
             continue
-        # An apostrophe is URL data unless the URL starts inside single quotes.
-        single_quoted = match.start() > 0 and value[match.start() - 1] == "'"
-        end = match.end()
-        while end < len(value):
-            character = value[end]
-            if character.isspace() or character in _WEB_URL_DELIMITERS:
-                break
-            if single_quoted and character == "'":
-                break
-            end += 1
-        # Do not exempt a scheme without a host-like first character.
-        if end == match.end() or value[match.end()] in "/?#'":
-            continue
-        fragments.extend((value[cursor : match.start()], " "))
-        cursor = end
-    fragments.append(value[cursor:])
+        if character == closing_quote:
+            closing_quote = ""
+        elif not closing_quote and character in _QUOTE_END:
+            closing_quote = _QUOTE_END[character]
+        cursor += 1
+    fragments.append(value[retained:])
     return "".join(fragments)
 
 

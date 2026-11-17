@@ -6,7 +6,7 @@ from pathlib import PureWindowsPath
 import pytest
 from src.core.commands import CancelRun, DecideToolCall, ResumeRun, RunLimits, SubmitRun
 from src.core.errors import RunErrorCode, RunFailure
-from src.core.events import DomainEvent, DomainEventType
+from src.core.events import DomainEvent, DomainEventType, _text_outside_web_urls
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 
 ID_TYPES = (RunId, SessionId, SubmissionId, ProfileId, EventId)
@@ -218,6 +218,67 @@ def test_event_rejects_host_paths_outside_url_delimiters(opening, closing, host_
 )
 def test_event_preserves_url_apostrophes_and_delimiters(message):
     assert _event({"message": message}).payload == {"message": message}
+
+
+@pytest.mark.parametrize(
+    ("opening", "closing"),
+    [("'", "'"), ('"', '"'), ("<", ">"), ("“", "”"), ("‘", "’")],
+)
+@pytest.mark.parametrize("prefix", ["", " ", "ref "])
+@pytest.mark.parametrize("host_path", ["/var/private/config.json", "C:/private/config.json"])
+def test_event_rejects_host_paths_touching_url_closing_delimiters(
+    opening, closing, prefix, host_path
+):
+    message = f"See {opening}{prefix}https://example.org/releases/v1:/artifact{closing}{host_path}"
+
+    with pytest.raises(ValueError, match="host paths"):
+        _event({"message": message})
+
+
+@pytest.mark.parametrize("prefix", [" ", "ref ", "ref with spaces ", "don't mention "])
+@pytest.mark.parametrize("host_path", ["/var/private/config.json", "C:/private/config.json"])
+def test_event_rejects_host_paths_after_urls_within_prefixed_single_quotes(prefix, host_path):
+    message = f"See '{prefix}https://example.org/doc':{host_path}"
+
+    with pytest.raises(ValueError, match="host paths"):
+        _event({"message": message})
+
+
+def test_event_rejects_host_paths_after_urls_with_single_quotes_touching_prose():
+    with pytest.raises(ValueError, match="host paths"):
+        _event({"message": "See'https://example.org/doc':/var/private/config.json"})
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "See 'ref https://example.org/releases/v1:/artifact'",
+        "See ' https://example.org/releases/v1:/artifact'",
+        "Don't discard https://example.org/o'brien/v1:/artifact",
+        'See "ref https://example.org/o\'brien/v1:/artifact"',
+    ],
+)
+def test_event_preserves_urls_in_quoted_prose_and_after_contractions(message):
+    assert _event({"message": message}).payload == {"message": message}
+
+
+@pytest.mark.parametrize("fragment", ["http:///", "https://?", "https://#"])
+@pytest.mark.parametrize("count", [200, 400, 800])
+def test_url_scanner_bounds_character_work_for_hostless_schemes(fragment, count):
+    class CountedText(str):
+        characters_read = 0
+
+        def __getitem__(self, key):
+            result = super().__getitem__(key)
+            self.characters_read += len(result)
+            return result
+
+    message = CountedText(fragment * count)
+
+    # Invalid URL prefixes must remain visible to host-path validation. Count
+    # character reads and copied slices, not wall-clock time or mocked results.
+    assert _text_outside_web_urls(message) == message
+    assert message.characters_read <= 4 * len(message) + 32
 
 
 def test_event_bounds_utf8_payload_size():
