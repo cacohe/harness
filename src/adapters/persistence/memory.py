@@ -1,9 +1,10 @@
+import json
 from bisect import bisect_right
-from copy import deepcopy
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import datetime
 from threading import Lock
-from typing import TypeAlias, TypeVar
+from typing import Any, TypeAlias, TypeVar
 
 from src.core.commands import RunLimits, ToolCallRequest
 from src.core.errors import RunErrorCode, RunFailure
@@ -27,9 +28,12 @@ from src.core.state import (
     ToolCallState,
 )
 
-_IntentValue: TypeAlias = "str | int | None | tuple[_IntentValue, ...]"
+_IntentValue: TypeAlias = tuple[str, object]
+_ID_TYPES = (EventId, ProfileId, RunId, SessionId, SubmissionId)
 _RECORD_TYPES = (
     JournalCommit,
+    JournalSnapshot,
+    JournalEvent,
     RunState,
     RunLimits,
     RunFailure,
@@ -45,18 +49,24 @@ _RECORD_TYPES = (
 )
 
 
-@dataclass
+@dataclass(frozen=True)
 class _Session:
     version: int = 0
     sequence: int = 0
     state: RunState | None = None
-    runs: dict[str, RunState] = field(default_factory=dict)
-    events: list[JournalEvent] = field(default_factory=list)
-    transcript: list[TranscriptEntry] = field(default_factory=list)
-    summaries: dict[tuple[str, int, str, str], ConversationSummaryCheckpoint] = field(
+    runs: Mapping[str, RunState] = field(default_factory=dict)
+    events: tuple[JournalEvent, ...] = ()
+    transcript: tuple[TranscriptEntry, ...] = ()
+    summaries: Mapping[tuple[str, int, str, str], ConversationSummaryCheckpoint] = field(
         default_factory=dict
     )
-    submissions: dict[str, tuple[_IntentValue, JournalSnapshot]] = field(default_factory=dict)
+    submissions: Mapping[str, tuple[_IntentValue, JournalSnapshot]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _Store:
+    sessions: Mapping[str, _Session] = field(default_factory=dict)
+    event_ids: frozenset[str] = frozenset()
 
 
 class InMemoryRunJournal:
@@ -64,8 +74,7 @@ class InMemoryRunJournal:
 
     def __init__(self) -> None:
         self._lock = Lock()
-        self._sessions: dict[str, _Session] = {}
-        self._event_ids: set[str] = set()
+        self._store = _Store()
 
     async def commit(self, batch: JournalCommit, expected_version: int) -> JournalSnapshot:
         with self._lock:
@@ -73,27 +82,31 @@ class InMemoryRunJournal:
                 type(expected_version) is not int
                 or expected_version < 0
                 or type(batch) is not JournalCommit
-                or type(batch.state) is not RunState
             ):
                 raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
 
-            intent = _validated_intent(batch)
+            batch = _canonical_copy(batch)
             state = batch.state
+            if type(state) is not RunState:
+                raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+
+            store = self._store
             session_key = state.session_id.value
             run_key = state.run_id.value
             submission_key = state.submission_id.value
-            session = self._sessions.get(session_key)
+            session = store.sessions.get(session_key)
             if session is None:
                 session = _Session()
 
             _validate_members(batch, session.sequence)
+            intent = _intent_value(batch) if batch.submission is not None else None
             accepted = session.submissions.get(submission_key)
             if accepted is not None:
                 original, receipt = accepted
-                if batch.submission is not None:
+                if intent is not None:
                     if intent != original:
                         raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
-                    return _copy(receipt)
+                    return _canonical_copy(receipt)
                 if receipt.state is not None and receipt.state.run_id != state.run_id:
                     raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
 
@@ -108,21 +121,9 @@ class InMemoryRunJournal:
                 raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
 
             event_ids = {event.event_id.value for event in batch.events}
-            if len(event_ids) != len(batch.events) or not self._event_ids.isdisjoint(event_ids):
+            if len(event_ids) != len(batch.events) or not store.event_ids.isdisjoint(event_ids):
                 raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
 
-            summary = batch.summary
-            summary_key = (
-                (
-                    session_key,
-                    summary.covered_through_sequence,
-                    summary.policy_version,
-                    summary.profile_id.value,
-                )
-                if summary is not None
-                else None
-            )
-            batch = _copy(batch)
             summary = batch.summary
             cursor = session.sequence
             events = tuple(
@@ -144,110 +145,179 @@ class InMemoryRunJournal:
                 summaries=(summary,) if summary is not None else (),
                 submission=batch.submission,
             )
-            result = _copy(receipt)
-
-            # All checks and copies complete before updates to the journal and its indexes.
-            session.version = receipt.version
-            session.sequence = receipt.sequence
-            session.state = batch.state
-            session.runs[run_key] = batch.state
-            session.events.extend(events)
-            session.transcript.extend(transcript)
-            if summary_key is not None and summary is not None:
-                session.summaries[summary_key] = summary
-            if batch.submission is not None:
-                session.submissions[submission_key] = intent, receipt
-            self._event_ids.update(event_ids)
-            self._sessions[session_key] = session
+            result = _canonical_copy(receipt)
+            summaries = session.summaries
+            if summary is not None:
+                summary_key = (
+                    session_key,
+                    summary.covered_through_sequence,
+                    summary.policy_version,
+                    summary.profile_id.value,
+                )
+                summaries = {**summaries, summary_key: summary}
+            submissions = session.submissions
+            if intent is not None:
+                submissions = {**submissions, submission_key: (intent, receipt)}
+            next_session = _Session(
+                version=receipt.version,
+                sequence=receipt.sequence,
+                state=state,
+                runs={**session.runs, run_key: state},
+                events=session.events + events,
+                transcript=session.transcript + transcript,
+                summaries=summaries,
+                submissions=submissions,
+            )
+            self._store = _Store(
+                sessions={**store.sessions, session_key: next_session},
+                event_ids=store.event_ids.union(event_ids),
+            )
             return result
 
     async def load_session(self, session_id: SessionId, after_sequence: int = 0) -> JournalSnapshot:
         if (
             type(session_id) is not SessionId
-            or type(session_id.value) is not str
             or type(after_sequence) is not int
             or after_sequence < 0
         ):
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        session_id = _canonical_copy(session_id)
         with self._lock:
-            session = self._sessions.get(session_id.value)
-            if session is None:
-                return JournalSnapshot(session_id, 0, 0)
+            store = self._store
 
-            event_start = bisect_right(
-                session.events, after_sequence, key=lambda entry: entry.sequence
+        session = store.sessions.get(session_id.value)
+        if session is None:
+            return JournalSnapshot(session_id, 0, 0)
+        event_start = bisect_right(session.events, after_sequence, key=lambda entry: entry.sequence)
+        transcript_start = bisect_right(
+            session.transcript, after_sequence, key=lambda entry: entry.sequence
+        )
+        return _canonical_copy(
+            JournalSnapshot(
+                session_id,
+                session.version,
+                session.sequence,
+                session.state,
+                session.events[event_start:],
+                session.transcript[transcript_start:],
+                tuple(session.summaries.values()),
             )
-            transcript_start = bisect_right(
-                session.transcript, after_sequence, key=lambda entry: entry.sequence
-            )
-            return _copy(
-                JournalSnapshot(
-                    session_id,
-                    session.version,
-                    session.sequence,
-                    session.state,
-                    tuple(session.events[event_start:]),
-                    tuple(session.transcript[transcript_start:]),
-                    tuple(session.summaries.values()),
-                )
-            )
+        )
 
     async def find_submission(
         self, session_id: SessionId, submission_id: SubmissionId
     ) -> SubmissionRecord | None:
-        if (
-            type(session_id) is not SessionId
-            or type(session_id.value) is not str
-            or type(submission_id) is not SubmissionId
-            or type(submission_id.value) is not str
-        ):
+        if type(session_id) is not SessionId or type(submission_id) is not SubmissionId:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        session_id = _canonical_copy(session_id)
+        submission_id = _canonical_copy(submission_id)
         with self._lock:
-            session = self._sessions.get(session_id.value)
-            accepted = session.submissions.get(submission_id.value) if session is not None else None
-            return _copy(accepted[1].submission) if accepted is not None else None
+            store = self._store
+
+        session = store.sessions.get(session_id.value)
+        accepted = session.submissions.get(submission_id.value) if session is not None else None
+        return _canonical_copy(accepted[1].submission) if accepted is not None else None
 
 
-def _validated_intent(batch: JournalCommit) -> _IntentValue:
+_T = TypeVar("_T")
+
+
+def _canonical_copy(value: _T) -> _T:
+    """Rebuild record fields through trusted constructors, without instance copy protocols."""
     try:
-        intent = _intent_value(batch)
-        if type(batch.state.limits) is not RunLimits:
-            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
-        RunLimits.__post_init__(batch.state.limits)
-        RunState.__post_init__(batch.state)
-        return intent
-    except (AttributeError, TypeError, ValueError, RecursionError):
+        return _rebuild(value)
+    except (AttributeError, KeyError, TypeError, ValueError, RecursionError, OverflowError):
         raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
 
 
-def _intent_value(value: object) -> _IntentValue:
-    """Capture records as immutable, typed persistence values without custom equality."""
-    if value is None or type(value) is int or type(value) is str:
+def _rebuild(value: object) -> Any:
+    if (
+        value is None
+        or type(value) is bool
+        or type(value) is bytes
+        or type(value) is float
+        or type(value) is int
+        or type(value) is str
+        or type(value) is RunStatus
+        or type(value) is RunErrorCode
+        or type(value) is DomainEventType
+    ):
         return value
+    if type(value) is datetime and _is_canonical_timestamp(value):
+        return value.replace()
+    if type(value) is tuple:
+        return tuple(_rebuild(item) for item in value)
+    if type(value) is frozenset and all(type(item) is str for item in value):
+        return value
+
+    record_type = type(value)
+    if not (
+        any(record_type is allowed for allowed in (*_ID_TYPES, *_RECORD_TYPES))
+        and is_dataclass(value)
+    ):
+        raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+
+    declared = fields(value)
+    names = {member.name for member in declared}
+    source = {
+        name: member
+        for name, member in dict.items(object.__getattribute__(value, "__dict__"))
+        if type(name) is str and name in names
+    }
+    args = {member.name: _rebuild(source[member.name]) for member in declared if member.init}
+    if record_type is DomainEvent:
+        # Decode the source of the public payload and let DomainEvent validate it again.
+        encoded = source["_payload_json"]
+        if type(encoded) is not str:
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        return DomainEvent(**args, payload=json.loads(encoded))
+
+    constructor: Any = record_type
+    rebuilt = constructor(**args)
+    if record_type is RunFailure:
+        message = source["message"]
+        if type(message) is not str or message != rebuilt.message:
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+    return rebuilt
+
+
+def _intent_value(value: object) -> _IntentValue:
+    """Encode each rebuilt value with a disjoint tag before comparing acceptance intents."""
+    if value is None:
+        return ("none", None)
     if type(value) is bool:
-        return ("bool", int(value))
+        return ("bool", value)
+    if type(value) is int:
+        return ("int", value)
     if type(value) is float:
         return ("float", value.hex())
-    if type(value) is datetime and _is_canonical_timestamp(value):
+    if type(value) is str:
+        return ("str", value)
+    if type(value) is bytes:
+        return ("bytes", value)
+    if type(value) is datetime:
         return ("datetime", value.isoformat(timespec="microseconds"))
     if type(value) is RunStatus or type(value) is RunErrorCode or type(value) is DomainEventType:
-        return (type(value).__name__, value.value)
+        return ("enum", (type(value).__name__, value.value))
     if (
         type(value) is SessionId
         or type(value) is RunId
         or type(value) is SubmissionId
         or type(value) is ProfileId
         or type(value) is EventId
-    ) and type(value.value) is str:
-        return (type(value).__name__, value.value)
+    ):
+        return ("id", (type(value).__name__, value.value))
     if type(value) is tuple:
-        return tuple(_intent_value(item) for item in value)
-    if type(value) is frozenset and all(type(item) is str for item in value):
-        return ("frozenset", *sorted(value))
+        return ("tuple", tuple(_intent_value(item) for item in value))
+    if type(value) is frozenset:
+        return ("frozenset", tuple(sorted(value)))
     if any(type(value) is record_type for record_type in _RECORD_TYPES) and is_dataclass(value):
         return (
-            type(value).__name__,
-            *(_intent_value(getattr(value, member.name)) for member in fields(value)),
+            "record",
+            (
+                type(value).__name__,
+                tuple(_intent_value(getattr(value, member.name)) for member in fields(value)),
+            ),
         )
     raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
 
@@ -329,13 +399,3 @@ def _is_text(value: object) -> bool:
     except UnicodeEncodeError:
         return False
     return True
-
-
-_T = TypeVar("_T")
-
-
-def _copy(value: _T) -> _T:
-    try:
-        return deepcopy(value)
-    except Exception:
-        raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None

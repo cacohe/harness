@@ -8,9 +8,58 @@ import pytest
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.core.errors import RunErrorCode
 from src.core.events import DomainEvent, JsonValue
-from src.core.ids import SessionId
+from src.core.ids import EventId, SessionId
 from src.core.journal import JournalCommit, JournalError, JournalSnapshot
 from tests.unit.core.test_journal_contract import acceptance
+
+
+def test_instance_copy_hook_is_ignored_for_exact_journal_records() -> None:
+    def unexpected_copy(_memo: object) -> object:
+        pytest.fail("journal must not call an instance copy hook")
+
+    journal = InMemoryRunJournal()
+    batch = acceptance("first")
+    assert batch.submission is not None and batch.summary is not None
+    for record in (batch, batch.state, batch.events[0], batch.submission, batch.summary):
+        object.__setattr__(record, "__deepcopy__", unexpected_copy)
+
+    receipt = asyncio.run(journal.commit(batch, expected_version=0))
+
+    assert receipt.state == batch.state and receipt.state is not batch.state
+    assert receipt.events[0].event == batch.events[0]
+    assert receipt.events[0].event is not batch.events[0]
+    assert receipt.submission == batch.submission and receipt.submission is not batch.submission
+    assert receipt.summaries == (batch.summary,) and receipt.summaries[0] is not batch.summary
+    assert asyncio.run(journal.commit(acceptance("first"), expected_version=0)) == receipt
+
+
+def test_event_storage_and_index_use_the_same_canonical_copy() -> None:
+    journal = InMemoryRunJournal()
+    batch = acceptance("first")
+    event = batch.events[0]
+    alternate = DomainEvent(
+        EventId("alternate"), event.type, event.run_id, event.session_id, event.timestamp, {}
+    )
+    object.__setattr__(event, "__deepcopy__", lambda memo: alternate)
+
+    receipt = asyncio.run(journal.commit(batch, expected_version=0))
+    assert receipt.events[0].event == event
+    assert receipt.events[0].event.event_id is not event.event_id
+    object.__setattr__(event.event_id, "value", "changed-input-id")
+    object.__setattr__(receipt.events[0].event.event_id, "value", "changed-output-id")
+
+    stored = asyncio.run(journal.load_session(batch.state.session_id))
+    assert stored.events[0].event.event_id == EventId("event-first")
+    assert stored.events[0].event.timestamp.tzinfo is event.timestamp.tzinfo
+    replay = asyncio.run(journal.commit(acceptance("first"), expected_version=0))
+    assert replay == replace(stored, submission=batch.submission)
+    repeated = acceptance("second", event_id="event-first")
+    with pytest.raises(JournalError) as error:
+        asyncio.run(journal.commit(repeated, expected_version=1))
+    assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    assert asyncio.run(journal.load_session(batch.state.session_id)) == stored
+    available = acceptance("second", event_id="alternate")
+    assert asyncio.run(journal.commit(available, expected_version=1)).version == 2
 
 
 def test_unhashable_checkpoint_identity_rejects_every_commit_member() -> None:

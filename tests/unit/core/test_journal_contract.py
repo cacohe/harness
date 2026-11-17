@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone, tzinfo
 import pytest
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.core.commands import RunLimits
-from src.core.errors import RunErrorCode
+from src.core.errors import RunErrorCode, RunFailure
 from src.core.events import DomainEvent, DomainEventType
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 from src.core.journal import (
@@ -285,6 +285,49 @@ def test_same_submission_id_is_independent_between_sessions(journal: RunJournal)
             asyncio.run(journal.find_submission(batch.state.session_id, batch.state.submission_id))
             == batch.submission
         )
+
+
+@pytest.mark.parametrize("message", [False, ("bool", 0)])
+def test_replay_rejects_tampered_failure_message(journal: RunJournal, message: object) -> None:
+    batch = acceptance("first")
+    failure = RunFailure(RunErrorCode.MODEL_FAILED)
+    original = replace(batch, state=replace(batch.state, status=RunStatus.FAILED, failure=failure))
+    receipt = asyncio.run(journal.commit(original, expected_version=0))
+    corrupt = RunFailure(RunErrorCode.MODEL_FAILED)
+    object.__setattr__(corrupt, "message", message)
+    invalid = replace(original, state=replace(original.state, failure=corrupt))
+
+    with pytest.raises(JournalError) as error:
+        asyncio.run(journal.commit(invalid, expected_version=1))
+    assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    assert asyncio.run(journal.commit(original, expected_version=0)) == receipt
+
+
+@pytest.mark.parametrize("suffix", ["Z", "+00:00"])
+def test_utc_iso_timestamp_round_trips(journal: RunJournal, suffix: str) -> None:
+    batch = acceptance("first")
+    timestamp = datetime.fromisoformat("2026-11-17T00:00:00" + suffix)
+    event = _event_with_timestamp(batch.events[0], timestamp)
+
+    receipt = asyncio.run(journal.commit(replace(batch, events=(event,)), expected_version=0))
+
+    persisted = receipt.events[0].event.timestamp
+    assert persisted == NOW and persisted.tzinfo is timezone.utc
+    assert persisted is not timestamp
+
+
+def test_lookup_rejects_malformed_identifiers(journal: RunJournal) -> None:
+    session_id = SessionId("first")
+    submission_id = SubmissionId("first")
+    object.__delattr__(session_id, "value")
+    with pytest.raises(JournalError) as error:
+        asyncio.run(journal.load_session(session_id))
+    assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+    object.__delattr__(submission_id, "value")
+    with pytest.raises(JournalError) as error:
+        asyncio.run(journal.find_submission(SessionId("first"), submission_id))
+    assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
 
 
 def test_summary_checkpoints_use_all_key_components(journal: RunJournal) -> None:
