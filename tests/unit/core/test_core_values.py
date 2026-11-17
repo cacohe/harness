@@ -175,6 +175,24 @@ def test_event_preserves_non_path_diagnostic_text_with_colons(message):
     assert _event({"message": message}).payload == {"message": message}
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "https://example.org/releases/v1:/artifact",
+        'See "https://example.org/releases/v1:/artifact"',
+    ],
+)
+def test_event_preserves_internal_colons_in_https_urls(message):
+    assert _event({"message": message}).payload == {"message": message}
+
+
+def test_event_rejects_a_host_path_after_a_quoted_https_url():
+    message = 'See "https://example.org/releases/v1:/artifact":/var/private/config.json'
+
+    with pytest.raises(ValueError, match="host paths"):
+        _event({"message": message})
+
+
 def test_event_bounds_utf8_payload_size():
     # The compact JSON object framing takes 8 bytes.
     payload = {"v": "é" * ((1_048_576 - 8) // 2)}

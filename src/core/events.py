@@ -13,6 +13,9 @@ from src.core.ids import EventId, RunId, SessionId
 
 _MAX_PAYLOAD_BYTES = 1_048_576
 _MAX_PAYLOAD_DEPTH = 16
+_WEB_URL = re.compile(
+    r"""(?<![\w+.-])https?://[^/?#\s<>"'`\\][^\s<>"'`\\]*""", re.IGNORECASE
+)
 # A URI's "://" separator does not introduce a local path.
 _HOST_PATH = re.compile(
     r"""^(?:[a-z]:[\\/]|(?:~|\.{1,2})?[\\/]|file:)"""
@@ -62,7 +65,7 @@ def _json_fragments(value: object, depth: int, *, path_value: bool = False) -> I
         if isinstance(value, str):
             if len(value) > _MAX_PAYLOAD_BYTES:
                 raise ValueError("Event payload exceeds its UTF-8 byte limit")
-            if (path_value and value) or _HOST_PATH.search(value.lstrip()):
+            if (path_value and value) or _HOST_PATH.search(_WEB_URL.sub(" ", value.lstrip())):
                 raise ValueError("Event payload must not contain host paths")
         yield json.dumps(value, allow_nan=False, ensure_ascii=False)
     else:
