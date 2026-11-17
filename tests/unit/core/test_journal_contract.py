@@ -1,5 +1,5 @@
 import asyncio
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 
 import pytest
@@ -58,6 +58,45 @@ def acceptance(
             state.session_id, 2, "v1", state.profile_id, f"summary-{name}"
         ),
     )
+
+
+def test_commit_schema_ignores_instance_field_metadata(journal: RunJournal) -> None:
+    batch = acceptance("first")
+    reduced_fields = {
+        member.name: member
+        for member in fields(JournalCommit)
+        if member.name not in ("events", "summary")
+    }
+    object.__setattr__(batch, "__dataclass_fields__", reduced_fields)
+
+    receipt = asyncio.run(journal.commit(batch, expected_version=0))
+    persisted = asyncio.run(journal.load_session(batch.state.session_id))
+
+    assert (receipt.version, receipt.sequence) == (1, 2)
+    assert persisted.events[0].event == batch.events[0]
+    assert persisted.summaries == (batch.summary,)
+    assert asyncio.run(journal.commit(acceptance("first"), expected_version=0)) == receipt
+    duplicate = acceptance("second", event_id="event-first")
+    with pytest.raises(JournalError) as error:
+        asyncio.run(journal.commit(duplicate, expected_version=1))
+    assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    assert asyncio.run(journal.load_session(batch.state.session_id)) == persisted
+
+
+def test_nested_record_schema_does_not_call_instance_metadata(journal: RunJournal) -> None:
+    class UnexpectedFields:
+        def values(self):
+            raise RuntimeError("journal must use the trusted record class schema")
+
+    batch = acceptance("first")
+    object.__setattr__(batch.events[0], "__dataclass_fields__", UnexpectedFields())
+
+    receipt = asyncio.run(journal.commit(batch, expected_version=0))
+
+    assert (receipt.version, receipt.sequence) == (1, 2)
+    assert receipt.events[0].event == batch.events[0]
+    assert receipt.summaries == (batch.summary,)
+    assert receipt.submission == batch.submission
 
 
 def test_session_sequence_orders_events_before_transcript(journal: RunJournal) -> None:

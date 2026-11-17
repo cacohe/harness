@@ -253,11 +253,11 @@ def _rebuild(value: object) -> Any:
     record_type = type(value)
     if not (
         any(record_type is allowed for allowed in (*_ID_TYPES, *_RECORD_TYPES))
-        and is_dataclass(value)
+        and is_dataclass(record_type)
     ):
         raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
 
-    declared = fields(value)
+    declared = fields(record_type)
     names = {member.name for member in declared}
     source = {
         name: member
@@ -311,12 +311,16 @@ def _intent_value(value: object) -> _IntentValue:
         return ("tuple", tuple(_intent_value(item) for item in value))
     if type(value) is frozenset:
         return ("frozenset", tuple(sorted(value)))
-    if any(type(value) is record_type for record_type in _RECORD_TYPES) and is_dataclass(value):
+    record_type = type(value)
+    if any(record_type is allowed for allowed in _RECORD_TYPES) and is_dataclass(record_type):
         return (
             "record",
             (
-                type(value).__name__,
-                tuple(_intent_value(getattr(value, member.name)) for member in fields(value)),
+                record_type.__name__,
+                tuple(
+                    _intent_value(object.__getattribute__(value, member.name))
+                    for member in fields(record_type)
+                ),
             ),
         )
     raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
