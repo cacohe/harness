@@ -4,7 +4,8 @@ from enum import StrEnum
 from typing import Protocol
 
 from src.core.commands import _check_child_id
-from src.core.tools import ToolSpec, _canonical_arguments, _text_size
+from src.core.json_values import MAX_TOOL_ARGUMENT_BYTES, validate_bounded_text, validate_json_text
+from src.core.tools import ToolSpec
 
 _MAX_TEXT_BYTES = 1_048_576
 _MAX_REQUEST_BYTES = 8 * 1_048_576
@@ -30,7 +31,7 @@ class ModelToolCall:
     def __post_init__(self) -> None:
         _check_child_id(self.tool_call_id)
         _check_child_id(self.name)
-        object.__setattr__(self, "arguments_json", _canonical_arguments(self.arguments_json))
+        validate_json_text(self.arguments_json, MAX_TOOL_ARGUMENT_BYTES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,7 +50,7 @@ class ModelMessage:
         if type(self.role) is not ModelRole:
             raise ValueError("Message requires a model role")
         if self.content is not None:
-            _text_size(self.content, _MAX_TEXT_BYTES)
+            validate_bounded_text(self.content, _MAX_TEXT_BYTES)
 
         if self.role is ModelRole.ASSISTANT:
             if self.tool_call_id is not None:
@@ -159,7 +160,7 @@ class ModelResponse:
 
     def __post_init__(self) -> None:
         if self.text is not None:
-            _text_size(self.text, _MAX_TEXT_BYTES)
+            validate_bounded_text(self.text, _MAX_TEXT_BYTES)
         calls = _snapshot_calls(self.tool_calls)
         _require_assistant_output(self.text, calls)
         object.__setattr__(self, "tool_calls", calls)

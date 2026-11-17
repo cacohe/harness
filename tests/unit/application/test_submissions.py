@@ -198,7 +198,13 @@ def test_waiting_for_approval_reserves_the_session() -> None:
         state = accepted.state
         identity = (state.run_id, SESSION)
         context = CommandContext(NOW, 1, (EventId("waiting"),))
-        request = ToolCallRequest("tool-call", "test-tool", "{}")
+        request = ToolCallRequest(
+            "tool-call",
+            "test-tool",
+            "{}",
+            approval_scope="test-scope",
+            workspace_id="test-workspace",
+        )
         transition = TaskStateMachine.apply(state, StartStep(*identity, "step", context=context))
         transition = TaskStateMachine.apply(
             transition.state, StartModelCall(*identity, "step", "model", context=context)

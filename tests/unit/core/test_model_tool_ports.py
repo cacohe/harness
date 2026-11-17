@@ -2,6 +2,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 from src.core.artifacts import MAX_SUMMARY_BYTES, ArtifactRef, InlineContent
+from src.core.commands import ToolCallRequest
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.ids import RunId, SessionId
 from src.core.model import (
@@ -47,7 +48,19 @@ def _request(**overrides):
         "workspace_id": "workspace-1",
         "approval": ToolApproval.UNDECIDED,
     }
-    return ToolRequest(**(fields | overrides))
+    fields.update(overrides)
+    if fields["approval"] in (ToolApproval.APPROVED, ToolApproval.DENIED):
+        fields.setdefault(
+            "original_call",
+            ToolCallRequest(
+                fields["tool_call_id"],
+                fields["name"],
+                fields["arguments_json"],
+                approval_scope=fields["approval_scope"],
+                workspace_id=fields["workspace_id"],
+            ),
+        )
+    return ToolRequest(**fields)
 
 
 def _artifact():
@@ -180,16 +193,15 @@ def test_model_response_rejects_opaque_usage_object():
         ModelResponse(text="Done", usage={"prompt_tokens": 1})
 
 
-def test_ports_canonicalize_json_and_keep_tool_input_paths():
+def test_ports_preserve_json_text_and_keep_tool_input_paths():
     raw = '{ "path" : "./docs/readme.md", "credentials": {"z":null,"a":true} }'
-    expected = '{"credentials":{"a":true,"z":null},"path":"./docs/readme.md"}'
     spec = ToolSpec(
         "read", "Read a file", '{"type":"object","properties":{"path":{"type":"string"}}}'
     )
-    assert ModelToolCall("call-1", "read", raw).arguments_json == expected
-    assert _request(arguments_json=raw).arguments_json == expected
-    assert spec.input_schema_json == '{"properties":{"path":{"type":"string"}},"type":"object"}'
-    assert ToolSpec("read", "Any input", " true ").input_schema_json == "true"
+    assert ModelToolCall("call-1", "read", raw).arguments_json == raw
+    assert _request(arguments_json=raw).arguments_json == raw
+    assert spec.input_schema_json == '{"type":"object","properties":{"path":{"type":"string"}}}'
+    assert ToolSpec("read", "Any input", " true ").input_schema_json == " true "
 
 
 @pytest.mark.parametrize(
@@ -198,7 +210,6 @@ def test_ports_canonicalize_json_and_keep_tool_input_paths():
         '{"nested":{"x":1,"x":2}}',
         '{"value":NaN}',
         '{"value":Infinity}',
-        '{"value":1e999}',
         r'{"value":"\ud800"}',
         r'{"\ud800":0}',
         '{"value":' + "[" * 20 + "0" + "]" * 20 + "}",
@@ -289,7 +300,7 @@ def test_tool_result_returns_copy_isolated_inline_and_artifact_content():
 
 
 def test_tool_result_revalidates_nested_instances_at_construction():
-    inline = InlineContent("OK", "text/plain")
+    inline = InlineContent("OK", "application/json")
     object.__setattr__(inline, "size_bytes", -1)
     with pytest.raises(ValueError):
         ToolResult(ToolResultStatus.SUCCESS, inline_content=inline)
@@ -307,7 +318,7 @@ def test_tool_result_accepts_explicit_inline_json_null():
 
 
 def test_tool_result_success_requires_exactly_one_usable_content_variant():
-    inline = InlineContent("OK", "text/plain")
+    inline = InlineContent("OK", "application/json")
     for fields in (
         {},
         {"summary": "No refs"},
@@ -379,3 +390,82 @@ def test_tool_failure_rejects_execution_content():
             inline_content=InlineContent("secret", "text/plain"),
             failure=RunFailure(RunErrorCode.TOOL_FAILED),
         )
+
+
+@pytest.mark.parametrize("number", ["9007199254740993.0", "1e-999", "1e999"])
+def test_argument_and_schema_snapshots_preserve_exact_json_numbers(number):
+    arguments = '{"value":' + number + "}"
+    schema = '{"multipleOf":' + number + "}"
+    assert ModelToolCall("one", "read", arguments).arguments_json == arguments
+    assert _request(arguments_json=arguments).arguments_json == arguments
+    assert ToolSpec("read", "Read", schema).input_schema_json == schema
+
+
+@pytest.mark.parametrize(
+    "inline",
+    [
+        InlineContent(b"\x00\xff", "application/octet-stream"),
+        InlineContent("text", "text/plain"),
+        InlineContent({"n": 1}, "application/example+json"),
+    ],
+)
+def test_tool_result_rejects_inline_content_outside_application_json(inline):
+    with pytest.raises(ValueError):
+        ToolResult(ToolResultStatus.SUCCESS, inline_content=inline)
+
+
+@pytest.mark.parametrize(
+    "decision, executable, requires_approval",
+    [
+        (ToolApproval.UNDECIDED, False, True),
+        (ToolApproval.DENIED, False, False),
+        (ToolApproval.APPROVED, True, False),
+        (ToolApproval.NOT_REQUIRED, True, False),
+    ],
+)
+def test_tool_request_exposes_execution_and_pending_approval_guards(
+    decision,
+    executable,
+    requires_approval,
+):
+    request = _request(approval=decision)
+    assert request.is_executable is executable
+    assert request.requires_approval is requires_approval
+
+
+def test_denied_result_carries_no_payload():
+    status = ToolResultStatus.DENIED
+    result = ToolResult(status)
+    assert result.failure is result.inline_content is result.summary is None
+    assert result.artifacts == ()
+    for payload in (
+        {"inline_content": InlineContent(None, "application/json")},
+        {"artifacts": (_artifact(),)},
+        {"summary": "secret"},
+        {"failure": RunFailure(RunErrorCode.TOOL_FAILED)},
+    ):
+        with pytest.raises(ValueError):
+            ToolResult(status, **payload)
+
+
+def test_model_request_counts_raw_arguments_and_schema_in_aggregate_utf8_limit():
+    arguments = ' {"x":"' + "a" * 16_000 + '"}'
+    schema = ' {"description":"' + "b" * 64_000 + '"}'
+    call = ModelToolCall("one", "read_file", arguments)
+    batch = ModelMessage(ModelRole.ASSISTANT, tool_calls=(call,))
+    spec = ToolSpec("read_file", "Read", schema)
+    full = ModelMessage(ModelRole.USER, "x" * 1_048_576)
+    header_bytes = 8 * len("user") + len("assistantoneread_fileread_fileRead")
+    tail_size = 8_388_608 - 7 * 1_048_576 - header_bytes - len(arguments) - len(schema)
+    head = (full,) * 7
+    exact = ModelMessage(ModelRole.USER, "x" * tail_size)
+    over = ModelMessage(ModelRole.USER, "x" * (tail_size + 1))
+    assert ModelRequest((*head, exact, batch), (spec,)).messages[-1] == batch
+    with pytest.raises(ValueError):
+        ModelRequest((*head, over, batch), (spec,))
+
+
+def test_decided_approval_cannot_be_constructed_without_original_call():
+    for decision in (ToolApproval.APPROVED, ToolApproval.DENIED):
+        with pytest.raises(ValueError):
+            _request(approval=decision, original_call=None)

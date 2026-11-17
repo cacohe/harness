@@ -249,7 +249,12 @@ def _advance_running(
             if model.result is not None:
                 raise InvalidTransition
             _check_text(state, command.result)
-            model = replace(model, result=command.result, tool_request=command.tool_request)
+            request = command.tool_request
+            if request is not None:
+                if type(request) is not ToolCallRequest:
+                    raise InvalidTransition
+                request = replace(request)
+            model = replace(model, result=command.result, tool_request=request)
             return replace(state, current_step=replace(step, model_call=model)), None
         case StartToolCall():
             return _start_tool(state, command)

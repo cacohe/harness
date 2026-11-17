@@ -1,17 +1,16 @@
-import json
 import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TypeAlias
 from unicodedata import category
 
+from src.core.approval import validate_approval_binding
 from src.core.errors import InvalidTransition, RunFailure
-from src.core.events import JsonValue, _contains_host_path
+from src.core.events import _contains_host_path
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
+from src.core.json_values import MAX_TOOL_ARGUMENT_BYTES, validate_json_text
 
 _MAX_CHILD_ID_BYTES = 256
-_MAX_TOOL_ARGUMENT_BYTES = 16_384
-_MAX_TOOL_ARGUMENT_DEPTH = 16
 
 
 @dataclass(frozen=True)
@@ -111,22 +110,21 @@ class StartModelCall(_RunCommand):
 
 @dataclass(frozen=True)
 class ToolCallRequest:
-    """Provider-independent request with immutable JSON argument text."""
+    """Persistent call identity, approval binding, and lossless JSON arguments."""
 
     tool_call_id: str
     name: str
-    arguments_json: str
+    arguments_json: str = field(repr=False)
+    approval_scope: str = field(kw_only=True)
+    workspace_id: str = field(kw_only=True)
 
     def __post_init__(self) -> None:
         _check_child_id(self.tool_call_id)
         _check_child_id(self.name)
-        _check_bounded_text(self.arguments_json, _MAX_TOOL_ARGUMENT_BYTES)
         try:
-            arguments = json.loads(self.arguments_json, object_pairs_hook=_unique_json_object)
-            if not isinstance(arguments, dict):
-                raise ValueError("Tool arguments must be a JSON object")
-            _validate_tool_json(arguments, depth=0)
-        except (ValueError, RecursionError):
+            validate_approval_binding(self.approval_scope, self.workspace_id)
+            validate_json_text(self.arguments_json, MAX_TOOL_ARGUMENT_BYTES)
+        except ValueError:
             raise InvalidTransition from None
 
 
@@ -205,25 +203,3 @@ def _check_bounded_text(text: object, limit: int) -> None:
         raise InvalidTransition from None
     if size > limit:
         raise InvalidTransition
-
-
-def _unique_json_object(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
-    result = dict(pairs)
-    if len(result) != len(pairs):
-        raise ValueError("Duplicate tool argument key")
-    return result
-
-
-def _validate_tool_json(value: JsonValue, depth: int) -> None:
-    if isinstance(value, (dict, list)):
-        if depth >= _MAX_TOOL_ARGUMENT_DEPTH:
-            raise ValueError("Tool arguments are nested too deeply")
-        if isinstance(value, dict):
-            for key in value:
-                key.encode("utf-8")
-        for child in value.values() if isinstance(value, dict) else value:
-            _validate_tool_json(child, depth + 1)
-    elif isinstance(value, str):
-        value.encode("utf-8")
-    elif isinstance(value, float) and not math.isfinite(value):
-        raise ValueError("Tool arguments must contain finite numbers")

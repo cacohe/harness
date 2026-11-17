@@ -1,8 +1,10 @@
+import asyncio
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
 from itertools import product
 
 import pytest
+from src.adapters.persistence.memory import InMemoryRunJournal
 from src.core.commands import (
     CancelRun,
     CommandContext,
@@ -24,7 +26,9 @@ from src.core.commands import (
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.events import DomainEventType
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
+from src.core.journal import JournalCommit
 from src.core.state import ApprovalState, InvalidTransition, RunState, RunStatus, TaskStateMachine
+from src.core.tools import ToolApproval, ToolRequest
 
 RUN = RunId("run")
 SESSION = SessionId("session")
@@ -61,7 +65,11 @@ def advance(state: RunState, *commands: CoreCommand) -> RunState:
 def begin_step(
     step_id: str = "step", tool_call_id: str | None = "tool"
 ) -> tuple[StartStep, StartModelCall, FinishModelCall]:
-    request = ToolCallRequest(tool_call_id, "lookup", "{}") if tool_call_id is not None else None
+    request = (
+        ToolCallRequest(tool_call_id, "lookup", "{}", approval_scope="read", workspace_id="work")
+        if tool_call_id is not None
+        else None
+    )
     return (
         StartStep(RUN, SESSION, step_id, context=context()),
         StartModelCall(RUN, SESSION, step_id, "model", context=context()),
@@ -541,13 +549,20 @@ def test_rejects_unsafe_ids_at_first_acceptance(kind, value):
             command = finish_model
     with pytest.raises(InvalidTransition) as error:
         if kind == "tool":
-            command = replace(finish_model, tool_request=ToolCallRequest(value, "lookup", "{}"))
+            command = replace(
+                finish_model,
+                tool_request=ToolCallRequest(
+                    value, "lookup", "{}", approval_scope="read", workspace_id="work"
+                ),
+            )
         TaskStateMachine.apply(state, command)
     assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
 
 
 def test_approved_tool_request_can_be_restored_and_resumed():
-    request = ToolCallRequest("tool", "read_file", '{"path":"README.md"}')
+    request = ToolCallRequest(
+        "tool", "read_file", '{"path":"README.md"}', approval_scope="read", workspace_id="work"
+    )
     start_step, start_model, finish_model = begin_step()
     model_done = advance(
         initial(), submit(), start_step, start_model, replace(finish_model, tool_request=request)
@@ -575,7 +590,6 @@ def test_approved_tool_request_can_be_restored_and_resumed():
     [
         '["not an object"]',
         '{"n":NaN}',
-        '{"n":1e999}',
         '{"n":1,"n":2}',
         '{"n":1,"\\u006e":2}',
         '{"\\ud800":"value"}',
@@ -589,7 +603,10 @@ def test_rejects_invalid_or_oversized_tool_request_payload(arguments_json):
     running = advance(initial(), submit(), start_step, start_model)
     with pytest.raises(InvalidTransition) as error:
         command = replace(
-            finish_model, tool_request=ToolCallRequest("tool", "lookup", arguments_json)
+            finish_model,
+            tool_request=ToolCallRequest(
+                "tool", "lookup", arguments_json, approval_scope="read", workspace_id="work"
+            ),
         )
         TaskStateMachine.apply(running, command)
     assert error.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
@@ -599,6 +616,7 @@ def test_rejects_invalid_or_oversized_tool_request_payload(arguments_json):
     "arguments_json",
     [
         '{"path":"src/nested/main.py"}',
+        '{"n":9007199254740993.0,"small":1e-999,"large":1e999}',
         '{"path":"C:\\\\temp\\\\host.txt"}',
         '{"path":"\\u002ftmp\\u002fhost.txt"}',
         '{"nested":' + "[" * 15 + "0" + "]" * 15 + "}",
@@ -606,5 +624,65 @@ def test_rejects_invalid_or_oversized_tool_request_payload(arguments_json):
     ],
 )
 def test_tool_request_retains_path_and_exact_boundaries_for_tool_adapter(arguments_json):
-    request = ToolCallRequest("tool", "read_file", arguments_json)
+    request = ToolCallRequest(
+        "tool", "read_file", arguments_json, approval_scope="read", workspace_id="work"
+    )
     assert request.arguments_json == arguments_json
+
+
+@pytest.mark.parametrize(
+    "bindings",
+    [
+        {},
+        {"approval_scope": "read"},
+        {"workspace_id": "workspace-1"},
+        {"approval_scope": "read", "workspace_id": r"C:\secret"},
+        {"approval_scope": "/host", "workspace_id": "workspace-1"},
+    ],
+)
+def test_tool_call_projection_requires_an_opaque_approval_binding(bindings):
+    with pytest.raises((TypeError, InvalidTransition)):
+        ToolCallRequest("tool", "lookup", "{}", **bindings)
+
+
+@pytest.mark.parametrize("decision", [ToolApproval.APPROVED, ToolApproval.DENIED])
+def test_resumed_tool_request_uses_original_journaled_binding(decision):
+    request = ToolCallRequest(
+        "tool",
+        "read_file",
+        ' {"number":1e-999}',
+        approval_scope="read-v1",
+        workspace_id="checkout-1",
+    )
+    start_step, start_model, finish_model = begin_step()
+    running = advance(initial(), submit(), start_step, start_model)
+    waiting = advance(running, replace(finish_model, tool_request=request), ask_approval())
+    object.__setattr__(request, "approval_scope", "changed-after-capture")
+
+    async def recover():
+        journal = InMemoryRunJournal()
+        await journal.commit(JournalCommit(waiting), expected_version=0)
+        return (await journal.load_head(SESSION)).state
+
+    restored = asyncio.run(recover())
+    ready = advance(restored, decide(decision is ToolApproval.APPROVED), resume())
+    original = ready.current_step.tool_call.request
+    tool = ToolRequest.from_call(
+        original,
+        run_id=ready.run_id,
+        session_id=ready.session_id,
+        step_id=ready.current_step.step_id,
+        approval=decision,
+    )
+    assert (tool.approval_scope, tool.workspace_id) == ("read-v1", "checkout-1")
+    assert tool.arguments_json == ' {"number":1e-999}'
+    for changes in (
+        {"approval_scope": "read-v2"},
+        {"workspace_id": "checkout-2"},
+        {"tool_call_id": "other"},
+        {"name": "write_file"},
+        {"arguments_json": '{"number":1e-999}'},
+        {"original_call": None},
+    ):
+        with pytest.raises(ValueError):
+            replace(tool, **changes)

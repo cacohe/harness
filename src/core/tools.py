@@ -1,53 +1,21 @@
-import re
 from collections.abc import Awaitable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Protocol
 
-from src.core.artifacts import (
-    ArtifactRef,
-    ExternalizedContent,
-    InlineContent,
-    _decode_json,
-    _encode_json,
-)
-from src.core.commands import _check_child_id
+from src.core.artifacts import ArtifactRef, ExternalizedContent, InlineContent
+from src.core.commands import ToolCallRequest, _check_child_id
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.ids import RunId, SessionId
+from src.core.json_values import validate_bounded_text, validate_json_text
 
-_MAX_ARGUMENT_BYTES = 16_384
 _MAX_SCHEMA_BYTES = 65_536
 _MAX_DESCRIPTION_BYTES = 16_384
-_WORKSPACE_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,255}")
-
-
-def _text_size(text: str, max_bytes: int) -> int:
-    if type(text) is not str or len(text) > max_bytes:
-        raise ValueError("Text must be an exact string within its byte limit")
-    size = len(text.encode("utf-8"))
-    if size > max_bytes:
-        raise ValueError("Text exceeds its byte limit")
-    return size
-
-
-def _canonical_json(text: str, max_bytes: int, *, allow_boolean_schema: bool = False) -> str:
-    try:
-        _text_size(text, max_bytes)
-        value = _decode_json(text)
-        if type(value) is not dict and not (allow_boolean_schema and type(value) is bool):
-            raise ValueError
-        return _encode_json(value, max_bytes)
-    except ValueError:
-        raise ValueError("Expected bounded strict JSON for tool arguments or schema") from None
-
-
-def _canonical_arguments(text: str) -> str:
-    return _canonical_json(text, _MAX_ARGUMENT_BYTES)
 
 
 @dataclass(frozen=True, slots=True)
 class ToolSpec:
-    """Tool catalog entry with a canonical JSON Schema snapshot."""
+    """Tool catalog entry with an immutable JSON Schema snapshot."""
 
     name: str
     description: str
@@ -55,12 +23,8 @@ class ToolSpec:
 
     def __post_init__(self) -> None:
         _check_child_id(self.name)
-        _text_size(self.description, _MAX_DESCRIPTION_BYTES)
-        object.__setattr__(
-            self,
-            "input_schema_json",
-            _canonical_json(self.input_schema_json, _MAX_SCHEMA_BYTES, allow_boolean_schema=True),
-        )
+        validate_bounded_text(self.description, _MAX_DESCRIPTION_BYTES)
+        validate_json_text(self.input_schema_json, _MAX_SCHEMA_BYTES, allow_boolean_root=True)
 
 
 class ToolApproval(StrEnum):
@@ -83,27 +47,76 @@ class ToolRequest:
     approval_scope: str
     workspace_id: str
     approval: ToolApproval
+    original_call: ToolCallRequest | None = field(default=None, kw_only=True, repr=False)
 
     def __post_init__(self) -> None:
-        for identity in (self.tool_call_id, self.name, self.step_id, self.approval_scope):
-            _check_child_id(identity)
+        _check_child_id(self.step_id)
         if type(self.run_id) is not RunId or type(self.session_id) is not SessionId:
             raise ValueError("Tool request requires typed run and session IDs")
-        if (
-            type(self.workspace_id) is not str
-            or len(self.workspace_id) > 256
-            or not _WORKSPACE_ID.fullmatch(self.workspace_id)
-        ):
-            raise ValueError("Tool request requires an opaque workspace ID")
         if type(self.approval) is not ToolApproval:
             raise ValueError("Tool request requires an explicit approval decision")
+
+        call = ToolCallRequest(
+            self.tool_call_id,
+            self.name,
+            self.arguments_json,
+            approval_scope=self.approval_scope,
+            workspace_id=self.workspace_id,
+        )
+        original = self.original_call
+        if original is not None:
+            if type(original) is not ToolCallRequest:
+                raise ValueError("Tool request requires a valid original call")
+            original = replace(original)
+            if original != call:
+                raise ValueError("Tool request must match its original call and approval binding")
+            object.__setattr__(self, "original_call", original)
+        elif self.approval in (ToolApproval.APPROVED, ToolApproval.DENIED):
+            raise ValueError("A decided approval requires the original call")
+
         object.__setattr__(self, "run_id", RunId(self.run_id.value))
         object.__setattr__(self, "session_id", SessionId(self.session_id.value))
-        object.__setattr__(self, "arguments_json", _canonical_arguments(self.arguments_json))
+
+    @classmethod
+    def from_call(
+        cls,
+        call: ToolCallRequest,
+        *,
+        run_id: RunId,
+        session_id: SessionId,
+        step_id: str,
+        approval: ToolApproval,
+    ) -> "ToolRequest":
+        """Carry the persisted call and its original approval binding into execution."""
+        if type(call) is not ToolCallRequest:
+            raise ValueError("Tool request requires a valid original call")
+        return cls(
+            tool_call_id=call.tool_call_id,
+            name=call.name,
+            arguments_json=call.arguments_json,
+            run_id=run_id,
+            session_id=session_id,
+            step_id=step_id,
+            approval_scope=call.approval_scope,
+            workspace_id=call.workspace_id,
+            approval=approval,
+            original_call=call,
+        )
+
+    @property
+    def is_executable(self) -> bool:
+        """Whether the decision permits execution, subject to live adapter validation."""
+        return self.approval in (ToolApproval.NOT_REQUIRED, ToolApproval.APPROVED)
+
+    @property
+    def requires_approval(self) -> bool:
+        """Whether a decision is still required before execution."""
+        return self.approval is ToolApproval.UNDECIDED
 
 
 class ToolResultStatus(StrEnum):
     PENDING_APPROVAL = "pending_approval"
+    DENIED = "denied"
     SUCCESS = "success"
     FAILED = "failed"
     TIMED_OUT = "timed_out"
@@ -145,12 +158,15 @@ class ToolResult:
             if failure is not None:
                 raise ValueError("Successful tool results cannot carry a failure")
             content = ExternalizedContent(inline_content, artifacts, summary)
+            inline = content.inline_content
+            if inline is not None and inline.media_type != "application/json":
+                raise ValueError("Inline tool results require application/json")
         else:
             if inline_content is not None or artifacts or summary is not None:
                 raise ValueError("Unsuccessful tool results cannot carry execution content")
-            if status is ToolResultStatus.PENDING_APPROVAL:
+            if status in (ToolResultStatus.PENDING_APPROVAL, ToolResultStatus.DENIED):
                 if failure is not None:
-                    raise ValueError("Pending approval cannot carry a failure")
+                    raise ValueError("A pending or denied approval cannot carry a failure")
             elif (
                 type(failure) is not RunFailure
                 or type(failure.code) is not RunErrorCode
@@ -183,5 +199,10 @@ class ToolResult:
 
 class ToolGateway(Protocol):
     def execute(self, request: ToolRequest) -> Awaitable[ToolResult]:
-        """Return a pending result for required approval or a settled execution result."""
+        """Revalidate the current approval policy, scope, and workspace before any side effect.
+
+        Return PENDING_APPROVAL for UNDECIDED and DENIED for a denied or stale
+        approval without invoking the tool. Dispatch only executable requests
+        whose original binding still matches the active tool and workspace.
+        """
         ...
