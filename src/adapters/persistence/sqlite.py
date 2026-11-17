@@ -11,6 +11,7 @@ from typing import TypeVar
 
 from src.adapters.persistence.memory import _canonical_copy, _validate_members
 from src.adapters.persistence.sqlite_codec import decode, encode
+from src.adapters.persistence.sqlite_integrity import genesis_hash, record_hash, validate_hash
 from src.core.errors import RunErrorCode
 from src.core.ids import SessionId, SubmissionId
 from src.core.journal import (
@@ -34,12 +35,15 @@ CREATE TABLE sessions (
   session_id TEXT PRIMARY KEY,
   version INTEGER NOT NULL CHECK(version >= 0),
   sequence INTEGER NOT NULL CHECK(sequence >= 0),
-  state_json TEXT NOT NULL
+  state_json TEXT NOT NULL,
+  ledger_hash TEXT NOT NULL
 ) STRICT;
 CREATE TABLE journal_entries (
   session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
   sequence INTEGER NOT NULL CHECK(sequence > 0),
   kind TEXT NOT NULL CHECK(kind IN ('event', 'transcript')),
+  previous_hash TEXT NOT NULL,
+  record_hash TEXT NOT NULL,
   PRIMARY KEY(session_id, sequence)
 ) STRICT;
 CREATE TABLE runs (
@@ -98,8 +102,8 @@ CREATE INDEX submissions_by_identity ON submissions(session_id, submission_id, d
 """
 
 _EXPECTED_COLUMNS = {
-    "sessions": ("session_id", "version", "sequence", "state_json"),
-    "journal_entries": ("session_id", "sequence", "kind"),
+    "sessions": ("session_id", "version", "sequence", "state_json", "ledger_hash"),
+    "journal_entries": ("session_id", "sequence", "kind", "previous_hash", "record_hash"),
     "runs": (
         "session_id",
         "run_id",
@@ -270,6 +274,7 @@ class SQLiteRunJournal:
             row, _current = _preflight_existing_ledger(connection, session_key)
             version = int(row["version"]) if row is not None else 0
             previous_sequence = int(row["sequence"]) if row is not None else 0
+            ledger_hash = row["ledger_hash"] if row is not None else genesis_hash(session_key)
             existing = connection.execute(
                 "SELECT session_id, submission_id, run_id, digest, intent_json, receipt_json, "
                 "acceptance_state_json, acceptance_version FROM submissions "
@@ -314,9 +319,9 @@ class SQLiteRunJournal:
             persisted_version = version + 1
             state_json = encode(state)
             connection.execute(
-                "INSERT INTO sessions(session_id, version, sequence, state_json) VALUES (?, ?, ?, ?) "
+                "INSERT INTO sessions(session_id, version, sequence, state_json, ledger_hash) VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(session_id) DO UPDATE SET version=excluded.version, sequence=excluded.sequence, state_json=excluded.state_json",
-                (session_key, persisted_version, final_sequence, state_json),
+                (session_key, persisted_version, final_sequence, state_json, ledger_hash),
             )
             connection.execute(
                 "INSERT INTO runs(session_id, run_id, submission_id, profile_id, status, state_version, state_json) VALUES (?, ?, ?, ?, ?, ?, ?) "
@@ -335,19 +340,20 @@ class SQLiteRunJournal:
             for event in batch.events:
                 cursor += 1
                 record = JournalEvent(cursor, event)
+                record_json = encode(record)
                 connection.execute(
                     "INSERT INTO events(event_id, session_id, sequence, run_id, event_json) VALUES (?, ?, ?, ?, ?)",
-                    (event.event_id.value, session_key, cursor, event.run_id.value, encode(record)),
+                    (event.event_id.value, session_key, cursor, event.run_id.value, record_json),
                 )
-                connection.execute(
-                    "INSERT INTO journal_entries(session_id, sequence, kind) VALUES (?, ?, 'event')",
-                    (session_key, cursor),
+                ledger_hash = _append_anchor(
+                    connection, session_key, cursor, "event", record_json, ledger_hash
                 )
                 events.append(record)
             transcript: list[TranscriptEntry] = []
             for entry in batch.transcript:
                 cursor += 1
                 transcript_record = replace(entry, sequence=cursor)
+                record_json = encode(transcript_record)
                 connection.execute(
                     "INSERT INTO transcript(session_id, sequence, run_id, submission_id, role, content, entry_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
@@ -357,14 +363,16 @@ class SQLiteRunJournal:
                         transcript_record.submission_id.value,
                         transcript_record.role,
                         transcript_record.content,
-                        encode(transcript_record),
+                        record_json,
                     ),
                 )
-                connection.execute(
-                    "INSERT INTO journal_entries(session_id, sequence, kind) VALUES (?, ?, 'transcript')",
-                    (session_key, cursor),
+                ledger_hash = _append_anchor(
+                    connection, session_key, cursor, "transcript", record_json, ledger_hash
                 )
                 transcript.append(transcript_record)
+            connection.execute(
+                "UPDATE sessions SET ledger_hash=? WHERE session_id=?", (ledger_hash, session_key)
+            )
             receipt = JournalSnapshot(
                 state.session_id,
                 persisted_version,
@@ -453,8 +461,10 @@ class SQLiteRunJournal:
     def _load_head_sync(self, session_key: str) -> JournalHead:
         connection = self._connect()
         try:
+            connection.execute("BEGIN")
             row = connection.execute(
-                "SELECT session_id, version, sequence, state_json FROM sessions WHERE session_id = ?",
+                "SELECT session_id, version, sequence, state_json, ledger_hash "
+                "FROM sessions WHERE session_id = ?",
                 (session_key,),
             ).fetchone()
             if row is None:
@@ -469,6 +479,7 @@ class SQLiteRunJournal:
             if run_row is None or decode(run_row["state_json"], RunState) != state:
                 raise ValueError
             _validate_run_row(run_row, state)
+            _verify_ledger_tail(connection, session_key, sequence, row["ledger_hash"])
             return JournalHead(version, sequence, state)
         except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
@@ -479,26 +490,23 @@ class SQLiteRunJournal:
         connection = self._connect()
         try:
             connection.execute("BEGIN")
-            row = connection.execute(
-                "SELECT session_id, version, sequence, state_json FROM sessions WHERE session_id = ?",
-                (session_key,),
-            ).fetchone()
+            row, state = _preflight_existing_ledger(connection, session_key)
             if row is None:
                 connection.commit()
                 return JournalSnapshot(SessionId(session_key), 0, 0)
             event_rows = tuple(
                 connection.execute(
                     "SELECT event_id, session_id, sequence, run_id, event_json FROM events "
-                    "WHERE session_id = ? ORDER BY sequence",
-                    (session_key,),
+                    "WHERE session_id = ? AND sequence > ? ORDER BY sequence",
+                    (session_key, after_sequence),
                 )
             )
             events = tuple(_decode_event_row(item, session_key) for item in event_rows)
             transcript_rows = tuple(
                 connection.execute(
                     "SELECT session_id, sequence, run_id, submission_id, role, content, entry_json "
-                    "FROM transcript WHERE session_id = ? ORDER BY sequence",
-                    (session_key,),
+                    "FROM transcript WHERE session_id = ? AND sequence > ? ORDER BY sequence",
+                    (session_key, after_sequence),
                 )
             )
             transcript = tuple(
@@ -513,65 +521,8 @@ class SQLiteRunJournal:
                 )
             )
             summaries = tuple(_decode_summary_row(item, session_key) for item in summary_rows)
-            submission_rows = tuple(
-                connection.execute(
-                    "SELECT session_id, submission_id, run_id, digest, intent_json, receipt_json, "
-                    "acceptance_state_json, acceptance_version FROM submissions "
-                    "WHERE session_id = ? ORDER BY submission_id",
-                    (session_key,),
-                )
-            )
-            acceptance_receipts = tuple(
-                _decode_submission_row(item, session_key, str(item["submission_id"]))[0]
-                for item in submission_rows
-            )
-            order_rows = tuple(
-                connection.execute(
-                    "SELECT sequence, kind FROM journal_entries "
-                    "WHERE session_id = ? ORDER BY sequence",
-                    (session_key,),
-                )
-            )
-            state = decode(row["state_json"], RunState)
+            assert state is not None
             version, sequence = _validate_session_row(row, session_key, state)
-            run_row = connection.execute(
-                "SELECT session_id, run_id, submission_id, profile_id, status, state_version, state_json "
-                "FROM runs WHERE session_id = ? AND run_id = ?",
-                (session_key, state.run_id.value),
-            ).fetchone()
-            if run_row is None or decode(run_row["state_json"], RunState) != state:
-                raise ValueError
-            _validate_run_row(run_row, state)
-            shared_sequences = sorted(
-                (entry.sequence for entry in events),
-                key=int,
-            )
-            shared_sequences.extend(entry.sequence for entry in transcript)
-            shared_sequences.sort()
-            if shared_sequences != list(range(1, sequence + 1)):
-                raise ValueError
-            events_by_sequence = {entry.sequence: entry for entry in events}
-            transcript_by_sequence = {entry.sequence: entry for entry in transcript}
-            expected_order = {
-                **{entry.sequence: "event" for entry in events},
-                **{entry.sequence: "transcript" for entry in transcript},
-            }
-            if (
-                len(order_rows) != sequence
-                or [row["sequence"] for row in order_rows] != list(range(1, sequence + 1))
-                or any(expected_order.get(row["sequence"]) != row["kind"] for row in order_rows)
-            ):
-                raise ValueError
-            for receipt in acceptance_receipts:
-                if any(events_by_sequence.get(entry.sequence) != entry for entry in receipt.events):
-                    raise ValueError
-                if any(
-                    transcript_by_sequence.get(entry.sequence) != entry
-                    for entry in receipt.transcript
-                ):
-                    raise ValueError
-            events = tuple(entry for entry in events if entry.sequence > after_sequence)
-            transcript = tuple(entry for entry in transcript if entry.sequence > after_sequence)
             result = JournalSnapshot(
                 SessionId(session_key),
                 version,
@@ -594,6 +545,8 @@ class SQLiteRunJournal:
     ) -> SubmissionAcceptance | None:
         connection = self._connect()
         try:
+            connection.execute("BEGIN")
+            _preflight_existing_ledger(connection, session_key)
             row = connection.execute(
                 "SELECT session_id, submission_id, run_id, digest, intent_json, receipt_json, "
                 "acceptance_state_json, acceptance_version FROM submissions "
@@ -690,12 +643,85 @@ def _expected_schema_signature() -> tuple[tuple[str, str, str, str], ...]:
         connection.close()
 
 
+_CHAIN_ROWS = (
+    "SELECT j.session_id, j.sequence, j.kind, j.previous_hash, j.record_hash, "
+    "e.event_id, e.event_json, t.entry_json, t.submission_id, t.role, t.content, "
+    "CASE j.kind WHEN 'event' THEN e.run_id ELSE t.run_id END AS run_id "
+    "FROM journal_entries AS j "
+    "LEFT JOIN events AS e ON e.session_id=j.session_id AND e.sequence=j.sequence "
+    "LEFT JOIN transcript AS t ON t.session_id=j.session_id AND t.sequence=j.sequence"
+)
+
+
+def _append_anchor(
+    connection: sqlite3.Connection,
+    session_key: str,
+    sequence: int,
+    kind: str,
+    canonical_json: str,
+    previous_hash: str,
+) -> str:
+    digest = record_hash(session_key, sequence, kind, canonical_json, previous_hash)
+    connection.execute(
+        "INSERT INTO journal_entries(session_id, sequence, kind, previous_hash, record_hash) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (session_key, sequence, kind, previous_hash, digest),
+    )
+    return digest
+
+
+def _verify_anchor(anchor: sqlite3.Row, session_key: str, previous_hash: str) -> str:
+    if validate_hash(anchor["previous_hash"]) != previous_hash:
+        raise ValueError("SQLite ledger predecessor hash disagrees")
+    if anchor["kind"] == "event" and anchor["entry_json"] is None:
+        _decode_event_row(anchor, session_key)
+        canonical_json = anchor["event_json"]
+    elif anchor["kind"] == "transcript" and anchor["event_json"] is None:
+        _decode_transcript_row(anchor, session_key)
+        canonical_json = anchor["entry_json"]
+    else:
+        raise ValueError("SQLite ledger anchor kind disagrees with its record")
+    # The decoders reject non-canonical JSON before the stored text is hashed.
+    digest = record_hash(
+        session_key, anchor["sequence"], anchor["kind"], canonical_json, previous_hash
+    )
+    if validate_hash(anchor["record_hash"]) != digest:
+        raise ValueError("SQLite ledger record hash disagrees with its payload")
+    return digest
+
+
+def _verify_ledger_tail(
+    connection: sqlite3.Connection, session_key: str, sequence: int, ledger_hash: object
+) -> None:
+    """Check the head boundary in O(1) indexed reads, without authenticating older history."""
+    root = validate_hash(ledger_hash)
+    previous_hash = genesis_hash(session_key)
+    if sequence == 0:
+        if root != previous_hash:
+            raise ValueError("SQLite empty ledger root disagrees with its Session")
+        return
+    if sequence > 1:
+        previous = connection.execute(
+            "SELECT record_hash FROM journal_entries WHERE session_id=? AND sequence=?",
+            (session_key, sequence - 1),
+        ).fetchone()
+        if previous is None:
+            raise ValueError("SQLite ledger tail predecessor is missing")
+        previous_hash = validate_hash(previous["record_hash"])
+    anchor = connection.execute(
+        _CHAIN_ROWS + " WHERE j.session_id=? AND j.sequence=?", (session_key, sequence)
+    ).fetchone()
+    if anchor is None or _verify_anchor(anchor, session_key, previous_hash) != root:
+        raise ValueError("SQLite ledger tail disagrees with its Session root")
+
+
 def _preflight_existing_ledger(
     connection: sqlite3.Connection, session_key: str
 ) -> tuple[sqlite3.Row | None, RunState | None]:
     """Validate one Session's immutable ledger before a commit reads its CAS counters."""
     row = connection.execute(
-        "SELECT session_id, version, sequence, state_json FROM sessions WHERE session_id = ?",
+        "SELECT session_id, version, sequence, state_json, ledger_hash "
+        "FROM sessions WHERE session_id = ?",
         (session_key,),
     ).fetchone()
     anchor_stats = connection.execute(
@@ -776,18 +802,13 @@ def _preflight_existing_ledger(
     if bad_anchor or orphan_event or orphan_transcript:
         raise ValueError("SQLite ledger anchors disagree with physical records")
 
-    for event_row in connection.execute(
-        "SELECT event_id, session_id, sequence, run_id, event_json FROM events "
-        "WHERE session_id = ? ORDER BY sequence",
-        (session_key,),
+    previous_hash = genesis_hash(session_key)
+    for anchor in connection.execute(
+        _CHAIN_ROWS + " WHERE j.session_id=? ORDER BY j.sequence", (session_key,)
     ):
-        _decode_event_row(event_row, session_key)
-    for transcript_row in connection.execute(
-        "SELECT session_id, sequence, run_id, submission_id, role, content, entry_json "
-        "FROM transcript WHERE session_id = ? ORDER BY sequence",
-        (session_key,),
-    ):
-        _decode_transcript_row(transcript_row, session_key)
+        previous_hash = _verify_anchor(anchor, session_key, previous_hash)
+    if previous_hash != validate_hash(row["ledger_hash"]):
+        raise ValueError("SQLite ledger root disagrees with its history")
 
     for submission_row in connection.execute(
         "SELECT session_id, submission_id, run_id, digest, intent_json, receipt_json, "

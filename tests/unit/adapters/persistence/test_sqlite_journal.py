@@ -200,6 +200,14 @@ def test_corrupt_codec_version_is_rejected_without_rewriting_storage(tmp_path: P
         sqlite_module._DDL.replace("session_id TEXT PRIMARY KEY", "session_id TEXT", 1),
         sqlite_module._DDL.replace("ON DELETE CASCADE", "ON DELETE RESTRICT", 1),
         sqlite_module._DDL.replace(
+            "  previous_hash TEXT NOT NULL,\n  record_hash TEXT NOT NULL,\n", ""
+        ),
+        sqlite_module._DDL.replace(
+            "  state_json TEXT NOT NULL,\n  ledger_hash TEXT NOT NULL\n",
+            "  state_json TEXT NOT NULL\n",
+            1,
+        ),
+        sqlite_module._DDL.replace(
             "runs_active_by_session ON runs(session_id, status)",
             "runs_active_by_session ON runs(status, session_id)",
             1,
@@ -432,6 +440,179 @@ def _raw_session_rows(path: Path, session_id: SessionId) -> tuple[tuple[str, tup
             )
             result.append((table, rows))
     return tuple(result)
+
+
+@pytest.mark.parametrize("with_records", [False, True], ids=["state-only", "with-records"])
+@pytest.mark.parametrize(
+    "corruption", ["synchronized-reorder", "synchronized-content", "synchronized-event"]
+)
+def test_independent_chain_rejects_self_consistent_history_rewrites(
+    tmp_path: Path, corruption: str, with_records: bool
+) -> None:
+    journal = make_journal(tmp_path)
+    first = acceptance("chain")
+    asyncio.run(journal.commit(first, 0))
+    receipt = _append_second_pair(journal, first)
+    attempted = _new_commit_after(receipt.state, version=2, sequence=4, with_records=with_records)
+    with sqlite3.connect(journal.path) as connection:
+        if corruption == "synchronized-reorder":
+            connection.execute(
+                "UPDATE events SET sequence=4, event_json=? WHERE sequence=3",
+                (encode(replace(receipt.events[0], sequence=4)),),
+            )
+            connection.execute(
+                "UPDATE transcript SET sequence=3, entry_json=? WHERE sequence=4",
+                (encode(replace(receipt.transcript[0], sequence=3)),),
+            )
+            connection.execute("UPDATE journal_entries SET kind='transcript' WHERE sequence=3")
+            connection.execute("UPDATE journal_entries SET kind='event' WHERE sequence=4")
+        elif corruption == "synchronized-content":
+            changed = replace(receipt.transcript[0], content="rewritten history")
+            connection.execute(
+                "UPDATE transcript SET content=?, entry_json=? WHERE sequence=4",
+                (changed.content, encode(changed)),
+            )
+        else:
+            event = receipt.events[0].event
+            changed_event = type(event)(
+                EventId("rewritten-event"),
+                event.type,
+                event.run_id,
+                event.session_id,
+                event.timestamp,
+                {"fact": "rewritten"},
+            )
+            connection.execute(
+                "UPDATE events SET event_id=?, event_json=? WHERE sequence=3",
+                (changed_event.event_id.value, encode(JournalEvent(3, changed_event))),
+            )
+    before = _raw_session_rows(journal.path, first.state.session_id)
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(journal.commit(attempted, 2))
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    assert _raw_session_rows(journal.path, first.state.session_id) == before
+    operations = [
+        lambda: journal.load_session(first.state.session_id, after_sequence=4),
+        lambda: journal.find_submission(first.state.session_id, first.state.submission_id),
+        lambda: journal.commit(first, 0),
+    ]
+    if corruption != "synchronized-event":
+        operations.append(lambda: journal.load_head(first.state.session_id))
+    for operation in operations:
+        with pytest.raises(JournalError) as caught:
+            asyncio.run(operation())
+        assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    assert _raw_session_rows(journal.path, first.state.session_id) == before
+
+
+@pytest.mark.parametrize("with_records", [False, True], ids=["state-only", "with-records"])
+@pytest.mark.parametrize(
+    "corruption",
+    ["root", "previous", "record", "uppercase", "short", "truncate", "insert"],
+)
+def test_chain_hash_corruption_rejects_reads_and_writes(
+    tmp_path: Path, corruption: str, with_records: bool
+) -> None:
+    journal = make_journal(tmp_path)
+    first = acceptance("chain-fields")
+    asyncio.run(journal.commit(first, 0))
+    receipt = _append_second_pair(journal, first)
+    with sqlite3.connect(journal.path) as connection:
+        sequence = 4
+        if corruption == "root":
+            connection.execute("UPDATE sessions SET ledger_hash=?", ("0" * 64,))
+        elif corruption in ("previous", "record", "uppercase", "short"):
+            column = "previous_hash" if corruption == "previous" else "record_hash"
+            value = "0" * 64
+            if corruption == "uppercase":
+                value = "A" * 64
+            elif corruption == "short":
+                value = "0"
+            connection.execute(f"UPDATE journal_entries SET {column}=? WHERE sequence=4", (value,))
+        else:
+            if corruption == "truncate":
+                connection.execute("DELETE FROM events WHERE sequence=3")
+                connection.execute("DELETE FROM transcript WHERE sequence=4")
+                connection.execute("DELETE FROM journal_entries WHERE sequence>2")
+                sequence = 2
+            else:
+                extra = replace(receipt.transcript[0], sequence=5)
+                connection.execute(
+                    "INSERT INTO transcript(session_id, sequence, run_id, submission_id, role, "
+                    "content, entry_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        extra.session_id.value,
+                        5,
+                        extra.run_id.value,
+                        extra.submission_id.value,
+                        extra.role,
+                        extra.content,
+                        encode(extra),
+                    ),
+                )
+                root = connection.execute("SELECT ledger_hash FROM sessions").fetchone()[0]
+                connection.execute(
+                    "INSERT INTO journal_entries(session_id, sequence, kind, previous_hash, "
+                    "record_hash) VALUES (?, 5, 'transcript', ?, ?)",
+                    (first.state.session_id.value, root, "0" * 64),
+                )
+                sequence = 5
+            # Also synchronize the head and Run counters: only the old chain/root remain.
+            state_json = encode(replace(receipt.state, journal_sequence=sequence))
+            connection.execute(
+                "UPDATE sessions SET sequence=?, state_json=?", (sequence, state_json)
+            )
+            connection.execute("UPDATE runs SET state_json=?", (state_json,))
+    before = _raw_session_rows(journal.path, first.state.session_id)
+    attempted = _new_commit_after(
+        receipt.state, version=2, sequence=sequence, with_records=with_records
+    )
+    for operation in (
+        lambda: journal.commit(attempted, 2),
+        lambda: journal.load_session(first.state.session_id, after_sequence=99),
+        lambda: journal.load_head(first.state.session_id),
+        lambda: journal.find_submission(first.state.session_id, first.state.submission_id),
+        lambda: journal.commit(first, 0),
+    ):
+        with pytest.raises(JournalError) as caught:
+            asyncio.run(operation())
+        assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+        assert _raw_session_rows(journal.path, first.state.session_id) == before
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_chain_cannot_be_transplanted_between_sessions(tmp_path: Path, empty: bool) -> None:
+    journal = make_journal(tmp_path)
+    batches = (acceptance("a", session="a"), acceptance("b", session="b"))
+    if empty:
+        batches = tuple(JournalCommit(replace(b.state, journal_sequence=0)) for b in batches)
+    for batch in batches:
+        asyncio.run(journal.commit(batch, 0))
+    with sqlite3.connect(journal.path) as connection:
+        connection.execute(
+            "UPDATE sessions SET ledger_hash=(SELECT ledger_hash FROM sessions WHERE session_id='a') "
+            "WHERE session_id='b'"
+        )
+        connection.execute(
+            "UPDATE journal_entries AS target SET "
+            "previous_hash=(SELECT previous_hash FROM journal_entries WHERE session_id='a' "
+            "AND sequence=target.sequence), "
+            "record_hash=(SELECT record_hash FROM journal_entries WHERE session_id='a' "
+            "AND sequence=target.sequence) WHERE session_id='b'"
+        )
+    before = _raw_session_rows(journal.path, batches[1].state.session_id)
+    attempted = _new_commit_after(
+        batches[1].state, version=1, sequence=0 if empty else 2, with_records=False
+    )
+    for operation in (
+        lambda: journal.commit(attempted, 1),
+        lambda: journal.load_session(batches[1].state.session_id),
+        lambda: journal.load_head(batches[1].state.session_id),
+    ):
+        with pytest.raises(JournalError) as caught:
+            asyncio.run(operation())
+        assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    assert _raw_session_rows(journal.path, batches[1].state.session_id) == before
 
 
 def _new_commit_after(

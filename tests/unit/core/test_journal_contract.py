@@ -188,9 +188,29 @@ def test_session_sequence_orders_events_before_transcript(journal: RunJournal) -
     assert suffix.summaries == all_entries.summaries
     beyond_head = asyncio.run(journal.load_session(state.session_id, after_sequence=10))
     assert beyond_head.events == beyond_head.transcript == ()
+    assert asyncio.run(journal.commit(batch, expected_version=0)) == first
+    found = asyncio.run(journal.find_submission(state.session_id, state.submission_id))
+    assert found is not None and (found.state, found.version) == (state, 1)
+    assert asyncio.run(journal.load_session(state.session_id)) == all_entries
 
     independent = asyncio.run(journal.commit(acceptance("other", session="other"), 0))
     assert (independent.version, independent.sequence) == (1, 2)
+
+
+def test_empty_ledger_can_advance_to_records_after_state_only_commits(journal: RunJournal) -> None:
+    batch = acceptance("empty-ledger")
+    initial = replace(batch.state, journal_sequence=0)
+    asyncio.run(journal.commit(JournalCommit(initial), 0))
+    advanced = replace(initial, version=2, journal_version=2)
+    asyncio.run(journal.commit(JournalCommit(advanced), 1))
+    assert asyncio.run(journal.load_session(initial.session_id)).sequence == 0
+    assert asyncio.run(journal.load_head(initial.session_id)).state == advanced
+    final = replace(batch.state, version=3, journal_version=3)
+    receipt = asyncio.run(
+        journal.commit(JournalCommit(final, events=batch.events, transcript=batch.transcript), 2)
+    )
+    assert (receipt.version, receipt.sequence) == (3, 2)
+    assert asyncio.run(journal.load_session(final.session_id)) == receipt
 
 
 def test_session_head_returns_only_current_projection_and_counters(journal: RunJournal) -> None:

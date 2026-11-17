@@ -134,13 +134,18 @@ class RunJournal(Protocol):
         Invalid members and duplicate event IDs raise INVARIANT_VIOLATION.
         Event timestamps must be plain UTC datetimes with fold zero.
         A rejected or replayed batch makes no writes.
+        Durable adapters validate the existing Session ledger before using its
+        counters, including for state-only commits and acceptance replay. Detected
+        storage corruption raises INVARIANT_VIOLATION without publishing writes.
         """
         ...
 
     def load_head(self, session_id: SessionId) -> Awaitable[JournalHead]:
-        """Read the current projection and CAS counters without reading Session history.
+        """Read the current projection and CAS counters without scanning Session history.
 
         A missing Session has version and sequence zero and no state.
+        Durable adapters may check indexed tail integrity metadata. This operation
+        does not certify the complete history; load_session and commit do that.
         """
         ...
 
@@ -152,6 +157,8 @@ class RunJournal(Protocol):
         Each entry collection is ordered by the shared sequence. Summaries are
         indexed independently of the cursor. A missing Session has version and
         sequence zero and no state. Zero is the cursor before the first entry.
+        Durable adapters validate the complete Session ledger, even for a suffix
+        or a cursor beyond the head, before returning persisted facts.
         """
         ...
 
@@ -162,5 +169,7 @@ class RunJournal(Protocol):
 
         Persist the acceptance with its commit, so a durable journal can return
         the same snapshot and version after reopening.
+        Durable adapters verify its agreement with the stored Session ledger;
+        detected corruption raises INVARIANT_VIOLATION.
         """
         ...
