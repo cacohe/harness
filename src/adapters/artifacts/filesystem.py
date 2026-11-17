@@ -536,9 +536,12 @@ class FilesystemArtifactRepository:
         try:
             info = root.stat(intent.tombstone)
         except FileNotFoundError:
-            final = _load(root, intent.digest, artifact_id_from_sha256(intent.digest))
-            if not _original_matches(final, intent):
-                raise ArtifactRepositoryError("Unresolved artifact retirement intent") from None
+            # Authorization is durable before any member or tombstone is removed.
+            # Once its tombstone is gone, only the authorized record needs cleanup.
+            if intent.captured_mtime_ns is None:
+                final = _load(root, intent.digest, artifact_id_from_sha256(intent.digest))
+                if not _original_matches(final, intent):
+                    raise ArtifactRepositoryError("Unresolved artifact retirement intent") from None
             remove_record(control, record)
             return False
 

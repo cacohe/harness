@@ -1072,3 +1072,101 @@ def test_restart_recovers_when_persisting_cleanup_permission_fails(tmp_path, mon
         assert not list((tmp_path / ".retire-intents").iterdir())
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("recovery", ["delete", "gc"])
+@pytest.mark.parametrize("republish_first", [False, True])
+def test_restart_finishes_retirement_after_tombstone_removal(
+    tmp_path, monkeypatch, recovery, republish_first
+):
+    async def scenario():
+        repo = FilesystemArtifactRepository(tmp_path, 3)
+        original = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="original"))
+        control = tmp_path / ".retire-intents"
+        original_unlink = Directory.unlink
+        failed_once = False
+
+        def fail_first_record_removal(directory, name, info):
+            nonlocal failed_once
+            if directory.path == control and name.endswith(".json") and not failed_once:
+                failed_once = True
+                raise PermissionError(errno.EACCES, "injected intent unlink failure")
+            return original_unlink(directory, name, info)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Directory, "unlink", fail_first_record_removal)
+            with pytest.raises(ArtifactRepositoryError):
+                await repo.delete(original.artifact_id)
+        assert failed_once
+        assert not list(tmp_path.glob(".delete-*"))
+        (old_record,) = control.glob("*.json")
+        assert await repo.stat(original.artifact_id) is None
+
+        restarted = FilesystemArtifactRepository(tmp_path, 3)
+
+        async def put_replacement():
+            return await restarted.put(
+                ArtifactWrite(_chunks(b"abc"), "text/plain", name="replacement")
+            )
+
+        replacement = await put_replacement() if republish_first else None
+        if recovery == "delete":
+            await restarted.delete(original.artifact_id)
+            assert await restarted.stat(original.artifact_id) is None
+        else:
+            references = {original.artifact_id} if replacement is not None else set()
+            assert await restarted.collect_orphans(references, datetime.now(timezone.utc)) == 0
+            assert await restarted.stat(original.artifact_id) == replacement
+        assert not old_record.exists()
+
+        if replacement is None or recovery == "delete":
+            replacement = await put_replacement()
+        assert await _read(restarted, replacement.artifact_id) == b"abc"
+        if recovery == "delete":
+            await restarted.delete(replacement.artifact_id)
+        else:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+            old = int((cutoff - timedelta(days=1)).timestamp())
+            os.utime(_object(tmp_path, replacement.artifact_id), (old, old))
+            assert await restarted.collect_orphans([], cutoff) == 1
+        assert await restarted.stat(original.artifact_id) is None
+        assert not list(control.iterdir())
+
+    asyncio.run(scenario())
+
+
+def test_repeated_record_removal_failure_preserves_same_digest_replacement(tmp_path, monkeypatch):
+    async def scenario():
+        repo = FilesystemArtifactRepository(tmp_path, 3)
+        original = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="original"))
+        control = tmp_path / ".retire-intents"
+        original_unlink = Directory.unlink
+
+        def fail_record_removal(directory, name, info):
+            if directory.path == control and name.endswith(".json"):
+                raise PermissionError(errno.EACCES, "persistent failure", str(control))
+            return original_unlink(directory, name, info)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Directory, "unlink", fail_record_removal)
+            with pytest.raises(ArtifactRepositoryError):
+                await repo.delete(original.artifact_id)
+            (old_record,) = control.glob("*.json")
+            restarted = FilesystemArtifactRepository(tmp_path, 3)
+            replacement = await restarted.put(
+                ArtifactWrite(_chunks(b"abc"), "text/plain", name="replacement")
+            )
+            with pytest.raises(ArtifactRepositoryError) as caught:
+                await restarted.delete(replacement.artifact_id)
+            assert str(control) not in str(caught.value)
+            assert await restarted.collect_orphans([], datetime.now(timezone.utc)) == 0
+            assert old_record.exists()
+            assert not list(tmp_path.glob(".delete-*"))
+            assert await restarted.stat(replacement.artifact_id) == replacement
+            assert await _read(restarted, replacement.artifact_id) == b"abc"
+
+        await restarted.delete(replacement.artifact_id)
+        assert await restarted.stat(replacement.artifact_id) is None
+        assert not list(control.iterdir())
+
+    asyncio.run(scenario())
