@@ -90,6 +90,9 @@ Conversation history is read in bounded pages. Durable summary checkpoints recor
 policy version, profile and Artifact references. Authenticated coverage witnesses allow older
 history to be omitted without scanning or silently forgetting it. `BoundedRunJournal` rejects a
 canonical serialized RunState larger than `ApplicationConfig.max_serialized_run_state_bytes`.
+Before each model advance, application composition reloads matching durable checkpoints from the
+authenticated journal snapshot; a checkpoint's summary and Artifact projection enter the trusted
+SYSTEM prefix as one indivisible group, including after process restart.
 
 A budget or state-envelope violation is a stable failure; the runtime does not send an oversized
 request or truncate JSON into an invalid value.

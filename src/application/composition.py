@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import math
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import NoReturn
 
@@ -25,7 +25,7 @@ from src.core.artifacts import ArtifactExternalizer
 from src.core.commands import RunLimits
 from src.core.context import ContextBudget, ContextProvider, ContextRequest, TokenCounter
 from src.core.ids import Clock, IdGenerator, ProfileId
-from src.core.journal import RunJournal
+from src.core.journal import JournalSnapshot, RunJournal
 from src.core.model import ModelGateway
 from src.core.run import RunCoordinator
 from src.core.state import RunState
@@ -255,10 +255,14 @@ def _compose(
     bounded_journal = BoundedRunJournal(journal, config.max_serialized_run_state_bytes)
     submissions = SubmissionService(bounded_journal, ids, clock, config.limits)
 
-    def coordinator_factory(state: RunState, user_input: str) -> RunCoordinator:
+    async def coordinator_factory(state: RunState, user_input: str) -> RunCoordinator:
         request = context_request_factory(state, user_input)
         if type(request) is not ContextRequest:
             raise ValueError("Context request factory returned an invalid request")
+        snapshot = await bounded_journal.load_session(
+            state.session_id, after_sequence=state.journal_sequence
+        )
+        request = _with_durable_summaries(request, state, snapshot)
         return RunCoordinator(
             context=context,
             model=model,
@@ -286,6 +290,36 @@ def _compose(
         observer_timeout_seconds=config.observer_timeout_seconds,
     )
     return Agent(runtime, ids, profile_id)
+
+
+def _with_durable_summaries(
+    request: ContextRequest, state: RunState, snapshot: JournalSnapshot
+) -> ContextRequest:
+    if (
+        type(snapshot) is not JournalSnapshot
+        or snapshot.session_id != state.session_id
+        or snapshot.version != state.journal_version
+        or snapshot.sequence != state.journal_sequence
+        or snapshot.state != state
+    ):
+        raise ValueError("Context journal snapshot does not match the current Run")
+    matching = tuple(
+        checkpoint
+        for checkpoint in snapshot.summaries
+        if checkpoint.session_id == request.session_id
+        and checkpoint.profile_id == request.profile_id
+        and checkpoint.policy_version == request.policy_version
+    )
+    durable = tuple(
+        sorted(
+            matching,
+            key=lambda checkpoint: (
+                checkpoint.covered_through_sequence,
+                checkpoint.covered_from_sequence,
+            ),
+        )[-128:]
+    )
+    return replace(request, summary_checkpoints=durable)
 
 
 def _validate_composition_inputs(

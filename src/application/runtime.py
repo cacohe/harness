@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import math
 from collections import deque
+from collections.abc import Awaitable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Protocol, TypeVar
@@ -35,7 +36,9 @@ class SessionOwnershipError(ValueError):
 
 
 class CoordinatorFactory(Protocol):
-    def __call__(self, state: RunState, user_input: str) -> RunCoordinator: ...
+    def __call__(
+        self, state: RunState, user_input: str
+    ) -> RunCoordinator | Awaitable[RunCoordinator]: ...
 
 
 class _Gate:
@@ -229,7 +232,7 @@ class RuntimeCoordinator:
                 if call_id != tool_call_id:
                     raise SessionOwnershipError("Tool call is not owned by this Session and Run")
                 message = await self._user_input(state)
-                coordinator = self._coordinator_factory(state, message)
+                coordinator = await self._coordinator(state, message)
                 outcome = await coordinator.advance(
                     state,
                     DecideToolCall(
@@ -242,7 +245,8 @@ class RuntimeCoordinator:
                 )
                 decided = _outcome_state(outcome, state)
                 await self._observe("run.advanced", decided)
-                resumed = await self._coordinator_factory(decided, message).advance(
+                resumed_coordinator = await self._coordinator(decided, message)
+                resumed = await resumed_coordinator.advance(
                     decided,
                     ResumeRun(
                         decided.run_id,
@@ -266,7 +270,8 @@ class RuntimeCoordinator:
                 if state.status.terminal:
                     return state
                 message = await self._user_input(state)
-                outcome = await self._coordinator_factory(state, message).advance(
+                coordinator = await self._coordinator(state, message)
+                outcome = await coordinator.advance(
                     state,
                     CancelRun(
                         state.run_id,
@@ -378,7 +383,7 @@ class RuntimeCoordinator:
         for _ in range(self._max_advances):
             if state.status.terminal or state.status is RunStatus.WAITING_APPROVAL:
                 return state
-            coordinator = self._coordinator_factory(state, message)
+            coordinator = await self._coordinator(state, message)
             outcome = await coordinator.advance(
                 state,
                 AdvanceRun(
@@ -393,6 +398,12 @@ class RuntimeCoordinator:
                 raise RuntimeError("Run coordinator did not advance the state")
             state = next_state
         raise RuntimeError("Application operation exceeded its advance limit")
+
+    async def _coordinator(self, state: RunState, message: str) -> RunCoordinator:
+        value = self._coordinator_factory(state, message)
+        if inspect.isawaitable(value):
+            value = await value
+        return value
 
     async def _observe(self, kind: str, state: RunState) -> None:
         observer = self._observer

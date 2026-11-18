@@ -12,13 +12,14 @@ import pytest
 from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactExternalizer
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.context.bounded import BoundedContextProvider
+from src.adapters.context.summarization import SummaryCheckpointService
 from src.adapters.context.tokenizers import ExactTokenCounter
 from src.adapters.persistence.bounded import BoundedRunJournal
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.adapters.persistence.sqlite_codec import encode
 from src.application.composition import ApplicationConfig, create_development_agent
-from src.core.artifacts import ArtifactRef
+from src.core.artifacts import ArtifactRef, InlineContent
 from src.core.commands import RunLimits
 from src.core.context import (
     ContextBudget,
@@ -264,6 +265,45 @@ class ArtifactTools:
         )
 
 
+class ApprovalTools:
+    async def execute(self, request):
+        return ToolResult(
+            ToolResultStatus.SUCCESS,
+            inline_content=InlineContent({"approved": True}, "application/json"),
+            execution_key=request.idempotency_key,
+        )
+
+
+class DurableSummaryCompactor:
+    def __init__(self, artifacts: tuple[ArtifactRef, ...]) -> None:
+        self._artifacts = artifacts
+
+    async def compact(self, request):
+        return ConversationSummaryCheckpoint(
+            request.session_id,
+            request.interactions[-1].sequence_through,
+            request.policy_version,
+            request.profile_id,
+            "durable restart summary",
+            covered_from_sequence=request.interactions[0].sequence_from,
+            artifacts=self._artifacts,
+        )
+
+
+class DurableSummaryModel:
+    def __init__(self, missing_summary_call_id: str) -> None:
+        self.requests = []
+        self._missing_summary_call_id = missing_summary_call_id
+
+    async def complete(self, request):
+        self.requests.append(request)
+        if not any(message.content == "durable restart summary" for message in request.messages):
+            return ModelResponse(
+                tool_calls=(ModelToolCall(self._missing_summary_call_id, "guarded", "{}"),)
+            )
+        return ModelResponse("summary-reused")
+
+
 def _history(count: int) -> tuple[ConversationInteraction, ...]:
     return tuple(
         ConversationInteraction(
@@ -275,6 +315,108 @@ def _history(count: int) -> tuple[ConversationInteraction, ...]:
             ),
         )
         for index in range(count)
+    )
+
+
+@pytest.mark.parametrize(
+    ("backend", "restart"),
+    (("memory", False), ("memory", True), ("sqlite", True)),
+)
+def test_committed_candidate_is_reused_on_next_advance_or_authenticated_restart(
+    backend: str, restart: bool, tmp_path: Path
+) -> None:
+    async def scenario():
+        path = (tmp_path / "summary-restart.sqlite3").resolve()
+        first_journal = InMemoryRunJournal() if backend == "memory" else SQLiteRunJournal(path)
+        digests = ("c" * 64, "d" * 64)
+        artifacts = tuple(
+            ArtifactRef(f"sha256:{digest}", "text/plain", 1, digest) for digest in digests
+        )
+        tool = ToolSpec(
+            "guarded",
+            "approval tool",
+            "{}",
+            requires_approval=True,
+            approval_scope="guarded",
+            workspace_id="workspace",
+        )
+        message = "question-" + "q" * 500
+
+        def request_factory(state, current):
+            return ContextRequest(
+                state.session_id,
+                state.profile_id,
+                "durable-v1",
+                ModelMessage(ModelRole.SYSTEM, "durable system"),
+                ModelMessage(ModelRole.USER, current),
+                (tool,),
+            )
+
+        def provider(journal):
+            return BoundedContextProvider(
+                journal,
+                ExactTokenCounter(),
+                summary_service=SummaryCheckpointService(DurableSummaryCompactor(artifacts)),
+            )
+
+        async def make_agent(journal, model, namespace):
+            repository = InMemoryArtifactRepository(1_048_576)
+            externalizer = PolicyArtifactExternalizer(
+                repository,
+                ArtifactPolicy(128, 1_048_576, 256, frozenset({"application/json"})),
+            )
+            return await create_development_agent(
+                ApplicationConfig(
+                    limits=RunLimits(8, 30.0, 128),
+                    context_budget=ContextBudget(1_000, 25, 25),
+                ),
+                model=model,
+                tools=ApprovalTools(),
+                context=provider(journal),
+                context_counter=ExactTokenCounter(),
+                context_request_factory=request_factory,
+                ids=Ids(namespace),
+                clock=Clock(),
+                profile_id=ProfileId("profile"),
+                journal=journal,
+                artifacts=externalizer,
+            )
+
+        first_model = DurableSummaryModel("guarded-call")
+        first_agent = await make_agent(first_journal, first_model, f"{backend}-first")
+        first_session = await first_agent.open_session(SessionId("summary-session"))
+        waiting = await first_session.submit(message, SubmissionId("summary-submission"))
+        persisted = await first_journal.load_session(waiting.session_id, waiting.journal_sequence)
+        assert len(persisted.summaries) == 1
+        if not restart:
+            settled = await first_session.decide_tool_call(waiting.run_id, "guarded-call", True)
+            await first_agent.close()
+            return message, artifacts, persisted, first_model.requests, settled
+
+        await first_agent.close()
+        restarted_journal = first_journal if backend == "memory" else SQLiteRunJournal(path)
+        restarted_model = DurableSummaryModel("unexpected-call")
+        restarted_agent = await make_agent(restarted_journal, restarted_model, f"{backend}-restart")
+        restarted_session = await restarted_agent.open_session(waiting.session_id)
+        settled = await restarted_session.decide_tool_call(waiting.run_id, "guarded-call", True)
+        await restarted_agent.close()
+        return message, artifacts, persisted, restarted_model.requests, settled
+
+    message, artifacts, persisted, requests, settled = asyncio.run(scenario())
+
+    assert len(persisted.summaries) == 1
+    assert len(requests) == (1 if restart else 2)
+    reused = requests[-1]
+    contents = tuple(item.content for item in reused.messages)
+    assert "durable restart summary" in contents, contents
+    assert settled.final_text == "summary-reused"
+    summary_index = contents.index("durable restart summary")
+    assert contents[summary_index + 1] == (
+        "Artifacts: " + ", ".join(ref.artifact_id for ref in artifacts)
+    )
+    assert (
+        sum(item.role is ModelRole.USER and item.content == message for item in reused.messages)
+        == 1
     )
 
 

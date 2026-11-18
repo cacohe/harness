@@ -8,7 +8,7 @@ from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactEx
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.context.tokenizers import ExactTokenCounter
 from src.adapters.persistence.memory import InMemoryRunJournal
-from src.core.artifacts import InlineContent
+from src.core.artifacts import ArtifactRef, InlineContent
 from src.core.commands import (
     AdvanceRun,
     CancelRun,
@@ -181,6 +181,7 @@ def coordinator(
     journal=None,
     context=None,
     context_request=None,
+    context_budget=BUDGET,
 ):
     calls = []
     journal = journal or Journal(calls)
@@ -199,7 +200,7 @@ def coordinator(
         clock=Clock(),
         ids=Ids(),
         context_request=context_request or request(specs),
-        context_budget=BUDGET,
+        context_budget=context_budget,
         context_counter=ExactTokenCounter(),
     )
     return result, calls, journal, tools, repository
@@ -358,6 +359,107 @@ def test_trusted_multi_system_skill_prefix_is_allowed():
         responses=[ModelResponse("answer")],
         context=SkillsContext(),
         context_request=trusted,
+    )
+
+    outcome = run(coordinator_.advance(initial(), submit()))
+
+    assert calls == ["model", "journal"]
+    assert outcome.state.status is RunStatus.COMPLETED
+
+
+def _checkpoint_with_artifacts() -> ConversationSummaryCheckpoint:
+    first = "a" * 64
+    second = "b" * 64
+    return ConversationSummaryCheckpoint(
+        SESSION,
+        1,
+        "v1",
+        PROFILE,
+        "durable summary",
+        artifacts=(
+            ArtifactRef(f"sha256:{first}", "text/plain", 1, first),
+            ArtifactRef(f"sha256:{second}", "text/plain", 1, second),
+        ),
+    )
+
+
+@pytest.mark.parametrize("attack", ("summary-only", "partial-artifacts", "reordered", "copied"))
+def test_model_is_not_called_when_checkpoint_system_group_is_split(attack: str):
+    calls = []
+    checkpoint = _checkpoint_with_artifacts()
+    summary = ModelMessage(ModelRole.SYSTEM, "durable summary")
+    artifacts = ModelMessage(
+        ModelRole.SYSTEM,
+        "Artifacts: " + ", ".join(ref.artifact_id for ref in checkpoint.artifacts),
+    )
+    if attack == "summary-only":
+        supplied = (summary,)
+    elif attack == "partial-artifacts":
+        supplied = (
+            summary,
+            ModelMessage(ModelRole.SYSTEM, f"Artifacts: {checkpoint.artifacts[0].artifact_id}"),
+        )
+    elif attack == "reordered":
+        supplied = (artifacts, summary)
+    else:
+        supplied = (summary, artifacts, summary, artifacts)
+    trusted = replace(request(), summary_checkpoints=(checkpoint,))
+
+    class SplitsCheckpointContext:
+        async def build(self, request_, budget):
+            calls.append("context")
+            messages = (request_.system_message, *supplied, request_.current_input)
+            return ContextWindow(
+                messages,
+                request_.tools,
+                TokenEstimate(len(messages), EstimateQuality.EXACT),
+                budget,
+                (),
+                request_.policy_version,
+            )
+
+    coordinator_, calls_, _, _, _ = coordinator(
+        responses=[ModelResponse("must-not-run")],
+        context=SplitsCheckpointContext(),
+        context_request=trusted,
+        context_budget=ContextBudget(500, 10, 5),
+    )
+    calls = calls_
+
+    outcome = run(coordinator_.advance(initial(), submit()))
+
+    assert calls == ["context", "journal"]
+    assert outcome.state.failure == RunFailure(RunErrorCode.INVARIANT_VIOLATION)
+
+
+@pytest.mark.parametrize("include_checkpoint", (False, True))
+def test_complete_checkpoint_system_group_or_whole_omission_is_allowed(include_checkpoint: bool):
+    checkpoint = _checkpoint_with_artifacts()
+    summary = ModelMessage(ModelRole.SYSTEM, "durable summary")
+    artifacts = ModelMessage(
+        ModelRole.SYSTEM,
+        "Artifacts: " + ", ".join(ref.artifact_id for ref in checkpoint.artifacts),
+    )
+    supplied = (summary, artifacts) if include_checkpoint else ()
+    trusted = replace(request(), summary_checkpoints=(checkpoint,))
+
+    class CheckpointContext:
+        async def build(self, request_, budget):
+            messages = (request_.system_message, *supplied, request_.current_input)
+            return ContextWindow(
+                messages,
+                request_.tools,
+                TokenEstimate(len(messages), EstimateQuality.EXACT),
+                budget,
+                (),
+                request_.policy_version,
+            )
+
+    coordinator_, calls, _, _, _ = coordinator(
+        responses=[ModelResponse("answer")],
+        context=CheckpointContext(),
+        context_request=trusted,
+        context_budget=ContextBudget(500, 10, 5),
     )
 
     outcome = run(coordinator_.advance(initial(), submit()))

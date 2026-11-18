@@ -74,25 +74,21 @@ def _matches_trusted_context_shape(
     while prefix_end < len(messages) and messages[prefix_end].role is ModelRole.SYSTEM:
         prefix_end += 1
     supplied_prefix = messages[1:prefix_end]
-    trusted_optional = (
-        *request.memory_messages,
-        *request.skill_messages,
-        *(
-            message
-            for checkpoint in request.summary_checkpoints
-            for message in summary_system_messages(checkpoint)
-        ),
+    trusted_groups = (
+        *((message,) for message in request.memory_messages),
+        *((message,) for message in request.skill_messages),
+        *(summary_system_messages(checkpoint) for checkpoint in request.summary_checkpoints),
     )
-    candidate_index = 0
-    for supplied in supplied_prefix:
-        while (
-            candidate_index < len(trusted_optional)
-            and trusted_optional[candidate_index] != supplied
-        ):
-            candidate_index += 1
-        if candidate_index == len(trusted_optional):
-            return False
-        candidate_index += 1
+    positions = {0}
+    for group in trusted_groups:
+        next_positions = set(positions)
+        for position in positions:
+            through = position + len(group)
+            if supplied_prefix[position:through] == group:
+                next_positions.add(through)
+        positions = next_positions
+    if len(supplied_prefix) not in positions:
+        return False
 
     suffix_length = len(request.open_tool_messages) + 1
     if len(messages) < prefix_end + suffix_length:
