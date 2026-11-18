@@ -10,7 +10,7 @@ from typing import Protocol, TypeVar
 
 from src.application.observability import Observation, PostCommitObserver
 from src.application.submissions import AcceptedRun, SubmissionService
-from src.core.commands import AdvanceRun, CommandContext, DecideToolCall, ResumeRun
+from src.core.commands import AdvanceRun, CancelRun, CommandContext, DecideToolCall, ResumeRun
 from src.core.ids import Clock, IdGenerator, ProfileId, RunId, SessionId, SubmissionId
 from src.core.journal import JournalHead, RunJournal
 from src.core.receipt_snapshot import snapshot_run_state, snapshot_transcript
@@ -254,6 +254,30 @@ class RuntimeCoordinator:
                 await self._observe("run.advanced", resumed_state)
                 return await self._drive(resumed_state, message)
 
+    async def cancel_run(self, session_id: SessionId, run_id: RunId) -> RunState:
+        session_id = _canonical_id(session_id, SessionId, "Cancellation identity is invalid")
+        run_id = _canonical_id(run_id, RunId, "Cancellation identity is invalid")
+        slot = await self._slot(session_id)
+        async with slot.gate.enter():
+            async with self._operation(session_id, slot):
+                state = await self._head_state(session_id)
+                if state.session_id != session_id or state.run_id != run_id:
+                    raise SessionOwnershipError("Run is not owned by this Session")
+                if state.status.terminal:
+                    return state
+                message = await self._user_input(state)
+                outcome = await self._coordinator_factory(state, message).advance(
+                    state,
+                    CancelRun(
+                        state.run_id,
+                        state.session_id,
+                        context=self._context(state),
+                    ),
+                )
+                cancelled = _outcome_state(outcome, state)
+                await self._observe("run.advanced", cancelled)
+                return cancelled
+
     async def close(self) -> None:
         async with self._lifecycle_lock:
             task = self._close_task
@@ -383,9 +407,7 @@ class RuntimeCoordinator:
             state.journal_sequence,
         )
         try:
-            await asyncio.wait_for(
-                observer.observe(observation), timeout=self._observer_timeout
-            )
+            await asyncio.wait_for(observer.observe(observation), timeout=self._observer_timeout)
         except asyncio.CancelledError:
             raise
         except Exception:

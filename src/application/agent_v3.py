@@ -33,6 +33,10 @@ class AgentSession:
         self._ensure_open()
         return await self._runtime.decide_tool_call(self.session_id, run_id, tool_call_id, approved)
 
+    async def cancel(self, run_id: RunId) -> RunState:
+        self._ensure_open()
+        return await self._runtime.cancel_run(self.session_id, run_id)
+
     async def close(self) -> None:
         task = self._close_task
         if task is None:
