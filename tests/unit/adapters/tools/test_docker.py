@@ -50,19 +50,24 @@ def test_create_argv_contains_all_hardening_and_no_shell(tmp_path: Path) -> None
 
 
 def test_command_timeout_and_cancel_kill_process(tmp_path: Path, monkeypatch) -> None:
+    class Reader:
+        async def read(self, _size):
+            return b""
+
     class Process:
         returncode = None
 
         def __init__(self):
             self.killed = False
-
-        async def communicate(self):
-            await asyncio.sleep(10)
+            self.stdout = Reader()
+            self.stderr = Reader()
 
         def kill(self):
             self.killed = True
 
         async def wait(self):
+            if not self.killed:
+                await asyncio.sleep(10)
             return 0
 
     async def scenario():
@@ -86,6 +91,44 @@ def test_command_timeout_and_cancel_kill_process(tmp_path: Path, monkeypatch) ->
         assert process.killed
 
     asyncio.run(scenario())
+
+
+def test_ambiguous_create_always_attempts_confirmed_cleanup(tmp_path: Path) -> None:
+    async def scenario():
+        gateway = _gateway(tmp_path)
+        calls = []
+
+        async def command(args, _timeout):
+            calls.append(args)
+            if "create" in args:
+                raise TimeoutError
+            return 0, b"", b"No such container"
+
+        gateway._command = command  # type: ignore[method-assign]
+        with pytest.raises(TimeoutError):
+            await gateway._run(DockerInvocation("echo ok"))
+        assert any("rm" in args and "--force" in args for args in calls)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["tcp://localhost:2375", "unix://relative", "unix:///tmp/sock?x=1", "npipe://bad"],
+)
+def test_rejects_noncanonical_docker_hosts(tmp_path: Path, host: str) -> None:
+    with pytest.raises(ValueError):
+        DockerToolGateway(
+            ToolCatalog(()), InMemoryToolExecutionStore(),
+            PolicyArtifactExternalizer(
+                InMemoryArtifactRepository(1024),
+                ArtifactPolicy(512, 1024, 128, frozenset({"application/json"})),
+            ),
+            docker_executable=Path(os.environ["COMSPEC"]),
+            image="example.invalid/tool@sha256:" + "a" * 64,
+            workspace_root=tmp_path.resolve(),
+            docker_host=host,
+        )
 
 
 def test_remove_failure_reader_failure_and_path_redaction(tmp_path: Path) -> None:

@@ -99,7 +99,7 @@ class Submissions:
         current = state(session_id, submission_id)
         self.journal.heads[session_id.value] = current
         self.journal.messages[current.run_id.value] = message
-        return AcceptedRun(current, 1)
+        return AcceptedRun(current, 1, True)
 
 
 class Journal:
@@ -207,6 +207,40 @@ async def test_post_commit_observer_runs_after_acceptance_and_advance_and_is_iso
         ("submission.accepted", "running"),
         ("run.advanced", "completed"),
     ]
+
+
+@async_test
+async def test_replayed_acceptance_emits_no_acceptance_observation_and_hung_observer_times_out():
+    from src.application.runtime import RuntimeCoordinator
+
+    journal = Journal()
+    observed = []
+
+    class ReplaySubmissions(Submissions):
+        async def accept(self, session_id, message, submission_id, profile_id):
+            accepted = await super().accept(session_id, message, submission_id, profile_id)
+            return AcceptedRun(accepted.state, accepted.version, False)
+
+    class Observer:
+        async def observe(self, observation):
+            observed.append(observation.kind)
+            await asyncio.sleep(10)
+
+    runtime = RuntimeCoordinator(
+        submissions=ReplaySubmissions(journal),
+        journal=journal,
+        coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, []),
+        ids=Ids(), clock=Clock(), max_sessions=1, max_waiters_per_session=0,
+        observer=Observer(), observer_timeout_seconds=0.01,
+    )
+    result = await asyncio.wait_for(
+        runtime.submit(
+            SessionId("replay"), ProfileId("profile"), "message", SubmissionId("submission")
+        ),
+        timeout=0.2,
+    )
+    assert result.status is RunStatus.COMPLETED
+    assert observed == ["run.advanced"]
 
 
 def waiting_state(session: SessionId, submission: SubmissionId) -> RunState:

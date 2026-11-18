@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import time
 
 from src.adapters.observability import CompositeObserver, EventObserver, MetricsObserver
 from src.application.composition import create_production_agent
@@ -55,3 +56,18 @@ def test_metrics_is_async_safe_and_default_composition_has_no_observer() -> None
 
     asyncio.run(scenario())
     assert inspect.signature(create_production_agent).parameters["observer"].default is None
+
+
+def test_sync_event_sink_runs_off_event_loop() -> None:
+    def sink(_event):
+        time.sleep(0.03)
+
+    async def scenario():
+        task = asyncio.create_task(
+            EventObserver(sink).observe(Observation("x", "s", "r", "running", 1, 1))
+        )
+        await asyncio.sleep(0.005)
+        assert not task.done()
+        await task
+
+    asyncio.run(scenario())

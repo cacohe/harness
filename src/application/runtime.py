@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -125,6 +126,7 @@ class RuntimeCoordinator:
         max_advances_per_operation: int = 1024,
         owned_resources: tuple[object, ...] = (),
         observer: PostCommitObserver | None = None,
+        observer_timeout_seconds: float = 0.1,
     ) -> None:
         if (
             type(max_sessions) is not int
@@ -135,6 +137,10 @@ class RuntimeCoordinator:
             or not 1 <= max_advances_per_operation <= 1_000_000
             or type(owned_resources) is not tuple
             or len({id(item) for item in owned_resources}) != len(owned_resources)
+            or isinstance(observer_timeout_seconds, bool)
+            or type(observer_timeout_seconds) not in (int, float)
+            or not math.isfinite(observer_timeout_seconds)
+            or not 0.001 <= observer_timeout_seconds <= 30
         ):
             raise ValueError("Runtime limits and resources are invalid")
         self._submissions = submissions
@@ -147,6 +153,7 @@ class RuntimeCoordinator:
         self._max_advances = max_advances_per_operation
         self._owned_resources = owned_resources
         self._observer = observer
+        self._observer_timeout = float(observer_timeout_seconds)
         self._sessions: dict[str, _SessionSlot] = {}
         self._registry_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
@@ -199,7 +206,8 @@ class RuntimeCoordinator:
                     session_id, message, submission_id, profile_id
                 )
                 state = await self._accepted_head(accepted)
-                await self._observe("submission.accepted", state)
+                if accepted.committed:
+                    await self._observe("submission.accepted", state)
                 return await self._drive(state, message)
 
     async def decide_tool_call(
@@ -375,7 +383,9 @@ class RuntimeCoordinator:
             state.journal_sequence,
         )
         try:
-            await observer.observe(observation)
+            await asyncio.wait_for(
+                observer.observe(observation), timeout=self._observer_timeout
+            )
         except asyncio.CancelledError:
             raise
         except Exception:

@@ -1,7 +1,7 @@
 import hashlib
 import json
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from src.core.commands import CommandContext, RunLimits, SubmitRun
 from src.core.errors import InvalidTransition, RunErrorCode
@@ -24,6 +24,11 @@ class AcceptedRun:
 
     state: RunState
     version: int
+    committed: bool = field(compare=False)
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version < 0 or type(self.committed) is not bool:
+            raise ValueError("Accepted run receipt is invalid")
 
 
 class SubmissionService:
@@ -80,7 +85,7 @@ class SubmissionService:
                 if accepted is not None:
                     return accepted
             raise
-        return AcceptedRun(persisted_state, receipt.version)
+        return AcceptedRun(persisted_state, receipt.version, True)
 
     async def _replay(
         self,
@@ -109,7 +114,7 @@ class SubmissionService:
             raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
         if state.profile_id != profile_id:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
-        return AcceptedRun(state, version)
+        return AcceptedRun(state, version, False)
 
 
 def _head_version(head: JournalHead) -> int:

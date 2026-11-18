@@ -7,7 +7,7 @@ import math
 from collections.abc import Awaitable, Callable
 
 from src.adapters.tools.catalog import ToolCatalog, ToolCatalogEntry
-from src.adapters.tools.execution_store import ToolExecutionStore
+from src.adapters.tools.idempotency import ClaimState, ToolExecutionStore
 from src.core.artifacts import ArtifactExternalizer
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.tools import ToolApproval, ToolRequest, ToolResult, ToolResultStatus
@@ -32,6 +32,11 @@ class LocalToolGateway:
         if not math.isfinite(timeout) or not 0 < timeout <= 3600:
             raise ValueError("Local tool timeout is invalid")
         self._catalog = catalog
+        if type(self) is LocalToolGateway and any(
+            entry.mutating and not inspect.iscoroutinefunction(entry.handler)
+            for entry in catalog.entries
+        ):
+            raise ValueError("Mutating local tools require cancellation-aware async handlers")
         self._store = store
         self._externalizer = externalizer
         self._timeout = timeout
@@ -50,10 +55,28 @@ class LocalToolGateway:
             lock = self._locks.setdefault(identity, asyncio.Lock())
         try:
             async with lock:
-                cached = await self._store.claim(request)
-                if cached is not None:
-                    return cached
-                result = await self._invoke(request, entry.handler, arguments)
+                claim = await self._store.claim(request)
+                if claim.state is ClaimState.COMPLETED:
+                    assert claim.result is not None
+                    return claim.result
+                if claim.state is ClaimState.WAIT:
+                    return await self._store.wait_completed(request)
+                try:
+                    result = await self._invoke(request, entry.handler, arguments)
+                except asyncio.CancelledError:
+                    cancelled = ToolResult(
+                        ToolResultStatus.CANCELLED,
+                        failure=RunFailure(RunErrorCode.CANCELLED),
+                        execution_key=request.idempotency_key,
+                    )
+                    completion = asyncio.create_task(self._store.complete(request, cancelled))
+                    while not completion.done():
+                        try:
+                            await asyncio.shield(completion)
+                        except asyncio.CancelledError:
+                            continue
+                    await completion
+                    raise
                 await self._store.complete(request, result)
                 return result
         finally:
@@ -106,12 +129,12 @@ def _authorize(request: ToolRequest, entry: ToolCatalogEntry | None) -> ToolResu
     if request.approval is ToolApproval.UNDECIDED:
         return ToolResult(ToolResultStatus.PENDING_APPROVAL)
     if entry is None:
-        return _failed()
+        return ToolResult(ToolResultStatus.DENIED)
     spec = entry.spec
     if spec.name != request.name or spec.approval_scope != request.approval_scope:
-        return _failed()
+        return ToolResult(ToolResultStatus.DENIED)
     if spec.workspace_id != request.workspace_id:
-        return _failed()
+        return ToolResult(ToolResultStatus.DENIED)
     # A live policy may tighten, but it can never remove the persisted gate.
     if spec.requires_approval and request.approval is not ToolApproval.APPROVED:
         return ToolResult(ToolResultStatus.PENDING_APPROVAL)

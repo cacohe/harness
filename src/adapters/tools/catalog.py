@@ -41,3 +41,7 @@ class ToolCatalog:
     @property
     def specs(self) -> tuple[ToolSpec, ...]:
         return tuple(entry.spec for entry in self._entries.values())
+
+    @property
+    def entries(self) -> tuple[ToolCatalogEntry, ...]:
+        return tuple(self._entries.values())

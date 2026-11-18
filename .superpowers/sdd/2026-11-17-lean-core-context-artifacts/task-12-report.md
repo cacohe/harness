@@ -129,3 +129,87 @@ The 58 full-suite failures are exactly the pre-existing legacy groups approved f
 - `tests/unit/core/test_ports.py`: 1
 
 No non-legacy regression was introduced.
+
+## Fix round 1/5 — production ownership and lifecycle review
+
+Baseline: `b15d58a`. Two Critical and seven Important findings were reproduced with attacking
+tests. The two reviewer Minor findings remain explicitly deferred and were not mixed into this
+round.
+
+### RED evidence
+
+- A second `SQLiteToolExecutionStore` constructor could settle a live owner's `started` row, and a
+  contender's old five-second wait timeout could overwrite the live result with `FAILED`.
+- Docker cleanup ran only after an acknowledged create; a create timeout/cancellation could leave an
+  ambiguously created container. CLI `communicate()` could also buffer without the adapter bound.
+- SQLite accepted weakly similar schemas/results and did not require the stored execution key to
+  equal the claim binding before the first write.
+- MCP cancellation while waiting for an active lease could leave `closing=True`; cancellation of the
+  first `aclose()` caller could make later close calls return without finishing owned cleanup.
+- Artifact reads trusted declared length/iterator chunks, leaked a partial UTF-8 decode exception,
+  and had no chunk-size corruption bound.
+- LiteLLM rejected valid parallel fragment continuation (`[0,1] -> [0,1]`), accepted missing finish,
+  and did not guarantee explicit async-provider iterator close.
+- Replay acceptance produced the same observation as a new commit, and a hung observer had no hard
+  application bound. A synchronous event sink ran on the event loop.
+- A mutating synchronous local handler could continue in its worker thread after timeout/cancel;
+  stale live binding returned a generic failure rather than denial.
+
+### GREEN decisions and coverage
+
+- Durable execution now has explicit `OWNER`, `WAIT`, and `COMPLETED` claims. Constructors never
+  inspect or settle `started`; contenders only poll or cancel and never mutate owner state. SQLite
+  busy timeout, poll interval, and optional caller wait bound are separate. `recover_abandoned()` is
+  an explicit exclusive startup operation whose precondition is that the caller has excluded all
+  live owners. Tests cover three independent instances, execution longer than the SQLite timeout,
+  wait expiry with zero mutation, owner cancellation, exact shared result, and explicit recovery.
+- The SQLite store atomically creates and fingerprints two strict tables, checks exact SQL, columns,
+  PK/not-null layout, metadata/version, and rejects extra/future objects. Result writes rebuild
+  `ToolResult`, require the exact request execution key before mutation, use bounded canonical JSON,
+  and reject duplicate/unknown/noncanonical/corrupt data.
+- Docker chooses the random name before create and unconditionally runs one shielded confirmed
+  `rm --force` task from `finally`, including create timeout/cancel. Repeated cancellation cannot
+  interrupt owned cleanup. Create/start/remove all use concurrently drained bounded streams; reader
+  failure kills the process. Image leading dashes, noncanonical/nonlocal hosts, and invalid cleanup
+  bounds are rejected; not-found removal is treated as confirmed idempotence.
+- MCP refresh/remove rollback `closing` in `finally` before publication. Server close tasks and the
+  aggregate `aclose` task persist independently of any caller; a canceled caller can return, while a
+  later `aclose` awaits the same exactly-once cleanup. Tests cover active leases, refresh/remove
+  cancellation, stale generation, list/call/close failures, and later-close completion.
+- Artifact reads validate exact refs and declared length, reject short/long streams and oversized
+  chunks, retain only the requested slice plus the truncation byte, use `memoryview`, explicitly
+  close the iterator, and translate partial UTF-8 to base64.
+- LiteLLM requires and forwards bounded `max_output_tokens`, caps chunks/bytes/calls/usage, supports
+  parallel per-index builders, rejects same-chunk duplicate/illegal indices and post-finish/missing
+  finish, and closes the provider iterator under success, timeout, and cancellation.
+- `AcceptedRun.committed` is exact-bool trusted receipt metadata excluded from value equality. Runtime
+  emits acceptance only for a new commit, applies a configurable hard observer timeout, and isolates
+  timeout/failure. `CompositeObserver` bounds every child; synchronous event sinks use `to_thread`.
+- `LocalToolGateway` rejects synchronous mutating handlers at registration, persists a stable
+  cancellation result before propagating caller cancellation, and denies stale live bindings before
+  creating a claim.
+
+### Fix-round verification
+
+```text
+python -m pytest -q -p no:cacheprovider \
+  tests/unit/adapters/model tests/unit/adapters/tools \
+  tests/unit/adapters/observability tests/unit/application/test_runtime_v3.py \
+  tests/unit/application/test_submissions.py
+123 passed in 39.26s
+
+ruff check --no-cache src tests/unit/adapters tests/unit/application/test_runtime_v3.py
+All checks passed!
+
+mypy --cache-dir F:/CodeSpace/.tmp/mypy-task12-fix2 src
+Success: no issues found in 117 source files
+
+python -m pytest -qq -p no:cacheprovider tests <four legacy excludes>
+100% with no failures (1757 passed, 7 skipped)
+
+python -m pytest -q -p no:cacheprovider tests
+58 failed, 1762 passed, 7 skipped in 288.71s
+```
+
+The 58 failures remain exactly the four approved legacy groups (54 + 2 + 1 + 1); fix round 1 adds
+no non-legacy regression.

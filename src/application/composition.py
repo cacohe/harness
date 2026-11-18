@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,6 +48,7 @@ class ApplicationConfig:
     max_artifact_summary_bytes: int = 16_384
     sqlite_path: Path | None = None
     artifact_root: Path | None = None
+    observer_timeout_seconds: float = 0.1
 
     def __post_init__(self) -> None:
         integers = (
@@ -59,6 +61,7 @@ class ApplicationConfig:
         )
         limits = _snapshot_limits(object.__getattribute__(self, "limits"))
         context_budget = _snapshot_context_budget(object.__getattribute__(self, "context_budget"))
+        observer_timeout = object.__getattribute__(self, "observer_timeout_seconds")
         if (
             any(type(value) is not int for value in integers)
             or not 1 <= integers[0] <= 1_000_000
@@ -67,10 +70,15 @@ class ApplicationConfig:
             or not 1 <= integers[3] <= (1 << 63) - 1
             or not 0 <= integers[4] <= integers[3]
             or not 1 <= integers[5] <= 1_048_576
+            or isinstance(observer_timeout, bool)
+            or type(observer_timeout) not in (int, float)
+            or not math.isfinite(observer_timeout)
+            or not 0.001 <= observer_timeout <= 30
         ):
             raise ValueError("Application configuration limits are invalid")
         object.__setattr__(self, "limits", limits)
         object.__setattr__(self, "context_budget", context_budget)
+        object.__setattr__(self, "observer_timeout_seconds", float(observer_timeout))
         for name in ("sqlite_path", "artifact_root"):
             value = object.__getattribute__(self, name)
             if value is None:
@@ -262,6 +270,7 @@ def _compose(
         max_advances_per_operation=config.max_advances_per_operation,
         owned_resources=owned_resources,
         observer=observer,
+        observer_timeout_seconds=config.observer_timeout_seconds,
     )
     return Agent(runtime, ids, profile_id)
 
@@ -363,6 +372,7 @@ def _snapshot_application_config(value: object) -> ApplicationConfig:
             max_artifact_summary_bytes=object.__getattribute__(value, "max_artifact_summary_bytes"),
             sqlite_path=object.__getattribute__(value, "sqlite_path"),
             artifact_root=object.__getattribute__(value, "artifact_root"),
+            observer_timeout_seconds=object.__getattribute__(value, "observer_timeout_seconds"),
         )
     except (AttributeError, TypeError, ValueError):
         raise ValueError("Composition inputs are invalid") from None

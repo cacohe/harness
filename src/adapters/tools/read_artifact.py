@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+from collections.abc import AsyncIterator
 
 from src.core.artifacts import (
     MAX_ARTIFACT_SIZE_BYTES,
@@ -13,11 +15,20 @@ from src.core.artifacts import (
 class ReadArtifactTool:
     """Bounded, streaming read capability that never exposes repository locations."""
 
-    def __init__(self, repository: ArtifactRepository, *, max_read_bytes: int = 262_144) -> None:
+    def __init__(
+        self,
+        repository: ArtifactRepository,
+        *,
+        max_read_bytes: int = 262_144,
+        max_chunk_bytes: int = 1_048_576,
+    ) -> None:
         if type(max_read_bytes) is not int or not 1 <= max_read_bytes <= 1_048_576:
             raise ValueError("Artifact read limit is invalid")
         self._repository = repository
         self._max = max_read_bytes
+        if type(max_chunk_bytes) is not int or not 1 <= max_chunk_bytes <= 8 * 1_048_576:
+            raise ValueError("Artifact chunk limit is invalid")
+        self._max_chunk = max_chunk_bytes
 
     async def __call__(self, arguments: dict[str, object]) -> dict[str, object]:
         if type(arguments) is not dict or set(arguments) - {"artifact_id", "offset", "limit"}:
@@ -36,31 +47,69 @@ class ReadArtifactTool:
             or offset + limit > MAX_ARTIFACT_SIZE_BYTES
         ):
             raise ValueError("Artifact read range is invalid")
-        raw_ref = await self._repository.stat(artifact_id)  # type: ignore[arg-type]
+        try:
+            raw_ref = await self._repository.stat(artifact_id)  # type: ignore[arg-type]
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise ValueError("Artifact repository stat failed") from None
         if raw_ref is None:
             raise KeyError("Artifact is not available")
         ref = snapshot_artifact_ref(raw_ref)
         if ref.artifact_id != artifact_id:
             raise ValueError("Artifact repository returned an invalid reference")
-        wanted = limit + 1
-        skipped = 0
+        needed = min(ref.size_bytes + 1, offset + limit + 1)
+        required = min(ref.size_bytes, needed)
+        position = 0
         data = bytearray()
-        async for chunk in self._repository.open(artifact_id):
-            if type(chunk) is not bytes or not chunk:
-                raise ValueError("Artifact repository returned an invalid stream")
-            if skipped < offset:
-                take = min(len(chunk), offset - skipped)
-                skipped += take
-                chunk = chunk[take:]
-            if chunk and len(data) < wanted:
-                data.extend(chunk[: wanted - len(data)])
-            if len(data) >= wanted:
-                break
+        try:
+            iterator = self._repository.open(artifact_id)
+        except Exception:
+            raise ValueError("Artifact repository open failed") from None
+        if not isinstance(iterator, AsyncIterator):
+            raise ValueError("Artifact repository returned an invalid stream")
+        try:
+            while position < needed:
+                try:
+                    chunk = await anext(iterator)
+                except StopAsyncIteration:
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    raise ValueError("Artifact repository stream failed") from None
+                if type(chunk) is not bytes or not chunk or len(chunk) > self._max_chunk:
+                    raise ValueError("Artifact repository returned an invalid stream")
+                view = memoryview(chunk)
+                if position + len(view) > ref.size_bytes:
+                    raise ValueError("Artifact stream exceeds its declared size")
+                start = max(0, offset - position)
+                end = min(len(view), offset + limit + 1 - position)
+                if start < end:
+                    data.extend(view[start:end])
+                position += len(view)
+                if position >= needed:
+                    break
+        finally:
+            closer = getattr(iterator, "aclose", None)
+            if callable(closer):
+                try:
+                    await closer()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    raise ValueError("Artifact repository stream close failed") from None
+        if position < required:
+            raise ValueError("Artifact stream ended before its declared size")
         payload = bytes(data[:limit])
-        truncated = len(data) > limit or offset + len(payload) < ref.size_bytes
+        truncated = offset + len(payload) < ref.size_bytes
         if ref.media_type.startswith("text/") or ref.media_type.endswith("+json") or ref.media_type == "application/json":
-            content: str = payload.decode("utf-8", errors="strict")
-            encoding = "utf-8"
+            try:
+                content: str = payload.decode("utf-8", errors="strict")
+                encoding = "utf-8"
+            except UnicodeDecodeError:
+                content = base64.b64encode(payload).decode("ascii")
+                encoding = "base64"
         else:
             content = base64.b64encode(payload).decode("ascii")
             encoding = "base64"

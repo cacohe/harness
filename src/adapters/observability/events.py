@@ -12,17 +12,31 @@ EventSink = Callable[[dict[str, str | int]], None | Awaitable[None]]
 class CompositeObserver:
     """Ordered best-effort fan-out; one observer can never affect another."""
 
-    def __init__(self, observers: tuple[PostCommitObserver, ...]) -> None:
+    def __init__(
+        self,
+        observers: tuple[PostCommitObserver, ...],
+        *,
+        observer_timeout_seconds: float = 0.05,
+    ) -> None:
         if type(observers) is not tuple or len(observers) > 64:
             raise ValueError("Observer collection is invalid")
         self._observers = observers
+        if (
+            isinstance(observer_timeout_seconds, bool)
+            or type(observer_timeout_seconds) not in (int, float)
+            or not 0.001 <= observer_timeout_seconds <= 30
+        ):
+            raise ValueError("Observer timeout is invalid")
+        self._timeout = float(observer_timeout_seconds)
 
     async def observe(self, observation: Observation) -> None:
         if type(observation) is not Observation:
             raise ValueError("Observation is invalid")
         for observer in self._observers:
             try:
-                await observer.observe(observation)
+                await asyncio.wait_for(
+                    observer.observe(observation), timeout=self._timeout
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -46,6 +60,9 @@ class EventObserver:
             "journal_version": observation.journal_version,
             "journal_sequence": observation.journal_sequence,
         }
-        result = self._sink(event)
+        if inspect.iscoroutinefunction(self._sink):
+            await self._sink(event)
+            return
+        result = await asyncio.to_thread(self._sink, event)
         if inspect.isawaitable(result):
             await result

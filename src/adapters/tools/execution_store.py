@@ -249,3 +249,27 @@ def _decode_result(encoded: str, binding: str) -> ToolResult:
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         raise ToolExecutionStoreError("Corrupt tool execution result") from None
+
+
+# Public implementation moved to the stricter owner/wait protocol.
+from src.adapters.tools.idempotency import (  # type: ignore[assignment] # noqa: E402,F811
+    ClaimState,
+    ExecutionClaim,
+    InMemoryToolExecutionStore,
+    SQLiteToolExecutionStore,
+    ToolBindingConflict,
+    ToolExecutionStore,
+    ToolExecutionStoreError,
+    ToolExecutionWaitExpired,
+)
+
+__all__ = [
+    "ClaimState",
+    "ExecutionClaim",
+    "InMemoryToolExecutionStore",
+    "SQLiteToolExecutionStore",
+    "ToolBindingConflict",
+    "ToolExecutionStore",
+    "ToolExecutionStoreError",
+    "ToolExecutionWaitExpired",
+]

@@ -63,15 +63,15 @@ def test_rejects_invalid_ranges_and_extra_fields(arguments) -> None:
         asyncio.run(ReadArtifactTool(InMemoryArtifactRepository(1024), max_read_bytes=4)(arguments))
 
 
-def test_missing_and_invalid_utf8_are_stable() -> None:
+def test_missing_and_partial_utf8_falls_back_to_base64() -> None:
     async def scenario():
         repo = InMemoryArtifactRepository(1024)
         tool = ReadArtifactTool(repo)
         with pytest.raises(KeyError):
             await tool({"artifact_id": "sha256:" + "0" * 64, "offset": 0, "limit": 1})
         ref = await repo.put(ArtifactWrite(_stream(b"\xff"), "text/plain", max_bytes=1024))
-        with pytest.raises(UnicodeDecodeError):
-            await tool({"artifact_id": ref.artifact_id, "offset": 0, "limit": 1})
+        result = await tool({"artifact_id": ref.artifact_id, "offset": 0, "limit": 1})
+        assert result["encoding"] == "base64"
 
     asyncio.run(scenario())
 
@@ -92,3 +92,58 @@ def test_untrusted_stat_and_stream_are_rejected() -> None:
 
     with pytest.raises(ValueError):
         asyncio.run(ReadArtifactTool(BadRepository())({"artifact_id": "sha256:" + "0" * 64, "offset": 0, "limit": 1}))
+
+
+@pytest.mark.parametrize("payload", [b"ab", b"abcdef"])
+def test_declared_size_mismatch_is_rejected(payload: bytes) -> None:
+    from src.core.artifacts import ArtifactRef
+
+    declared = b"abcd"
+    digest = hashlib.sha256(declared).hexdigest()
+    ref = ArtifactRef("sha256:" + digest, "application/octet-stream", 4, digest)
+
+    class Repository:
+        async def stat(self, _artifact_id):
+            return ref
+
+        def open(self, _artifact_id):
+            async def chunks():
+                yield payload
+            return chunks()
+
+    with pytest.raises(ValueError):
+        asyncio.run(ReadArtifactTool(Repository())({"artifact_id": ref.artifact_id, "offset": 0, "limit": 4}))
+
+
+def test_huge_chunk_is_rejected_and_iterator_is_closed() -> None:
+    from src.core.artifacts import ArtifactRef
+
+    payload = b"abcd"
+    digest = hashlib.sha256(payload).hexdigest()
+    ref = ArtifactRef("sha256:" + digest, "application/octet-stream", 4, digest)
+    closed = False
+
+    class Stream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            nonlocal closed
+            if closed:
+                raise StopAsyncIteration
+            return payload
+
+        async def aclose(self):
+            nonlocal closed
+            closed = True
+
+    class Repository:
+        async def stat(self, _artifact_id):
+            return ref
+
+        def open(self, _artifact_id):
+            return Stream()
+
+    with pytest.raises(ValueError):
+        asyncio.run(ReadArtifactTool(Repository(), max_chunk_bytes=3)({"artifact_id": ref.artifact_id, "offset": 0, "limit": 2}))
+    assert closed

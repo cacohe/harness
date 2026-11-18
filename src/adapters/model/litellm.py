@@ -40,12 +40,14 @@ class LiteLLMModelGateway:
         self,
         model: str,
         *,
+        max_output_tokens: int,
         api_key: str | None = None,
         api_base: str | None = None,
         timeout_seconds: float = 60.0,
         stream: bool = False,
         max_response_bytes: int = 1_048_576,
         max_tool_calls: int = 64,
+        max_stream_chunks: int = 4096,
         completion: Completion | None = None,
         options: dict[str, object] | None = None,
     ) -> None:
@@ -66,9 +68,16 @@ class LiteLLMModelGateway:
             raise ValueError("LiteLLM response limit is invalid")
         if type(max_tool_calls) is not int or not 1 <= max_tool_calls <= 64:
             raise ValueError("LiteLLM tool-call limit is invalid")
+        if type(max_output_tokens) is not int or not 1 <= max_output_tokens <= 1_000_000:
+            raise ValueError("LiteLLM output-token limit is invalid")
+        if type(max_stream_chunks) is not int or not 1 <= max_stream_chunks <= 1_000_000:
+            raise ValueError("LiteLLM stream-chunk limit is invalid")
         if options is not None and type(options) is not dict:
             raise ValueError("LiteLLM options are invalid")
-        forbidden = {"model", "messages", "tools", "stream", "api_key", "api_base", "timeout"}
+        forbidden = {
+            "model", "messages", "tools", "stream", "api_key", "api_base", "timeout",
+            "max_tokens",
+        }
         if options is not None and forbidden.intersection(options):
             raise ValueError("LiteLLM options override adapter-owned fields")
         self._model = model
@@ -78,6 +87,8 @@ class LiteLLMModelGateway:
         self._stream = stream
         self._max_bytes = max_response_bytes
         self._max_calls = max_tool_calls
+        self._max_output_tokens = max_output_tokens
+        self._max_chunks = max_stream_chunks
         self._completion = completion or litellm.acompletion
         self._options = dict(options or {})
 
@@ -91,6 +102,7 @@ class LiteLLMModelGateway:
             "messages": [_message(item) for item in request.messages],
             "stream": self._stream,
             "timeout": self._timeout,
+            "max_tokens": self._max_output_tokens,
         }
         if request.tools:
             arguments["tools"] = [_tool(item) for item in request.tools]
@@ -124,7 +136,9 @@ class LiteLLMModelGateway:
             raise ValueError
         calls = tuple(_whole_call(item) for item in raw_calls)
         self._check_size(text, calls)
-        return ModelResponse(text, calls, _usage(_field(response, "usage", None)))
+        usage = _usage(_field(response, "usage", None))
+        self._check_usage(usage)
+        return ModelResponse(text, calls, usage)
 
     async def _assemble(self, response: AsyncIterator[object]) -> ModelResponse:
         text_parts: list[str] = []
@@ -132,75 +146,95 @@ class LiteLLMModelGateway:
         usage: ModelUsage | None = None
         size = 0
         finished = False
-        last_tool_index = -1
-        async for chunk in response:
-            chunk_usage = _usage(_field(chunk, "usage", None))
-            if chunk_usage is not None:
-                usage = chunk_usage
-            choices = _field(chunk, "choices", [])
-            if type(choices) is not list or len(choices) > 1:
-                raise ValueError
-            if not choices:
-                continue
-            choice = choices[0]
-            finish = _field(choice, "finish_reason", None)
-            if finish is not None:
-                if type(finish) is not str or finished:
+        chunks = 0
+        try:
+            async for chunk in response:
+                chunks += 1
+                if chunks > self._max_chunks:
                     raise ValueError
-                finished = True
-            delta = _field(choice, "delta", None)
-            if delta is None:
-                continue
-            content = _field(delta, "content", None)
-            if content is not None:
-                if type(content) is not str or finished and finish is None:
+                chunk_usage = _usage(_field(chunk, "usage", None))
+                if chunk_usage is not None:
+                    usage = chunk_usage
+                choices = _field(chunk, "choices", [])
+                if type(choices) is not list or len(choices) > 1:
                     raise ValueError
-                size += len(content.encode("utf-8"))
-                if size > self._max_bytes:
+                if not choices:
+                    continue
+                choice = choices[0]
+                finish = _field(choice, "finish_reason", None)
+                if finish is not None and (type(finish) is not str or finished):
                     raise ValueError
-                text_parts.append(content)
-            fragments = _field(delta, "tool_calls", [])
-            if type(fragments) is not list:
-                raise ValueError
-            for fragment in fragments:
-                index = _field(fragment, "index", None)
-                if (
-                    type(index) is not int
-                    or index < 0
-                    or index > len(calls)
-                    or index < last_tool_index
-                ):
+                delta = _field(choice, "delta", None)
+                if delta is None:
+                    if finish is not None:
+                        finished = True
+                    continue
+                content = _field(delta, "content", None)
+                fragments = _field(delta, "tool_calls", [])
+                if finished and (content is not None or fragments):
                     raise ValueError
-                last_tool_index = index
-                if index == len(calls):
-                    if len(calls) >= self._max_calls:
+                if content is not None:
+                    if type(content) is not str:
                         raise ValueError
-                    calls.append(_CallParts())
-                current = calls[index]
-                call_id = _field(fragment, "id", None)
-                function = _field(fragment, "function", {})
-                name = _field(function, "name", None)
-                arguments = _field(function, "arguments", None)
-                if call_id is not None:
-                    if type(call_id) is not str or current.call_id is not None:
-                        raise ValueError
-                    current.call_id = call_id
-                if name is not None:
-                    if type(name) is not str or current.name is not None:
-                        raise ValueError
-                    current.name = name
-                if arguments is not None:
-                    if type(arguments) is not str:
-                        raise ValueError
-                    size += len(arguments.encode("utf-8"))
+                    size += len(content.encode("utf-8"))
                     if size > self._max_bytes:
                         raise ValueError
-                    current.arguments += arguments
+                    text_parts.append(content)
+                if type(fragments) is not list:
+                    raise ValueError
+                seen_indexes: set[int] = set()
+                for fragment in fragments:
+                    index = _field(fragment, "index", None)
+                    if type(index) is not int or index < 0 or index > len(calls) or index in seen_indexes:
+                        raise ValueError
+                    seen_indexes.add(index)
+                    if index == len(calls):
+                        if len(calls) >= self._max_calls:
+                            raise ValueError
+                        calls.append(_CallParts())
+                    current = calls[index]
+                    call_id = _field(fragment, "id", None)
+                    function = _field(fragment, "function", {})
+                    name = _field(function, "name", None)
+                    arguments = _field(function, "arguments", None)
+                    if call_id is not None:
+                        if type(call_id) is not str or current.call_id is not None:
+                            raise ValueError
+                        current.call_id = call_id
+                    if name is not None:
+                        if type(name) is not str or current.name is not None:
+                            raise ValueError
+                        current.name = name
+                    if arguments is not None:
+                        if type(arguments) is not str:
+                            raise ValueError
+                        size += len(arguments.encode("utf-8"))
+                        if size > self._max_bytes:
+                            raise ValueError
+                        current.arguments += arguments
+                if finish is not None:
+                    finished = True
+        finally:
+            closer = getattr(response, "aclose", None)
+            if callable(closer):
+                cleanup = asyncio.create_task(closer())
+                cancellation: asyncio.CancelledError | None = None
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError as error:
+                        cancellation = error
+                await cleanup
+                if cancellation is not None:
+                    raise cancellation
+        if not finished:
+            raise ValueError
         model_calls = tuple(
             ModelToolCall(item.call_id or "", item.name or "", item.arguments) for item in calls
         )
         text = "".join(text_parts) or None
         self._check_size(text, model_calls)
+        self._check_usage(usage)
         return ModelResponse(text, model_calls, usage)
 
     def _check_size(self, text: str | None, calls: tuple[ModelToolCall, ...]) -> None:
@@ -208,6 +242,10 @@ class LiteLLMModelGateway:
             len(item.arguments_json.encode("utf-8")) for item in calls
         )
         if size > self._max_bytes:
+            raise ValueError
+
+    def _check_usage(self, usage: ModelUsage | None) -> None:
+        if usage is not None and usage.output_tokens > self._max_output_tokens:
             raise ValueError
 
 

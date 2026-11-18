@@ -157,13 +157,47 @@ def test_close_cleanup_survives_caller_cancellation() -> None:
         task = asyncio.create_task(gateway.aclose())
         await client.closing.wait()
         task.cancel()
-        await asyncio.sleep(0)
-        assert not task.done()
-        client.release.set()
         try:
             await task
         except asyncio.CancelledError:
             pass
+        client.release.set()
+        await gateway.aclose()
         assert client.closed == 1
 
     asyncio.run(scenario())
+
+
+def test_cancelled_refresh_and_remove_roll_back_closing_state() -> None:
+    class Blocking(Client):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def call_tool(self, name, arguments):
+            self.started.set()
+            await self.release.wait()
+            return await super().call_tool(name, arguments)
+
+    async def cancel_operation(operation):
+        client = Blocking()
+        gateway = _gateway(client)
+        await gateway.add_server("server", object())
+        generation = gateway._servers["server"].generation
+        call = asyncio.create_task(gateway._call("server", generation, "read", {}))
+        await client.started.wait()
+        lifecycle = asyncio.create_task(operation(gateway))
+        await asyncio.sleep(0)
+        lifecycle.cancel()
+        try:
+            await lifecycle
+        except asyncio.CancelledError:
+            pass
+        assert gateway._servers["server"].closing is False
+        client.release.set()
+        await call
+        await gateway.aclose()
+
+    asyncio.run(cancel_operation(lambda gateway: gateway.refresh_server("server")))
+    asyncio.run(cancel_operation(lambda gateway: gateway.remove_server("server")))

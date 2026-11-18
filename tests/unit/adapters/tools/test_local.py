@@ -1,10 +1,17 @@
 import asyncio
+import sqlite3
 import threading
 from pathlib import Path
 
+import pytest
 from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactExternalizer
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
-from src.adapters.tools import SQLiteToolExecutionStore, ToolCatalog, ToolCatalogEntry
+from src.adapters.tools import (
+    InMemoryToolExecutionStore,
+    SQLiteToolExecutionStore,
+    ToolCatalog,
+    ToolCatalogEntry,
+)
 from src.adapters.tools.local import LocalToolGateway
 from src.core.commands import ToolCallRequest
 from src.core.ids import RunId, SessionId
@@ -115,7 +122,7 @@ def test_timeout_exception_and_cancellation_are_stable(tmp_path: Path) -> None:
     async def scenario():
         slow_gateway = LocalToolGateway(
             ToolCatalog((ToolCatalogEntry(ToolSpec("increment", "x", "true"), slow, True),)),
-            SQLiteToolExecutionStore((tmp_path / "slow.db").resolve(), timeout_seconds=0.05),
+            SQLiteToolExecutionStore((tmp_path / "slow.db").resolve(), sqlite_busy_timeout_seconds=0.05),
             _externalizer(), timeout_seconds=0.01,
         )
         timed = await slow_gateway.execute(_request())
@@ -138,7 +145,7 @@ def test_timeout_exception_and_cancellation_are_stable(tmp_path: Path) -> None:
 
         cancel_gateway = LocalToolGateway(
             ToolCatalog((ToolCatalogEntry(ToolSpec("increment", "x", "true"), cancellable, True),)),
-            SQLiteToolExecutionStore((tmp_path / "cancel.db").resolve(), timeout_seconds=0.05),
+            SQLiteToolExecutionStore((tmp_path / "cancel.db").resolve(), sqlite_busy_timeout_seconds=0.05),
             _externalizer(), timeout_seconds=20,
         )
         task = asyncio.create_task(cancel_gateway.execute(_request()))
@@ -151,7 +158,7 @@ def test_timeout_exception_and_cancellation_are_stable(tmp_path: Path) -> None:
         else:
             raise AssertionError("caller cancellation was swallowed")
         retry = await cancel_gateway.execute(_request())
-        assert retry.status.value == "failed"
+        assert retry.status.value == "cancelled"
 
     asyncio.run(scenario())
 
@@ -177,5 +184,43 @@ def test_binding_change_is_rejected(tmp_path: Path) -> None:
         except RuntimeError:
             return
         raise AssertionError("binding conflict was accepted")
+
+    asyncio.run(scenario())
+
+
+def test_sync_mutating_handler_is_rejected_at_registration() -> None:
+    def handler(_arguments):
+        return {}
+
+    with pytest.raises(ValueError, match="Mutating local tools"):
+        LocalToolGateway(
+            ToolCatalog((ToolCatalogEntry(ToolSpec("increment", "x", "true"), handler, True),)),
+            InMemoryToolExecutionStore(), _externalizer(),
+        )
+
+
+def test_stale_workspace_binding_is_denied_before_claim(tmp_path: Path) -> None:
+    async def handler(_arguments):
+        raise AssertionError("stale binding executed")
+
+    async def scenario():
+        path = (tmp_path / "tools.db").resolve()
+        store = SQLiteToolExecutionStore(path)
+        gateway = LocalToolGateway(
+            ToolCatalog((ToolCatalogEntry(ToolSpec("increment", "x", "true"), handler, False),)),
+            store, _externalizer(),
+        )
+        call = ToolCallRequest(
+            "call-1", "increment", "{}", requires_approval=False,
+            approval_scope="execute", workspace_id="stale",
+        )
+        request = ToolRequest.from_call(
+            call, run_id=RunId("run-1"), session_id=SessionId("session-1"),
+            step_id="step-1", approval=ToolApproval.NOT_REQUIRED,
+        )
+        result = await gateway.execute(request)
+        assert result.status.value == "denied"
+        with sqlite3.connect(path) as connection:
+            assert connection.execute("SELECT count(*) FROM executions").fetchone() == (0,)
 
     asyncio.run(scenario())

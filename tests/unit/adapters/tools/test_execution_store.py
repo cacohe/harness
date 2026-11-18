@@ -4,9 +4,11 @@ from pathlib import Path
 
 import pytest
 from src.adapters.tools.execution_store import (
+    ClaimState,
     SQLiteToolExecutionStore,
     ToolBindingConflict,
     ToolExecutionStoreError,
+    ToolExecutionWaitExpired,
 )
 from src.core.commands import ToolCallRequest
 from src.core.errors import RunErrorCode, RunFailure
@@ -37,10 +39,10 @@ def test_completed_result_survives_reopen(tmp_path: Path) -> None:
         path = (tmp_path / "store.db").resolve()
         request = _request()
         first = SQLiteToolExecutionStore(path)
-        assert await first.claim(request) is None
+        assert (await first.claim(request)).state is ClaimState.OWNER
         await first.complete(request, _result(request))
         reopened = SQLiteToolExecutionStore(path)
-        assert await reopened.claim(request) == _result(request)
+        assert (await reopened.claim(request)).result == _result(request)
 
     asyncio.run(scenario())
 
@@ -48,11 +50,11 @@ def test_completed_result_survives_reopen(tmp_path: Path) -> None:
 def test_independent_instances_coordinate_same_active_key(tmp_path: Path) -> None:
     async def scenario():
         path = (tmp_path / "store.db").resolve()
-        first = SQLiteToolExecutionStore(path, timeout_seconds=1)
-        second = SQLiteToolExecutionStore(path, timeout_seconds=1)
+        first = SQLiteToolExecutionStore(path, sqlite_busy_timeout_seconds=1)
+        second = SQLiteToolExecutionStore(path, sqlite_busy_timeout_seconds=1)
         request = _request()
-        assert await first.claim(request) is None
-        waiter = asyncio.create_task(second.claim(request))
+        assert (await first.claim(request)).state is ClaimState.OWNER
+        waiter = asyncio.create_task(second.wait_completed(request))
         await asyncio.sleep(0.03)
         assert not waiter.done()
         await first.complete(request, _result(request))
@@ -61,12 +63,71 @@ def test_independent_instances_coordinate_same_active_key(tmp_path: Path) -> Non
     asyncio.run(scenario())
 
 
+def test_three_instances_wait_longer_than_busy_timeout_without_poisoning(tmp_path: Path) -> None:
+    async def scenario():
+        path = (tmp_path / "store.db").resolve()
+        stores = [
+            SQLiteToolExecutionStore(
+                path, sqlite_busy_timeout_seconds=0.01, poll_interval_seconds=0.005
+            )
+            for _ in range(3)
+        ]
+        request = _request()
+        assert (await stores[0].claim(request)).state is ClaimState.OWNER
+        waiters = [asyncio.create_task(store.wait_completed(request)) for store in stores[1:]]
+        await asyncio.sleep(0.08)
+        assert all(not waiter.done() for waiter in waiters)
+        await stores[0].complete(request, _result(request))
+        assert await asyncio.gather(*waiters) == [_result(request), _result(request)]
+
+    asyncio.run(scenario())
+
+
+def test_wait_expiry_never_changes_live_owner_row(tmp_path: Path) -> None:
+    async def scenario():
+        path = (tmp_path / "store.db").resolve()
+        owner = SQLiteToolExecutionStore(path)
+        contender = SQLiteToolExecutionStore(
+            path, poll_interval_seconds=0.005, execution_wait_seconds=0.02
+        )
+        request = _request()
+        assert (await owner.claim(request)).state is ClaimState.OWNER
+        with pytest.raises(ToolExecutionWaitExpired):
+            await contender.wait_completed(request)
+        assert (await owner.claim(request)).state is ClaimState.WAIT
+        await owner.complete(request, _result(request))
+        assert (await contender.claim(request)).result == _result(request)
+
+    asyncio.run(scenario())
+
+
+def test_wrong_execution_key_is_zero_write(tmp_path: Path) -> None:
+    async def scenario():
+        store = SQLiteToolExecutionStore((tmp_path / "store.db").resolve())
+        request = _request()
+        assert (await store.claim(request)).state is ClaimState.OWNER
+        wrong = ToolResult(
+            ToolResultStatus.FAILED,
+            failure=RunFailure(RunErrorCode.TOOL_FAILED),
+            execution_key="0" * 64,
+        )
+        with pytest.raises(ToolExecutionStoreError):
+            await store.complete(request, wrong)
+        assert (await store.claim(request)).state is ClaimState.WAIT
+
+    asyncio.run(scenario())
+
+
 def test_started_is_recovered_without_replay(tmp_path: Path) -> None:
     async def scenario():
         path = (tmp_path / "store.db").resolve()
         request = _request()
-        assert await SQLiteToolExecutionStore(path).claim(request) is None
-        recovered = await SQLiteToolExecutionStore(path).claim(request)
+        store = SQLiteToolExecutionStore(path)
+        assert (await store.claim(request)).state is ClaimState.OWNER
+        reopened = SQLiteToolExecutionStore(path)
+        assert (await reopened.claim(request)).state is ClaimState.WAIT
+        assert await reopened.recover_abandoned() == 1
+        recovered = (await reopened.claim(request)).result
         assert recovered is not None and recovered.status is ToolResultStatus.FAILED
         assert recovered.execution_key == request.idempotency_key
 
@@ -78,7 +139,7 @@ def test_binding_conflict_and_unknown_schema_are_rejected(tmp_path: Path) -> Non
         path = (tmp_path / "store.db").resolve()
         store = SQLiteToolExecutionStore(path)
         request = _request()
-        assert await store.claim(request) is None
+        assert (await store.claim(request)).state is ClaimState.OWNER
         await store.complete(request, _result(request))
         with pytest.raises(ToolBindingConflict):
             await store.claim(_request('{"changed":true}'))
@@ -97,7 +158,7 @@ def test_corrupt_completed_payload_is_rejected(tmp_path: Path) -> None:
         path = (tmp_path / "store.db").resolve()
         request = _request()
         store = SQLiteToolExecutionStore(path)
-        assert await store.claim(request) is None
+        assert (await store.claim(request)).state is ClaimState.OWNER
         with sqlite3.connect(path) as connection:
             connection.execute(
                 "UPDATE executions SET state='completed', result_json='{}'"
