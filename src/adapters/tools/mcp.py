@@ -15,10 +15,25 @@ from src.adapters.tools.local import LocalToolGateway
 from src.core.artifacts import ArtifactExternalizer
 from src.core.tools import ToolSpec
 
-_MAX_SYNC_CALLS = 16
-_sync_calls_lock = threading.Lock()
-_sync_calls_active = 0
+_MAX_SYNC_CALLS_PER_GATEWAY = 4
 _late_cleanup_tasks: set[asyncio.Task[None]] = set()
+
+
+class _SyncLimiter:
+    def __init__(self, limit: int = _MAX_SYNC_CALLS_PER_GATEWAY) -> None:
+        self._limit = limit
+        self._lock = threading.Lock()
+        self._active = 0
+
+    def acquire(self) -> None:
+        with self._lock:
+            if self._active >= self._limit:
+                raise TimeoutError("MCP synchronous call capacity is exhausted")
+            self._active += 1
+
+    def release(self) -> None:
+        with self._lock:
+            self._active -= 1
 
 
 @dataclass(slots=True)
@@ -53,6 +68,7 @@ class MCPToolGateway(LocalToolGateway):
         )
         self._factory = client_factory
         self._sync_timeout = self._timeout
+        self._sync_limiter = _SyncLimiter()
         self._workspace = workspace_id
         self._servers: dict[str, _Server] = {}
         self._lifecycle = asyncio.Lock()
@@ -72,14 +88,27 @@ class MCPToolGateway(LocalToolGateway):
             self._pending_adds += 1
             self._adds_idle.clear()
         client: object | None = None
+        discovery: _Invocation | None = None
         try:
             client = await _invoke(
                 self._factory,
                 source,
                 timeout=self._sync_timeout,
-                late_result_cleanup=partial(_close_once, timeout=self._sync_timeout),
+                limiter=self._sync_limiter,
+                late_result_cleanup=partial(
+                    _close_once,
+                    timeout=self._sync_timeout,
+                    limiter=self._sync_limiter,
+                ),
             )
-            descriptors = await _await_method(client, "list_tools", timeout=self._sync_timeout)
+            discovery = _Invocation(
+                _client_method(client, "list_tools"),
+                (),
+                self._sync_limiter,
+                None,
+                self._sync_timeout,
+            )
+            descriptors = await discovery.wait(self._sync_timeout)
             generation = secrets.token_hex(16)
             entries = self._entries(name, generation, client, descriptors)
             async with self._lifecycle:
@@ -90,7 +119,10 @@ class MCPToolGateway(LocalToolGateway):
                 self._servers = replacement
         except BaseException:
             if client is not None:
-                await _owned_close(client, self._sync_timeout)
+                if discovery is not None and discovery.abandoned:
+                    self._defer_close_until_settled(client, discovery.settled)
+                else:
+                    await _owned_close(client, self._sync_timeout, self._sync_limiter)
             raise
         finally:
             async with self._lifecycle:
@@ -107,11 +139,22 @@ class MCPToolGateway(LocalToolGateway):
             async with state.condition:
                 state.active += 1
         committed = False
+        invocation: _Invocation | None = None
+        lease_transferred = False
         try:
-            await self._wait_active(state, 1)
-            descriptors = await _await_method(
-                state.client, "list_tools", timeout=self._sync_timeout
+            await asyncio.wait_for(self._wait_active(state, 1), self._sync_timeout)
+            invocation = _Invocation(
+                _client_method(state.client, "list_tools"),
+                (),
+                self._sync_limiter,
+                None,
+                self._sync_timeout,
             )
+            invocation.settled.add_done_callback(
+                lambda _future: asyncio.create_task(self._release_active(state))
+            )
+            lease_transferred = True
+            descriptors = await invocation.wait(self._sync_timeout)
             generation = secrets.token_hex(16)
             entries = self._entries(name, generation, state.client, descriptors)
             async with self._lifecycle:
@@ -124,11 +167,14 @@ class MCPToolGateway(LocalToolGateway):
                 self._servers = replacement
                 committed = True
         finally:
-            async with state.condition:
-                state.active -= 1
-                state.condition.notify_all()
+            if not lease_transferred:
+                await self._release_active(state)
             async with self._lifecycle:
-                if not committed and self._servers.get(name) is state:
+                if (
+                    not committed
+                    and self._servers.get(name) is state
+                    and (invocation is None or not invocation.abandoned)
+                ):
                     state.closing = False
 
     async def remove_server(self, name: str) -> None:
@@ -140,7 +186,7 @@ class MCPToolGateway(LocalToolGateway):
         committed = False
         close_task: asyncio.Task[None] | None = None
         try:
-            await self._wait_idle(state)
+            await asyncio.wait_for(self._wait_idle(state), self._sync_timeout)
             async with self._lifecycle:
                 if self._servers.get(name) is not state:
                     raise RuntimeError("MCP server changed during removal")
@@ -180,20 +226,26 @@ class MCPToolGateway(LocalToolGateway):
         retired_failure: BaseException | None,
     ) -> None:
         await self._adds_idle.wait()
+        async with self._lifecycle:
+            retired = tuple({*retired, *self._retired_closes})
+            if retired_failure is None:
+                retired_failure = self._retired_failure
         failure = retired_failure
         for task in retired:
             try:
-                await asyncio.shield(task)
+                await asyncio.wait_for(asyncio.shield(task), self._sync_timeout)
             except BaseException as error:
                 if failure is None:
                     failure = error
         for state in states:
             try:
-                await self._wait_idle(state)
+                await asyncio.wait_for(self._wait_idle(state), self._sync_timeout)
                 await self._shielded_close(state)
             except BaseException as error:
                 if failure is None:
                     failure = error
+                if state.active > 0:
+                    self._defer_close_until_idle(state)
         if failure is not None:
             raise failure
 
@@ -252,17 +304,27 @@ class MCPToolGateway(LocalToolGateway):
             async with state.condition:
                 state.active += 1
         try:
-            return await _await_method(
-                state.client,
-                "call_tool",
-                tool_name,
-                arguments,
-                timeout=self._sync_timeout,
+            method = _client_method(state.client, "call_tool")
+            invocation = _Invocation(
+                method,
+                (tool_name, arguments),
+                self._sync_limiter,
+                None,
+                self._sync_timeout,
             )
-        finally:
-            async with state.condition:
-                state.active -= 1
-                state.condition.notify_all()
+        except BaseException:
+            await self._release_active(state)
+            raise
+        invocation.settled.add_done_callback(
+            lambda _future: asyncio.create_task(self._release_active(state))
+        )
+        return await invocation.wait(self._sync_timeout)
+
+    @staticmethod
+    async def _release_active(state: _Server) -> None:
+        async with state.condition:
+            state.active -= 1
+            state.condition.notify_all()
 
     async def _wait_idle(self, state: _Server) -> None:
         await self._wait_active(state, 0)
@@ -278,7 +340,9 @@ class MCPToolGateway(LocalToolGateway):
         task = state.close_task
         if task is None:
             state.closed = True
-            task = asyncio.create_task(_close_once(state.client, self._sync_timeout))
+            task = asyncio.create_task(
+                _close_once(state.client, self._sync_timeout, self._sync_limiter)
+            )
             state.close_task = task
         return task
 
@@ -290,6 +354,25 @@ class MCPToolGateway(LocalToolGateway):
             failure = error
         if failure is not None and self._retired_failure is None:
             self._retired_failure = failure
+
+    def _track_retired_close(self, task: asyncio.Task[None]) -> None:
+        self._retired_closes.add(task)
+        task.add_done_callback(self._retired_close_done)
+
+    def _defer_close_until_settled(self, client: object, settled: asyncio.Future[None]) -> None:
+        async def close_later() -> None:
+            await asyncio.shield(settled)
+            await _close_once(client, self._sync_timeout, self._sync_limiter)
+
+        self._track_retired_close(asyncio.create_task(close_later()))
+
+    def _defer_close_until_idle(self, state: _Server) -> None:
+        async def close_later() -> None:
+            await self._wait_idle(state)
+            await self._shielded_close(state)
+
+        if state.close_task is None:
+            self._track_retired_close(asyncio.create_task(close_later()))
 
     def _publish(self, servers: dict[str, _Server]) -> None:
         entries = tuple(entry for state in servers.values() for entry in state.entries)
@@ -311,66 +394,72 @@ def _value(value: object, name: str, default: object = ...) -> object:
     return getattr(value, name, default)
 
 
-async def _await_method(target: object, name: str, *args: object, timeout: float) -> object:
+def _client_method(target: object, name: str) -> Callable[..., object]:
     method = getattr(target, name, None)
     if not callable(method):
         raise ValueError("MCP client contract is invalid")
-    return await _invoke(method, *args, timeout=timeout)
+    return method
 
 
 async def _invoke(
     method: Callable[..., object],
     *args: object,
     timeout: float,
+    limiter: _SyncLimiter,
     late_result_cleanup: Callable[[object], object] | None = None,
 ) -> object:
-    if inspect.iscoroutinefunction(method):
-        return await method(*args)
-    call = _SyncCall(method, args, late_result_cleanup, timeout)
-    result = await call.wait(timeout)
-    if inspect.isawaitable(result):
-        result = await asyncio.wait_for(result, timeout)
-    return result
+    return await _Invocation(
+        method,
+        args,
+        limiter,
+        late_result_cleanup,
+        timeout,
+    ).wait(timeout)
 
 
-class _SyncCall:
+class _Invocation:
     def __init__(
         self,
         method: Callable[..., object],
         args: tuple[object, ...],
+        limiter: _SyncLimiter,
         late_result_cleanup: Callable[[object], object] | None,
         cleanup_timeout: float,
     ) -> None:
         self._method = method
         self._args = args
+        self._limiter = limiter
         self._loop = asyncio.get_running_loop()
         self._future: asyncio.Future[object] = self._loop.create_future()
+        self.settled: asyncio.Future[None] = self._loop.create_future()
         self._late_result_cleanup = late_result_cleanup
         self._cleanup_timeout = cleanup_timeout
         self._abandoned = False
         self._abandoned_signal = threading.Event()
         self._cleanup_scheduled = False
-        self._start()
+        if inspect.iscoroutinefunction(method):
+            task = asyncio.create_task(method(*args))
+            task.add_done_callback(self._async_done)
+        else:
+            self._start_sync()
 
-    def _start(self) -> None:
-        global _sync_calls_active
-        with _sync_calls_lock:
-            if _sync_calls_active >= _MAX_SYNC_CALLS:
-                raise TimeoutError("MCP synchronous call capacity is exhausted")
-            _sync_calls_active += 1
+    @property
+    def abandoned(self) -> bool:
+        return self._abandoned
+
+    def _start_sync(self) -> None:
+        self._limiter.acquire()
         try:
             threading.Thread(
-                target=self._run,
+                target=self._run_sync,
                 name="harness-mcp-sync",
                 daemon=True,
             ).start()
         except BaseException:
-            with _sync_calls_lock:
-                _sync_calls_active -= 1
+            self._limiter.release()
             raise
 
-    def _run(self) -> None:
-        global _sync_calls_active
+    def _run_sync(self) -> None:
         result: object | None = None
         failure: BaseException | None = None
         cleaned = False
@@ -398,8 +487,15 @@ class _SyncCall:
                 ):
                     _fallback_late_close(result, self._cleanup_timeout)
         finally:
-            with _sync_calls_lock:
-                _sync_calls_active -= 1
+            self._limiter.release()
+
+    def _async_done(self, task: asyncio.Task[object]) -> None:
+        try:
+            result = task.result()
+        except BaseException as error:
+            self._complete(None, error, False)
+        else:
+            self._complete(result, None, False)
 
     def _complete(
         self,
@@ -407,6 +503,12 @@ class _SyncCall:
         failure: BaseException | None,
         cleaned: bool,
     ) -> None:
+        if failure is None and result is not None and inspect.isawaitable(result):
+            task = asyncio.ensure_future(result)
+            task.add_done_callback(self._async_done)
+            return
+        if not self.settled.done():
+            self.settled.set_result(None)
         if self._abandoned:
             if failure is None and not cleaned:
                 self._schedule_cleanup(result)
@@ -490,14 +592,14 @@ def _fallback_late_close(result: object, timeout: float) -> None:
         pass
 
 
-async def _close_once(client: object, timeout: float) -> None:
+async def _close_once(client: object, timeout: float, limiter: _SyncLimiter) -> None:
     closer = getattr(client, "aclose", None) or getattr(client, "close", None)
     if callable(closer):
-        await _invoke(closer, timeout=timeout)
+        await _invoke(closer, timeout=timeout, limiter=limiter)
 
 
-async def _owned_close(client: object, timeout: float) -> None:
-    task = asyncio.create_task(_close_once(client, timeout))
+async def _owned_close(client: object, timeout: float, limiter: _SyncLimiter) -> None:
+    task = asyncio.create_task(_close_once(client, timeout, limiter))
     cancellation: asyncio.CancelledError | None = None
     while not task.done():
         try:

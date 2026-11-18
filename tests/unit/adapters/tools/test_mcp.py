@@ -388,7 +388,7 @@ def test_cancelled_add_tracks_late_synchronous_factory_client_cleanup() -> None:
     asyncio.run(scenario())
 
 
-def test_cancelled_add_closes_owned_client_without_waiting_for_sync_discovery() -> None:
+def test_cancelled_add_defers_close_until_sync_discovery_settles() -> None:
     discovery_started = threading.Event()
     release_discovery = threading.Event()
 
@@ -414,9 +414,14 @@ def test_cancelled_add_closes_owned_client_without_waiting_for_sync_discovery() 
         try:
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(adding, 0.2)
-            assert client.closed == 1
+            assert client.closed == 0
         finally:
             release_discovery.set()
+        for _ in range(100):
+            if client.closed:
+                break
+            await asyncio.sleep(0.01)
+        assert client.closed == 1
 
     asyncio.run(scenario())
 
@@ -519,6 +524,8 @@ def test_blocked_synchronous_call_times_out_and_shutdown_is_bounded() -> None:
     class BlockingCall:
         def __init__(self):
             self.closed = 0
+            self.in_call = False
+            self.closed_while_in_call = False
 
         def list_tools(self):
             return [
@@ -532,10 +539,15 @@ def test_blocked_synchronous_call_times_out_and_shutdown_is_bounded() -> None:
 
         def call_tool(self, _name, _arguments):
             call_started.set()
-            release_call.wait()
-            return {"late": True}
+            self.in_call = True
+            try:
+                release_call.wait()
+                return {"late": True}
+            finally:
+                self.in_call = False
 
         def close(self):
+            self.closed_while_in_call = self.in_call
             self.closed += 1
 
     async def scenario():
@@ -547,10 +559,18 @@ def test_blocked_synchronous_call_times_out_and_shutdown_is_bounded() -> None:
         assert await asyncio.to_thread(call_started.wait, 1)
         closing = asyncio.create_task(gateway.aclose())
         result = await asyncio.wait_for(executing, 0.3)
-        await asyncio.wait_for(closing, 0.3)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(closing, 0.3)
         assert result.status is ToolResultStatus.TIMED_OUT
         assert time.monotonic() - started < 0.3
+        assert client.closed == 0
+        release_call.set()
+        for _ in range(100):
+            if client.closed:
+                break
+            await asyncio.sleep(0.01)
         assert client.closed == 1
+        assert client.closed_while_in_call is False
 
     watchdog = threading.Timer(0.6, release_call.set)
     watchdog.daemon = True
@@ -603,13 +623,20 @@ def test_blocked_synchronous_discovery_times_out_and_owned_client_is_closed() ->
     class BlockingDiscovery:
         def __init__(self):
             self.closed = 0
+            self.in_list = False
+            self.closed_while_listing = False
 
         def list_tools(self):
             discovery_started.set()
-            release_discovery.wait()
-            return []
+            self.in_list = True
+            try:
+                release_discovery.wait()
+                return []
+            finally:
+                self.in_list = False
 
         def close(self):
+            self.closed_while_listing = self.in_list
             self.closed += 1
 
     async def scenario():
@@ -619,8 +646,16 @@ def test_blocked_synchronous_discovery_times_out_and_owned_client_is_closed() ->
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(gateway.add_server("server", object()), 0.3)
         assert time.monotonic() - started < 0.3
+        assert client.closed == 0
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gateway.aclose(), 0.3)
+        release_discovery.set()
+        for _ in range(100):
+            if client.closed:
+                break
+            await asyncio.sleep(0.01)
         assert client.closed == 1
-        assert await asyncio.wait_for(gateway.aclose(), 0.3) is None
+        assert client.closed_while_listing is False
 
     watchdog = threading.Timer(0.6, release_discovery.set)
     watchdog.daemon = True
@@ -706,7 +741,14 @@ def test_cancelled_synchronous_call_releases_lease_and_shutdown_completes() -> N
         executing.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(executing, 0.2)
-        assert await asyncio.wait_for(gateway.aclose(), 0.2) is None
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gateway.aclose(), 0.3)
+        assert client.closed == 0
+        release_call.set()
+        for _ in range(100):
+            if client.closed:
+                break
+            await asyncio.sleep(0.01)
         assert client.closed == 1
 
     watchdog = threading.Timer(0.6, release_call.set)
@@ -739,8 +781,11 @@ def test_synchronous_worker_count_is_bounded_and_late_clients_are_owned() -> Non
         )
         assert all(isinstance(outcome, TimeoutError) for outcome in outcomes)
         workers = [thread for thread in threading.enumerate() if thread.name == "harness-mcp-sync"]
-        assert len(workers) <= mcp_module._MAX_SYNC_CALLS
-        assert len(created) <= mcp_module._MAX_SYNC_CALLS
+        assert len(workers) <= mcp_module._MAX_SYNC_CALLS_PER_GATEWAY
+        assert len(created) <= mcp_module._MAX_SYNC_CALLS_PER_GATEWAY
+        healthy = _gateway(Client(), timeout_seconds=0.05)
+        await healthy.add_server("healthy", object())
+        assert await asyncio.wait_for(healthy.aclose(), 0.2) is None
         release_factory.set()
         for _ in range(200):
             if created and all(client.closed == 1 for client in created):
@@ -757,3 +802,140 @@ def test_synchronous_worker_count_is_bounded_and_late_clients_are_owned() -> Non
     finally:
         release_factory.set()
         watchdog.cancel()
+
+
+def test_blocked_async_factory_times_out_and_late_client_is_closed() -> None:
+    async def scenario():
+        release_factory = asyncio.Event()
+        client = Client()
+
+        async def factory(_source):
+            await release_factory.wait()
+            return client
+
+        gateway = _gateway(client, timeout_seconds=0.05, factory=factory)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gateway.add_server("server", object()), 0.2)
+        assert await asyncio.wait_for(gateway.aclose(), 0.2) is None
+        assert client.closed == 0
+        release_factory.set()
+        for _ in range(100):
+            if client.closed:
+                break
+            await asyncio.sleep(0.01)
+        assert client.closed == 1
+
+    asyncio.run(scenario())
+
+
+def test_blocked_async_discovery_never_closes_client_concurrently() -> None:
+    class BlockingDiscovery(Client):
+        def __init__(self):
+            super().__init__()
+            self.in_list = False
+            self.closed_while_listing = False
+            self.release_list = asyncio.Event()
+
+        async def list_tools(self):
+            self.in_list = True
+            try:
+                await self.release_list.wait()
+                return []
+            finally:
+                self.in_list = False
+
+        async def aclose(self):
+            self.closed_while_listing = self.in_list
+            await super().aclose()
+
+    async def scenario():
+        client = BlockingDiscovery()
+        gateway = _gateway(client, timeout_seconds=0.05)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gateway.add_server("server", object()), 0.2)
+        assert client.closed == 0
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gateway.aclose(), 0.2)
+        client.release_list.set()
+        for _ in range(100):
+            if client.closed:
+                break
+            await asyncio.sleep(0.01)
+        assert client.closed == 1
+        assert client.closed_while_listing is False
+
+    asyncio.run(scenario())
+
+
+def test_blocked_async_call_times_out_without_concurrent_close() -> None:
+    class BlockingCall(Client):
+        def __init__(self):
+            super().__init__()
+            self.in_call = False
+            self.closed_while_calling = False
+            self.call_started = asyncio.Event()
+            self.release_call = asyncio.Event()
+
+        async def call_tool(self, _name, _arguments):
+            self.in_call = True
+            self.call_started.set()
+            try:
+                await self.release_call.wait()
+                return {}
+            finally:
+                self.in_call = False
+
+        async def aclose(self):
+            self.closed_while_calling = self.in_call
+            await super().aclose()
+
+    async def scenario():
+        client = BlockingCall()
+        gateway = _gateway(client, timeout_seconds=0.05)
+        await gateway.add_server("server", object())
+        executing = asyncio.create_task(gateway.execute(_request(gateway)))
+        await client.call_started.wait()
+        result = await asyncio.wait_for(executing, 0.2)
+        assert result.status is ToolResultStatus.TIMED_OUT
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gateway.aclose(), 0.2)
+        assert client.closed == 0
+        client.release_call.set()
+        for _ in range(100):
+            if client.closed:
+                break
+            await asyncio.sleep(0.01)
+        assert client.closed == 1
+        assert client.closed_while_calling is False
+
+    asyncio.run(scenario())
+
+
+def test_blocked_async_close_has_bounded_idempotent_failure() -> None:
+    class BlockingClose(Client):
+        def __init__(self):
+            super().__init__()
+            self.close_calls = 0
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+
+        async def aclose(self):
+            self.close_calls += 1
+            self.close_started.set()
+            await self.release_close.wait()
+            self.closed += 1
+
+    async def scenario():
+        client = BlockingClose()
+        gateway = _gateway(client, timeout_seconds=0.05)
+        await gateway.add_server("server", object())
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gateway.aclose(), 0.2)
+        assert client.close_started.is_set()
+        client.release_close.set()
+        await asyncio.sleep(0)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gateway.aclose(), 0.1)
+        assert client.close_calls == 1
+
+    asyncio.run(scenario())
