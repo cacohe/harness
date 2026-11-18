@@ -180,6 +180,7 @@ def coordinator(
     checkpoint=None,
     journal=None,
     context=None,
+    context_request=None,
 ):
     calls = []
     journal = journal or Journal(calls)
@@ -197,7 +198,7 @@ def coordinator(
         journal=journal,
         clock=Clock(),
         ids=Ids(),
-        context_request=request(specs),
+        context_request=context_request or request(specs),
         context_budget=BUDGET,
         context_counter=ExactTokenCounter(),
     )
@@ -262,6 +263,107 @@ def test_model_is_not_called_when_context_window_changes_the_bound_tool_catalog(
 
     assert calls == ["context", "journal"]
     assert outcome.state.failure == RunFailure(RunErrorCode.INVARIANT_VIOLATION)
+
+
+def test_model_is_not_called_when_context_injects_system_into_history():
+    calls = []
+
+    class InjectsSystemContext:
+        async def build(self, request_, budget):
+            calls.append("context")
+            return ContextWindow(
+                (
+                    request_.system_message,
+                    ModelMessage(ModelRole.USER, "history"),
+                    ModelMessage(ModelRole.SYSTEM, "injected"),
+                    request_.current_input,
+                ),
+                request_.tools,
+                TokenEstimate(4, EstimateQuality.EXACT),
+                budget,
+                (),
+                request_.policy_version,
+            )
+
+    coordinator_, calls_, _, _, _ = coordinator(
+        responses=[ModelResponse("must-not-run")], context=InjectsSystemContext()
+    )
+    calls = calls_
+
+    outcome = run(coordinator_.advance(initial(), submit()))
+
+    assert calls == ["context", "journal"]
+    assert outcome.state.failure == RunFailure(RunErrorCode.INVARIANT_VIOLATION)
+
+
+def test_model_is_not_called_when_trusted_system_prefix_is_reordered():
+    calls = []
+    first = ModelMessage(ModelRole.SYSTEM, "skill-one")
+    second = ModelMessage(ModelRole.SYSTEM, "skill-two")
+    trusted = replace(request(), skill_messages=(first, second))
+
+    class ReordersSkillsContext:
+        async def build(self, request_, budget):
+            calls.append("context")
+            return ContextWindow(
+                (
+                    request_.system_message,
+                    second,
+                    first,
+                    request_.current_input,
+                ),
+                request_.tools,
+                TokenEstimate(4, EstimateQuality.EXACT),
+                budget,
+                (),
+                request_.policy_version,
+            )
+
+    coordinator_, calls_, _, _, _ = coordinator(
+        responses=[ModelResponse("must-not-run")],
+        context=ReordersSkillsContext(),
+        context_request=trusted,
+    )
+    calls = calls_
+
+    outcome = run(coordinator_.advance(initial(), submit()))
+
+    assert calls == ["context", "journal"]
+    assert outcome.state.failure == RunFailure(RunErrorCode.INVARIANT_VIOLATION)
+
+
+def test_trusted_multi_system_skill_prefix_is_allowed():
+    first = ModelMessage(ModelRole.SYSTEM, "skill-one")
+    second = ModelMessage(ModelRole.SYSTEM, "skill-two")
+    trusted = replace(request(), skill_messages=(first, second))
+
+    class SkillsContext:
+        async def build(self, request_, budget):
+            return ContextWindow(
+                (
+                    request_.system_message,
+                    first,
+                    second,
+                    ModelMessage(ModelRole.USER, "history"),
+                    request_.current_input,
+                ),
+                request_.tools,
+                TokenEstimate(5, EstimateQuality.EXACT),
+                budget,
+                (),
+                request_.policy_version,
+            )
+
+    coordinator_, calls, _, _, _ = coordinator(
+        responses=[ModelResponse("answer")],
+        context=SkillsContext(),
+        context_request=trusted,
+    )
+
+    outcome = run(coordinator_.advance(initial(), submit()))
+
+    assert calls == ["model", "journal"]
+    assert outcome.state.status is RunStatus.COMPLETED
 
 
 def run(awaitable):

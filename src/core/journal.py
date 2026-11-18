@@ -1,5 +1,6 @@
 from collections.abc import Awaitable
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Protocol
 
 from src.core.artifacts import ArtifactRef, snapshot_artifact_ref
@@ -34,6 +35,12 @@ class SubmissionAcceptance:
     version: int
 
 
+class TranscriptEntryType(StrEnum):
+    MESSAGE = "message"
+    ASSISTANT_TOOL_BATCH = "assistant_tool_batch"
+    TOOL_RESULT = "tool_result"
+
+
 @dataclass(frozen=True)
 class TranscriptEntry:
     session_id: SessionId
@@ -42,6 +49,8 @@ class TranscriptEntry:
     role: str
     content: str
     sequence: int = 0  # Assigned by the journal on append.
+    entry_type: TranscriptEntryType = TranscriptEntryType.MESSAGE
+    format_version: int = 1
 
 
 @dataclass(frozen=True)

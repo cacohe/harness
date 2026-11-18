@@ -46,11 +46,12 @@ from src.core.journal import (
     JournalSnapshot,
     SubmissionAcceptance,
     TranscriptEntry,
+    TranscriptEntryType,
 )
 from src.core.run_receipt import validate_commit_receipt
 from src.core.state import RunState
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _COVERAGE_BLOCK_SIZE = 128
 _COVERAGE_DEPTH = 32
 _T = TypeVar("_T")
@@ -103,6 +104,8 @@ CREATE TABLE transcript (
   submission_id TEXT NOT NULL,
   role TEXT NOT NULL,
   content TEXT NOT NULL,
+  entry_type TEXT NOT NULL CHECK(entry_type IN ('message', 'assistant_tool_batch', 'tool_result')),
+  format_version INTEGER NOT NULL CHECK(format_version = 1),
   entry_json TEXT NOT NULL,
   PRIMARY KEY(session_id, sequence)
 ) STRICT;
@@ -243,6 +246,8 @@ _EXPECTED_COLUMNS = {
         "submission_id",
         "role",
         "content",
+        "entry_type",
+        "format_version",
         "entry_json",
     ),
     "transcript_coverage_blocks": (
@@ -450,7 +455,7 @@ class SQLiteRunJournal:
                     + f"\nPRAGMA user_version = {_SCHEMA_VERSION};\nCOMMIT;"
                 )
             elif version != _SCHEMA_VERSION:
-                raise ValueError("SQLite journal requires an exact schema v3 database")
+                raise ValueError("SQLite journal requires an exact schema v4 database")
             self._validate_schema(connection)
             if str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() != "wal":
                 raise ValueError("SQLite journal requires WAL mode")
@@ -587,7 +592,9 @@ class SQLiteRunJournal:
                 transcript_record = replace(entry, sequence=cursor)
                 record_json = encode(transcript_record)
                 connection.execute(
-                    "INSERT INTO transcript(session_id, sequence, run_id, submission_id, role, content, entry_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO transcript(session_id, sequence, run_id, submission_id, role, "
+                    "content, entry_type, format_version, entry_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         session_key,
                         cursor,
@@ -595,6 +602,8 @@ class SQLiteRunJournal:
                         transcript_record.submission_id.value,
                         transcript_record.role,
                         transcript_record.content,
+                        transcript_record.entry_type.value,
+                        transcript_record.format_version,
                         record_json,
                     ),
                 )
@@ -757,7 +766,8 @@ class SQLiteRunJournal:
             events = tuple(_decode_event_row(item, session_key) for item in event_rows)
             transcript_rows = tuple(
                 connection.execute(
-                    "SELECT session_id, sequence, run_id, submission_id, role, content, entry_json "
+                    "SELECT session_id, sequence, run_id, submission_id, role, content, "
+                    "entry_type, format_version, entry_json "
                     "FROM transcript WHERE session_id = ? AND sequence > ? ORDER BY sequence",
                     (session_key, after_sequence),
                 )
@@ -804,7 +814,7 @@ class SQLiteRunJournal:
                 rows = tuple(
                     connection.execute(
                         "SELECT session_id, sequence, run_id, submission_id, role, content, "
-                        "entry_json FROM transcript WHERE session_id=? "
+                        "entry_type, format_version, entry_json FROM transcript WHERE session_id=? "
                         "ORDER BY sequence DESC LIMIT ?",
                         (session_key, (limit + 1) * MAX_TRANSCRIPT_ROWS_PER_INTERACTION),
                     )
@@ -813,7 +823,8 @@ class SQLiteRunJournal:
                 rows = tuple(
                     connection.execute(
                         "SELECT session_id, sequence, run_id, submission_id, role, content, "
-                        "entry_json FROM transcript WHERE session_id=? AND sequence<? "
+                        "entry_type, format_version, entry_json FROM transcript "
+                        "WHERE session_id=? AND sequence<? "
                         "ORDER BY sequence DESC LIMIT ?",
                         (
                             session_key,
@@ -829,7 +840,11 @@ class SQLiteRunJournal:
             raw_limit = (limit + 1) * MAX_TRANSCRIPT_ROWS_PER_INTERACTION
             if len(rows) == raw_limit:
                 boundary = next(
-                    (index for index, entry in enumerate(chronological) if entry.role != "tool"),
+                    (
+                        index
+                        for index, entry in enumerate(chronological)
+                        if entry.entry_type is not TranscriptEntryType.TOOL_RESULT
+                    ),
                     len(chronological),
                 )
                 chronological = chronological[boundary:]
@@ -949,7 +964,8 @@ class SQLiteRunJournal:
             rows = tuple(
                 connection.execute(
                     "SELECT session_id, sequence, run_id, submission_id, role, content, "
-                    "entry_json FROM transcript WHERE session_id=? AND run_id=? "
+                    "entry_type, format_version, entry_json FROM transcript "
+                    "WHERE session_id=? AND run_id=? "
                     "AND submission_id=? AND role='user' ORDER BY sequence LIMIT 2",
                     (session_key, run_key, submission_key),
                 )
@@ -999,13 +1015,13 @@ class SQLiteRunJournal:
     @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:
         if _schema_signature(connection) != _expected_schema_signature():
-            raise ValueError("SQLite journal schema v3 definition has drifted")
+            raise ValueError("SQLite journal schema v4 definition has drifted")
         for table, expected in _EXPECTED_COLUMNS.items():
             columns = tuple(
                 str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")
             )
             if columns != expected:
-                raise ValueError("SQLite journal schema v3 has drifted")
+                raise ValueError("SQLite journal schema v4 has drifted")
         indexes = {
             str(row[0])
             for row in connection.execute(
@@ -1013,13 +1029,13 @@ class SQLiteRunJournal:
             )
         }
         if not set(_EXPECTED_INDEXES) <= indexes:
-            raise ValueError("SQLite journal schema v3 is missing required indexes")
+            raise ValueError("SQLite journal schema v4 is missing required indexes")
         for index, expected_columns in _EXPECTED_INDEXES.items():
             actual_columns = tuple(
                 str(row[2]) for row in connection.execute(f"PRAGMA index_info({index})")
             )
             if actual_columns != expected_columns:
-                raise ValueError("SQLite journal schema v3 index has drifted")
+                raise ValueError("SQLite journal schema v4 index has drifted")
         for table in (
             "journal_entries",
             "runs",
@@ -1039,7 +1055,7 @@ class SQLiteRunJournal:
                 and str(row[6]).upper() == "CASCADE"
                 for row in foreign
             ):
-                raise ValueError("SQLite journal schema v3 is missing a Session foreign key")
+                raise ValueError("SQLite journal schema v4 is missing a Session foreign key")
 
 
 def _schema_signature(connection: sqlite3.Connection) -> tuple[tuple[str, str, str, str], ...]:
@@ -1064,6 +1080,7 @@ def _expected_schema_signature() -> tuple[tuple[str, str, str, str], ...]:
 _CHAIN_ROWS = (
     "SELECT j.session_id, j.sequence, j.kind, j.previous_hash, j.record_hash, "
     "e.event_id, e.event_json, t.entry_json, t.submission_id, t.role, t.content, "
+    "t.entry_type, t.format_version, "
     "CASE j.kind WHEN 'event' THEN e.run_id ELSE t.run_id END AS run_id "
     "FROM journal_entries AS j "
     "LEFT JOIN events AS e ON e.session_id=j.session_id AND e.sequence=j.sequence "
@@ -1167,7 +1184,8 @@ def _refresh_coverage_block(
     rows = tuple(
         connection.execute(
             "SELECT t.session_id, t.sequence, t.run_id, t.submission_id, t.role, t.content, "
-            "t.entry_json, j.record_hash FROM transcript AS t JOIN journal_entries AS j "
+            "t.entry_type, t.format_version, t.entry_json, j.record_hash "
+            "FROM transcript AS t JOIN journal_entries AS j "
             "ON j.session_id=t.session_id AND j.sequence=t.sequence AND j.kind='transcript' "
             "WHERE t.session_id=? AND t.sequence>=? ORDER BY t.sequence LIMIT ?",
             (session_key, first_row["sequence"], _COVERAGE_BLOCK_SIZE),
@@ -1276,7 +1294,8 @@ def _verify_physical_coverage_block(
     rows = tuple(
         connection.execute(
             "SELECT t.session_id, t.sequence, t.run_id, t.submission_id, t.role, t.content, "
-            "t.entry_json, j.record_hash FROM transcript AS t JOIN journal_entries AS j "
+            "t.entry_type, t.format_version, t.entry_json, j.record_hash "
+            "FROM transcript AS t JOIN journal_entries AS j "
             "ON j.session_id=t.session_id AND j.sequence=t.sequence AND j.kind='transcript' "
             "WHERE t.session_id=? AND t.sequence>=? ORDER BY t.sequence LIMIT ?",
             (session_key, block["first_sequence"], _COVERAGE_BLOCK_SIZE),
@@ -1612,7 +1631,8 @@ def _preflight_existing_ledger(
                 raise ValueError("SQLite acceptance Event disagrees with physical history")
         for expected_entry in receipt.transcript:
             physical = connection.execute(
-                "SELECT session_id, sequence, run_id, submission_id, role, content, entry_json "
+                "SELECT session_id, sequence, run_id, submission_id, role, content, "
+                "entry_type, format_version, entry_json "
                 "FROM transcript WHERE session_id = ? AND sequence = ?",
                 (session_key, expected_entry.sequence),
             ).fetchone()
@@ -1675,6 +1695,8 @@ def _decode_transcript_row(row: sqlite3.Row, session_key: str) -> TranscriptEntr
         or row["submission_id"] != record.submission_id.value
         or row["role"] != record.role
         or row["content"] != record.content
+        or row["entry_type"] != record.entry_type.value
+        or row["format_version"] != record.format_version
         or record.session_id.value != session_key
     ):
         raise ValueError("SQLite Transcript row disagrees with its payload")

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactExternalizer
 from src.adapters.artifacts.filesystem import FilesystemArtifactRepository
+from src.adapters.context.bounded import BoundedContextProvider
 from src.adapters.context.tokenizers import ExactTokenCounter
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.adapters.persistence.sqlite_codec import encode
@@ -23,9 +24,6 @@ from src.core.commands import RunLimits
 from src.core.context import (
     ContextBudget,
     ContextRequest,
-    ContextWindow,
-    EstimateQuality,
-    TokenEstimate,
 )
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 from src.core.model import ModelMessage, ModelResponse, ModelRole, ModelToolCall
@@ -73,29 +71,10 @@ class Clock:
 
 class JournalContext:
     def __init__(self, journal: InMemoryRunJournal) -> None:
-        self._journal = journal
+        self._provider = BoundedContextProvider(journal, ExactTokenCounter())
 
-    async def build(self, request: ContextRequest, budget: ContextBudget) -> ContextWindow:
-        snapshot = await self._journal.load_session(request.session_id)
-        history = tuple(
-            ModelMessage(ModelRole.SYSTEM, f"journal-{entry.role}:{entry.content}")
-            for entry in snapshot.transcript
-            if entry.role != "user"
-        )
-        messages = (request.system_message, *history, request.current_input)
-        estimate = TokenEstimate(
-            sum(len(message.content or "") for message in messages),
-            EstimateQuality.EXACT,
-        )
-        assert estimate.tokens <= budget.input_allowance_tokens
-        return ContextWindow(
-            messages,
-            request.tools,
-            estimate,
-            budget,
-            (),
-            request.policy_version,
-        )
+    async def build(self, request: ContextRequest, budget: ContextBudget):
+        return await self._provider.build(request, budget)
 
 
 class ArtifactModel:

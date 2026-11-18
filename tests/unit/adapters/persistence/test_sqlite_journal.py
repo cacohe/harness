@@ -17,6 +17,7 @@ from src.core.journal import (
     JournalEvent,
     JournalSnapshot,
     TranscriptEntry,
+    TranscriptEntryType,
 )
 from src.core.state import RunState, RunStatus
 from tests.unit.core.test_journal_contract import acceptance
@@ -103,7 +104,7 @@ def test_direct_insert_cannot_bypass_full_middle_block(tmp_path, table, connecti
                 # Sequence 202 is an event inside the second complete transcript block.
                 entry = replace(receipt.transcript[0], sequence=202)
                 connection.execute(
-                    "INSERT INTO transcript VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO transcript VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         entry.session_id.value,
                         202,
@@ -111,6 +112,8 @@ def test_direct_insert_cannot_bypass_full_middle_block(tmp_path, table, connecti
                         entry.submission_id.value,
                         entry.role,
                         entry.content,
+                        entry.entry_type.value,
+                        entry.format_version,
                         encode(entry),
                     ),
                 )
@@ -394,7 +397,7 @@ def test_conversation_aggregate_rejects_full_block_and_witness_corruption(
     assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
 
 
-def test_sqlite_v3_round_trips_and_reopens(tmp_path: Path) -> None:
+def test_sqlite_v4_round_trips_and_reopens(tmp_path: Path) -> None:
     journal = make_journal(tmp_path)
     batch = acceptance("first")
     receipt = asyncio.run(journal.commit(batch, 0))
@@ -407,6 +410,58 @@ def test_sqlite_v3_round_trips_and_reopens(tmp_path: Path) -> None:
     found = asyncio.run(reopened.find_submission(batch.state.session_id, batch.state.submission_id))
     assert found is not None and (found.state, found.version) == (batch.state, 1)
     assert asyncio.run(reopened.commit(acceptance("first"), 0)) == receipt
+
+
+def test_sqlite_reopen_preserves_structured_multi_tool_interaction(tmp_path: Path) -> None:
+    journal = make_journal(tmp_path)
+    batch = acceptance("structured-tools")
+    assistant = TranscriptEntry(
+        batch.state.session_id,
+        batch.state.run_id,
+        batch.state.submission_id,
+        "assistant",
+        '{"text":"checking","tool_calls":['
+        '{"id":"a","name":"alpha","arguments":"{}"},'
+        '{"id":"b","name":"beta","arguments":"{}"}]}',
+        entry_type=TranscriptEntryType.ASSISTANT_TOOL_BATCH,
+        format_version=1,
+    )
+    results = (
+        TranscriptEntry(
+            batch.state.session_id,
+            batch.state.run_id,
+            batch.state.submission_id,
+            "tool",
+            '{"tool_call_id":"b","result":2}',
+            entry_type=TranscriptEntryType.TOOL_RESULT,
+            format_version=1,
+        ),
+        TranscriptEntry(
+            batch.state.session_id,
+            batch.state.run_id,
+            batch.state.submission_id,
+            "tool",
+            '{"tool_call_id":"a","result":1}',
+            entry_type=TranscriptEntryType.TOOL_RESULT,
+            format_version=1,
+        ),
+    )
+    committed = replace(
+        batch,
+        state=replace(batch.state, journal_sequence=4),
+        transcript=(assistant, *results),
+    )
+
+    asyncio.run(journal.commit(committed, 0))
+    page = asyncio.run(make_journal(tmp_path).read_page(batch.state.session_id, None, 1))
+
+    assert len(page.interactions) == 1
+    assert [message.role.value for message in page.interactions[0].messages] == [
+        "assistant",
+        "tool",
+        "tool",
+    ]
+    assert [message.tool_call_id for message in page.interactions[0].messages[1:]] == ["b", "a"]
 
 
 def test_sqlite_commit_is_atomic_on_conflict(tmp_path: Path) -> None:
@@ -453,10 +508,10 @@ def test_two_connections_can_advance_different_sessions(tmp_path: Path) -> None:
     assert [(item.version, item.sequence) for item in receipts] == [(1, 2), (1, 2)]
 
 
-def test_schema_is_exact_v3_and_has_required_indexes(tmp_path: Path) -> None:
+def test_schema_is_exact_v4_and_has_required_indexes(tmp_path: Path) -> None:
     journal = make_journal(tmp_path)
     with sqlite3.connect(journal.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         tables = {
             row[0]
             for row in connection.execute(
@@ -524,7 +579,7 @@ def test_version_zero_unknown_objects_are_rejected_without_mutation(
             )
         )
 
-    with pytest.raises(ValueError, match="schema v3"):
+    with pytest.raises(ValueError, match="schema v4"):
         SQLiteRunJournal(path)
 
     assert path.read_bytes() == before_bytes
@@ -593,8 +648,8 @@ def test_schema_definition_drift_is_rejected(tmp_path: Path, changed_ddl: str) -
     path = (tmp_path / "drift.sqlite3").resolve()
     with sqlite3.connect(path) as connection:
         connection.executescript(changed_ddl)
-        connection.execute("PRAGMA user_version=3")
-    with pytest.raises(ValueError, match="schema v3"):
+        connection.execute("PRAGMA user_version=4")
+    with pytest.raises(ValueError, match="schema v4"):
         SQLiteRunJournal(path)
 
 
@@ -914,7 +969,8 @@ def test_chain_hash_corruption_rejects_reads_and_writes(
                 connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
                 connection.execute(
                     "INSERT INTO transcript(session_id, sequence, run_id, submission_id, role, "
-                    "content, entry_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "content, entry_type, format_version, entry_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         extra.session_id.value,
                         5,
@@ -922,6 +978,8 @@ def test_chain_hash_corruption_rejects_reads_and_writes(
                         extra.submission_id.value,
                         extra.role,
                         extra.content,
+                        extra.entry_type.value,
+                        extra.format_version,
                         encode(extra),
                     ),
                 )

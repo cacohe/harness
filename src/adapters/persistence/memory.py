@@ -30,6 +30,7 @@ from src.core.journal import (
     SubmissionAcceptance,
     SubmissionRecord,
     TranscriptEntry,
+    TranscriptEntryType,
 )
 from src.core.state import (
     ApprovalState,
@@ -423,6 +424,7 @@ def _rebuild(value: object) -> Any:
         or type(value) is RunStatus
         or type(value) is RunErrorCode
         or type(value) is DomainEventType
+        or type(value) is TranscriptEntryType
     ):
         return value
     if type(value) is datetime and _is_canonical_timestamp(value):
@@ -520,7 +522,12 @@ def _intent_value(value: object) -> _IntentValue:
                 rebuilt.summary,
             ),
         )
-    if type(value) is RunStatus or type(value) is RunErrorCode or type(value) is DomainEventType:
+    if (
+        type(value) is RunStatus
+        or type(value) is RunErrorCode
+        or type(value) is DomainEventType
+        or type(value) is TranscriptEntryType
+    ):
         return ("enum", (type(value).__name__, value.value))
     if (
         type(value) is SessionId
@@ -596,6 +603,14 @@ def _validate_members(batch: JournalCommit, sequence: int, expected_version: int
             or not _is_text(entry.role)
             or not entry.role
             or not _is_text(entry.content)
+            or type(entry.entry_type) is not TranscriptEntryType
+            or entry.format_version != 1
+            or entry.entry_type is TranscriptEntryType.MESSAGE
+            and entry.role not in {"user", "assistant", "system"}
+            or entry.entry_type is TranscriptEntryType.ASSISTANT_TOOL_BATCH
+            and entry.role != "assistant"
+            or entry.entry_type is TranscriptEntryType.TOOL_RESULT
+            and entry.role != "tool"
         ):
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
 

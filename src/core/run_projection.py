@@ -3,7 +3,7 @@ import json
 from src.core.artifacts import ExternalizedContent
 from src.core.commands import ToolCallRequest
 from src.core.errors import RunErrorCode, RunFailure
-from src.core.journal import TranscriptEntry
+from src.core.journal import TranscriptEntry, TranscriptEntryType
 from src.core.model import ModelResponse
 from src.core.state import RunState, ToolCallState
 from src.core.tools import ToolResult, ToolResultStatus, ToolSpec
@@ -56,6 +56,7 @@ def tool_transcript(state: RunState) -> tuple[TranscriptEntry, ...]:
             json.dumps(
                 {"text": step.model_call.result, "tool_calls": calls}, separators=(",", ":")
             ),
+            entry_type=TranscriptEntryType.ASSISTANT_TOOL_BATCH,
         )
     ]
     entries.extend(
@@ -65,6 +66,7 @@ def tool_transcript(state: RunState) -> tuple[TranscriptEntry, ...]:
             state.submission_id,
             "tool",
             _tool_text(call),
+            entry_type=TranscriptEntryType.TOOL_RESULT,
         )
         for call in step.tool_calls
     )

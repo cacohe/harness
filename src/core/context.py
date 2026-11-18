@@ -294,6 +294,22 @@ def snapshot_summary_checkpoint(
         raise ValueError("Summary checkpoint does not match the context request") from None
 
 
+def summary_system_messages(
+    checkpoint: ConversationSummaryCheckpoint,
+) -> tuple[ModelMessage, ...]:
+    """Project a trusted durable summary into its model-facing system prefix."""
+
+    messages = [ModelMessage(ModelRole.SYSTEM, checkpoint.summary)]
+    if checkpoint.artifacts:
+        messages.append(
+            ModelMessage(
+                ModelRole.SYSTEM,
+                "Artifacts: " + ", ".join(ref.artifact_id for ref in checkpoint.artifacts),
+            )
+        )
+    return tuple(messages)
+
+
 def _optional_messages(messages: tuple[ModelMessage, ...], name: str) -> tuple[ModelMessage, ...]:
     if (
         type(messages) is not tuple

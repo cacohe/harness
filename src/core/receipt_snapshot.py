@@ -21,6 +21,7 @@ from src.core.journal import (
     JournalSnapshot,
     SubmissionRecord,
     TranscriptEntry,
+    TranscriptEntryType,
 )
 from src.core.state import (
     ApprovalState,
@@ -103,7 +104,14 @@ def snapshot_transcript(value: object, *, sequence: int | None = None) -> Transc
     role = _exact_text(_raw(value, "role"))
     content = _exact_text(_raw(value, "content"), allow_empty=True)
     raw_sequence = _exact_int(_raw(value, "sequence"))
-    if raw_sequence < 0 or not role:
+    entry_type = _raw(value, "entry_type")
+    format_version = _exact_int(_raw(value, "format_version"))
+    if (
+        raw_sequence < 0
+        or not role
+        or type(entry_type) is not TranscriptEntryType
+        or format_version != 1
+    ):
         raise ValueError
     return TranscriptEntry(
         _snapshot_id(_raw(value, "session_id"), SessionId),
@@ -112,6 +120,8 @@ def snapshot_transcript(value: object, *, sequence: int | None = None) -> Transc
         role,
         content,
         raw_sequence if sequence is None else sequence,
+        entry_type,
+        format_version,
     )
 
 

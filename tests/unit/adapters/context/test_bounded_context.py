@@ -304,7 +304,7 @@ def test_durable_summary_excludes_covered_raw_history() -> None:
 
 
 @pytest.mark.parametrize("page_size", [2, 10])
-def test_partial_range_summary_keeps_older_raw_in_time_order(page_size: int) -> None:
+def test_partial_range_summary_stays_in_trusted_prefix_before_raw_history(page_size: int) -> None:
     records = tuple(_interaction(index, f"raw-{index}") for index in range(1, 8))
     reader = Reader(records)
     checkpoint = ConversationSummaryCheckpoint(
@@ -322,9 +322,9 @@ def test_partial_range_summary_keeps_older_raw_in_time_order(page_size: int) -> 
     )
     assert [message.content for message in window.messages] == [
         "SS",
+        "summary-3-5",
         "raw-1",
         "raw-2",
-        "summary-3-5",
         "raw-6",
         "raw-7",
         "UUU",
@@ -383,8 +383,8 @@ def test_persisted_candidate_does_not_hide_history_before_its_source_range() -> 
         )
     )
     contents = [message.content for message in window.messages]
-    assert contents.index("raw-1") < contents.index("persisted-candidate")
-    assert contents.index("raw-2") < contents.index("persisted-candidate")
+    assert contents.index("persisted-candidate") < contents.index("raw-1")
+    assert contents.index("persisted-candidate") < contents.index("raw-2")
     assert contents.index("persisted-candidate") < contents.index("raw-6")
 
 

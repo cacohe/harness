@@ -26,6 +26,7 @@ from src.core.context import (
     ContextProvider,
     ContextRequest,
     TokenCounter,
+    summary_system_messages,
 )
 from src.core.errors import InvalidTransition, RunErrorCode, RunFailure
 from src.core.events import DomainEvent
@@ -36,7 +37,13 @@ from src.core.journal import (
     RunJournal,
     TranscriptEntry,
 )
-from src.core.model import ModelGateway, ModelRequest, snapshot_model_response
+from src.core.model import (
+    ModelGateway,
+    ModelMessage,
+    ModelRequest,
+    ModelRole,
+    snapshot_model_response,
+)
 from src.core.run_content import externalize_final_text, externalize_tool_result
 from src.core.run_projection import model_tool_requests, tool_failure, tool_transcript
 from src.core.run_receipt import validate_commit_receipt
@@ -56,6 +63,46 @@ class RunOutcome:
     journal_version: int
     sequence: int
     events: tuple[DomainEvent, ...] = ()
+
+
+def _matches_trusted_context_shape(
+    messages: tuple[ModelMessage, ...], request: ContextRequest
+) -> bool:
+    if not messages or messages[0] != request.system_message:
+        return False
+    prefix_end = 1
+    while prefix_end < len(messages) and messages[prefix_end].role is ModelRole.SYSTEM:
+        prefix_end += 1
+    supplied_prefix = messages[1:prefix_end]
+    trusted_optional = (
+        *request.memory_messages,
+        *request.skill_messages,
+        *(
+            message
+            for checkpoint in request.summary_checkpoints
+            for message in summary_system_messages(checkpoint)
+        ),
+    )
+    candidate_index = 0
+    for supplied in supplied_prefix:
+        while (
+            candidate_index < len(trusted_optional)
+            and trusted_optional[candidate_index] != supplied
+        ):
+            candidate_index += 1
+        if candidate_index == len(trusted_optional):
+            return False
+        candidate_index += 1
+
+    suffix_length = len(request.open_tool_messages) + 1
+    if len(messages) < prefix_end + suffix_length:
+        return False
+    if messages[-1] != request.current_input:
+        return False
+    if request.open_tool_messages and (messages[-suffix_length:-1] != request.open_tool_messages):
+        return False
+    history = messages[prefix_end:-suffix_length]
+    return all(message.role is not ModelRole.SYSTEM for message in history)
 
 
 class RunCoordinator:
@@ -140,8 +187,7 @@ class RunCoordinator:
             if (
                 window.policy_version != self._request.policy_version
                 or window.tools != self._request.tools
-                or window.messages[0] != self._request.system_message
-                or window.messages[-1] != self._request.current_input
+                or not _matches_trusted_context_shape(window.messages, self._request)
             ):
                 raise ValueError("Context window does not match its request binding")
             if (

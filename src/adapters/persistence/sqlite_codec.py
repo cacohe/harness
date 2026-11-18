@@ -18,6 +18,7 @@ from src.core.journal import (
     JournalSnapshot,
     SubmissionRecord,
     TranscriptEntry,
+    TranscriptEntryType,
 )
 from src.core.state import (
     ApprovalState,
@@ -52,7 +53,9 @@ _RECORDS: dict[str, type[Any]] = {
     )
 }
 _IDS = {cls.__name__: cls for cls in (EventId, ProfileId, RunId, SessionId, SubmissionId)}
-_ENUMS = {cls.__name__: cls for cls in (RunStatus, RunErrorCode, DomainEventType)}
+_ENUMS = {
+    cls.__name__: cls for cls in (RunStatus, RunErrorCode, DomainEventType, TranscriptEntryType)
+}
 
 
 def encode(value: object) -> str:

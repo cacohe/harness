@@ -104,7 +104,7 @@ def test_new_checkpoint_is_only_a_candidate_until_journal_commit() -> None:
     assert service.find_reusable((candidate,), request, 8) == candidate
 
 
-def test_build_invokes_compactor_and_projects_candidate_summary_and_refs() -> None:
+def test_build_invokes_compactor_but_defers_candidate_until_a_trusted_request() -> None:
     request = _request()
     records = tuple(
         ConversationInteraction(index, index, (ModelMessage(ModelRole.ASSISTANT, "X" * 120),))
@@ -131,8 +131,8 @@ def test_build_invokes_compactor_and_projects_candidate_summary_and_refs() -> No
     assert len(compactor.calls) == 1
     assert window.new_checkpoint == candidate
     rendered = "\n".join(message.content or "" for message in window.messages)
-    assert "compacted" in rendered
-    assert ref.artifact_id in rendered
+    assert "compacted" not in rendered
+    assert ref.artifact_id not in rendered
     assert request.summary_checkpoints == ()
 
 

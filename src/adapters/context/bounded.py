@@ -13,9 +13,10 @@ from src.core.context import (
     ConversationReader,
     OmittedContextRef,
     TokenCounter,
+    summary_system_messages,
 )
 from src.core.journal import ConversationSummaryCheckpoint
-from src.core.model import ModelMessage, ModelRole
+from src.core.model import ModelMessage
 
 
 @dataclass
@@ -184,17 +185,6 @@ class BoundedContextProvider:
         if compaction:
             outcome = await self._summary_service.compact_or_retain(request, tuple(compaction))
             candidate_checkpoint = outcome.checkpoint
-        if candidate_checkpoint is not None:
-            _, estimate = self._consider_checkpoint(
-                request,
-                budget,
-                selected,
-                included_checkpoints,
-                omitted_checkpoints,
-                candidate_checkpoint,
-                True,
-                estimate,
-            )
 
         omitted = [
             OmittedContextRef("transcript", item.first, item.last, item.count)
@@ -337,15 +327,7 @@ class BoundedContextProvider:
     def _checkpoint_messages(
         checkpoint: ConversationSummaryCheckpoint,
     ) -> tuple[ModelMessage, ...]:
-        messages = [ModelMessage(ModelRole.SYSTEM, checkpoint.summary)]
-        if checkpoint.artifacts:
-            messages.append(
-                ModelMessage(
-                    ModelRole.SYSTEM,
-                    "Artifacts: " + ", ".join(ref.artifact_id for ref in checkpoint.artifacts),
-                )
-            )
-        return tuple(messages)
+        return summary_system_messages(checkpoint)
 
     def _include_messages(
         self,
@@ -390,22 +372,20 @@ class BoundedContextProvider:
             (interaction.sequence_from, interaction.sequence_through, interaction.messages)
             for interaction in selected
         ]
-        segments.extend(
-            (
-                checkpoint.covered_from_sequence,
-                checkpoint.covered_through_sequence,
-                BoundedContextProvider._checkpoint_messages(checkpoint),
-            )
-            for checkpoint in checkpoints
-        )
         ordered = sorted(segments, key=lambda item: item[0])
         if any(earlier[1] >= later[0] for earlier, later in zip(ordered, ordered[1:])):
             raise ValueError("Context history segments overlap")
         history = tuple(message for _, _, messages in ordered for message in messages)
+        summaries = tuple(
+            message
+            for checkpoint in checkpoints
+            for message in BoundedContextProvider._checkpoint_messages(checkpoint)
+        )
         return (
             request.system_message,
             *memory,
             *skills,
+            *summaries,
             *history,
             *request.open_tool_messages,
             request.current_input,
