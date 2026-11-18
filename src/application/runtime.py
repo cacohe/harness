@@ -260,7 +260,12 @@ class RuntimeCoordinator:
         run_key = _id_value(run_id)
         async with self._lifecycle_lock:
             task = slot.cancel_task
-            if task is None or slot.cancel_run_id != run_key:
+            if (
+                task is None
+                or task.done()
+                or task.cancelling()
+                or slot.cancel_run_id != run_key
+            ):
                 task = asyncio.create_task(self._cancel_run_impl(session_id, run_id, slot))
                 slot.cancel_task = task
                 slot.cancel_run_id = run_key
@@ -375,11 +380,17 @@ class RuntimeCoordinator:
         state = _head(head, initial.session_id)
         if state.run_id == initial.run_id and state.submission_id == initial.submission_id:
             return state
-        historical = await self._journal.find_run_state(
+        value = await self._journal.find_run_state(
             initial.session_id, initial.run_id, initial.submission_id
         )
+        try:
+            historical = snapshot_run_state(value)
+        except (AttributeError, OverflowError, RecursionError, TypeError, ValueError):
+            raise SessionOwnershipError("Historical Run projection is invalid") from None
         if (
-            historical is None
+            historical.session_id != initial.session_id
+            or historical.run_id != initial.run_id
+            or historical.submission_id != initial.submission_id
             or historical.profile_id != initial.profile_id
             or not historical.status.terminal
         ):

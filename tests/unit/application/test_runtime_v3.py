@@ -800,6 +800,223 @@ async def test_cancel_completion_race_returns_the_existing_terminal_outcome():
 
 
 @async_test
+async def test_cancel_retry_rebuilds_after_post_commit_observer_cancellation():
+    from src.application.runtime import RuntimeCoordinator
+
+    journal = Journal()
+    current = state(SessionId("a"), SubmissionId("one"))
+    journal.heads["a"] = current
+    journal.runs[current.run_id.value] = current
+    journal.messages[current.run_id.value] = "hello"
+    cancel_commits = 0
+
+    class CancelCoordinator:
+        async def advance(self, run, command):
+            nonlocal cancel_commits
+            assert isinstance(command, CancelRun)
+            cancel_commits += 1
+            cancelled = replace(
+                run,
+                status=RunStatus.CANCELLED,
+                failure=RunFailure(RunErrorCode.CANCELLED),
+                version=run.version + 1,
+                journal_version=run.journal_version + 1,
+            )
+            journal.heads["a"] = cancelled
+            journal.runs[run.run_id.value] = cancelled
+            return RunOutcome(cancelled, cancelled.journal_version, cancelled.journal_sequence)
+
+    class CancelObserver:
+        calls = 0
+
+        async def observe(self, _observation):
+            self.calls += 1
+            raise asyncio.CancelledError
+
+    observer = CancelObserver()
+    runtime = RuntimeCoordinator(
+        submissions=Submissions(journal),
+        journal=journal,
+        coordinator_factory=lambda *_args: CancelCoordinator(),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=2,
+        observer=observer,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await runtime.cancel_run(SessionId("a"), current.run_id)
+
+    first, second = await asyncio.gather(
+        runtime.cancel_run(SessionId("a"), current.run_id),
+        runtime.cancel_run(SessionId("a"), current.run_id),
+    )
+    assert first == second
+    assert first.status is RunStatus.CANCELLED
+    assert cancel_commits == 1
+    assert observer.calls == 1
+
+
+@async_test
+async def test_cancel_retry_recovers_when_adapter_raises_after_durable_commit():
+    from src.application.runtime import RuntimeCoordinator
+
+    journal = Journal()
+    current = state(SessionId("a"), SubmissionId("one"))
+    journal.heads["a"] = current
+    journal.runs[current.run_id.value] = current
+    journal.messages[current.run_id.value] = "hello"
+    cancel_commits = 0
+
+    class CommitThenRaise:
+        async def advance(self, run, command):
+            nonlocal cancel_commits
+            assert isinstance(command, CancelRun)
+            cancel_commits += 1
+            cancelled = replace(
+                run,
+                status=RunStatus.CANCELLED,
+                failure=RunFailure(RunErrorCode.CANCELLED),
+                version=run.version + 1,
+                journal_version=run.journal_version + 1,
+            )
+            journal.heads["a"] = cancelled
+            journal.runs[run.run_id.value] = cancelled
+            raise RuntimeError("adapter lost the committed receipt")
+
+    runtime = RuntimeCoordinator(
+        submissions=Submissions(journal),
+        journal=journal,
+        coordinator_factory=lambda *_args: CommitThenRaise(),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=2,
+    )
+    with pytest.raises(RuntimeError, match="committed receipt"):
+        await runtime.cancel_run(SessionId("a"), current.run_id)
+
+    first, second = await asyncio.gather(
+        runtime.cancel_run(SessionId("a"), current.run_id),
+        runtime.cancel_run(SessionId("a"), current.run_id),
+    )
+    assert first == second
+    assert first.status is RunStatus.CANCELLED
+    assert cancel_commits == 1
+
+
+@async_test
+async def test_cancel_retry_after_isolated_observer_exception_does_not_repeat_commit():
+    from src.application.runtime import RuntimeCoordinator
+
+    journal = Journal()
+    current = state(SessionId("a"), SubmissionId("one"))
+    journal.heads["a"] = current
+    journal.runs[current.run_id.value] = current
+    journal.messages[current.run_id.value] = "hello"
+    cancel_commits = 0
+
+    class CancelCoordinator:
+        async def advance(self, run, command):
+            nonlocal cancel_commits
+            assert isinstance(command, CancelRun)
+            cancel_commits += 1
+            cancelled = replace(
+                run,
+                status=RunStatus.CANCELLED,
+                failure=RunFailure(RunErrorCode.CANCELLED),
+                version=run.version + 1,
+                journal_version=run.journal_version + 1,
+            )
+            journal.heads["a"] = cancelled
+            journal.runs[run.run_id.value] = cancelled
+            return RunOutcome(cancelled, cancelled.journal_version, cancelled.journal_sequence)
+
+    class ErrorObserver:
+        calls = 0
+
+        async def observe(self, _observation):
+            self.calls += 1
+            raise RuntimeError("isolated observer failure")
+
+    observer = ErrorObserver()
+    runtime = RuntimeCoordinator(
+        submissions=Submissions(journal),
+        journal=journal,
+        coordinator_factory=lambda *_args: CancelCoordinator(),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=2,
+        observer=observer,
+    )
+    first = await runtime.cancel_run(SessionId("a"), current.run_id)
+    retried = await asyncio.gather(
+        runtime.cancel_run(SessionId("a"), current.run_id),
+        runtime.cancel_run(SessionId("a"), current.run_id),
+    )
+    assert first.status is RunStatus.CANCELLED
+    assert retried == [first, first]
+    assert cancel_commits == 1
+    assert observer.calls == 1
+
+
+@async_test
+async def test_close_session_during_post_commit_observation_allows_terminal_cancel_retry():
+    from src.application.runtime import RuntimeCoordinator
+
+    journal = Journal()
+    current = state(SessionId("a"), SubmissionId("one"))
+    journal.heads["a"] = current
+    journal.runs[current.run_id.value] = current
+    journal.messages[current.run_id.value] = "hello"
+    observing = asyncio.Event()
+    cancel_commits = 0
+
+    class CancelCoordinator:
+        async def advance(self, run, command):
+            nonlocal cancel_commits
+            assert isinstance(command, CancelRun)
+            cancel_commits += 1
+            cancelled = replace(
+                run,
+                status=RunStatus.CANCELLED,
+                failure=RunFailure(RunErrorCode.CANCELLED),
+                version=run.version + 1,
+                journal_version=run.journal_version + 1,
+            )
+            journal.heads["a"] = cancelled
+            journal.runs[run.run_id.value] = cancelled
+            return RunOutcome(cancelled, cancelled.journal_version, cancelled.journal_sequence)
+
+    class BlockingObserver:
+        async def observe(self, _observation):
+            observing.set()
+            await asyncio.Event().wait()
+
+    runtime = RuntimeCoordinator(
+        submissions=Submissions(journal),
+        journal=journal,
+        coordinator_factory=lambda *_args: CancelCoordinator(),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=1,
+        observer=BlockingObserver(),
+        observer_timeout_seconds=30,
+    )
+    cancelling = asyncio.create_task(runtime.cancel_run(SessionId("a"), current.run_id))
+    await observing.wait()
+    await runtime.close_session(SessionId("a"))
+    with pytest.raises(asyncio.CancelledError):
+        await cancelling
+
+    retried = await runtime.cancel_run(SessionId("a"), current.run_id)
+    assert retried.status is RunStatus.CANCELLED
+    assert cancel_commits == 1
+
+
+@async_test
 async def test_historical_submission_replay_returns_its_terminal_run_without_driving():
     from src.application.runtime import RuntimeCoordinator
 
@@ -841,6 +1058,200 @@ async def test_historical_submission_replay_returns_its_terminal_run_without_dri
     )
     assert result == original_done
     assert journal.heads["a"] == newer
+
+
+@pytest.mark.parametrize("forged_field", ["session_id", "run_id", "submission_id", "profile_id"])
+def test_historical_run_lookup_rejects_each_forged_identity(forged_field):
+    async def scenario():
+        from src.application.runtime import RuntimeCoordinator, SessionOwnershipError
+
+        journal = Journal()
+        original = state(SessionId("a"), SubmissionId("first"), RunId("original"))
+        terminal = replace(
+            original,
+            status=RunStatus.COMPLETED,
+            final_text="original result",
+            version=2,
+            journal_version=2,
+        )
+        replacements = {
+            "session_id": {"session_id": SessionId("other-session")},
+            "run_id": {"run_id": RunId("other-run")},
+            "submission_id": {"submission_id": SubmissionId("other-submission")},
+            "profile_id": {"profile_id": ProfileId("other-profile")},
+        }
+        forged = replace(terminal, **replacements[forged_field])
+        newer = replace(
+            state(SessionId("a"), SubmissionId("second"), RunId("newer")),
+            status=RunStatus.COMPLETED,
+            final_text="newer result",
+            journal_version=4,
+        )
+        journal.heads["a"] = newer
+
+        async def forged_lookup(*_args):
+            return forged
+
+        journal.find_run_state = forged_lookup
+
+        class Replay:
+            async def accept(self, *_args):
+                return AcceptedRun(original, 1, False)
+
+        runtime = RuntimeCoordinator(
+            submissions=Replay(),
+            journal=journal,
+            coordinator_factory=lambda *_args: pytest.fail("forged replay must not drive"),
+            ids=Ids(),
+            clock=Clock(),
+            max_sessions=1,
+            max_waiters_per_session=1,
+        )
+        with pytest.raises(SessionOwnershipError):
+            await runtime.submit(SessionId("a"), ProfileId("profile"), "old", SubmissionId("first"))
+
+    asyncio.run(scenario())
+
+
+@async_test
+async def test_historical_run_lookup_returns_a_canonical_copy_not_port_alias():
+    from src.application.runtime import RuntimeCoordinator
+
+    journal = Journal()
+    original = state(SessionId("a"), SubmissionId("first"), RunId("original"))
+    terminal = replace(
+        original,
+        status=RunStatus.COMPLETED,
+        final_text="original result",
+        version=2,
+        journal_version=2,
+    )
+    newer = replace(
+        state(SessionId("a"), SubmissionId("second"), RunId("newer")),
+        status=RunStatus.COMPLETED,
+        final_text="newer result",
+        journal_version=4,
+    )
+    journal.heads["a"] = newer
+
+    async def aliased_lookup(*_args):
+        return terminal
+
+    journal.find_run_state = aliased_lookup
+
+    class Replay:
+        async def accept(self, *_args):
+            return AcceptedRun(original, 1, False)
+
+    runtime = RuntimeCoordinator(
+        submissions=Replay(),
+        journal=journal,
+        coordinator_factory=lambda *_args: pytest.fail("historical replay must not drive"),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=1,
+    )
+    result = await runtime.submit(
+        SessionId("a"), ProfileId("profile"), "old", SubmissionId("first")
+    )
+    object.__setattr__(terminal, "final_text", "mutated alias")
+    assert result.final_text == "original result"
+
+
+@async_test
+async def test_historical_run_lookup_rejects_forged_nested_terminal_state():
+    from src.application.runtime import RuntimeCoordinator, SessionOwnershipError
+
+    journal = Journal()
+    original = state(SessionId("a"), SubmissionId("first"), RunId("original"))
+    forged = replace(
+        state(SessionId("a"), SubmissionId("first"), RunId("original")),
+        status=RunStatus.COMPLETED,
+        final_text="original result",
+        version=2,
+        journal_version=2,
+    )
+    object.__setattr__(forged, "final_artifacts", (object(),))
+    newer = replace(
+        state(SessionId("a"), SubmissionId("second"), RunId("newer")),
+        status=RunStatus.COMPLETED,
+        final_text="newer result",
+        journal_version=4,
+    )
+    journal.heads["a"] = newer
+
+    async def forged_lookup(*_args):
+        return forged
+
+    journal.find_run_state = forged_lookup
+
+    class Replay:
+        async def accept(self, *_args):
+            return AcceptedRun(original, 1, False)
+
+    runtime = RuntimeCoordinator(
+        submissions=Replay(),
+        journal=journal,
+        coordinator_factory=lambda *_args: pytest.fail("forged replay must not drive"),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=1,
+    )
+    with pytest.raises(SessionOwnershipError):
+        await runtime.submit(SessionId("a"), ProfileId("profile"), "old", SubmissionId("first"))
+
+
+@async_test
+async def test_historical_run_lookup_rejects_hostile_identity_without_running_hooks():
+    from src.application.runtime import RuntimeCoordinator, SessionOwnershipError
+
+    class HostileText(str):
+        def __eq__(self, _other):
+            raise AssertionError("hostile equality executed")
+
+        def __hash__(self):
+            raise AssertionError("hostile hash executed")
+
+    journal = Journal()
+    original = state(SessionId("a"), SubmissionId("first"), RunId("original"))
+    forged = replace(
+        state(SessionId("a"), SubmissionId("first"), RunId("original")),
+        status=RunStatus.COMPLETED,
+        final_text="original result",
+        version=2,
+        journal_version=2,
+    )
+    object.__setattr__(forged.run_id, "value", HostileText("original"))
+    newer = replace(
+        state(SessionId("a"), SubmissionId("second"), RunId("newer")),
+        status=RunStatus.COMPLETED,
+        final_text="newer result",
+        journal_version=4,
+    )
+    journal.heads["a"] = newer
+
+    async def forged_lookup(*_args):
+        return forged
+
+    journal.find_run_state = forged_lookup
+
+    class Replay:
+        async def accept(self, *_args):
+            return AcceptedRun(original, 1, False)
+
+    runtime = RuntimeCoordinator(
+        submissions=Replay(),
+        journal=journal,
+        coordinator_factory=lambda *_args: pytest.fail("forged replay must not drive"),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=1,
+    )
+    with pytest.raises(SessionOwnershipError):
+        await runtime.submit(SessionId("a"), ProfileId("profile"), "old", SubmissionId("first"))
 
 
 @async_test
