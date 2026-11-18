@@ -1,5 +1,6 @@
 import asyncio
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -219,5 +220,74 @@ def test_corrupt_completed_payload_is_rejected(tmp_path: Path) -> None:
             connection.execute("UPDATE executions SET state='completed', result_json='{}'")
         with pytest.raises(ToolExecutionStoreError):
             await store.claim(request)
+
+    asyncio.run(scenario())
+
+
+def test_every_operation_deterministically_closes_sqlite_connections(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class TrackingConnection:
+        def __init__(self, connection):
+            self.connection = connection
+            self.closed = False
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+        def __enter__(self):
+            self.connection.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.connection.__exit__(*args)
+
+        def close(self):
+            self.closed = True
+            self.connection.close()
+
+    async def scenario():
+        store = SQLiteToolExecutionStore((tmp_path / "store.db").resolve())
+        original_connect = store._connect
+        opened = []
+
+        def connect():
+            tracked = TrackingConnection(original_connect())
+            opened.append(tracked)
+            return tracked
+
+        monkeypatch.setattr(store, "_connect", connect)
+        request = _request()
+        assert (await store.claim(request)).state is ClaimState.OWNER
+        assert opened and all(connection.closed for connection in opened)
+        await store.complete(request, _result(request))
+        assert all(connection.closed for connection in opened)
+        assert (await store.claim(request)).state is ClaimState.COMPLETED
+        assert all(connection.closed for connection in opened)
+        with pytest.raises(ToolBindingConflict):
+            await store.claim(_request('{"changed":true}'))
+        assert all(connection.closed for connection in opened)
+
+    asyncio.run(scenario())
+
+
+def test_deep_result_json_maps_recursion_to_stable_corrupt_result_error(tmp_path: Path) -> None:
+    async def scenario():
+        path = (tmp_path / "deep.db").resolve()
+        store = SQLiteToolExecutionStore(path)
+        request = _request()
+        assert (await store.claim(request)).state is ClaimState.OWNER
+        depth = sys.getrecursionlimit() + 100
+        encoded = "[" * depth + "0" + "]" * depth
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                "UPDATE executions SET state='completed', result_json=?",
+                (encoded,),
+            )
+        with pytest.raises(
+            ToolExecutionStoreError, match="^Corrupt tool execution result$"
+        ) as caught:
+            await store.claim(request)
+        assert caught.value.__cause__ is None
 
     asyncio.run(scenario())

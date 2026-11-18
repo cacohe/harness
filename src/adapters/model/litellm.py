@@ -44,6 +44,7 @@ class LiteLLMModelGateway:
         api_key: str | None = None,
         api_base: str | None = None,
         timeout_seconds: float = 60.0,
+        cleanup_timeout_seconds: float = 5.0,
         stream: bool = False,
         max_response_bytes: int = 1_048_576,
         max_tool_calls: int = 64,
@@ -62,6 +63,14 @@ class LiteLLMModelGateway:
         timeout = float(timeout_seconds)
         if not math.isfinite(timeout) or not 0 < timeout <= 3600:
             raise ValueError("LiteLLM timeout is invalid")
+        if isinstance(cleanup_timeout_seconds, bool) or type(cleanup_timeout_seconds) not in (
+            int,
+            float,
+        ):
+            raise ValueError("LiteLLM cleanup timeout is invalid")
+        cleanup_timeout = float(cleanup_timeout_seconds)
+        if not math.isfinite(cleanup_timeout) or not 0 < cleanup_timeout <= 3600:
+            raise ValueError("LiteLLM cleanup timeout is invalid")
         if type(stream) is not bool:
             raise ValueError("LiteLLM stream mode is invalid")
         if type(max_response_bytes) is not int or not 1 <= max_response_bytes <= 8_388_608:
@@ -90,6 +99,7 @@ class LiteLLMModelGateway:
         self._api_key = api_key
         self._api_base = api_base
         self._timeout = timeout
+        self._cleanup_timeout = cleanup_timeout
         self._stream = stream
         self._max_bytes = max_response_bytes
         self._max_calls = max_tool_calls
@@ -153,6 +163,7 @@ class LiteLLMModelGateway:
         size = 0
         finished = False
         chunks = 0
+        cancellation: asyncio.CancelledError | None = None
         try:
             async for chunk in response:
                 chunks += 1
@@ -225,19 +236,18 @@ class LiteLLMModelGateway:
                         current.arguments += arguments
                 if finish is not None:
                     finished = True
+        except asyncio.CancelledError as error:
+            cancellation = error
+            raise
         finally:
             closer = getattr(response, "aclose", None)
             if callable(closer):
-                cleanup = asyncio.create_task(closer())
-                cancellation: asyncio.CancelledError | None = None
-                while not cleanup.done():
-                    try:
-                        await asyncio.shield(cleanup)
-                    except asyncio.CancelledError as error:
-                        cancellation = error
-                await cleanup
-                if cancellation is not None:
-                    raise cancellation
+                try:
+                    await _bounded_cleanup(closer(), self._cleanup_timeout)
+                except BaseException:
+                    if cancellation is not None:
+                        raise cancellation
+                    raise
         if not finished:
             raise ValueError
         model_calls = tuple(
@@ -323,3 +333,39 @@ def _field(value: object, name: str, default: Any = ...) -> Any:
     if default is ...:
         return getattr(value, name)
     return getattr(value, name, default)
+
+
+class _StreamCleanupError(RuntimeError):
+    pass
+
+
+async def _bounded_cleanup(cleanup: Awaitable[object], timeout: float) -> None:
+    task: asyncio.Future[object] = asyncio.ensure_future(cleanup)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            task.cancel()
+            task.add_done_callback(_consume_task_result)
+            if cancellation is not None:
+                raise cancellation
+            raise _StreamCleanupError("Provider stream cleanup timed out")
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=remaining)
+            if not done:
+                continue
+        except asyncio.CancelledError as error:
+            cancellation = error
+    if cancellation is not None:
+        _consume_task_result(task)
+        raise cancellation
+    await task
+
+
+def _consume_task_result(task: asyncio.Future[object]) -> None:
+    try:
+        task.result()
+    except BaseException:
+        pass

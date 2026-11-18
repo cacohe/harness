@@ -5,6 +5,7 @@ import json
 import math
 import sqlite3
 import time
+from contextlib import closing
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -147,13 +148,16 @@ class SQLiteToolExecutionStore:
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._path, timeout=self._busy_timeout)
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout * 1000)}")
-        return connection
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout * 1000)}")
+            return connection
+        except BaseException:
+            connection.close()
+            raise
 
     def _initialize(self) -> None:
-        connection = self._connect()
-        try:
+        with closing(self._connect()) as connection, connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("BEGIN EXCLUSIVE")
             objects = connection.execute(
@@ -169,12 +173,6 @@ class SQLiteToolExecutionStore:
                 connection.execute(f"PRAGMA user_version = {_VERSION}")
             else:
                 self._validate_schema(connection, version, objects)
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
 
     @staticmethod
     def _validate_schema(
@@ -212,7 +210,7 @@ class SQLiteToolExecutionStore:
         deadline = time.monotonic() + self._busy_timeout
         while True:
             try:
-                with self._connect() as connection:
+                with closing(self._connect()) as connection, connection:
                     connection.execute("BEGIN IMMEDIATE")
                     row = connection.execute(
                         "SELECT binding_key, state, result_json FROM executions "
@@ -245,13 +243,15 @@ class SQLiteToolExecutionStore:
 
     def _read_claim(self, identity: tuple[str, str, str]) -> tuple[object, ...] | None:
         try:
-            with self._connect() as connection:
+            with closing(self._connect()) as connection:
                 return connection.execute(
                     "SELECT binding_key, state, result_json FROM executions "
                     "WHERE session_id=? AND run_id=? AND tool_call_id=?",
                     identity,
                 ).fetchone()
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as error:
+            if _is_busy(error):
+                return None
             raise ToolExecutionStoreError("Tool execution store read failed") from None
 
     async def wait_completed(self, request: ToolRequest) -> ToolResult:
@@ -279,7 +279,7 @@ class SQLiteToolExecutionStore:
 
     def _complete(self, request: ToolRequest, encoded: str) -> None:
         identity = _identity(request)
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT binding_key, state, result_json FROM executions WHERE session_id=? AND run_id=? AND tool_call_id=?",
@@ -303,8 +303,7 @@ class SQLiteToolExecutionStore:
         return await asyncio.to_thread(self._recover_abandoned)
 
     def _recover_abandoned(self) -> int:
-        connection = self._connect()
-        try:
+        with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN EXCLUSIVE")
             rows = connection.execute(
                 "SELECT session_id, run_id, tool_call_id, binding_key FROM executions WHERE state='started' ORDER BY session_id, run_id, tool_call_id"
@@ -314,13 +313,7 @@ class SQLiteToolExecutionStore:
                     "UPDATE executions SET state='completed', result_json=? WHERE session_id=? AND run_id=? AND tool_call_id=? AND state='started'",
                     (_encode_result(_interrupted(binding)), session_id, run_id, call_id),
                 )
-            connection.commit()
             return len(rows)
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
 
 
 def _duration(value: object, label: str) -> float:
@@ -467,7 +460,7 @@ def _decode_result(encoded: str, binding: str) -> ToolResult:
         if _encode_result(result) != encoded:
             raise ValueError
         return result
-    except (KeyError, OverflowError, TypeError, ValueError, json.JSONDecodeError):
+    except (KeyError, OverflowError, RecursionError, TypeError, ValueError, json.JSONDecodeError):
         raise ToolExecutionStoreError("Corrupt tool execution result") from None
 
 

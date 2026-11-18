@@ -141,13 +141,6 @@ def _authorize(request: ToolRequest, entry: ToolCatalogEntry | None) -> ToolResu
     return None
 
 
-def _failed() -> ToolResult:
-    return ToolResult(
-        ToolResultStatus.FAILED,
-        failure=RunFailure(RunErrorCode.TOOL_FAILED),
-    )
-
-
 def _arguments(encoded: str, entry: ToolCatalogEntry) -> dict[str, object]:
     try:
         arguments = json.loads(encoded)

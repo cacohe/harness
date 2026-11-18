@@ -272,3 +272,70 @@ def test_stream_requires_finish_and_closes_provider_iterator() -> None:
             ).complete(request)
         )
     assert closed
+
+
+def test_stream_close_has_a_finite_cleanup_deadline() -> None:
+    close_started = asyncio.Event()
+
+    class Stream(_Stream):
+        async def aclose(self):
+            close_started.set()
+            await asyncio.Event().wait()
+
+    async def completion(**_kwargs):
+        return Stream([{"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}])
+
+    async def scenario():
+        gateway = LiteLLMModelGateway(
+            "p/m",
+            max_output_tokens=128,
+            stream=True,
+            timeout_seconds=1,
+            cleanup_timeout_seconds=0.01,
+            completion=completion,
+        )
+        request = ModelRequest((ModelMessage(ModelRole.USER, "x"),))
+        with pytest.raises(ModelProviderError, match="Model request failed"):
+            await asyncio.wait_for(gateway.complete(request), 0.2)
+        assert close_started.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_stream_cancellation_preserves_cancelled_error_after_bounded_close() -> None:
+    iteration_started = asyncio.Event()
+    close_started = asyncio.Event()
+
+    class Stream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            iteration_started.set()
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            close_started.set()
+            await asyncio.Event().wait()
+
+    async def completion(**_kwargs):
+        return Stream()
+
+    async def scenario():
+        gateway = LiteLLMModelGateway(
+            "p/m",
+            max_output_tokens=128,
+            stream=True,
+            timeout_seconds=1,
+            cleanup_timeout_seconds=0.01,
+            completion=completion,
+        )
+        request = ModelRequest((ModelMessage(ModelRole.USER, "x"),))
+        task = asyncio.create_task(gateway.complete(request))
+        await iteration_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 0.2)
+        assert close_started.is_set()
+
+    asyncio.run(scenario())

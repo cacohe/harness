@@ -50,13 +50,24 @@ class MCPToolGateway(LocalToolGateway):
         self._lifecycle = asyncio.Lock()
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
+        self._pending_adds = 0
+        self._adds_idle = asyncio.Event()
+        self._adds_idle.set()
 
     async def add_server(self, name: str, source: object) -> None:
         _server_name(name)
-        client = self._factory(source)
-        if inspect.isawaitable(client):
-            client = await client
+        async with self._lifecycle:
+            if self._closed:
+                raise ValueError("MCP server cannot be added")
+            self._pending_adds += 1
+            self._adds_idle.clear()
+        client: object | None = None
         try:
+            client = await _invoke(
+                self._factory,
+                source,
+                cancelled_result_cleanup=_close_once,
+            )
             descriptors = await _await_method(client, "list_tools")
             generation = secrets.token_hex(16)
             entries = self._entries(name, generation, client, descriptors)
@@ -67,8 +78,14 @@ class MCPToolGateway(LocalToolGateway):
                 self._publish(replacement)
                 self._servers = replacement
         except BaseException:
-            await _owned_close(client)
+            if client is not None:
+                await _owned_close(client)
             raise
+        finally:
+            async with self._lifecycle:
+                self._pending_adds -= 1
+                if self._pending_adds == 0:
+                    self._adds_idle.set()
 
     async def refresh_server(self, name: str) -> None:
         async with self._lifecycle:
@@ -76,9 +93,11 @@ class MCPToolGateway(LocalToolGateway):
             if state is None or state.closing:
                 raise KeyError("MCP server is unavailable")
             state.closing = True
+            async with state.condition:
+                state.active += 1
         committed = False
         try:
-            await self._wait_idle(state)
+            await self._wait_active(state, 1)
             descriptors = await _await_method(state.client, "list_tools")
             generation = secrets.token_hex(16)
             entries = self._entries(name, generation, state.client, descriptors)
@@ -92,6 +111,9 @@ class MCPToolGateway(LocalToolGateway):
                 self._servers = replacement
                 committed = True
         finally:
+            async with state.condition:
+                state.active -= 1
+                state.condition.notify_all()
             async with self._lifecycle:
                 if not committed and self._servers.get(name) is state:
                     state.closing = False
@@ -99,7 +121,7 @@ class MCPToolGateway(LocalToolGateway):
     async def remove_server(self, name: str) -> None:
         async with self._lifecycle:
             state = self._servers.get(name)
-            if state is None:
+            if state is None or state.closing:
                 raise KeyError("MCP server is unavailable")
             state.closing = True
         committed = False
@@ -134,6 +156,7 @@ class MCPToolGateway(LocalToolGateway):
         await asyncio.shield(task)
 
     async def _close_all(self, states: tuple[_Server, ...]) -> None:
+        await self._adds_idle.wait()
         failure: BaseException | None = None
         for state in states:
             try:
@@ -207,8 +230,11 @@ class MCPToolGateway(LocalToolGateway):
                 state.condition.notify_all()
 
     async def _wait_idle(self, state: _Server) -> None:
+        await self._wait_active(state, 0)
+
+    async def _wait_active(self, state: _Server, expected: int) -> None:
         async with state.condition:
-            await state.condition.wait_for(lambda: state.active == 0)
+            await state.condition.wait_for(lambda: state.active == expected)
 
     async def _shielded_close(self, state: _Server) -> None:
         task = state.close_task
@@ -242,16 +268,56 @@ async def _await_method(target: object, name: str, *args: object) -> object:
     method = getattr(target, name, None)
     if not callable(method):
         raise ValueError("MCP client contract is invalid")
-    result = method(*args)
-    return await result if inspect.isawaitable(result) else result
+    return await _invoke(method, *args)
+
+
+async def _invoke(
+    method: Callable[..., object],
+    *args: object,
+    cancelled_result_cleanup: Callable[[object], object] | None = None,
+) -> object:
+    if inspect.iscoroutinefunction(method):
+        return await method(*args)
+    result, cancellation = await _settle(asyncio.to_thread(method, *args))
+    if inspect.isawaitable(result):
+        result, cancellation = await _settle(result, cancellation)
+    if cancellation is not None:
+        if cancelled_result_cleanup is not None:
+            try:
+                cleanup = cancelled_result_cleanup(result)
+                if inspect.isawaitable(cleanup):
+                    await cleanup
+            except BaseException:
+                pass
+        raise cancellation
+    return result
+
+
+async def _settle(
+    awaitable: object,
+    cancellation: asyncio.CancelledError | None = None,
+) -> tuple[object, asyncio.CancelledError | None]:
+    if not inspect.isawaitable(awaitable):
+        raise TypeError("MCP awaitable contract is invalid")
+    task = asyncio.ensure_future(awaitable)
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+    try:
+        return task.result(), cancellation
+    except BaseException:
+        if cancellation is not None:
+            raise cancellation
+        raise
 
 
 async def _close_once(client: object) -> None:
     closer = getattr(client, "aclose", None) or getattr(client, "close", None)
     if callable(closer):
-        result = closer()
-        if inspect.isawaitable(result):
-            await result
+        await _invoke(closer)
 
 
 async def _owned_close(client: object) -> None:

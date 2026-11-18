@@ -85,6 +85,29 @@ def test_retirement_index_rewrites_cannot_hide_allocation_damage(tmp_path: Path,
         assert database_dump(journal.path) == before
 
 
+def test_retirement_artifact_id_replace_cannot_hide_middle_gap(tmp_path: Path):
+    journal = SQLiteRunJournal((tmp_path / "artifact-id-replace.sqlite3").resolve())
+    for seed in "abc":
+        asyncio.run(journal.reserve_artifact_retirement(artifact_ref(seed).artifact_id))
+    with closing(sqlite3.connect(journal.path)) as connection, connection:
+        connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
+        assert connection.execute("PRAGMA recursive_triggers").fetchone() == (0,)
+        connection.execute(
+            "UPDATE OR REPLACE artifact_retirements "
+            "SET artifact_id=(SELECT artifact_id FROM artifact_retirements WHERE artifact_index=1) "
+            "WHERE artifact_index=2"
+        )
+        assert connection.execute(
+            "SELECT artifact_index FROM artifact_retirements ORDER BY artifact_index"
+        ).fetchall() == [(0,), (2,)]
+    before = database_dump(journal.path)
+    for candidate in (journal, SQLiteRunJournal(journal.path)):
+        with pytest.raises(JournalError) as caught:
+            asyncio.run(candidate.reserve_artifact_retirement(artifact_ref("d").artifact_id))
+        assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+        assert database_dump(journal.path) == before
+
+
 def test_retirement_allocation_damage_cannot_be_cleared_with_write_capability(tmp_path: Path):
     journal = SQLiteRunJournal((tmp_path / "permanent.sqlite3").resolve())
     asyncio.run(journal.reserve_artifact_retirement(artifact_ref("a").artifact_id))

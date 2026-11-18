@@ -389,6 +389,11 @@ WHEN NEW.artifact_index != OLD.artifact_index BEGIN
   INSERT INTO artifact_retirement_allocation_damage
   SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM artifact_retirement_allocation_damage WHERE singleton=1);
 END;
+CREATE TRIGGER artifact_retirements_id_damage AFTER UPDATE OF artifact_id ON artifact_retirements
+WHEN NEW.artifact_id != OLD.artifact_id BEGIN
+  INSERT INTO artifact_retirement_allocation_damage
+  SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM artifact_retirement_allocation_damage WHERE singleton=1);
+END;
 CREATE TRIGGER artifact_retirements_replace_damage BEFORE INSERT ON artifact_retirements
 WHEN EXISTS (
   SELECT 1 FROM artifact_retirements
