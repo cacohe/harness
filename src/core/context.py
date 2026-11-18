@@ -118,6 +118,7 @@ class ConversationPage:
 
     interactions: tuple[ConversationInteraction, ...]
     next_before_sequence: int | None
+    remaining_omission: OmittedContextRef | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -132,6 +133,15 @@ class ConversationPage:
             )
         ):
             raise ValueError("Conversation page is invalid")
+        remaining = self.remaining_omission
+        if remaining is not None and (
+            type(remaining) is not OmittedContextRef
+            or remaining.source != "transcript"
+            or self.next_before_sequence is None
+            or not self.interactions
+            or remaining.last_sequence >= self.interactions[-1].sequence_from
+        ):
+            raise ValueError("Conversation page remaining omission is invalid")
         snapshot = tuple(
             ConversationInteraction(item.sequence_from, item.sequence_through, item.messages)
             for item in self.interactions
@@ -142,6 +152,17 @@ class ConversationPage:
         ):
             raise ValueError("Conversation page must be non-overlapping and newest first")
         object.__setattr__(self, "interactions", snapshot)
+        if remaining is not None:
+            object.__setattr__(
+                self,
+                "remaining_omission",
+                OmittedContextRef(
+                    remaining.source,
+                    remaining.first_sequence,
+                    remaining.last_sequence,
+                    remaining.item_count,
+                ),
+            )
 
 
 def _policy(value: str) -> str:

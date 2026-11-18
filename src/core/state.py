@@ -237,7 +237,7 @@ def _advance_running(
                 final_artifacts=command.artifacts,
             ), (
                 DomainEventType.RUN_COMPLETED,
-                {},
+                {"artifact_ids": [ref.artifact_id for ref in command.artifacts]},
             )
         case StartStep():
             _check_child_id(command.step_id)

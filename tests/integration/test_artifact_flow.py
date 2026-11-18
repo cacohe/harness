@@ -101,10 +101,13 @@ class ArtifactModel:
     def __init__(self) -> None:
         self.requests = []
         self.artifact_id: str | None = None
+        self.final_body = "final-" + "z" * 8_192
 
     async def complete(self, request):
         self.requests.append(request)
         payload = json.loads(request.messages[-1].content)
+        if payload["message"] == "after-final":
+            return ModelResponse("follow-up")
         round_number = payload["round"]
         if round_number == 0:
             return ModelResponse(tool_calls=(ModelToolCall("produce-call", "produce", "{}"),))
@@ -127,7 +130,7 @@ class ArtifactModel:
             )
         assert '"returned_bytes":32' in history
         assert '"truncated":true' in history
-        return ModelResponse("final-" + "z" * 8_192)
+        return ModelResponse(self.final_body)
 
 
 def test_large_tool_result_is_referenced_read_in_bounded_slice_and_never_journaled(tmp_path):
@@ -201,14 +204,21 @@ def test_large_tool_result_is_referenced_read_in_bounded_slice_and_never_journal
         )
         session = await agent.open_session(SessionId("artifact-session"))
         result = await session.submit("artifact-flow", SubmissionId("artifact-submission"))
+        follow_up = await session.submit("after-final", SubmissionId("after-final"))
         snapshot = await journal.load_session(SessionId("artifact-session"))
         assert model.artifact_id is not None
         source_ref = await repository.stat(model.artifact_id)
+        final_bytes = bytearray()
+        async for chunk in repository.open(result.final_artifacts[0].artifact_id):
+            final_bytes.extend(chunk)
         await agent.close()
-        return root, large_body, model, result, snapshot, source_ref
+        return root, large_body, model, result, follow_up, snapshot, source_ref, bytes(final_bytes)
 
-    root, large_body, model, result, snapshot, source_ref = asyncio.run(scenario())
+    root, large_body, model, result, follow_up, snapshot, source_ref, final_bytes = asyncio.run(
+        scenario()
+    )
     assert result.status is RunStatus.COMPLETED
+    assert follow_up.status is RunStatus.COMPLETED
     assert source_ref is not None
     assert result.final_artifacts
     assert all(len(request.messages) < 16 for request in model.requests)
@@ -216,7 +226,20 @@ def test_large_tool_result_is_referenced_read_in_bounded_slice_and_never_journal
     assert source_ref.artifact_id in second_wire
     assert large_body not in second_wire
     journal_wire = encode(snapshot)
+    run_wire = encode(result)
+    transcript_wire = encode(snapshot.transcript)
+    events_wire = encode(snapshot.events)
     assert source_ref.artifact_id in journal_wire
     assert large_body not in journal_wire
+    assert model.final_body.encode("utf-8") == final_bytes
+    assert model.final_body not in run_wire
+    assert model.final_body not in transcript_wire
+    assert model.final_body not in events_wire
+    assert model.final_body not in journal_wire
+    assert model.final_body not in "\n".join(
+        message.content or "" for message in model.requests[-1].messages
+    )
+    assert len(result.final_text.encode("utf-8")) <= 512
+    assert result.final_artifacts[0].artifact_id in journal_wire
     assert str(root) not in journal_wire
     assert all(ref.artifact_id != source_ref.artifact_id for ref in result.final_artifacts)

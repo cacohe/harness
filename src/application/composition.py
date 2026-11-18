@@ -14,6 +14,7 @@ from src.adapters.artifacts.externalizer import (
 )
 from src.adapters.artifacts.filesystem import FilesystemArtifactRepository
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
+from src.adapters.persistence.bounded import BoundedRunJournal
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.application.agent_v3 import Agent
@@ -46,6 +47,7 @@ class ApplicationConfig:
     max_artifact_bytes: int = 64 * 1_048_576
     max_inline_artifact_bytes: int = 65_536
     max_artifact_summary_bytes: int = 16_384
+    max_serialized_run_state_bytes: int = 16 * 1_048_576
     sqlite_path: Path | None = None
     artifact_root: Path | None = None
     observer_timeout_seconds: float = 0.1
@@ -58,6 +60,7 @@ class ApplicationConfig:
             object.__getattribute__(self, "max_artifact_bytes"),
             object.__getattribute__(self, "max_inline_artifact_bytes"),
             object.__getattribute__(self, "max_artifact_summary_bytes"),
+            object.__getattribute__(self, "max_serialized_run_state_bytes"),
         )
         limits = _snapshot_limits(object.__getattribute__(self, "limits"))
         context_budget = _snapshot_context_budget(object.__getattribute__(self, "context_budget"))
@@ -70,6 +73,7 @@ class ApplicationConfig:
             or not 1 <= integers[3] <= (1 << 63) - 1
             or not 0 <= integers[4] <= integers[3]
             or not 1 <= integers[5] <= 1_048_576
+            or not 1_024 <= integers[6] <= 16 * 1_048_576
             or isinstance(observer_timeout, bool)
             or type(observer_timeout) not in (int, float)
             or not math.isfinite(observer_timeout)
@@ -241,7 +245,8 @@ def _compose(
     owned_resources: tuple[object, ...],
     observer: PostCommitObserver | None,
 ) -> Agent:
-    submissions = SubmissionService(journal, ids, clock, config.limits)
+    bounded_journal = BoundedRunJournal(journal, config.max_serialized_run_state_bytes)
+    submissions = SubmissionService(bounded_journal, ids, clock, config.limits)
 
     def coordinator_factory(state: RunState, user_input: str) -> RunCoordinator:
         request = context_request_factory(state, user_input)
@@ -252,7 +257,7 @@ def _compose(
             model=model,
             tools=tools,
             artifacts=artifacts,
-            journal=journal,
+            journal=bounded_journal,
             clock=clock,
             ids=ids,
             context_request=request,
@@ -261,7 +266,7 @@ def _compose(
 
     runtime = RuntimeCoordinator(
         submissions=submissions,
-        journal=journal,
+        journal=bounded_journal,
         coordinator_factory=coordinator_factory,
         ids=ids,
         clock=clock,
@@ -370,6 +375,9 @@ def _snapshot_application_config(value: object) -> ApplicationConfig:
             max_artifact_bytes=object.__getattribute__(value, "max_artifact_bytes"),
             max_inline_artifact_bytes=object.__getattribute__(value, "max_inline_artifact_bytes"),
             max_artifact_summary_bytes=object.__getattribute__(value, "max_artifact_summary_bytes"),
+            max_serialized_run_state_bytes=object.__getattribute__(
+                value, "max_serialized_run_state_bytes"
+            ),
             sqlite_path=object.__getattribute__(value, "sqlite_path"),
             artifact_root=object.__getattribute__(value, "artifact_root"),
             observer_timeout_seconds=object.__getattribute__(value, "observer_timeout_seconds"),

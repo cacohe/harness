@@ -1,0 +1,54 @@
+from __future__ import annotations
+
+from src.adapters.persistence.sqlite_codec import encode
+from src.core.errors import RunErrorCode
+from src.core.ids import RunId, SessionId, SubmissionId
+from src.core.journal import (
+    JournalCommit,
+    JournalError,
+    JournalHead,
+    JournalSnapshot,
+    RunJournal,
+    SubmissionAcceptance,
+    TranscriptEntry,
+)
+
+
+class BoundedRunJournal:
+    """Reject a RunState whose canonical durable projection exceeds its envelope."""
+
+    def __init__(self, delegate: RunJournal, max_state_bytes: int) -> None:
+        if type(max_state_bytes) is not int or not 1_024 <= max_state_bytes <= 16 * 1_048_576:
+            raise ValueError("Serialized RunState envelope is invalid")
+        self._delegate = delegate
+        self.max_state_bytes = max_state_bytes
+
+    async def commit(self, batch: JournalCommit, expected_version: int) -> JournalSnapshot:
+        if type(batch) is not JournalCommit:
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        try:
+            size = len(encode(batch.state).encode("utf-8"))
+        except (AttributeError, MemoryError, RecursionError, TypeError, ValueError):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        if size > self.max_state_bytes:
+            raise JournalError(RunErrorCode.LIMIT_EXCEEDED)
+        return await self._delegate.commit(batch, expected_version)
+
+    async def load_head(self, session_id: SessionId) -> JournalHead:
+        return await self._delegate.load_head(session_id)
+
+    async def load_session(self, session_id: SessionId, after_sequence: int = 0) -> JournalSnapshot:
+        return await self._delegate.load_session(session_id, after_sequence)
+
+    async def find_submission(
+        self, session_id: SessionId, submission_id: SubmissionId
+    ) -> SubmissionAcceptance | None:
+        return await self._delegate.find_submission(session_id, submission_id)
+
+    async def find_run_input(
+        self,
+        session_id: SessionId,
+        run_id: RunId,
+        submission_id: SubmissionId,
+    ) -> TranscriptEntry | None:
+        return await self._delegate.find_run_input(session_id, run_id, submission_id)

@@ -127,6 +127,27 @@ class BoundedContextProvider:
                     current_omission.include(item)
                 if compaction_open and len(compaction) < self._max_compaction_interactions:
                     compaction.append(item)
+            remaining = page.remaining_omission
+            if (
+                durable is None
+                and not suffix_open
+                and len(compaction) >= self._max_compaction_interactions
+                and remaining is not None
+            ):
+                if current_omission is None:
+                    omission_segments.append(
+                        _Omission(
+                            remaining.first_sequence,
+                            remaining.last_sequence,
+                            remaining.item_count,
+                        )
+                    )
+                else:
+                    current_omission.first = min(current_omission.first, remaining.first_sequence)
+                    current_omission.last = max(current_omission.last, remaining.last_sequence)
+                    current_omission.count += remaining.item_count
+                cursor = None
+                break
             cursor = page.next_before_sequence
             if cursor is None:
                 break
