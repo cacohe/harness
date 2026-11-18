@@ -1,12 +1,15 @@
 import asyncio
 import os
+import threading
 from pathlib import Path
 
 import pytest
 from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactExternalizer
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.tools import InMemoryToolExecutionStore, ToolCatalog
+from src.adapters.tools.catalog import ToolCatalogEntry
 from src.adapters.tools.docker import DockerInvocation, DockerToolGateway, _drain
+from src.core.tools import ToolSpec
 
 
 def test_invocation_rejects_nul() -> None:
@@ -32,6 +35,26 @@ def _gateway(tmp_path: Path) -> DockerToolGateway:
         docker_executable=Path(os.environ["COMSPEC"]),
         image="example.invalid/tool@sha256:" + "a" * 64,
         workspace_root=tmp_path.resolve(),
+    )
+
+
+def _configured_gateway(
+    tmp_path: Path,
+    catalog: ToolCatalog,
+    *,
+    builder_timeout_seconds: float = 0.02,
+) -> DockerToolGateway:
+    return DockerToolGateway(
+        catalog,
+        InMemoryToolExecutionStore(),
+        PolicyArtifactExternalizer(
+            InMemoryArtifactRepository(1024),
+            ArtifactPolicy(512, 1024, 128, frozenset({"application/json"})),
+        ),
+        docker_executable=Path(os.environ["COMSPEC"]),
+        image="example.invalid/tool@sha256:" + "a" * 64,
+        workspace_root=tmp_path.resolve(),
+        builder_timeout_seconds=builder_timeout_seconds,
     )
 
 
@@ -129,6 +152,74 @@ def test_rejects_noncanonical_docker_hosts(tmp_path: Path, host: str) -> None:
             workspace_root=tmp_path.resolve(),
             docker_host=host,
         )
+
+
+def test_sync_mutating_invocation_builder_is_rejected(tmp_path: Path) -> None:
+    def builder(_arguments):
+        return DockerInvocation("echo unsafe")
+
+    catalog = ToolCatalog(
+        (ToolCatalogEntry(ToolSpec("docker", "docker", "true"), builder, True),)
+    )
+    with pytest.raises(ValueError, match="Mutating Docker tools"):
+        _configured_gateway(tmp_path, catalog)
+
+
+def test_sync_nonmutating_builder_timeout_does_not_block_event_loop(tmp_path: Path) -> None:
+    release = threading.Event()
+
+    def builder(_arguments):
+        release.wait()
+        return DockerInvocation("echo late")
+
+    gateway = _configured_gateway(
+        tmp_path,
+        ToolCatalog(
+            (ToolCatalogEntry(ToolSpec("docker", "docker", "true"), builder, False),)
+        ),
+        builder_timeout_seconds=0.01,
+    )
+
+    async def scenario():
+        try:
+            with pytest.raises(TimeoutError):
+                await gateway._build_invocation(builder, {})
+        finally:
+            release.set()
+
+    asyncio.run(scenario())
+
+
+def test_async_builder_timeout_and_caller_cancellation_are_bounded(tmp_path: Path) -> None:
+    cancelled = asyncio.Event()
+
+    async def builder(_arguments):
+        try:
+            await asyncio.sleep(10)
+        finally:
+            cancelled.set()
+
+    gateway = _configured_gateway(
+        tmp_path,
+        ToolCatalog(
+            (ToolCatalogEntry(ToolSpec("docker", "docker", "true"), builder, True),)
+        ),
+        builder_timeout_seconds=0.01,
+    )
+
+    async def scenario():
+        with pytest.raises(TimeoutError):
+            await gateway._build_invocation(builder, {})
+        assert cancelled.is_set()
+        cancelled.clear()
+        task = asyncio.create_task(gateway._build_invocation(builder, {}))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cancelled.is_set()
+
+    asyncio.run(scenario())
 
 
 def test_remove_failure_reader_failure_and_path_redaction(tmp_path: Path) -> None:

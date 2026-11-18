@@ -83,6 +83,7 @@ def test_live_approval_tightening_prevents_claim_and_effect(tmp_path: Path) -> N
         gateway = LocalToolGateway(ToolCatalog((ToolCatalogEntry(spec, handler, True),)), store, _externalizer())
         result = await gateway.execute(_request())
         assert result.status.value == "pending_approval"
+        assert result.execution_key == _request().idempotency_key
 
     asyncio.run(scenario())
     assert effects == 0
@@ -220,6 +221,7 @@ def test_stale_workspace_binding_is_denied_before_claim(tmp_path: Path) -> None:
         )
         result = await gateway.execute(request)
         assert result.status.value == "denied"
+        assert result.execution_key == request.idempotency_key
         with sqlite3.connect(path) as connection:
             assert connection.execute("SELECT count(*) FROM executions").fetchone() == (0,)
 

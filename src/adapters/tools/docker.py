@@ -48,6 +48,7 @@ class DockerToolGateway(LocalToolGateway):
         workspace_root: Path,
         docker_host: str | None = None,
         timeout_seconds: float = 60.0,
+        builder_timeout_seconds: float = 5.0,
         cleanup_timeout_seconds: float = 10.0,
         max_output_bytes: int = 1_048_576,
         memory_bytes: int = 536_870_912,
@@ -57,6 +58,11 @@ class DockerToolGateway(LocalToolGateway):
         user: str = "65534:65534",
     ) -> None:
         super().__init__(catalog, store, externalizer, timeout_seconds=timeout_seconds)
+        if any(
+            entry.mutating and not asyncio.iscoroutinefunction(entry.handler)
+            for entry in catalog.entries
+        ):
+            raise ValueError("Mutating Docker tools require async invocation builders")
         if type(docker_executable) is not type(Path()) or not docker_executable.is_absolute():
             raise ValueError("Docker CLI must be an explicit absolute path")
         resolved_cli = docker_executable.resolve(strict=True)
@@ -86,6 +92,9 @@ class DockerToolGateway(LocalToolGateway):
         self._root = root
         self._host = host
         self._cleanup_timeout = _duration(cleanup_timeout_seconds, "Docker cleanup timeout")
+        self._builder_timeout = _duration(
+            builder_timeout_seconds, "Docker builder timeout"
+        )
         self._output_limit = max_output_bytes
         self._memory = memory_bytes
         self._pids = pids_limit
@@ -100,11 +109,7 @@ class DockerToolGateway(LocalToolGateway):
         arguments: dict[str, object],
     ) -> ToolResult:
         try:
-            candidate = handler(arguments)
-            if asyncio.iscoroutine(candidate):
-                candidate = await candidate
-            if type(candidate) is not DockerInvocation:
-                raise ValueError
+            candidate = await self._build_invocation(handler, arguments)
             output = await self._run(candidate)
             content = await self._externalizer.externalize(output, "application/json")
             return ToolResult(
@@ -120,6 +125,23 @@ class DockerToolGateway(LocalToolGateway):
             raise
         except Exception:
             return ToolResult(ToolResultStatus.FAILED, failure=RunFailure(RunErrorCode.TOOL_FAILED), execution_key=request.idempotency_key)
+
+    async def _build_invocation(
+        self,
+        handler: Callable[[dict[str, object]], object | Awaitable[object]],
+        arguments: dict[str, object],
+    ) -> DockerInvocation:
+        if asyncio.iscoroutinefunction(handler):
+            candidate = await asyncio.wait_for(
+                handler(arguments), timeout=self._builder_timeout
+            )
+        else:
+            candidate = await asyncio.wait_for(
+                asyncio.to_thread(handler, arguments), timeout=self._builder_timeout
+            )
+        if type(candidate) is not DockerInvocation:
+            raise ValueError("Docker invocation builder returned an invalid value")
+        return candidate
 
     async def _run(self, invocation: DockerInvocation) -> dict[str, JsonValue]:
         name = f"harness-{secrets.token_hex(16)}"

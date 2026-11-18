@@ -798,11 +798,12 @@ def test_checkpoint_is_attached_only_to_the_single_successful_commit():
     [
         (ToolResultStatus.FAILED, RunErrorCode.TOOL_FAILED),
         (ToolResultStatus.TIMED_OUT, RunErrorCode.TOOL_TIMED_OUT),
+        (ToolResultStatus.DENIED, None),
     ],
 )
 def test_tool_failures_use_stable_classification(status, code):
     response = ModelResponse(tool_calls=(ModelToolCall("call", "read", "{}"),))
-    result = ToolResult(status, failure=RunFailure(code))
+    result = ToolResult(status, failure=RunFailure(code) if code is not None else None)
     coordinator_, _, _, _, _ = coordinator(
         responses=[response], specs=(ToolSpec("read", "read", "{}"),), tool_results=[result]
     )

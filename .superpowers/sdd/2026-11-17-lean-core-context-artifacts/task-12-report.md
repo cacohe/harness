@@ -213,3 +213,58 @@ python -m pytest -q -p no:cacheprovider tests
 
 The 58 failures remain exactly the four approved legacy groups (54 + 2 + 1 + 1); fix round 1 adds
 no non-legacy regression.
+
+## Fix round 2/5 — contention, result identity, and builder bounds
+
+Baseline: `1aab5b9`. Three Important findings were addressed; the deferred Minor findings and
+legacy compatibility surface were not changed.
+
+### RED and GREEN evidence
+
+- **SQLite claim contention.** RED: every `claim()` used `BEGIN IMMEDIATE`, so an already-owned
+  WAIT lookup competed for a write lock, and first-claim contention could leak raw
+  `sqlite3.OperationalError`. The attack suite holds an external reserved writer lock while twelve
+  callers observe one live owner, and runs twenty rounds of eight independent first claimants at a
+  10ms SQLite busy timeout. The first pressure run exposed the bounded-contention branch as
+  `ToolExecutionStoreError("Tool execution store is busy")` (`1 failed, 9 passed in 21.86s`) rather
+  than a raw SQLite exception; the retry assertion was then made explicit. GREEN: existing claims
+  are read through a plain SELECT connection, absent claims alone enter `BEGIN IMMEDIATE`, SQLite
+  busy/locked extended codes are recognized, non-busy failures are mapped, and a contender performs
+  a final durable read before returning the stable busy error. A retry after that stable transient
+  must converge to exactly one OWNER and seven WAIT claims in every round.
+- **Pre-execution result identity.** RED: approval denial/pending and stale binding paths constructed
+  `ToolResult` without the required execution key, which Core rejects before it can consume the
+  stable denial. GREEN: every Local pre-execution `DENIED`/`PENDING_APPROVAL` result carries
+  `request.idempotency_key`. Local assertions cover pending approval and stale workspace denial;
+  the coordinator classification suite consumes an exact keyed `DENIED` result without a failure
+  payload.
+- **Docker invocation builder boundary.** RED: the adapter subclass bypassed Local's exact-type
+  mutating sync-handler guard, and evaluated invocation builders before any timeout/cancellation
+  boundary. GREEN: Docker construction rejects synchronous mutating builders. Async builders are
+  awaited under the configured finite `builder_timeout_seconds` and are canceled on timeout or
+  caller cancellation. Only non-mutating synchronous builders may use `asyncio.to_thread`; their
+  timeout cannot block the event loop and their contract forbids side effects. Tests cover all three
+  cases. Existing Docker process and cleanup bounds remain unchanged.
+
+### Fix-round verification
+
+```text
+python -m pytest -q -p no:cacheprovider \
+  tests/unit/adapters/tools/test_execution_store.py \
+  tests/unit/adapters/tools/test_local.py \
+  tests/unit/adapters/tools/test_docker.py \
+  tests/unit/core/test_run_coordinator.py
+73 passed in 32.52s
+
+ruff check --no-cache src <changed Task 12 tests>
+All checks passed!
+
+mypy --cache-dir F:/CodeSpace/.tmp/mypy-task12-fix2 src
+Success: no issues found in 117 source files
+
+python -m pytest -q -p no:cacheprovider tests <four legacy excludes>
+1763 passed, 7 skipped in 475.00s
+```
+
+The non-legacy run excludes only the same four Task 14 legacy files documented above. No raw
+SQLite lock failure, missing execution key, unbounded builder wait, or unrelated regression remains.

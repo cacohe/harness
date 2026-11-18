@@ -16,9 +16,9 @@ from src.core.ids import RunId, SessionId
 from src.core.tools import ToolApproval, ToolRequest, ToolResult, ToolResultStatus
 
 
-def _request(arguments: str = "{}") -> ToolRequest:
+def _request(arguments: str = "{}", *, call_id: str = "call") -> ToolRequest:
     call = ToolCallRequest(
-        "call", "tool", arguments,
+        call_id, "tool", arguments,
         requires_approval=False, approval_scope="execute", workspace_id="default",
     )
     return ToolRequest.from_call(
@@ -43,6 +43,54 @@ def test_completed_result_survives_reopen(tmp_path: Path) -> None:
         await first.complete(request, _result(request))
         reopened = SQLiteToolExecutionStore(path)
         assert (await reopened.claim(request)).result == _result(request)
+
+    asyncio.run(scenario())
+
+
+def test_wait_claim_is_read_only_under_reserved_writer_lock(tmp_path: Path) -> None:
+    async def scenario():
+        path = (tmp_path / "store.db").resolve()
+        store = SQLiteToolExecutionStore(
+            path, sqlite_busy_timeout_seconds=0.001, poll_interval_seconds=0.001
+        )
+        request = _request()
+        assert (await store.claim(request)).state is ClaimState.OWNER
+        lock = sqlite3.connect(path, timeout=0.001)
+        try:
+            lock.execute("BEGIN IMMEDIATE")
+            claims = await asyncio.gather(*(store.claim(request) for _ in range(12)))
+            assert all(claim.state is ClaimState.WAIT for claim in claims)
+        finally:
+            lock.rollback()
+            lock.close()
+
+    asyncio.run(scenario())
+
+
+def test_first_claim_write_race_is_stable_across_many_rounds(tmp_path: Path) -> None:
+    async def scenario():
+        path = (tmp_path / "store.db").resolve()
+        stores = [
+            SQLiteToolExecutionStore(
+                path, sqlite_busy_timeout_seconds=0.01, poll_interval_seconds=0.001
+            )
+            for _ in range(8)
+        ]
+        for index in range(20):
+            request = _request(call_id=f"call-{index}")
+            outcomes = await asyncio.gather(
+                *(store.claim(request) for store in stores), return_exceptions=True
+            )
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException):
+                    assert type(outcome) is ToolExecutionStoreError
+                    assert str(outcome) == "Tool execution store is busy"
+            claims = [outcome for outcome in outcomes if not isinstance(outcome, BaseException)]
+            for store, outcome in zip(stores, outcomes, strict=True):
+                if isinstance(outcome, BaseException):
+                    claims.append(await store.claim(request))
+            assert sum(claim.state is ClaimState.OWNER for claim in claims) == 1
+            assert sum(claim.state is ClaimState.WAIT for claim in claims) == 7
 
     asyncio.run(scenario())
 

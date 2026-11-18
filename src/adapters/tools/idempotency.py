@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -121,13 +122,13 @@ class SQLiteToolExecutionStore:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._path, timeout=self._busy_timeout)
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
         connection.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout * 1000)}")
         return connection
 
     def _initialize(self) -> None:
         connection = self._connect()
         try:
+            connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("BEGIN EXCLUSIVE")
             objects = connection.execute("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name").fetchall()
             version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -165,20 +166,53 @@ class SQLiteToolExecutionStore:
 
     def _claim(self, request: ToolRequest) -> ExecutionClaim:
         identity = _identity(request)
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute("SELECT binding_key, state, result_json FROM executions WHERE session_id=? AND run_id=? AND tool_call_id=?", identity).fetchone()
-            if row is None:
-                connection.execute("INSERT INTO executions VALUES (?, ?, ?, ?, 'started', NULL)", (*identity, request.idempotency_key))
-                return ExecutionClaim(ClaimState.OWNER)
-            binding, state, encoded = row
-            if binding != request.idempotency_key:
-                raise ToolBindingConflict("Tool call identity is already bound")
-            if state == "started" and encoded is None:
-                return ExecutionClaim(ClaimState.WAIT)
-            if state != "completed" or type(encoded) is not str:
-                raise ToolExecutionStoreError("Corrupt tool execution record")
-            return ExecutionClaim(ClaimState.COMPLETED, _decode_result(encoded, binding))
+        row = self._read_claim(identity)
+        if row is not None:
+            return _claim_from_row(row, request.idempotency_key)
+        deadline = time.monotonic() + self._busy_timeout
+        while True:
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    row = connection.execute(
+                        "SELECT binding_key, state, result_json FROM executions "
+                        "WHERE session_id=? AND run_id=? AND tool_call_id=?",
+                        identity,
+                    ).fetchone()
+                    if row is not None:
+                        return _claim_from_row(row, request.idempotency_key)
+                    connection.execute(
+                        "INSERT INTO executions VALUES (?, ?, ?, ?, 'started', NULL)",
+                        (*identity, request.idempotency_key),
+                    )
+                    return ExecutionClaim(ClaimState.OWNER)
+            except sqlite3.IntegrityError:
+                row = self._read_claim(identity)
+                if row is not None:
+                    return _claim_from_row(row, request.idempotency_key)
+            except sqlite3.OperationalError as error:
+                if not _is_busy(error):
+                    raise ToolExecutionStoreError("Tool execution store operation failed") from None
+            if time.monotonic() >= deadline:
+                # A competing first claimant may have committed at the busy
+                # deadline.  Observe that durable winner before surfacing the
+                # stable store-busy error.
+                row = self._read_claim(identity)
+                if row is not None:
+                    return _claim_from_row(row, request.idempotency_key)
+                raise ToolExecutionStoreError("Tool execution store is busy") from None
+            time.sleep(min(self._poll_interval, max(0.0, deadline - time.monotonic())))
+
+    def _read_claim(self, identity: tuple[str, str, str]) -> tuple[object, ...] | None:
+        try:
+            with self._connect() as connection:
+                return connection.execute(
+                    "SELECT binding_key, state, result_json FROM executions "
+                    "WHERE session_id=? AND run_id=? AND tool_call_id=?",
+                    identity,
+                ).fetchone()
+        except sqlite3.OperationalError:
+            raise ToolExecutionStoreError("Tool execution store read failed") from None
 
     async def wait_completed(self, request: ToolRequest) -> ToolResult:
         loop = asyncio.get_running_loop()
@@ -245,6 +279,27 @@ def _duration(value: object, label: str) -> float:
 
 def _normalize_sql(value: str | None) -> str:
     return "" if type(value) is not str else " ".join(value.replace("\n", " ").split()).strip().lower()
+
+
+def _is_busy(error: sqlite3.OperationalError) -> bool:
+    code = getattr(error, "sqlite_errorcode", None)
+    return type(code) is int and code & 0xFF in {
+        sqlite3.SQLITE_BUSY,
+        sqlite3.SQLITE_LOCKED,
+    }
+
+
+def _claim_from_row(row: tuple[object, ...], binding_key: str) -> ExecutionClaim:
+    if len(row) != 3:
+        raise ToolExecutionStoreError("Corrupt tool execution record")
+    binding, state, encoded = row
+    if binding != binding_key:
+        raise ToolBindingConflict("Tool call identity is already bound")
+    if state == "started" and encoded is None:
+        return ExecutionClaim(ClaimState.WAIT)
+    if state != "completed" or type(encoded) is not str:
+        raise ToolExecutionStoreError("Corrupt tool execution record")
+    return ExecutionClaim(ClaimState.COMPLETED, _decode_result(encoded, binding_key))
 
 
 def _identity(request: ToolRequest) -> tuple[str, str, str]:

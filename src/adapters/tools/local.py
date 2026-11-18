@@ -125,21 +125,29 @@ class LocalToolGateway:
 
 def _authorize(request: ToolRequest, entry: ToolCatalogEntry | None) -> ToolResult | None:
     if request.approval is ToolApproval.DENIED:
-        return ToolResult(ToolResultStatus.DENIED)
+        return ToolResult(
+            ToolResultStatus.DENIED, execution_key=request.idempotency_key
+        )
     if request.approval is ToolApproval.UNDECIDED:
-        return ToolResult(ToolResultStatus.PENDING_APPROVAL)
+        return ToolResult(
+            ToolResultStatus.PENDING_APPROVAL, execution_key=request.idempotency_key
+        )
     if entry is None:
-        return ToolResult(ToolResultStatus.DENIED)
+        return ToolResult(ToolResultStatus.DENIED, execution_key=request.idempotency_key)
     spec = entry.spec
     if spec.name != request.name or spec.approval_scope != request.approval_scope:
-        return ToolResult(ToolResultStatus.DENIED)
+        return ToolResult(ToolResultStatus.DENIED, execution_key=request.idempotency_key)
     if spec.workspace_id != request.workspace_id:
-        return ToolResult(ToolResultStatus.DENIED)
+        return ToolResult(ToolResultStatus.DENIED, execution_key=request.idempotency_key)
     # A live policy may tighten, but it can never remove the persisted gate.
     if spec.requires_approval and request.approval is not ToolApproval.APPROVED:
-        return ToolResult(ToolResultStatus.PENDING_APPROVAL)
+        return ToolResult(
+            ToolResultStatus.PENDING_APPROVAL, execution_key=request.idempotency_key
+        )
     if request.approval_required and request.approval is not ToolApproval.APPROVED:
-        return ToolResult(ToolResultStatus.PENDING_APPROVAL)
+        return ToolResult(
+            ToolResultStatus.PENDING_APPROVAL, execution_key=request.idempotency_key
+        )
     return None
 
 
