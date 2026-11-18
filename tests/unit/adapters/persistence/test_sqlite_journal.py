@@ -1008,6 +1008,7 @@ def test_schema_is_exact_v6_and_has_required_indexes(tmp_path: Path) -> None:
             "artifact_retirement_facts",
             "artifact_retirement_nodes",
             "artifact_retirement_meta",
+            "artifact_retirement_allocation_damage",
         }
         indexes = {
             row[0]

@@ -26,6 +26,193 @@ def database_dump(path: Path) -> tuple[str, ...]:
         return tuple(connection.iterdump())
 
 
+@pytest.mark.parametrize("missing", ((1,), (0, 2), (1, 2)))
+def test_new_retirement_rejects_missing_current_rows(tmp_path: Path, missing: tuple[int, ...]):
+    journal = SQLiteRunJournal((tmp_path / "occupancy.sqlite3").resolve())
+    for seed in "abcd":
+        asyncio.run(journal.reserve_artifact_retirement(artifact_ref(seed).artifact_id))
+    with closing(sqlite3.connect(journal.path)) as connection, connection:
+        connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
+        connection.executemany(
+            "DELETE FROM artifact_retirements WHERE artifact_index=?", [(i,) for i in missing]
+        )
+    before = database_dump(journal.path)
+    for candidate in (journal, SQLiteRunJournal(journal.path)):
+        with pytest.raises(JournalError) as caught:
+            asyncio.run(candidate.reserve_artifact_retirement(artifact_ref("e").artifact_id))
+        assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+        assert database_dump(journal.path) == before
+
+
+@pytest.mark.parametrize("operation", ("update", "replace", "upsert"))
+def test_retirement_index_rewrites_cannot_hide_allocation_damage(tmp_path: Path, operation: str):
+    journal = SQLiteRunJournal((tmp_path / "rewritten.sqlite3").resolve())
+    for seed in "abc":
+        asyncio.run(journal.reserve_artifact_retirement(artifact_ref(seed).artifact_id))
+    with closing(sqlite3.connect(journal.path)) as connection, connection:
+        connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
+        if operation == "update":
+            connection.execute(
+                "UPDATE artifact_retirements SET artifact_index=4 WHERE artifact_index=1"
+            )
+            connection.execute(
+                "UPDATE artifact_retirements SET artifact_index=1 WHERE artifact_index=4"
+            )
+        else:
+            # REPLACE's implicit DELETE does not run DELETE triggers with recursive_triggers OFF.
+            assert connection.execute("PRAGMA recursive_triggers").fetchone() == (0,)
+            command = (
+                "INSERT OR REPLACE INTO artifact_retirements "
+                if operation == "replace"
+                else "INSERT INTO artifact_retirements "
+            )
+            command += (
+                "SELECT artifact_id, 2, generation, state, fact_count, fact_root, state_hash "
+                "FROM artifact_retirements WHERE artifact_index=1"
+            )
+            if operation == "upsert":
+                command += " ON CONFLICT(artifact_id) DO UPDATE SET artifact_index=4"
+            connection.execute(command)
+            if operation == "upsert":
+                connection.execute(
+                    "UPDATE artifact_retirements SET artifact_index=1 WHERE artifact_index=4"
+                )
+    before = database_dump(journal.path)
+    for candidate in (journal, SQLiteRunJournal(journal.path)):
+        with pytest.raises(JournalError) as caught:
+            asyncio.run(candidate.reserve_artifact_retirement(artifact_ref("d").artifact_id))
+        assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+        assert database_dump(journal.path) == before
+
+
+def test_retirement_allocation_damage_cannot_be_cleared_with_write_capability(tmp_path: Path):
+    journal = SQLiteRunJournal((tmp_path / "permanent.sqlite3").resolve())
+    asyncio.run(journal.reserve_artifact_retirement(artifact_ref("a").artifact_id))
+    with closing(sqlite3.connect(journal.path)) as connection, connection:
+        connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
+        connection.execute("DELETE FROM artifact_retirements")
+    before = database_dump(journal.path)
+    with closing(sqlite3.connect(journal.path)) as connection:
+        connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
+        for statement in (
+            "DELETE FROM artifact_retirement_allocation_damage",
+            "UPDATE artifact_retirement_allocation_damage SET singleton=1",
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="damage is permanent"):
+                connection.execute(statement)
+            connection.rollback()
+        # REPLACE cannot erase the only legal singleton, even without recursive triggers.
+        with connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO artifact_retirement_allocation_damage VALUES (1)"
+            )
+    assert database_dump(journal.path) == before
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(journal.reserve_artifact_retirement(artifact_ref("b").artifact_id))
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+@pytest.mark.parametrize(
+    "target", ("artifact_retirements_delete_damage", "artifact_retirement_damage_delete_guard")
+)
+def test_retirement_allocation_witness_schema_is_authenticated(tmp_path: Path, target: str):
+    journal = SQLiteRunJournal((tmp_path / "schema.sqlite3").resolve())
+    with closing(sqlite3.connect(journal.path)) as connection, connection:
+        connection.execute(f"DROP TRIGGER {target}")
+    with pytest.raises(ValueError, match="definition has drifted"):
+        SQLiteRunJournal(journal.path)
+
+
+def test_rolled_back_retirement_damage_preserves_future_allocation(tmp_path: Path):
+    journal = SQLiteRunJournal((tmp_path / "rollback.sqlite3").resolve())
+    for seed in "abc":
+        asyncio.run(journal.reserve_artifact_retirement(artifact_ref(seed).artifact_id))
+    before = database_dump(journal.path)
+    with closing(sqlite3.connect(journal.path)) as connection:
+        connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
+        connection.execute("DELETE FROM artifact_retirements WHERE artifact_index=1")
+        assert connection.execute(
+            "SELECT singleton FROM artifact_retirement_allocation_damage"
+        ).fetchall() == [(1,)]
+        connection.rollback()
+    assert database_dump(journal.path) == before
+    reopened = SQLiteRunJournal(journal.path)
+    assert (
+        asyncio.run(reopened.reserve_artifact_retirement(artifact_ref("d").artifact_id)) is not None
+    )
+
+
+@pytest.mark.parametrize("operation", ("complete", "abort", "cross-session-attach"))
+def test_current_row_damage_rejects_other_operations_atomically(tmp_path: Path, operation: str):
+    journal = SQLiteRunJournal((tmp_path / "global-damage.sqlite3").resolve())
+    reservations = [
+        asyncio.run(journal.reserve_artifact_retirement(artifact_ref(seed).artifact_id))
+        for seed in "abc"
+    ]
+    reservation = reservations[0]
+    assert reservation is not None
+    with closing(sqlite3.connect(journal.path)) as connection, connection:
+        connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
+        connection.execute("DELETE FROM artifact_retirements WHERE artifact_index=1")
+    before = database_dump(journal.path)
+    with pytest.raises(JournalError) as caught:
+        if operation == "complete":
+            asyncio.run(journal.complete_artifact_retirement(reservation))
+        elif operation == "abort":
+            asyncio.run(journal.abort_artifact_retirement(reservation))
+        else:
+            batch = acceptance("unrelated-session")
+            fact = ArtifactAttachmentFact(
+                batch.state.session_id,
+                batch.state.run_id,
+                batch.state.submission_id,
+                "owner",
+                ArtifactAttachmentRole.FINAL_OUTPUT,
+                ArtifactAttachmentAction.ATTACHED,
+                artifact_ref("d"),
+            )
+            asyncio.run(journal.commit(replace(batch, artifact_facts=(fact,)), 0))
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    assert database_dump(journal.path) == before
+
+
+def test_retirement_occupancy_queries_are_indexed_and_bounded(tmp_path: Path):
+    journal = SQLiteRunJournal((tmp_path / "query-plan.sqlite3").resolve())
+    steps = []
+    for total in (4, 64):
+
+        async def populate():
+            for i in range(0 if total == 4 else 4, total):
+                await journal.reserve_artifact_retirement(f"sha256:{i:064x}")
+
+        asyncio.run(populate())
+        with closing(sqlite3.connect(journal.path)) as connection:
+            connection.row_factory = sqlite3.Row
+            statements: list[str] = []
+            ticks = []
+            connection.set_trace_callback(statements.append)
+            connection.set_progress_handler(lambda: ticks.append(1) or 0, 1)
+            root, count = sqlite_module._verify_retirement_meta(connection)
+            sqlite_module._verify_retirement_allocation(connection, root, count)
+            connection.set_progress_handler(None, 0)
+            connection.set_trace_callback(None)
+            steps.append(len(ticks))
+            assert not any("COUNT(" in sql.upper() for sql in statements)
+            for sql in statements:
+                plan = " ".join(
+                    str(row[3]) for row in connection.execute("EXPLAIN QUERY PLAN " + sql)
+                )
+                if "ORDER BY artifact_index" in sql:
+                    assert "USING COVERING INDEX" in plan
+                    assert "LIMIT 1" in sql
+                else:
+                    assert "SEARCH" in plan
+                    assert "SCAN" not in plan
+    # Fixed-depth proof plus singleton/tail seeks: VM work is independent of row count.
+    assert max(steps) < 4_000
+    assert abs(steps[1] - steps[0]) < 100
+
+
 @pytest.mark.parametrize("level", range(32))
 @pytest.mark.parametrize("attack", ("orphan", "wrong-empty", "empty-with-count", "overflow"))
 def test_new_retirement_rejects_unauthenticated_empty_path(

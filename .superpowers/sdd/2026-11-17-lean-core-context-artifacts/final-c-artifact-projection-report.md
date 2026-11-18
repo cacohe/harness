@@ -222,3 +222,277 @@ wide 覆盖 `test_journal_contract.py`、`test_sqlite_journal.py`、`test_memory
 E2E 覆盖 integration 的 `test_artifact_flow.py`、`test_agent_v3.py`、`test_bounded_growth.py`
 以及 `tests/load/test_shared_agent_load.py`。原始输出保留于 `.superpowers/c4-{red,frontier-red,
 green,wide,e2e,full}.log`。本轮未修改 attachment 重放/index 双向核对或 saga/generation 状态机。
+
+## Fix round 5/5：current-row dense occupancy 的不可清除见证
+
+从 `d635ae6` 接手。本轮 RED 复现：四个正常 reservation 后删除索引 1、删除多个中间索引，
+或使用 `INSERT OR REPLACE` 隐式删除其他 current row，新的 reservation 都错误成功。
+`UPDATE`/`UPSERT` 把索引改走再改回也没有留下可验证证据。六个参数化用例均以
+`Failed: DID NOT RAISE JournalError` 失败。
+
+正常 lifecycle 可以更新 generation/state，但 current rows 只增不减、`artifact_index` 永不修改。
+因此新增 SQLite singleton `artifact_retirement_allocation_damage`，通过无条件 SQL trigger
+见证显式 DELETE 和 index rewrite；BEFORE INSERT 的 artifact_id 主键探测覆盖
+`recursive_triggers=OFF` 时会合并两个既有 current rows 的 `INSERT OR REPLACE` 隐式
+DELETE，以及 UPSERT。仅替换同一位置、保持 occupancy 的 REPLACE 仍由既有投影认证负责。
+见证表的 UPDATE/DELETE guard 无条件 `RAISE(ABORT)`，不读取
+`harness_journal_append_allowed()`，所以注册既有写 UDF 也不能清除证据；REPLACE 见证本身
+只能重新插入唯一合法的 `singleton=1`，无法变成无见证状态。重复损坏使用条件 INSERT，
+避免外层 UPSERT 的 conflict policy 覆盖 trigger 内的 OR IGNORE 语义。
+
+`_verify_retirement_meta()` 在验证任何 retirement 元数据前通过主键读取该见证，发现损坏
+稳定映射为 `INVARIANT_VIOLATION`，不会追加事实或推进分配。row 与见证在同一 SQLite
+事务中变更，原始攻击 rollback 会同时撤销见证；真实已提交攻击在 reopen 后继续拒绝。
+跨 Session attachment commit 中已暂写的 Session/Run/ledger 数据也随失败整体回滚。
+
+该结构依赖本分支既有 exact schema-definition authentication；删除/修改 witness trigger
+在 reopen 时会被 schema drift 检查拒绝。继续使用尚未发布的精确 v6 schema，不新增旧
+数据库迁移；没有这些 triggers/table 的前一轮 v6 数据库明确拒绝打开，不能在未认证旧
+occupancy 上补建空 witness。全新数据库首次打开和正确数据库 reopen 不产生见证。
+
+新增开销为最大一行的主键读取（O(1)），正常 INSERT 的额外主键探测为 O(log N)，空间
+为 O(1)；既有 dense-prefix 尾部检查与 32 层 proof 不变，没有 COUNT 或全表扫描。
+query-plan 测试分别构造 4/64 个正常 reservation，检查生产校验 SQL 全部使用 SEARCH，
+唯一尾部 ORDER BY 使用 covering index + LIMIT 1；SQLite VM 步数均小于 4,000，差值
+小于 100。Core、事实重放、generation、empty-path proof、orphan/frontier/tree capacity
+和 `fact_index >= MAX` 边界均未改变。
+
+新增测试覆盖：`test_new_retirement_rejects_missing_current_rows`（3 项）、
+`test_retirement_index_rewrites_cannot_hide_allocation_damage`（3 项）、
+`test_retirement_allocation_damage_cannot_be_cleared_with_write_capability`、
+`test_retirement_allocation_witness_schema_is_authenticated`（2 项）、
+`test_rolled_back_retirement_damage_preserves_future_allocation`、
+`test_current_row_damage_rejects_other_operations_atomically`（3 项），以及
+`test_retirement_occupancy_queries_are_indexed_and_bounded`。原有并发分配和所有 C 边界保留。
+
+
+以下命令均在专用 worktree 运行；记录完整标准输出，RED 预期退出码为 1，其余为 0。
+Ruff 仅借用主 checkout 的可执行文件，工作目录和读写目标始终是专用 worktree。
+
+RED：
+
+```powershell
+$env:PYTHONPATH = "$PWD/.venv/Lib/site-packages"; & E:/Applications/Scoop/persist/uv/python/versions/cpython-3.11.16-windows-x86_64-none/python.exe -m pytest -q -p no:cacheprovider tests/unit/adapters/persistence/test_sqlite_retirement_boundaries.py -k 'missing_current_rows or index_rewrites' --basetemp .superpowers/c5-rewrite-red --tb=short 2>&1 | Tee-Object .superpowers/c5-rewrite-red.log
+```
+
+```text
+FFFFFF                                                                   [100%]
+================================== FAILURES ===================================
+_________ test_new_retirement_rejects_missing_current_rows[missing0] __________
+tests\unit\adapters\persistence\test_sqlite_retirement_boundaries.py:41: in test_new_retirement_rejects_missing_current_rows
+    with pytest.raises(JournalError) as caught:
+E   Failed: DID NOT RAISE JournalError
+_________ test_new_retirement_rejects_missing_current_rows[missing1] __________
+tests\unit\adapters\persistence\test_sqlite_retirement_boundaries.py:41: in test_new_retirement_rejects_missing_current_rows
+    with pytest.raises(JournalError) as caught:
+E   Failed: DID NOT RAISE JournalError
+_________ test_new_retirement_rejects_missing_current_rows[missing2] __________
+tests\unit\adapters\persistence\test_sqlite_retirement_boundaries.py:41: in test_new_retirement_rejects_missing_current_rows
+    with pytest.raises(JournalError) as caught:
+E   Failed: DID NOT RAISE JournalError
+____ test_retirement_index_rewrites_cannot_hide_allocation_damage[update] _____
+tests\unit\adapters\persistence\test_sqlite_retirement_boundaries.py:76: in test_retirement_index_rewrites_cannot_hide_allocation_damage
+    with pytest.raises(JournalError) as caught:
+E   Failed: DID NOT RAISE JournalError
+____ test_retirement_index_rewrites_cannot_hide_allocation_damage[replace] ____
+tests\unit\adapters\persistence\test_sqlite_retirement_boundaries.py:76: in test_retirement_index_rewrites_cannot_hide_allocation_damage
+    with pytest.raises(JournalError) as caught:
+E   Failed: DID NOT RAISE JournalError
+____ test_retirement_index_rewrites_cannot_hide_allocation_damage[upsert] _____
+tests\unit\adapters\persistence\test_sqlite_retirement_boundaries.py:76: in test_retirement_index_rewrites_cannot_hide_allocation_damage
+    with pytest.raises(JournalError) as caught:
+E   Failed: DID NOT RAISE JournalError
+=========================== short test summary info ===========================
+FAILED tests/unit/adapters/persistence/test_sqlite_retirement_boundaries.py::test_new_retirement_rejects_missing_current_rows[missing0]
+FAILED tests/unit/adapters/persistence/test_sqlite_retirement_boundaries.py::test_new_retirement_rejects_missing_current_rows[missing1]
+FAILED tests/unit/adapters/persistence/test_sqlite_retirement_boundaries.py::test_new_retirement_rejects_missing_current_rows[missing2]
+FAILED tests/unit/adapters/persistence/test_sqlite_retirement_boundaries.py::test_retirement_index_rewrites_cannot_hide_allocation_damage[update]
+FAILED tests/unit/adapters/persistence/test_sqlite_retirement_boundaries.py::test_retirement_index_rewrites_cannot_hide_allocation_damage[replace]
+FAILED tests/unit/adapters/persistence/test_sqlite_retirement_boundaries.py::test_retirement_index_rewrites_cannot_hide_allocation_damage[upsert]
+6 failed, 177 deselected in 6.17s
+```
+
+GREEN：
+
+```powershell
+$env:PYTHONPATH = "$PWD/.venv/Lib/site-packages"; & E:/Applications/Scoop/persist/uv/python/versions/cpython-3.11.16-windows-x86_64-none/python.exe -m pytest -q -p no:cacheprovider tests/unit/adapters/persistence/test_sqlite_retirement_boundaries.py -k 'missing_current_rows or index_rewrites' --basetemp .superpowers/c5-focused-green2 --tb=short 2>&1 | Tee-Object .superpowers/c5-focused-green.log
+```
+
+```text
+......                                                                   [100%]
+6 passed, 177 deselected in 5.98s
+```
+
+扩展攻击与复杂度：
+
+```powershell
+$env:PYTHONPATH = "$PWD/.venv/Lib/site-packages"; & E:/Applications/Scoop/persist/uv/python/versions/cpython-3.11.16-windows-x86_64-none/python.exe -m pytest -q -p no:cacheprovider tests/unit/adapters/persistence/test_sqlite_retirement_boundaries.py -k 'current_rows or index_rewrites or allocation_damage or witness_schema or rolled_back or other_operations or occupancy_queries' --basetemp .superpowers/c5-extra --tb=short 2>&1 | Tee-Object .superpowers/c5-extra.log
+```
+
+```text
+..............                                                           [100%]
+14 passed, 177 deselected in 21.63s
+```
+
+完整边界：
+
+```powershell
+$env:PYTHONPATH = "$PWD/.venv/Lib/site-packages"; & E:/Applications/Scoop/persist/uv/python/versions/cpython-3.11.16-windows-x86_64-none/python.exe -m pytest -q -p no:cacheprovider tests/unit/adapters/persistence/test_sqlite_retirement_boundaries.py --basetemp .superpowers/c5-targeted --tb=short 2>&1 | Tee-Object .superpowers/c5-targeted.log
+```
+
+```text
+........................................................................ [ 37%]
+........................................................................ [ 75%]
+...............................................                          [100%]
+191 passed in 368.29s (0:06:08)
+```
+
+E2E：
+
+```powershell
+$env:PYTHONPATH = "$PWD/.venv/Lib/site-packages"; & E:/Applications/Scoop/persist/uv/python/versions/cpython-3.11.16-windows-x86_64-none/python.exe -m pytest -q -p no:cacheprovider tests/integration/test_artifact_flow.py tests/integration/test_agent_v3.py tests/integration/test_bounded_growth.py tests/load/test_shared_agent_load.py --basetemp .superpowers/c5-e2e --tb=short 2>&1 | Tee-Object .superpowers/c5-e2e.log
+```
+
+```text
+.......................                                                  [100%]
+23 passed in 36.76s
+```
+
+Ruff lint：
+
+```powershell
+& F:/CodeSpace/harness/.venv/Scripts/ruff.exe check --no-cache src tests 2>&1 | Tee-Object .superpowers/c5-ruff-check.log
+```
+
+```text
+All checks passed!
+```
+
+Ruff format：
+
+```powershell
+& F:/CodeSpace/harness/.venv/Scripts/ruff.exe format --check src tests 2>&1 | Tee-Object .superpowers/c5-ruff-format.log
+```
+
+```text
+95 files already formatted
+```
+
+mypy：
+
+```powershell
+$env:PYTHONPATH = "$PWD/.venv/Lib/site-packages"; & E:/Applications/Scoop/persist/uv/python/versions/cpython-3.11.16-windows-x86_64-none/python.exe -m mypy src 2>&1 | Tee-Object .superpowers/c5-mypy.log
+```
+
+```text
+Success: no issues found in 59 source files
+```
+
+首次 wide 运行发现既有精确 schema 测试尚未包含新表。单独复现后只更新该测试的表集合，
+不修改生产实现；停止已加载旧断言的 wide/full 运行，重新执行最终 wide/full。其余已通过
+检查保持有效；Ruff lint/format 在该测试同步后重新通过。
+
+Schema RED：
+
+```powershell
+$env:PYTHONPATH = "$PWD/.venv/Lib/site-packages"; & E:/Applications/Scoop/persist/uv/python/versions/cpython-3.11.16-windows-x86_64-none/python.exe -m pytest -q -p no:cacheprovider tests/unit/adapters/persistence/test_sqlite_journal.py::test_schema_is_exact_v6_and_has_required_indexes --basetemp .superpowers/c5-schema-red --tb=short 2>&1 | Tee-Object .superpowers/c5-schema-red.log
+```
+
+```text
+F                                                                        [100%]
+================================== FAILURES ===================================
+______________ test_schema_is_exact_v6_and_has_required_indexes _______________
+tests\unit\adapters\persistence\test_sqlite_journal.py:992: in test_schema_is_exact_v6_and_has_required_indexes
+    assert tables == {
+E   AssertionError: assert {'artifact_at...t_nodes', ...} == {'artifact_at...rements', ...}
+E
+E     Extra items in the left set:
+E     'artifact_retirement_allocation_damage'
+E     Use -v to get more diff
+=========================== short test summary info ===========================
+FAILED tests/unit/adapters/persistence/test_sqlite_journal.py::test_schema_is_exact_v6_and_has_required_indexes
+1 failed in 1.49s
+```
+
+Schema GREEN：
+
+```powershell
+$env:PYTHONPATH = "$PWD/.venv/Lib/site-packages"; & E:/Applications/Scoop/persist/uv/python/versions/cpython-3.11.16-windows-x86_64-none/python.exe -m pytest -q -p no:cacheprovider tests/unit/adapters/persistence/test_sqlite_journal.py::test_schema_is_exact_v6_and_has_required_indexes --basetemp .superpowers/c5-schema-green --tb=short 2>&1 | Tee-Object .superpowers/c5-schema-green.log
+```
+
+```text
+.                                                                        [100%]
+1 passed in 0.87s
+```
+
+解释器确认：
+
+```powershell
+& E:/Applications/Scoop/persist/uv/python/versions/cpython-3.11.16-windows-x86_64-none/python.exe -c "import sys; print(sys.version); print(sys.executable)"
+```
+
+```text
+3.11.16 (main, Sep  1 2026, 14:15:24) [MSC v.1944 64 bit (AMD64)]
+E:\Applications\Scoop\persist\uv\python\versions\cpython-3.11.16-windows-x86_64-none\python.exe
+```
+
+环境探测中，`uv python find 3.11` 因全局 uv cache 权限拒绝未执行；worktree 的
+Python/Ruff 启动文件挂起后已终止，改用上述真实 CPython 与同版本 Ruff binary。
+最初 wide 命令曾把 `test_recovery_v3.py` 写在 `tests/unit/application`，pytest 在收集前
+报告 `file or directory not found`；修正为 `tests/integration/test_recovery_v3.py` 后执行。
+这些探测没有修改主工作区，也没有改变测试或生产语义。
+
+
+最终 wide：
+
+```powershell
+$env:PYTHONPATH = "$PWD/.venv/Lib/site-packages"; & E:/Applications/Scoop/persist/uv/python/versions/cpython-3.11.16-windows-x86_64-none/python.exe -m pytest -q -p no:cacheprovider tests/unit/core/test_journal_contract.py tests/unit/adapters/persistence/test_sqlite_journal.py tests/unit/adapters/persistence/test_memory_journal.py tests/unit/application/test_artifact_retention.py tests/unit/application/test_artifact_lifecycle.py tests/integration/test_recovery_v3.py --basetemp .superpowers/c5-wide-final --tb=short 2>&1 | Tee-Object .superpowers/c5-wide-final.log
+```
+
+```text
+........................................................................ [ 23%]
+........................................................................ [ 47%]
+........................................................................ [ 71%]
+........................................................................ [ 94%]
+................                                                         [100%]
+304 passed in 624.01s (0:10:24)
+```
+
+
+最终 CPython 3.11 全仓：
+
+```powershell
+$env:PYTHONPATH = "$PWD/.venv/Lib/site-packages"; & E:/Applications/Scoop/persist/uv/python/versions/cpython-3.11.16-windows-x86_64-none/python.exe -m pytest -q -p no:cacheprovider --basetemp .superpowers/c5-full-final --tb=short -rs 2>&1 | Tee-Object .superpowers/c5-full-final.log
+```
+
+```text
+........................................................................ [  4%]
+..........................................ss............................ [  9%]
+........................................................................ [ 14%]
+........................................................................ [ 19%]
+........................................................................ [ 24%]
+........................................................................ [ 29%]
+........................................................................ [ 33%]
+........................................................................ [ 38%]
+........................................................................ [ 43%]
+........................................................................ [ 48%]
+........................................................................ [ 53%]
+........................................................................ [ 58%]
+........................................................................ [ 63%]
+........................................................................ [ 67%]
+........................................................................ [ 72%]
+........................................................................ [ 77%]
+........................................................................ [ 82%]
+........................................................................ [ 87%]
+........................................................................ [ 92%]
+........................................................................ [ 97%]
+...........................................                              [100%]
+=========================== short test summary info ===========================
+SKIPPED [2] tests\unit\adapters\artifacts\test_filesystem_artifacts.py:44: Windows symlink privilege is unavailable
+1481 passed, 2 skipped in 919.20s (0:15:19)
+```
+
+两个 skip 均为 Windows symlink 权限缺失，与既有验证一致。最终结果：边界 191 passed、
+wide 304 passed、E2E 23 passed、全仓 1481 passed / 2 skipped；Ruff lint/format、mypy
+59 files、`git diff --check` 均通过。原始输出保留在 `.superpowers/c5-*.log`；本文仅
+去掉复制日志的行末空白以满足 whitespace gate。

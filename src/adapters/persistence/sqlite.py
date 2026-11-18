@@ -369,6 +369,34 @@ CREATE TABLE artifact_retirement_meta (
   artifact_count INTEGER NOT NULL CHECK(artifact_count >= 0),
   authenticated_root TEXT NOT NULL
 ) STRICT;
+CREATE TABLE artifact_retirement_allocation_damage (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1)
+) STRICT;
+CREATE TRIGGER artifact_retirement_damage_update_guard
+BEFORE UPDATE ON artifact_retirement_allocation_damage BEGIN
+  SELECT RAISE(ABORT, 'retirement allocation damage is permanent');
+END;
+CREATE TRIGGER artifact_retirement_damage_delete_guard
+BEFORE DELETE ON artifact_retirement_allocation_damage BEGIN
+  SELECT RAISE(ABORT, 'retirement allocation damage is permanent');
+END;
+CREATE TRIGGER artifact_retirements_delete_damage AFTER DELETE ON artifact_retirements BEGIN
+  INSERT INTO artifact_retirement_allocation_damage
+  SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM artifact_retirement_allocation_damage WHERE singleton=1);
+END;
+CREATE TRIGGER artifact_retirements_index_damage AFTER UPDATE OF artifact_index ON artifact_retirements
+WHEN NEW.artifact_index != OLD.artifact_index BEGIN
+  INSERT INTO artifact_retirement_allocation_damage
+  SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM artifact_retirement_allocation_damage WHERE singleton=1);
+END;
+CREATE TRIGGER artifact_retirements_replace_damage BEFORE INSERT ON artifact_retirements
+WHEN EXISTS (
+  SELECT 1 FROM artifact_retirements
+  WHERE artifact_id=NEW.artifact_id AND artifact_index != NEW.artifact_index
+) BEGIN
+  INSERT INTO artifact_retirement_allocation_damage
+  SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM artifact_retirement_allocation_damage WHERE singleton=1);
+END;
 CREATE INDEX artifact_retirement_facts_by_artifact
 ON artifact_retirement_facts(artifact_id, fact_index);
 CREATE TRIGGER artifact_facts_insert_guard BEFORE INSERT ON artifact_attachment_facts
@@ -562,6 +590,7 @@ _EXPECTED_COLUMNS = {
         "fact_json",
     ),
     "artifact_retirement_nodes": ("level", "node_index", "digest", "item_count"),
+    "artifact_retirement_allocation_damage": ("singleton",),
     "artifact_retirement_meta": (
         "singleton",
         "projection_root",
@@ -2377,6 +2406,17 @@ def _set_retirement_leaf(
 
 
 def _verify_retirement_meta(connection: sqlite3.Connection) -> tuple[str, int]:
+    # Current rows are append-only with immutable indices. These unconditional SQL
+    # triggers attest that no deletion/index rewrite broke their dense prefix. The
+    # singleton witness cannot be cleared even by the lifecycle write capability;
+    # schema authentication protects its triggers. This primary-key lookup is O(1).
+    if (
+        connection.execute(
+            "SELECT 1 FROM artifact_retirement_allocation_damage WHERE singleton=1"
+        ).fetchone()
+        is not None
+    ):
+        raise ValueError("SQLite retirement allocation has permanent damage")
     row = connection.execute(
         "SELECT projection_root, artifact_count, authenticated_root "
         "FROM artifact_retirement_meta WHERE singleton=1"
