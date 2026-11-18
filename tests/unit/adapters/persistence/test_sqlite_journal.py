@@ -26,6 +26,266 @@ def make_journal(tmp_path: Path) -> SQLiteRunJournal:
     return SQLiteRunJournal((tmp_path / "journal.sqlite3").resolve())
 
 
+def _coverage_history(journal: SQLiteRunJournal):
+    batch = acceptance("sticky-coverage")
+    receipt = None
+    for version in range(2):
+        if version:
+            assert receipt is not None
+            batch = _new_commit_after(receipt.state, version=1, sequence=201, with_records=True)
+        entries = tuple(
+            TranscriptEntry(
+                batch.state.session_id,
+                batch.state.run_id,
+                batch.state.submission_id,
+                "assistant",
+                f"history-{version}-{index}",
+            )
+            for index in range(200)
+        )
+        receipt = asyncio.run(
+            journal.commit(
+                replace(
+                    batch,
+                    state=replace(batch.state, journal_sequence=(version + 1) * 201),
+                    submission=None,
+                    summary=None,
+                    transcript=entries,
+                ),
+                version,
+            )
+        )
+    assert receipt is not None
+    return receipt
+
+
+@pytest.mark.parametrize("attack", ("delete", "update", "replace", "replace-rowid"))
+def test_integrity_violation_cannot_be_cleared_with_ordinary_dml(tmp_path, attack):
+    journal = make_journal(tmp_path)
+    receipt = _coverage_history(journal)
+    with sqlite3.connect(journal.path) as connection:
+        connection.execute(
+            "UPDATE journal_entries SET record_hash=? WHERE sequence=200", ("0" * 64,)
+        )
+        try:
+            if attack == "delete":
+                connection.execute("DELETE FROM integrity_violations")
+            elif attack == "update":
+                connection.execute("UPDATE integrity_violations SET session_id='other'")
+            elif attack == "replace-rowid":
+                connection.execute(
+                    "INSERT OR REPLACE INTO integrity_violations(rowid, session_id, reason) "
+                    "SELECT rowid, 'other', reason FROM integrity_violations"
+                )
+            else:
+                connection.execute(
+                    "INSERT OR REPLACE INTO integrity_violations VALUES ('session', 'replacement')"
+                )
+                connection.execute("DELETE FROM integrity_violations")
+        except sqlite3.DatabaseError:
+            pass
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(journal.summarize_before(receipt.session_id, 403))
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+@pytest.mark.parametrize("table", ("transcript", "journal_entries"))
+@pytest.mark.parametrize("connection_kind", ("external", "reader"))
+def test_direct_insert_cannot_bypass_full_middle_block(tmp_path, table, connection_kind):
+    journal = make_journal(tmp_path)
+    receipt = _coverage_history(journal)
+    blocked = False
+    with (
+        sqlite3.connect(journal.path) if connection_kind == "external" else journal._connect()
+    ) as connection:
+        try:
+            if table == "transcript":
+                # Sequence 202 is an event inside the second complete transcript block.
+                entry = replace(receipt.transcript[0], sequence=202)
+                connection.execute(
+                    "INSERT INTO transcript VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        entry.session_id.value,
+                        202,
+                        entry.run_id.value,
+                        entry.submission_id.value,
+                        entry.role,
+                        entry.content,
+                        encode(entry),
+                    ),
+                )
+            else:
+                connection.execute(
+                    "INSERT INTO journal_entries VALUES ('session', 403, 'event', ?, ?)",
+                    ("0" * 64, "0" * 64),
+                )
+        except sqlite3.DatabaseError:
+            # A connection without the adapter's append capability must fail closed.
+            blocked = True
+    if blocked:
+        coverage = asyncio.run(journal.summarize_before(receipt.session_id, 403))
+        assert coverage.segments[0].item_count == 400
+        assert asyncio.run(journal.read_page(receipt.session_id, None, 2)).interactions
+    else:
+        with pytest.raises(JournalError):
+            asyncio.run(journal.summarize_before(receipt.session_id, 403))
+        with pytest.raises(JournalError):
+            asyncio.run(journal.read_page(receipt.session_id, None, 2))
+
+
+@pytest.mark.parametrize("table", ("transcript", "journal_entries"))
+@pytest.mark.parametrize("session", ("session", "destination"))
+def test_cross_session_update_taints_both_sessions(tmp_path, table, session):
+    journal = make_journal(tmp_path)
+    _coverage_history(journal)
+    asyncio.run(journal.commit(acceptance("dest", session="destination"), 0))
+    with sqlite3.connect(journal.path) as connection:
+        connection.execute(
+            f"UPDATE {table} SET session_id='destination' WHERE session_id='session' AND sequence=200"
+        )
+    with pytest.raises(JournalError):
+        asyncio.run(journal.summarize_before(SessionId(session), 403))
+
+
+@pytest.mark.parametrize("table", ("transcript", "journal_entries"))
+def test_reader_connection_cannot_replace_another_sessions_hidden_rowid(tmp_path, table):
+    journal = make_journal(tmp_path)
+    receipt = _coverage_history(journal)
+    asyncio.run(journal.commit(acceptance("dest", session="destination"), 0))
+    blocked = False
+    with journal._connect() as connection:
+        columns = [row[1] for row in connection.execute(f"PRAGMA table_info({table})")]
+        projection = ["'destination'" if column == "session_id" else column for column in columns]
+        try:
+            connection.execute(
+                f"INSERT OR REPLACE INTO {table}(rowid, {', '.join(columns)}) "
+                f"SELECT rowid, {', '.join(projection)} FROM {table} "
+                "WHERE session_id='session' AND sequence=200"
+            )
+        except sqlite3.DatabaseError:
+            blocked = True
+    if blocked:
+        assert (
+            asyncio.run(journal.summarize_before(receipt.session_id, 403)).segments[0].item_count
+            == 400
+        )
+    else:
+        with pytest.raises(JournalError):
+            asyncio.run(journal.summarize_before(receipt.session_id, 403))
+
+
+def test_read_page_rejects_known_middle_corruption(tmp_path):
+    journal = make_journal(tmp_path)
+    receipt = _coverage_history(journal)
+    with sqlite3.connect(journal.path) as connection:
+        connection.execute(
+            "UPDATE journal_entries SET record_hash=? WHERE sequence=200", ("0" * 64,)
+        )
+    with pytest.raises(JournalError):
+        asyncio.run(journal.read_page(receipt.session_id, None, 2))
+
+
+def test_read_page_does_not_publish_unauthenticated_remaining_omission(tmp_path):
+    journal = make_journal(tmp_path)
+    receipt = _coverage_history(journal)
+    page = asyncio.run(journal.read_page(receipt.session_id, None, 2))
+    assert page.next_before_sequence == 401
+    assert page.remaining_omission is None
+
+
+@pytest.mark.parametrize("table", ("transcript", "journal_entries"))
+def test_delete_taints_history_and_rollback_restores_clean_commit_channel(tmp_path, table):
+    journal = make_journal(tmp_path)
+    receipt = _coverage_history(journal)
+    with sqlite3.connect(journal.path) as connection:
+        connection.execute(f"DELETE FROM {table} WHERE sequence=200")
+        connection.rollback()
+    assert (
+        asyncio.run(journal.summarize_before(receipt.session_id, 403)).segments[0].item_count == 400
+    )
+    next_batch = _new_commit_after(receipt.state, version=2, sequence=402, with_records=True)
+    asyncio.run(journal.commit(next_batch, 2))
+    reopened = make_journal(tmp_path)
+    assert (
+        asyncio.run(reopened.summarize_before(receipt.session_id, 405)).segments[0].item_count
+        == 401
+    )
+    with sqlite3.connect(journal.path) as connection:
+        connection.execute(f"DELETE FROM {table} WHERE sequence=200")
+    with pytest.raises(JournalError):
+        asyncio.run(reopened.read_page(receipt.session_id, None, 2))
+    with pytest.raises(JournalError):
+        asyncio.run(reopened.summarize_before(receipt.session_id, 405))
+
+
+def test_sqlite_aggregate_vm_work_is_bounded_as_history_grows(
+    tmp_path, monkeypatch, record_property
+):
+    journal = make_journal(tmp_path)
+    batch = acceptance("vm-work")
+    steps = 0
+    real_connect = journal._connect
+
+    def measured_connect():
+        connection = real_connect()
+
+        def tick():
+            nonlocal steps
+            steps += 100
+            return 0
+
+        connection.set_progress_handler(tick, 100)
+        return connection
+
+    async def scenario():
+        nonlocal steps
+        counts = []
+        total = 0
+        for version, count in enumerate((400, *([960] * 10), *([1024] * 10))):
+            total += count
+            transcript = tuple(
+                replace(batch.transcript[0], content=f"row-{total}-{index}")
+                for index in range(count)
+            )
+            await journal.commit(
+                replace(
+                    batch,
+                    state=replace(
+                        batch.state, journal_version=version + 1, journal_sequence=total + 1
+                    ),
+                    events=batch.events if version == 0 else (),
+                    submission=None,
+                    summary=None,
+                    transcript=transcript,
+                ),
+                version,
+            )
+            if total in (400, 10_000, 20_240):
+                monkeypatch.setattr(journal, "_connect", measured_connect)
+                steps = 0
+                coverage = await journal.summarize_before(batch.state.session_id, total + 2)
+                assert coverage.segments[0].item_count == total
+                counts.append(steps)
+                monkeypatch.setattr(journal, "_connect", real_connect)
+        return counts
+
+    counts = asyncio.run(scenario())
+    record_property("sqlite_vm_steps_400_10000_20240", counts)
+    # All sizes have a 16-row final block. Additional interior blocks must be
+    # summarized via the fixed-depth tree, never visited as physical history.
+    assert max(counts) <= min(counts) + 10_000, counts
+
+
+def test_coverage_of_event_only_gap_inside_transcript_block_is_explicitly_empty(tmp_path):
+    journal = make_journal(tmp_path)
+    receipt = _coverage_history(journal)
+    coverage = asyncio.run(journal.summarize_before(receipt.session_id, 203, 1, 201))
+    assert [
+        (segment.first_sequence, segment.last_sequence, segment.item_count)
+        for segment in coverage.segments
+    ] == [(202, 202, 0)]
+
+
 @pytest.mark.parametrize("corruption", ("record-hash", "payload"))
 def test_conversation_aggregate_rejects_authenticated_middle_corruption(
     tmp_path: Path, corruption: str
@@ -649,6 +909,9 @@ def test_chain_hash_corruption_rejects_reads_and_writes(
                 sequence = 2
             else:
                 extra = replace(receipt.transcript[0], sequence=5)
+                # Offline damage fixture explicitly bypasses append authorization
+                # to keep testing hash validation independently of the SQL guard.
+                connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
                 connection.execute(
                     "INSERT INTO transcript(session_id, sequence, run_id, submission_id, role, "
                     "content, entry_json) VALUES (?, ?, ?, ?, ?, ?, ?)",

@@ -31,7 +31,6 @@ from src.core.context import (
     ConversationCoverage,
     ConversationCoverageSegment,
     ConversationPage,
-    OmittedContextRef,
 )
 from src.core.errors import RunErrorCode
 from src.core.ids import RunId, SessionId, SubmissionId
@@ -130,9 +129,34 @@ CREATE TABLE transcript_coverage_nodes (
 CREATE TABLE integrity_violations (
   session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
   reason TEXT NOT NULL
-) STRICT;
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER integrity_violations_keep_first BEFORE INSERT ON integrity_violations
+WHEN EXISTS(SELECT 1 FROM integrity_violations WHERE session_id=NEW.session_id)
+BEGIN
+  SELECT RAISE(IGNORE);
+END;
+CREATE TRIGGER integrity_violations_no_update BEFORE UPDATE ON integrity_violations
+BEGIN
+  SELECT RAISE(ABORT, 'integrity violations are permanent');
+END;
+CREATE TRIGGER integrity_violations_no_delete BEFORE DELETE ON integrity_violations
+BEGIN
+  SELECT RAISE(ABORT, 'integrity violations are permanent');
+END;
+CREATE TRIGGER journal_entries_insert_guard BEFORE INSERT ON journal_entries
+WHEN harness_journal_append_allowed() != 1
+BEGIN
+  SELECT RAISE(ABORT, 'journal entries require the commit append channel');
+END;
+CREATE TRIGGER transcript_insert_guard BEFORE INSERT ON transcript
+WHEN harness_journal_append_allowed() != 1
+BEGIN
+  SELECT RAISE(ABORT, 'transcript entries require the commit append channel');
+END;
 CREATE TRIGGER journal_entries_update_violation AFTER UPDATE ON journal_entries
 BEGIN
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason)
+  VALUES (OLD.session_id, 'journal_entries updated');
   INSERT OR IGNORE INTO integrity_violations(session_id, reason)
   VALUES (NEW.session_id, 'journal_entries updated');
 END;
@@ -143,6 +167,8 @@ BEGIN
 END;
 CREATE TRIGGER transcript_update_violation AFTER UPDATE ON transcript
 BEGIN
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason)
+  VALUES (OLD.session_id, 'transcript updated');
   INSERT OR IGNORE INTO integrity_violations(session_id, reason)
   VALUES (NEW.session_id, 'transcript updated');
 END;
@@ -434,6 +460,7 @@ class SQLiteRunJournal:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=self.timeout_seconds)
         connection.row_factory = sqlite3.Row
+        connection.create_function("harness_journal_append_allowed", 0, lambda: 0)
         connection.execute(f"PRAGMA busy_timeout = {max(1, int(self.timeout_seconds * 1000))}")
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA synchronous = FULL")
@@ -452,6 +479,9 @@ class SQLiteRunJournal:
             state = batch.state
             session_key = state.session_id.value
             row, _current = _preflight_existing_ledger(connection, session_key)
+            # This capability exists only on this private commit connection. It is
+            # neither persistent SQL state nor shared with concurrent readers/writers.
+            connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
             version = int(row["version"]) if row is not None else 0
             previous_sequence = int(row["sequence"]) if row is not None else 0
             ledger_hash = row["ledger_hash"] if row is not None else genesis_hash(session_key)
@@ -679,6 +709,7 @@ class SQLiteRunJournal:
         connection = self._connect()
         try:
             connection.execute("BEGIN")
+            _reject_integrity_violation(connection, session_key)
             row = connection.execute(
                 "SELECT session_id, version, sequence, state_json, ledger_hash, coverage_hash, "
                 "transcript_count, authenticated_root "
@@ -765,6 +796,7 @@ class SQLiteRunJournal:
         connection = self._connect()
         try:
             connection.execute("BEGIN")
+            _reject_integrity_violation(connection, session_key)
             if before_sequence is None:
                 rows = tuple(
                     connection.execute(
@@ -788,15 +820,9 @@ class SQLiteRunJournal:
             for entry in entries:
                 _verify_point_anchor(connection, session_key, entry.sequence)
             cursor = entries[-1].sequence if len(rows) > limit else None
-            remaining = (
-                _aggregate_transcript_range(connection, session_key, 1, cursor)
-                if cursor is not None
-                else None
-            )
             result = ConversationPage(
                 tuple(transcript_interaction(entry) for entry in entries),
                 cursor,
-                remaining,
             )
             connection.commit()
             return result
@@ -816,11 +842,7 @@ class SQLiteRunJournal:
         connection = self._connect()
         try:
             connection.execute("BEGIN")
-            if connection.execute(
-                "SELECT EXISTS(SELECT 1 FROM integrity_violations WHERE session_id=?)",
-                (session_key,),
-            ).fetchone()[0]:
-                raise ValueError("SQLite immutable journal history was modified")
+            _reject_integrity_violation(connection, session_key)
             session = connection.execute(
                 "SELECT sequence, ledger_hash, coverage_hash, transcript_count, authenticated_root "
                 "FROM sessions WHERE session_id=?",
@@ -1314,22 +1336,33 @@ def _authenticated_transcript_count(
     coverage_root: str,
 ) -> int:
     first_row = connection.execute(
-        "SELECT block_index FROM transcript_coverage_blocks WHERE session_id=? "
-        "AND last_sequence>=? AND first_sequence<=? ORDER BY block_index LIMIT 1",
-        (session_key, first_sequence, last_sequence),
+        "SELECT block_index, last_sequence FROM transcript_coverage_blocks WHERE session_id=? "
+        "AND first_sequence<=? ORDER BY first_sequence DESC LIMIT 1",
+        (session_key, first_sequence),
     ).fetchone()
+    if first_row is None or first_row["last_sequence"] < first_sequence:
+        first_row = connection.execute(
+            "SELECT block_index FROM transcript_coverage_blocks WHERE session_id=? "
+            "AND first_sequence>? AND first_sequence<=? ORDER BY first_sequence LIMIT 1",
+            (session_key, first_sequence, last_sequence),
+        ).fetchone()
     last_row = connection.execute(
         "SELECT block_index FROM transcript_coverage_blocks WHERE session_id=? "
-        "AND last_sequence>=? AND first_sequence<=? ORDER BY block_index DESC LIMIT 1",
+        "AND first_sequence<=? ORDER BY first_sequence DESC LIMIT 1",
+        (session_key, last_sequence),
+    ).fetchone()
+    physical_first = connection.execute(
+        "SELECT sequence FROM transcript WHERE session_id=? AND sequence>=? AND sequence<=? "
+        "ORDER BY sequence LIMIT 1",
         (session_key, first_sequence, last_sequence),
     ).fetchone()
-    physical = connection.execute(
-        "SELECT MIN(sequence) AS first_sequence, MAX(sequence) AS last_sequence "
-        "FROM transcript WHERE session_id=? AND sequence>=? AND sequence<=?",
+    physical_last = connection.execute(
+        "SELECT sequence FROM transcript WHERE session_id=? AND sequence>=? AND sequence<=? "
+        "ORDER BY sequence DESC LIMIT 1",
         (session_key, first_sequence, last_sequence),
     ).fetchone()
     if first_row is None or last_row is None:
-        if physical is None or physical["first_sequence"] is not None:
+        if physical_first is not None or physical_last is not None:
             raise ValueError("SQLite coverage index omitted physical transcript rows")
         return 0
     first_block = int(first_row["block_index"])
@@ -1342,10 +1375,17 @@ def _authenticated_transcript_count(
         if last_block == first_block
         else _verify_physical_coverage_block(connection, session_key, last_block, coverage_root)
     )
+    if physical_first is None and physical_last is None:
+        if first_block != last_block or any(
+            first_sequence <= sequence <= last_sequence for sequence in first_sequences
+        ):
+            raise ValueError("SQLite empty range disagrees with authenticated transcript rows")
+        return 0
     if (
-        physical is None
-        or physical["first_sequence"] not in first_sequences
-        or physical["last_sequence"] not in last_sequences
+        physical_first is None
+        or physical_last is None
+        or physical_first["sequence"] not in first_sequences
+        or physical_last["sequence"] not in last_sequences
     ):
         raise ValueError("SQLite coverage boundary blocks disagree with physical history")
     if first_block == last_block:
@@ -1421,40 +1461,12 @@ def _verify_point_anchor(connection: sqlite3.Connection, session_key: str, seque
         raise ValueError("SQLite point anchor disagrees with Session root")
 
 
-def _aggregate_transcript_range(
-    connection: sqlite3.Connection,
-    session_key: str,
-    first_inclusive: int,
-    before_sequence: int,
-) -> OmittedContextRef | None:
-    if first_inclusive >= before_sequence:
-        return None
-    row = connection.execute(
-        "SELECT COUNT(*) AS item_count, MIN(sequence) AS first_sequence, "
-        "MAX(sequence) AS last_sequence FROM transcript "
-        "WHERE session_id=? AND sequence>=? AND sequence<?",
-        (session_key, first_inclusive, before_sequence),
-    ).fetchone()
-    if row is None or type(row["item_count"]) is not int:
-        raise ValueError("SQLite transcript aggregate is invalid")
-    count = row["item_count"]
-    if count == 0:
-        if row["first_sequence"] is not None or row["last_sequence"] is not None:
-            raise ValueError("SQLite empty transcript aggregate has boundaries")
-        return None
-    first = row["first_sequence"]
-    last = row["last_sequence"]
-    if (
-        type(first) is not int
-        or type(last) is not int
-        or not first_inclusive <= first <= last < before_sequence
-        or count > last - first + 1
-    ):
-        raise ValueError("SQLite transcript aggregate disagrees with its range")
-    _verify_point_anchor(connection, session_key, first)
-    if last != first:
-        _verify_point_anchor(connection, session_key, last)
-    return OmittedContextRef("transcript", first, last, count)
+def _reject_integrity_violation(connection: sqlite3.Connection, session_key: str) -> None:
+    if connection.execute(
+        "SELECT EXISTS(SELECT 1 FROM integrity_violations WHERE session_id=?)",
+        (session_key,),
+    ).fetchone()[0]:
+        raise ValueError("SQLite immutable journal history was modified")
 
 
 def _preflight_existing_ledger(
@@ -1467,11 +1479,7 @@ def _preflight_existing_ledger(
         "FROM sessions WHERE session_id = ?",
         (session_key,),
     ).fetchone()
-    if connection.execute(
-        "SELECT EXISTS(SELECT 1 FROM integrity_violations WHERE session_id=?)",
-        (session_key,),
-    ).fetchone()[0]:
-        raise ValueError("SQLite immutable journal history was modified")
+    _reject_integrity_violation(connection, session_key)
     anchor_stats = connection.execute(
         "SELECT COUNT(*), MIN(sequence), MAX(sequence) FROM journal_entries WHERE session_id = ?",
         (session_key,),
