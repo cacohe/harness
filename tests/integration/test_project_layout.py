@@ -26,6 +26,7 @@ LEGACY_SOURCE_PATHS = (
 )
 EXPECTED_CORE_MODULES = {
     "__init__.py",
+    "_run_driver.py",
     "approval.py",
     "artifacts.py",
     "commands.py",
@@ -137,10 +138,24 @@ def _present_legacy_paths(root: Path) -> list[str]:
     return [name for name in LEGACY_SOURCE_PATHS if (root / "src" / name).exists()]
 
 
+def _core_line_counts(root: Path) -> dict[str, int]:
+    return {
+        path.name: len(path.read_text(encoding="utf-8").splitlines())
+        for path in (root / "src" / "core").glob("*.py")
+    }
+
+
 @pytest.mark.architecture
 def test_core_contains_only_harness_mechanism_and_extension_ports():
     assert {path.name for path in (ROOT / "src" / "core").glob("*.py")} == EXPECTED_CORE_MODULES
     assert _core_violations(ROOT) == []
+
+
+@pytest.mark.architecture
+def test_core_modules_stay_within_reviewable_size_limits():
+    line_counts = _core_line_counts(ROOT)
+    assert line_counts["run.py"] <= 350
+    assert {name: count for name, count in line_counts.items() if count > 500} == {}
 
 
 @pytest.mark.architecture
