@@ -6,6 +6,8 @@ from src.core.context import (
     ContextBudget,
     ContextRequest,
     ContextWindow,
+    ConversationInteraction,
+    ConversationPage,
     EstimateQuality,
     OmittedContextRef,
     TokenEstimate,
@@ -114,6 +116,26 @@ def test_request_rejects_checkpoint_from_another_policy_or_profile() -> None:
 def test_request_rejects_non_tool_messages_in_the_open_pair_slot() -> None:
     with pytest.raises(ValueError):
         _request(open_tool_messages=(ModelMessage(ModelRole.ASSISTANT, "plain"),))
+
+
+def test_conversation_page_rejects_remaining_aggregate_that_disagrees_with_cursor() -> None:
+    interaction = ConversationInteraction(
+        1_000,
+        1_001,
+        (ModelMessage(ModelRole.ASSISTANT, "newest"),),
+    )
+    with pytest.raises(ValueError):
+        ConversationPage(
+            (interaction,),
+            100,
+            remaining_omission=OmittedContextRef("transcript", 1, 999, 999),
+        )
+    with pytest.raises(ValueError):
+        ConversationPage(
+            (interaction,),
+            1_000,
+            remaining_omission=OmittedContextRef("transcript", 1, 999, 1_000),
+        )
 
 
 def test_checkpoint_snapshot_uses_only_trusted_fixed_fields() -> None:

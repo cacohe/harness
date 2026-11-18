@@ -129,7 +129,7 @@ class ConversationPage:
                 type(self.next_before_sequence) is not int
                 or self.next_before_sequence <= 0
                 or not self.interactions
-                or self.next_before_sequence > self.interactions[-1].sequence_from
+                or self.next_before_sequence != self.interactions[-1].sequence_from
             )
         ):
             raise ValueError("Conversation page is invalid")
@@ -139,7 +139,8 @@ class ConversationPage:
             or remaining.source != "transcript"
             or self.next_before_sequence is None
             or not self.interactions
-            or remaining.last_sequence >= self.interactions[-1].sequence_from
+            or remaining.last_sequence >= self.next_before_sequence
+            or remaining.item_count > remaining.last_sequence - remaining.first_sequence + 1
         ):
             raise ValueError("Conversation page remaining omission is invalid")
         snapshot = tuple(
@@ -394,6 +395,16 @@ class ConversationReader(Protocol):
     def read_page(
         self, session_id: SessionId, before_sequence: int | None, limit: int
     ) -> Awaitable[ConversationPage]: ...
+
+
+class ConversationAggregateReader(ConversationReader, Protocol):
+    def summarize_before(
+        self,
+        session_id: SessionId,
+        before_sequence: int,
+        excluded_from_sequence: int | None = None,
+        excluded_through_sequence: int | None = None,
+    ) -> Awaitable[tuple[OmittedContextRef, ...]]: ...
 
 
 class TokenCounter(Protocol):

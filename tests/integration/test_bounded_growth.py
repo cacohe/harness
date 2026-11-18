@@ -4,7 +4,9 @@ import asyncio
 import json
 import time
 from bisect import bisect_left
+from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactExternalizer
@@ -13,6 +15,7 @@ from src.adapters.context.bounded import BoundedContextProvider
 from src.adapters.context.tokenizers import ExactTokenCounter
 from src.adapters.persistence.bounded import BoundedRunJournal
 from src.adapters.persistence.memory import InMemoryRunJournal
+from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.adapters.persistence.sqlite_codec import encode
 from src.application.composition import ApplicationConfig, create_development_agent
 from src.core.artifacts import ArtifactRef
@@ -25,9 +28,14 @@ from src.core.context import (
     OmittedContextRef,
 )
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import JournalError
+from src.core.journal import (
+    ConversationSummaryCheckpoint,
+    JournalError,
+    TranscriptEntry,
+)
 from src.core.model import ModelMessage, ModelResponse, ModelRole, ModelToolCall
 from src.core.tools import ToolResult, ToolResultStatus, ToolSpec
+from tests.unit.core.test_journal_contract import acceptance
 
 
 class Ids:
@@ -121,6 +129,35 @@ class PagedJournalReader:
             )
         self.calls.append((before_sequence, limit, len(selected)))
         return ConversationPage(selected, next_cursor, remaining_omission=remaining)
+
+
+class CountingJournalReader:
+    def __init__(self, journal) -> None:
+        self.journal = journal
+        self.page_calls: list[tuple[int | None, int, int]] = []
+        self.aggregate_calls: list[tuple[int, int | None, int | None]] = []
+
+    async def read_page(self, session_id, before_sequence, limit):
+        page = await self.journal.read_page(session_id, before_sequence, limit)
+        self.page_calls.append((before_sequence, limit, len(page.interactions)))
+        return page
+
+    async def summarize_before(
+        self,
+        session_id,
+        before_sequence,
+        excluded_from_sequence=None,
+        excluded_through_sequence=None,
+    ):
+        self.aggregate_calls.append(
+            (before_sequence, excluded_from_sequence, excluded_through_sequence)
+        )
+        return await self.journal.summarize_before(
+            session_id,
+            before_sequence,
+            excluded_from_sequence,
+            excluded_through_sequence,
+        )
 
 
 class CapturingModel:
@@ -260,6 +297,84 @@ def test_ten_thousand_transcript_entries_are_paged_and_model_state_stays_bounded
     assert len(request.messages) < 32
     assert len(encode(result).encode("utf-8")) <= 4_096 + config.limits.max_inline_result_bytes
     assert "historical-user-0" not in encode(result)
+
+
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+def test_production_journal_reader_bounds_partial_checkpoint_history(
+    backend: str, tmp_path: Path
+) -> None:
+    async def scenario():
+        journal = (
+            InMemoryRunJournal()
+            if backend == "memory"
+            else SQLiteRunJournal((tmp_path / "bounded-history.sqlite3").resolve())
+        )
+        batch = acceptance("bounded-history")
+        transcript = tuple(
+            TranscriptEntry(
+                batch.state.session_id,
+                batch.state.run_id,
+                batch.state.submission_id,
+                "assistant",
+                f"history-{index:05d}",
+            )
+            for index in range(10_000)
+        )
+        checkpoint = ConversationSummaryCheckpoint(
+            batch.state.session_id,
+            6_000,
+            "v1",
+            batch.state.profile_id,
+            "durable middle summary",
+            covered_from_sequence=4_001,
+        )
+        for chunk in range(10):
+            commit = replace(
+                batch,
+                state=replace(
+                    batch.state,
+                    journal_version=chunk + 1,
+                    journal_sequence=1 + (chunk + 1) * 1_000,
+                ),
+                events=batch.events if chunk == 0 else (),
+                submission=None,
+                transcript=transcript[chunk * 1_000 : (chunk + 1) * 1_000],
+                summary=checkpoint if chunk == 9 else None,
+            )
+            await journal.commit(commit, chunk)
+        reader = CountingJournalReader(journal)
+        provider = BoundedContextProvider(
+            reader,
+            ExactTokenCounter(),
+            page_size=127,
+            max_compaction_interactions=128,
+        )
+        request = ContextRequest(
+            batch.state.session_id,
+            batch.state.profile_id,
+            "v1",
+            ModelMessage(ModelRole.SYSTEM, "bounded production history"),
+            ModelMessage(ModelRole.USER, "current"),
+            summary_checkpoints=(checkpoint,),
+        )
+        window = await provider.build(request, ContextBudget(128, 8, 8))
+        return reader, window
+
+    reader, window = asyncio.run(scenario())
+    assert len(reader.page_calls) <= 2
+    assert all(limit == 127 and returned <= 127 for _, limit, returned in reader.page_calls)
+    assert reader.aggregate_calls == [(9_748, 4_001, 6_000)]
+    transcript_omissions = tuple(item for item in window.omitted if item.source == "transcript")
+    assert transcript_omissions[0].first_sequence == 2
+    assert transcript_omissions[0].last_sequence == 4_000
+    assert transcript_omissions[1].first_sequence == 6_001
+    selected = tuple(
+        message
+        for message in window.messages
+        if (message.content or "").startswith("Historical assistant:")
+    )
+    assert transcript_omissions[1].last_sequence == 10_001 - len(selected)
+    assert sum(item.item_count for item in transcript_omissions) + 2_000 + len(selected) == 10_000
 
 
 def test_configured_serialized_run_envelope_bounds_large_batch_and_artifact_results():

@@ -129,25 +129,51 @@ class BoundedContextProvider:
                     compaction.append(item)
             remaining = page.remaining_omission
             if (
-                durable is None
-                and not suffix_open
+                not suffix_open
                 and len(compaction) >= self._max_compaction_interactions
-                and remaining is not None
+                and page.next_before_sequence is not None
             ):
-                if current_omission is None:
-                    omission_segments.append(
-                        _Omission(
-                            remaining.first_sequence,
-                            remaining.last_sequence,
-                            remaining.item_count,
-                        )
+                if not durable_processed:
+                    suffix_open, estimate = self._consider_checkpoint(
+                        request,
+                        budget,
+                        selected,
+                        included_checkpoints,
+                        omitted_checkpoints,
+                        durable,
+                        suffix_open,
+                        estimate,
                     )
-                else:
-                    current_omission.first = min(current_omission.first, remaining.first_sequence)
-                    current_omission.last = max(current_omission.last, remaining.last_sequence)
-                    current_omission.count += remaining.item_count
-                cursor = None
-                break
+                    durable_processed = True
+                    if compaction:
+                        compaction_open = False
+                aggregate = getattr(self._reader, "summarize_before", None)
+                if callable(aggregate):
+                    older = await aggregate(
+                        request.session_id,
+                        page.next_before_sequence,
+                        durable.covered_from_sequence if durable is not None else None,
+                        durable.covered_through_sequence if durable is not None else None,
+                    )
+                    self._append_aggregate(
+                        omission_segments,
+                        current_omission,
+                        older,
+                        page.next_before_sequence,
+                        durable,
+                    )
+                    cursor = None
+                    break
+                if durable is None and remaining is not None:
+                    self._append_aggregate(
+                        omission_segments,
+                        current_omission,
+                        (remaining,),
+                        page.next_before_sequence,
+                        None,
+                    )
+                    cursor = None
+                    break
             cursor = page.next_before_sequence
             if cursor is None:
                 break
@@ -230,6 +256,46 @@ class BoundedContextProvider:
             request.policy_version,
             candidate_checkpoint,
         )
+
+    @staticmethod
+    def _append_aggregate(
+        omissions: list[_Omission],
+        current: _Omission | None,
+        aggregate: object,
+        before_sequence: int,
+        excluded: ConversationSummaryCheckpoint | None,
+    ) -> None:
+        if type(aggregate) is not tuple:
+            raise ValueError("Conversation aggregate must be a tuple")
+        previous_first = before_sequence
+        for index, item in enumerate(aggregate):
+            if (
+                type(item) is not OmittedContextRef
+                or item.source != "transcript"
+                or item.last_sequence >= previous_first
+                or item.item_count > item.last_sequence - item.first_sequence + 1
+                or excluded is not None
+                and not (
+                    item.last_sequence < excluded.covered_from_sequence
+                    or item.first_sequence > excluded.covered_through_sequence
+                )
+            ):
+                raise ValueError("Conversation aggregate is inconsistent with its cursor")
+            separated_by_checkpoint = (
+                current is not None
+                and excluded is not None
+                and item.last_sequence < excluded.covered_from_sequence
+                and current.first > excluded.covered_through_sequence
+            )
+            if index == 0 and current is not None and not separated_by_checkpoint:
+                current.first = min(current.first, item.first_sequence)
+                current.last = max(current.last, item.last_sequence)
+                current.count += item.item_count
+            else:
+                omissions.append(
+                    _Omission(item.first_sequence, item.last_sequence, item.item_count)
+                )
+            previous_first = item.first_sequence
 
     @staticmethod
     def _checkpoint_relation(

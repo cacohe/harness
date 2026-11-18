@@ -9,9 +9,15 @@ from pathlib import Path
 from threading import Event
 from typing import TypeVar
 
-from src.adapters.persistence.memory import _canonical_copy, _validate_members
+from src.adapters.context.journal_history import transcript_interaction
+from src.adapters.persistence.memory import (
+    _canonical_copy,
+    _validate_aggregate_request,
+    _validate_members,
+)
 from src.adapters.persistence.sqlite_codec import decode, encode
 from src.adapters.persistence.sqlite_integrity import genesis_hash, record_hash, validate_hash
+from src.core.context import ConversationPage, OmittedContextRef
 from src.core.errors import RunErrorCode
 from src.core.ids import RunId, SessionId, SubmissionId
 from src.core.journal import (
@@ -217,6 +223,42 @@ class SQLiteRunJournal:
         if type(after_sequence) is not int or after_sequence < 0:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
         return await self._run(lambda _cancelled: self._load_session_sync(key, after_sequence))
+
+    async def read_page(
+        self, session_id: SessionId, before_sequence: int | None, limit: int
+    ) -> ConversationPage:
+        key = self._session_key(session_id)
+        if (
+            before_sequence is not None
+            and (type(before_sequence) is not int or before_sequence <= 0)
+            or type(limit) is not int
+            or not 1 <= limit <= 1_024
+        ):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        return await self._run(lambda _cancelled: self._read_page_sync(key, before_sequence, limit))
+
+    async def summarize_before(
+        self,
+        session_id: SessionId,
+        before_sequence: int,
+        excluded_from_sequence: int | None = None,
+        excluded_through_sequence: int | None = None,
+    ) -> tuple[OmittedContextRef, ...]:
+        _validate_aggregate_request(
+            session_id,
+            before_sequence,
+            excluded_from_sequence,
+            excluded_through_sequence,
+        )
+        key = self._session_key(session_id)
+        return await self._run(
+            lambda _cancelled: self._summarize_before_sync(
+                key,
+                before_sequence,
+                excluded_from_sequence,
+                excluded_through_sequence,
+            )
+        )
 
     async def find_submission(
         self, session_id: SessionId, submission_id: SubmissionId
@@ -570,6 +612,95 @@ class SQLiteRunJournal:
         finally:
             connection.close()
 
+    def _read_page_sync(
+        self, session_key: str, before_sequence: int | None, limit: int
+    ) -> ConversationPage:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            if before_sequence is None:
+                rows = tuple(
+                    connection.execute(
+                        "SELECT session_id, sequence, run_id, submission_id, role, content, "
+                        "entry_json FROM transcript WHERE session_id=? "
+                        "ORDER BY sequence DESC LIMIT ?",
+                        (session_key, limit + 1),
+                    )
+                )
+            else:
+                rows = tuple(
+                    connection.execute(
+                        "SELECT session_id, sequence, run_id, submission_id, role, content, "
+                        "entry_json FROM transcript WHERE session_id=? AND sequence<? "
+                        "ORDER BY sequence DESC LIMIT ?",
+                        (session_key, before_sequence, limit + 1),
+                    )
+                )
+            selected = rows[:limit]
+            entries = tuple(_decode_transcript_row(row, session_key) for row in selected)
+            for entry in entries:
+                _verify_point_anchor(connection, session_key, entry.sequence)
+            cursor = entries[-1].sequence if len(rows) > limit else None
+            remaining = (
+                _aggregate_transcript_range(connection, session_key, 1, cursor)
+                if cursor is not None
+                else None
+            )
+            result = ConversationPage(
+                tuple(transcript_interaction(entry) for entry in entries),
+                cursor,
+                remaining,
+            )
+            connection.commit()
+            return result
+        except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
+            connection.rollback()
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        finally:
+            connection.close()
+
+    def _summarize_before_sync(
+        self,
+        session_key: str,
+        before_sequence: int,
+        excluded_from_sequence: int | None,
+        excluded_through_sequence: int | None,
+    ) -> tuple[OmittedContextRef, ...]:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            result: tuple[OmittedContextRef, ...]
+            if excluded_from_sequence is None:
+                omission = _aggregate_transcript_range(connection, session_key, 1, before_sequence)
+                result = (omission,) if omission is not None else ()
+            else:
+                assert excluded_through_sequence is not None
+                result = tuple(
+                    item
+                    for item in (
+                        _aggregate_transcript_range(
+                            connection,
+                            session_key,
+                            excluded_through_sequence + 1,
+                            before_sequence,
+                        ),
+                        _aggregate_transcript_range(
+                            connection,
+                            session_key,
+                            1,
+                            min(excluded_from_sequence, before_sequence),
+                        ),
+                    )
+                    if item is not None
+                )
+            connection.commit()
+            return result
+        except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
+            connection.rollback()
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        finally:
+            connection.close()
+
     def _find_submission_sync(
         self, session_key: str, submission_key: str
     ) -> SubmissionAcceptance | None:
@@ -807,6 +938,42 @@ def _verify_point_anchor(connection: sqlite3.Connection, session_key: str, seque
     digest = _verify_anchor(anchor, session_key, previous_hash)
     if sequence == session["sequence"] and digest != validate_hash(session["ledger_hash"]):
         raise ValueError("SQLite point anchor disagrees with Session root")
+
+
+def _aggregate_transcript_range(
+    connection: sqlite3.Connection,
+    session_key: str,
+    first_inclusive: int,
+    before_sequence: int,
+) -> OmittedContextRef | None:
+    if first_inclusive >= before_sequence:
+        return None
+    row = connection.execute(
+        "SELECT COUNT(*) AS item_count, MIN(sequence) AS first_sequence, "
+        "MAX(sequence) AS last_sequence FROM transcript "
+        "WHERE session_id=? AND sequence>=? AND sequence<?",
+        (session_key, first_inclusive, before_sequence),
+    ).fetchone()
+    if row is None or type(row["item_count"]) is not int:
+        raise ValueError("SQLite transcript aggregate is invalid")
+    count = row["item_count"]
+    if count == 0:
+        if row["first_sequence"] is not None or row["last_sequence"] is not None:
+            raise ValueError("SQLite empty transcript aggregate has boundaries")
+        return None
+    first = row["first_sequence"]
+    last = row["last_sequence"]
+    if (
+        type(first) is not int
+        or type(last) is not int
+        or not first_inclusive <= first <= last < before_sequence
+        or count > last - first + 1
+    ):
+        raise ValueError("SQLite transcript aggregate disagrees with its range")
+    _verify_point_anchor(connection, session_key, first)
+    if last != first:
+        _verify_point_anchor(connection, session_key, last)
+    return OmittedContextRef("transcript", first, last, count)
 
 
 def _preflight_existing_ledger(

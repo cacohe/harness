@@ -1,4 +1,5 @@
 import asyncio
+from bisect import bisect_left, bisect_right
 
 import pytest
 from src.adapters.context.bounded import BoundedContextProvider
@@ -10,6 +11,7 @@ from src.core.context import (
     ConversationInteraction,
     ConversationPage,
     EstimateQuality,
+    OmittedContextRef,
 )
 from src.core.ids import ProfileId, SessionId
 from src.core.journal import ConversationSummaryCheckpoint
@@ -19,20 +21,65 @@ from src.core.tools import ToolSpec
 
 class Reader:
     def __init__(self, items: tuple[ConversationInteraction, ...]):
-        self.items = tuple(sorted(items, key=lambda item: item.sequence_through, reverse=True))
+        self.items = tuple(sorted(items, key=lambda item: item.sequence_through))
         self.calls: list[tuple[int | None, int]] = []
+        self.aggregate_calls: list[tuple[int, int | None, int | None]] = []
 
     async def read_page(self, session_id, before_sequence, limit):
         assert session_id == SessionId("session")
         self.calls.append((before_sequence, limit))
-        eligible = [
-            item
-            for item in self.items
-            if before_sequence is None or item.sequence_through < before_sequence
-        ]
-        page = tuple(eligible[:limit])
-        more = len(eligible) > len(page)
+        end = (
+            len(self.items)
+            if before_sequence is None
+            else bisect_left(self.items, before_sequence, key=lambda item: item.sequence_through)
+        )
+        start = max(0, end - limit)
+        page = tuple(reversed(self.items[start:end]))
+        more = start > 0
         return ConversationPage(page, page[-1].sequence_from if more else None)
+
+    async def summarize_before(
+        self,
+        session_id,
+        before_sequence,
+        excluded_from_sequence=None,
+        excluded_through_sequence=None,
+    ):
+        assert session_id == SessionId("session")
+        self.aggregate_calls.append(
+            (before_sequence, excluded_from_sequence, excluded_through_sequence)
+        )
+        end = bisect_left(self.items, before_sequence, key=lambda item: item.sequence_through)
+
+        def omission(start: int, stop: int):
+            if start >= stop:
+                return None
+            return OmittedContextRef(
+                "transcript",
+                self.items[start].sequence_from,
+                self.items[stop - 1].sequence_through,
+                stop - start,
+            )
+
+        if excluded_from_sequence is None:
+            aggregate = omission(0, end)
+            return (aggregate,) if aggregate is not None else ()
+        assert excluded_through_sequence is not None
+        high_start = bisect_right(
+            self.items,
+            excluded_through_sequence,
+            hi=end,
+            key=lambda item: item.sequence_through,
+        )
+        low_end = bisect_left(
+            self.items,
+            excluded_from_sequence,
+            hi=end,
+            key=lambda item: item.sequence_through,
+        )
+        return tuple(
+            item for item in (omission(high_start, end), omission(0, low_end)) if item is not None
+        )
 
 
 def _request(**changes) -> ContextRequest:
@@ -196,7 +243,8 @@ def test_ten_thousand_records_with_partial_checkpoint_remain_bounded_and_determi
         (1, 4_000),
         (6_001, 9_996),
     ]
-    assert len(reader.calls) > 100
+    assert len(reader.calls) <= 4
+    assert len(reader.aggregate_calls) == 2
 
 
 def test_tools_are_counted_in_the_budget() -> None:

@@ -1,13 +1,15 @@
 import json
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import datetime
 from threading import Lock
 from typing import Any, TypeAlias, TypeVar
 
+from src.adapters.context.journal_history import transcript_interaction
 from src.core.artifacts import ArtifactRef, ExternalizedContent, snapshot_artifact_ref
 from src.core.commands import RunLimits, ToolCallRequest
+from src.core.context import ConversationPage, OmittedContextRef
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.events import DomainEvent, DomainEventType, _is_canonical_timestamp
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
@@ -232,6 +234,70 @@ class InMemoryRunJournal:
             )
         )
 
+    async def read_page(
+        self, session_id: SessionId, before_sequence: int | None, limit: int
+    ) -> ConversationPage:
+        if (
+            type(session_id) is not SessionId
+            or before_sequence is not None
+            and (type(before_sequence) is not int or before_sequence <= 0)
+            or type(limit) is not int
+            or not 1 <= limit <= 1_024
+        ):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        key = SessionId(session_id.value).value
+        with self._lock:
+            session = self._store.sessions.get(key)
+        transcript = () if session is None else session.transcript
+        end = (
+            len(transcript)
+            if before_sequence is None
+            else bisect_left(transcript, before_sequence, key=lambda entry: entry.sequence)
+        )
+        start = max(0, end - limit)
+        entries = transcript[start:end]
+        page = tuple(transcript_interaction(entry) for entry in reversed(entries))
+        cursor = entries[0].sequence if start else None
+        remaining = _transcript_omission(transcript, 0, start) if start else None
+        return ConversationPage(page, cursor, remaining)
+
+    async def summarize_before(
+        self,
+        session_id: SessionId,
+        before_sequence: int,
+        excluded_from_sequence: int | None = None,
+        excluded_through_sequence: int | None = None,
+    ) -> tuple[OmittedContextRef, ...]:
+        _validate_aggregate_request(
+            session_id,
+            before_sequence,
+            excluded_from_sequence,
+            excluded_through_sequence,
+        )
+        key = SessionId(session_id.value).value
+        with self._lock:
+            session = self._store.sessions.get(key)
+        transcript = () if session is None else session.transcript
+        end = bisect_left(transcript, before_sequence, key=lambda entry: entry.sequence)
+        if excluded_from_sequence is None:
+            omission = _transcript_omission(transcript, 0, end)
+            return (omission,) if omission is not None else ()
+        assert excluded_through_sequence is not None
+        high_start = bisect_right(
+            transcript, excluded_through_sequence, hi=end, key=lambda entry: entry.sequence
+        )
+        low_end = bisect_left(
+            transcript, excluded_from_sequence, hi=end, key=lambda entry: entry.sequence
+        )
+        return tuple(
+            item
+            for item in (
+                _transcript_omission(transcript, high_start, end),
+                _transcript_omission(transcript, 0, low_end),
+            )
+            if item is not None
+        )
+
     async def find_submission(
         self, session_id: SessionId, submission_id: SubmissionId
     ) -> SubmissionAcceptance | None:
@@ -277,6 +343,40 @@ class InMemoryRunJournal:
         if len(matches) > 1:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
         return None if not matches else _canonical_copy(matches[0])
+
+
+def _validate_aggregate_request(
+    session_id: SessionId,
+    before_sequence: int,
+    excluded_from_sequence: int | None,
+    excluded_through_sequence: int | None,
+) -> None:
+    if (
+        type(session_id) is not SessionId
+        or type(before_sequence) is not int
+        or before_sequence <= 0
+        or (excluded_from_sequence is None) != (excluded_through_sequence is None)
+        or excluded_from_sequence is not None
+        and (
+            type(excluded_from_sequence) is not int
+            or type(excluded_through_sequence) is not int
+            or not 1 <= excluded_from_sequence <= excluded_through_sequence
+        )
+    ):
+        raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+
+
+def _transcript_omission(
+    transcript: tuple[TranscriptEntry, ...], start: int, end: int
+) -> OmittedContextRef | None:
+    if start >= end:
+        return None
+    return OmittedContextRef(
+        "transcript",
+        transcript[start].sequence,
+        transcript[end - 1].sequence,
+        end - start,
+    )
 
 
 _T = TypeVar("_T")
