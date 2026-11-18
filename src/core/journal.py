@@ -89,6 +89,16 @@ class ArtifactAttachmentFact:
 
 
 @dataclass(frozen=True)
+class ArtifactFactRecord:
+    index: int
+    fact: ArtifactAttachmentFact
+
+    def __post_init__(self) -> None:
+        if type(self.index) is not int or self.index < 0 or type(self.fact) is not ArtifactAttachmentFact:
+            raise ValueError("Artifact fact record is invalid")
+
+
+@dataclass(frozen=True)
 class TranscriptEntry:
     session_id: SessionId
     run_id: RunId
@@ -278,6 +288,12 @@ class RunJournal(Protocol):
         """
         ...
 
+    def find_run_state_by_id(
+        self, session_id: SessionId, run_id: RunId
+    ) -> Awaitable[RunState | None]:
+        """Read one authenticated Run projection without caller-supplied submission data."""
+        ...
+
     def load_artifact_attachments(
         self, session_id: SessionId, run_id: RunId
     ) -> Awaitable[tuple[ArtifactAttachmentFact, ...]]:
@@ -286,4 +302,14 @@ class RunJournal(Protocol):
 
     def artifact_has_active_attachments(self, artifact_id: str) -> Awaitable[bool]:
         """Return whether retirement is forbidden by any active durable attachment."""
+        ...
+
+    def load_artifact_facts(
+        self,
+        session_id: SessionId,
+        run_id: RunId,
+        after_index: int,
+        limit: int,
+    ) -> Awaitable[tuple[ArtifactFactRecord, ...]]:
+        """Page append-only lifecycle facts for one Run by Session-global fact index."""
         ...

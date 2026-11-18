@@ -48,6 +48,7 @@ from src.core.ids import ProfileId, RunId, SessionId, SubmissionId
 from src.core.journal import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
+    ArtifactFactRecord,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,
@@ -324,6 +325,7 @@ CREATE TABLE artifact_attachments (
   PRIMARY KEY(session_id, run_id, owner_id, role, artifact_id)
 ) STRICT;
 CREATE INDEX artifact_facts_by_artifact ON artifact_attachment_facts(artifact_id);
+CREATE INDEX artifact_facts_by_run ON artifact_attachment_facts(session_id, run_id, fact_index);
 CREATE INDEX artifact_attachments_by_artifact ON artifact_attachments(artifact_id);
 CREATE TRIGGER artifact_facts_insert_guard BEFORE INSERT ON artifact_attachment_facts
 WHEN harness_journal_append_allowed() != 1 BEGIN
@@ -464,6 +466,7 @@ _EXPECTED_INDEXES = {
     "submissions_by_identity": ("session_id", "submission_id", "digest"),
     "artifact_attachments_by_artifact": ("artifact_id",),
     "artifact_facts_by_artifact": ("artifact_id",),
+    "artifact_facts_by_run": ("session_id", "run_id", "fact_index"),
 }
 
 
@@ -635,6 +638,15 @@ class SQLiteRunJournal:
             lambda _cancelled: self._find_run_state_sync(session_key, run_key, submission_key)
         )
 
+    async def find_run_state_by_id(
+        self, session_id: SessionId, run_id: RunId
+    ) -> RunState | None:
+        session_key = self._session_key(session_id)
+        run_key = _typed_id_key(run_id, RunId)
+        return await self._run(
+            lambda _cancelled: self._find_run_state_by_id_sync(session_key, run_key)
+        )
+
     async def load_artifact_attachments(
         self, session_id: SessionId, run_id: RunId
     ) -> tuple[ArtifactAttachmentFact, ...]:
@@ -649,6 +661,28 @@ class SQLiteRunJournal:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
         return await self._run(
             lambda _cancelled: self._artifact_has_active_attachments_sync(artifact_id)
+        )
+
+    async def load_artifact_facts(
+        self,
+        session_id: SessionId,
+        run_id: RunId,
+        after_index: int,
+        limit: int,
+    ) -> tuple[ArtifactFactRecord, ...]:
+        session_key = self._session_key(session_id)
+        run_key = _typed_id_key(run_id, RunId)
+        if (
+            type(after_index) is not int
+            or after_index < -1
+            or type(limit) is not int
+            or not 1 <= limit <= 1_024
+        ):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        return await self._run(
+            lambda _cancelled: self._load_artifact_facts_sync(
+                session_key, run_key, after_index, limit
+            )
         )
 
     async def _run(self, operation: Callable[[Event], _T]) -> _T:
@@ -852,10 +886,14 @@ class SQLiteRunJournal:
                 ).fetchone()[0]
             )
             for fact in batch.artifact_facts:
+                target_run = connection.execute(
+                    "SELECT submission_id FROM runs WHERE session_id=? AND run_id=?",
+                    (session_key, fact.run_id.value),
+                ).fetchone()
                 if (
                     fact.session_id != state.session_id
-                    or fact.run_id != state.run_id
-                    or fact.submission_id != state.submission_id
+                    or target_run is None
+                    or target_run["submission_id"] != fact.submission_id.value
                 ):
                     raise ValueError("Artifact attachment identity disagrees")
                 fact_json = encode(fact)
@@ -1512,6 +1550,80 @@ class SQLiteRunJournal:
                 raise ValueError("SQLite Run acceptance identity disagrees")
             _verify_point_anchor(connection, session_key, receipt.transcript[0].sequence)
             return state
+        except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        finally:
+            connection.close()
+
+    def _find_run_state_by_id_sync(
+        self, session_key: str, run_key: str
+    ) -> RunState | None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            row = connection.execute(
+                "SELECT session_id, run_id, submission_id, profile_id, status, state_version, "
+                "run_index, state_hash, state_json FROM runs WHERE session_id=? AND run_id=?",
+                (session_key, run_key),
+            ).fetchone()
+            if row is None:
+                return None
+            state = decode(row["state_json"], RunState)
+            _validate_run_row(row, state)
+            session_row = connection.execute(
+                "SELECT session_id, version, sequence, state_json, ledger_hash, coverage_hash, "
+                "transcript_count, summary_hash, summary_count, session_state_hash, "
+                "run_projection_hash, run_count, authenticated_root FROM sessions WHERE session_id=?",
+                (session_key,),
+            ).fetchone()
+            if session_row is None:
+                raise ValueError("SQLite Run has no Session")
+            _reject_integrity_violation(connection, session_key)
+            _verify_authenticated_root(session_row, session_key)
+            _verify_run_projection_path(
+                connection,
+                session_key,
+                row["run_index"],
+                row["state_hash"],
+                session_row["run_projection_hash"],
+            )
+            return state
+        except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        finally:
+            connection.close()
+
+    def _load_artifact_facts_sync(
+        self,
+        session_key: str,
+        run_key: str,
+        after_index: int,
+        limit: int,
+    ) -> tuple[ArtifactFactRecord, ...]:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            _reject_integrity_violation(connection, session_key)
+            records: list[ArtifactFactRecord] = []
+            for row in connection.execute(
+                "SELECT fact_index, session_id, run_id, submission_id, owner_id, role, action, "
+                "artifact_id, fact_json FROM artifact_attachment_facts WHERE session_id=? "
+                "AND run_id=? AND fact_index>? ORDER BY fact_index LIMIT ?",
+                (session_key, run_key, after_index, limit),
+            ):
+                fact = decode(row["fact_json"], ArtifactAttachmentFact)
+                if (
+                    row["session_id"] != fact.session_id.value
+                    or row["run_id"] != fact.run_id.value
+                    or row["submission_id"] != fact.submission_id.value
+                    or row["owner_id"] != fact.owner_id
+                    or row["role"] != fact.role.value
+                    or row["action"] != fact.action.value
+                    or row["artifact_id"] != fact.artifact.artifact_id
+                ):
+                    raise ValueError("Artifact lifecycle fact row disagrees")
+                records.append(ArtifactFactRecord(int(row["fact_index"]), fact))
+            return tuple(records)
         except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
         finally:

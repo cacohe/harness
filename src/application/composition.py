@@ -355,6 +355,10 @@ _JOURNAL_METHODS = (
     "find_submission",
     "find_run_input",
     "find_run_state",
+    "find_run_state_by_id",
+    "load_artifact_attachments",
+    "artifact_has_active_attachments",
+    "load_artifact_facts",
 )
 
 

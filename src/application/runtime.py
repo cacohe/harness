@@ -9,11 +9,12 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Protocol, TypeVar
 
+from src.application.artifact_lifecycle import ArtifactLifecycleService
 from src.application.observability import Observation, PostCommitObserver
 from src.application.submissions import AcceptedRun, SubmissionService
 from src.core.commands import AdvanceRun, CancelRun, CommandContext, DecideToolCall, ResumeRun
 from src.core.ids import Clock, IdGenerator, ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import JournalHead, RunJournal
+from src.core.journal import ArtifactAttachmentFact, ArtifactAttachmentRole, JournalHead, RunJournal
 from src.core.receipt_snapshot import snapshot_run_state, snapshot_transcript
 from src.core.run import RunCoordinator, RunOutcome
 from src.core.state import RunState, RunStatus
@@ -152,6 +153,9 @@ class RuntimeCoordinator:
             raise ValueError("Runtime limits and resources are invalid")
         self._submissions = submissions
         self._journal = journal
+        self._artifact_lifecycle = ArtifactLifecycleService(
+            journal=journal, max_conflict_retries=max_advances_per_operation
+        )
         self._coordinator_factory = coordinator_factory
         self._ids = ids
         self._clock = clock
@@ -270,6 +274,29 @@ class RuntimeCoordinator:
                 slot.cancel_task = task
                 slot.cancel_run_id = run_key
         return await asyncio.shield(task)
+
+    async def detach_artifacts(
+        self,
+        session_id: SessionId,
+        run_id: RunId,
+        *,
+        roles: tuple[ArtifactAttachmentRole, ...] | None = None,
+    ) -> tuple[ArtifactAttachmentFact, ...]:
+        session_id = _canonical_id(session_id, SessionId, "Artifact ownership is invalid")
+        run_id = _canonical_id(run_id, RunId, "Artifact ownership is invalid")
+        slot = await self._slot(session_id)
+        async with slot.gate.enter():
+            async with self._operation(session_id, slot):
+                try:
+                    detached = await self._artifact_lifecycle.detach(
+                        session_id, run_id, roles=roles
+                    )
+                except ValueError as error:
+                    raise SessionOwnershipError(str(error)) from None
+                if detached:
+                    state = await self._head_state(session_id)
+                    await self._observe("artifact.detached", state)
+                return detached
 
     async def _cancel_run_impl(
         self, session_id: SessionId, run_id: RunId, slot: _SessionSlot

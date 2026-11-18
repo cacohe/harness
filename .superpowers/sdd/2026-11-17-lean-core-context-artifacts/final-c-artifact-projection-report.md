@@ -80,3 +80,38 @@ GREEN/回归：
 | `git diff --check` | 通过，仅 LF/CRLF 提示 |
 
 全仓使用 `cpython-3.11.16-windows-x86_64-none` 与 worktree `.venv` dependencies。
+
+## Fix round 1/5：公开 detach 生命周期与 Memory facts history
+
+本轮 RED 为 `ModuleNotFoundError: No module named 'src.application.artifact_lifecycle'`：生产
+attachment 虽然 durable，却没有调用方可达的释放入口。
+
+新增 `ArtifactLifecycleService`，并通过 `RuntimeCoordinator` 暴露
+`AgentSession.detach_artifacts(run_id, roles=None)`。调用方只能选择 Run 和 role，不能提交
+descriptor；服务从 journal active index 取得完整 owner/role/descriptor，确认目标 Run 属于当前
+Session 且已经 terminal，再以当前 Session head 做 CAS state-only commit，原子追加精确
+`DETACHED` facts。目标可以是历史 Run，commit 不会把 Session head 回退到旧 Run。CAS 冲突会重读
+durable state 后重试；空 active set、重复调用和并发调用都幂等。observer 仍在 commit 后运行，
+失败不回滚 detach，随后 retry 返回空集合。
+
+`RunJournal` 新增 authenticated `find_run_state_by_id()` 和有界
+`load_artifact_facts(session_id, run_id, after_index, limit<=1024)`。Memory journal 现在除 active
+派生索引外，还保存 Session-global、append-only `ArtifactFactRecord(index, fact)` 历史；SQLite
+使用既有 `fact_index` 并新增 `(session_id, run_id, fact_index)` 索引分页。facts 不复制到
+`RunState`。
+
+覆盖：Memory/SQLite reopen、tool/final/summary role 筛选、整 Run 释放、重复与并发 detach、真实
+stale CAS、wrong Run/non-terminal、两 Run 共享 digest、detach/retire 并发、observer failure 后
+retry，以及公开 AgentSession 生产生成 Artifact 流程。README 与 reliable runtime 文档已同步；
+Session/Agent close 不隐式释放 durable ownership。
+
+本轮最终验证：
+
+| 检查 | 结果 |
+| --- | --- |
+| lifecycle/retention/public API focused | `44 passed` |
+| journal contract + SQLite | `250 passed in 331.12s` |
+| application/runtime/Artifact/recovery/load E2E | `90 passed in 14.02s` |
+| Ruff `src tests` | `All checks passed!` |
+| mypy `src` | `Success: no issues found in 59 source files` |
+| CPython 3.11 全仓 | `1269 passed, 2 skipped in 461.19s` |

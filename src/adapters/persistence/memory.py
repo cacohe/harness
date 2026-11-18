@@ -24,6 +24,7 @@ from src.core.journal import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,
+    ArtifactFactRecord,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,
@@ -48,6 +49,7 @@ _IntentValue: TypeAlias = tuple[str, object]
 _ID_TYPES = (EventId, ProfileId, RunId, SessionId, SubmissionId)
 _RECORD_TYPES = (
     ArtifactAttachmentFact,
+    ArtifactFactRecord,
     JournalCommit,
     JournalSnapshot,
     JournalEvent,
@@ -83,6 +85,7 @@ class _Session:
     artifact_attachments: Mapping[tuple[str, str, str, str], ArtifactAttachmentFact] = field(
         default_factory=dict
     )
+    artifact_facts: tuple[ArtifactFactRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -207,11 +210,13 @@ class InMemoryRunJournal:
                     input_key: (*run_inputs.get(input_key, ()), entry),
                 }
             attachments = dict(session.artifact_attachments)
+            fact_history = list(session.artifact_facts)
             for fact in batch.artifact_facts:
+                target = state if fact.run_id == state.run_id else session.runs.get(fact.run_id.value)
                 if (
                     fact.session_id != state.session_id
-                    or fact.run_id != state.run_id
-                    or fact.submission_id != state.submission_id
+                    or target is None
+                    or fact.submission_id != target.submission_id
                 ):
                     raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
                 key = (fact.run_id.value, *fact.key)
@@ -224,6 +229,7 @@ class InMemoryRunJournal:
                     raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
                 else:
                     del attachments[key]
+                fact_history.append(ArtifactFactRecord(len(fact_history), fact))
             next_session = _Session(
                 version=receipt.version,
                 sequence=receipt.sequence,
@@ -236,6 +242,7 @@ class InMemoryRunJournal:
                 summary_order=summary_order,
                 submissions=submissions,
                 artifact_attachments=attachments,
+                artifact_facts=tuple(fact_history),
             )
             self._store = _Store(
                 sessions={**store.sessions, session_key: next_session},
@@ -480,6 +487,16 @@ class InMemoryRunJournal:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
         return state
 
+    async def find_run_state_by_id(
+        self, session_id: SessionId, run_id: RunId
+    ) -> RunState | None:
+        if type(session_id) is not SessionId or type(run_id) is not RunId:
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        with self._lock:
+            session = self._store.sessions.get(session_id.value)
+            state = None if session is None else session.runs.get(run_id.value)
+        return None if state is None else _canonical_copy(state)
+
     async def load_artifact_attachments(
         self, session_id: SessionId, run_id: RunId
     ) -> tuple[ArtifactAttachmentFact, ...]:
@@ -503,6 +520,33 @@ class InMemoryRunJournal:
                 for session in self._store.sessions.values()
                 for fact in session.artifact_attachments.values()
             )
+
+    async def load_artifact_facts(
+        self,
+        session_id: SessionId,
+        run_id: RunId,
+        after_index: int,
+        limit: int,
+    ) -> tuple[ArtifactFactRecord, ...]:
+        if (
+            type(session_id) is not SessionId
+            or type(run_id) is not RunId
+            or type(after_index) is not int
+            or after_index < -1
+            or type(limit) is not int
+            or not 1 <= limit <= 1_024
+        ):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        with self._lock:
+            session = self._store.sessions.get(session_id.value)
+            if session is None:
+                return ()
+            result = tuple(
+                record
+                for record in session.artifact_facts
+                if record.index > after_index and record.fact.run_id == run_id
+            )[:limit]
+        return _canonical_copy(result)
 
 
 def _validate_aggregate_request(

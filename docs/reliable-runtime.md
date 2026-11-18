@@ -60,11 +60,19 @@ async-only:
 - `await session.decide_tool_call(run_id, tool_call_id, approved=True)` to approve
 - `await session.decide_tool_call(run_id, tool_call_id, approved=False)` to reject
 - `await session.cancel(run_id)`
+- `await session.detach_artifacts(run_id, roles=None)` for a terminal Run
 - `await session.close()`
 - `await agent.close()`
 
 Runtime ownership checks prevent a Run from being resumed, decided or cancelled through a different
 Session. Terminal facts remain durable across restart.
+
+Artifact detach never accepts caller-supplied descriptors. It reads the Run's authoritative active
+attachments, appends exact `DETACHED` lifecycle facts with the current Session CAS, and retries a
+stale CAS from durable state. `roles` can select tool results, final outputs, or summaries; omitting
+it releases the whole Run. Repeated and concurrent calls are idempotent, and detaching one owner
+does not release another owner of the same content-addressed object. Lifecycle facts are available
+through the journal's bounded `load_artifact_facts(..., after_index, limit)` index.
 
 ## Tool side effects
 
@@ -107,6 +115,9 @@ If journal commit fails after an Artifact write, the result is an unreferenced o
 durable dangling ref. The filesystem adapter can retire such objects after a grace period.
 `ReadArtifactTool` provides authorized, bounded range reads; the model never receives repository
 access directly.
+
+Referenced objects are retired only after explicit detach. `ArtifactRetentionService` rejects a
+delete while any durable owner remains; after the last owner detaches, retirement becomes reachable.
 
 ## Observability and shutdown
 

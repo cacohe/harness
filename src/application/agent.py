@@ -4,6 +4,7 @@ import asyncio
 
 from src.application.runtime import RuntimeCoordinator
 from src.core.ids import IdGenerator, ProfileId, RunId, SessionId, SubmissionId
+from src.core.journal import ArtifactAttachmentFact, ArtifactAttachmentRole
 from src.core.state import RunState
 
 
@@ -36,6 +37,15 @@ class AgentSession:
     async def cancel(self, run_id: RunId) -> RunState:
         self._ensure_open()
         return await self._runtime.cancel_run(self.session_id, run_id)
+
+    async def detach_artifacts(
+        self,
+        run_id: RunId,
+        *,
+        roles: tuple[ArtifactAttachmentRole, ...] | None = None,
+    ) -> tuple[ArtifactAttachmentFact, ...]:
+        self._ensure_open()
+        return await self._runtime.detach_artifacts(self.session_id, run_id, roles=roles)
 
     async def close(self) -> None:
         task = self._close_task

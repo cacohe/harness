@@ -29,6 +29,7 @@ from src.application import ApplicationConfig, create_production_agent
 from src.core.commands import RunLimits
 from src.core.context import ContextBudget
 from src.core.ids import ProfileId
+from src.core.journal import ArtifactAttachmentRole
 
 config = ApplicationConfig(
     limits=RunLimits(max_steps=32, max_elapsed_seconds=300.0, max_inline_result_bytes=65_536),
@@ -58,6 +59,7 @@ async with agent:
     state = await session.submit("分析这批数据")
     if state.status.value == "waiting_approval":
         state = await session.decide_tool_call(state.run_id, "call-1", approved=True)
+    detached = await session.detach_artifacts(state.run_id)
 ```
 
 `create_development_agent()` 使用内存 journal 与内存 Artifact repository；生产组合在未显式注入
@@ -88,6 +90,13 @@ CAS 原子提交。外层循环由 application runtime 驱动，受以下边界�
 3. journal 仅提交 `ArtifactRef + bounded summary`；
 4. 模型需要内容时，通过普通 `read_artifact` 工具按范围读取；
 5. journal 失败可能留下未引用对象，由 adapter 的宽限期回收处理。
+
+terminal Run 的 ownership 不会随 Session handle 关闭而隐式消失。调用方应显式使用
+`await session.detach_artifacts(run_id)` 释放整 Run，或通过
+`roles=(ArtifactAttachmentRole.TOOL_RESULT,)` 只释放指定角色。该 API 不接受调用方构造的
+`ArtifactRef`，而是从 durable active index 读取完整 descriptor，并用 Session CAS 原子追加
+`DETACHED` facts；重复或并发调用幂等。共享 digest 只有在所有 owner 都 detach 后才允许
+`ArtifactRetentionService.retire()`。
 
 `FilesystemArtifactRepository` 使用 content-addressed 路径、临时写入、原子 finalize、大小/hash
 校验和路径防护；它是单机 reference adapter，不宣称支持多节点共享。

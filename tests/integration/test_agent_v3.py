@@ -116,6 +116,8 @@ class Model:
             await self._all_arrived.wait()
         if message == "model-timeout":
             raise TimeoutError("provider deadline")
+        if message == "artifact-lifecycle":
+            return ModelResponse("x" * 80)
         if round_number == 0 and message == "tools":
             return ModelResponse(
                 tool_calls=(
@@ -192,7 +194,7 @@ async def rig(*, journal=None, model=None, tools=None, ids=None, observer=None):
         ArtifactPolicy(
             64,
             1_048_576,
-            256,
+            64,
             frozenset({"application/json", "text/plain"}),
         ),
     )
@@ -241,6 +243,59 @@ def test_agent_runs_direct_answer_and_ordered_tool_batch_end_to_end():
         "tool",
         "assistant",
     ]
+
+
+def test_agent_session_publicly_detaches_production_generated_artifacts() -> None:
+    async def scenario():
+        agent, journal, _, _ = await rig()
+        session = await agent.open_session(SessionId("artifact-lifecycle"))
+        state = await session.submit(
+            "artifact-lifecycle", SubmissionId("artifact-lifecycle")
+        )
+        assert state.status is RunStatus.COMPLETED
+        assert state.final_artifacts
+        active = await journal.load_artifact_attachments(state.session_id, state.run_id)
+        detached = await session.detach_artifacts(
+            state.run_id, roles=(active[0].role,)
+        )
+        repeated = await session.detach_artifacts(state.run_id)
+        facts = await journal.load_artifact_facts(
+            state.session_id, state.run_id, -1, 16
+        )
+        await agent.close()
+        return active, detached, repeated, facts
+
+    active, detached, repeated, facts = asyncio.run(scenario())
+    assert len(active) == 1
+    assert detached[0].artifact == active[0].artifact
+    assert detached[0].owner_id == active[0].owner_id
+    assert detached[0].action.value == "detached"
+    assert repeated == ()
+    assert [record.fact.action.value for record in facts] == ["attached", "detached"]
+
+
+def test_detach_commit_survives_observer_failure_and_retry() -> None:
+    class Observer:
+        async def observe(self, observation):
+            if observation.kind == "artifact.detached":
+                raise RuntimeError("observer unavailable")
+
+    async def scenario():
+        agent, journal, _, _ = await rig(observer=Observer())
+        session = await agent.open_session(SessionId("artifact-observer"))
+        state = await session.submit(
+            "artifact-lifecycle", SubmissionId("artifact-observer")
+        )
+        first = await session.detach_artifacts(state.run_id)
+        retry = await session.detach_artifacts(state.run_id)
+        active = await journal.load_artifact_attachments(state.session_id, state.run_id)
+        await agent.close()
+        return first, retry, active
+
+    first, retry, active = asyncio.run(scenario())
+    assert len(first) == 1
+    assert retry == ()
+    assert active == ()
 
 
 @pytest.mark.parametrize("approved", [True, False])

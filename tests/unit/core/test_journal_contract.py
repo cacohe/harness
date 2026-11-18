@@ -107,6 +107,16 @@ def test_artifact_attachment_is_durable_indexed_and_blocks_retirement(
         journal.load_artifact_attachments(batch.state.session_id, batch.state.run_id)
     )
     assert not asyncio.run(journal.artifact_has_active_attachments(ref.artifact_id))
+    first_page = asyncio.run(
+        journal.load_artifact_facts(batch.state.session_id, batch.state.run_id, -1, 1)
+    )
+    second_page = asyncio.run(
+        journal.load_artifact_facts(
+            batch.state.session_id, batch.state.run_id, first_page[0].index, 1
+        )
+    )
+    assert first_page[0].fact == fact
+    assert second_page[0].fact == detach
 
 
 @pytest.mark.parametrize("mode", ("conflict", "detach-missing"))

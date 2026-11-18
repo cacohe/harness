@@ -9,6 +9,18 @@ from importlib import import_module
 _EXPORTS = {
     "Agent": ("src.application.agent", "Agent"),
     "AgentSession": ("src.application.agent", "AgentSession"),
+    "ArtifactLifecycleService": (
+        "src.application.artifact_lifecycle",
+        "ArtifactLifecycleService",
+    ),
+    "ArtifactRetentionBlocked": (
+        "src.application.artifact_retention",
+        "ArtifactRetentionBlocked",
+    ),
+    "ArtifactRetentionService": (
+        "src.application.artifact_retention",
+        "ArtifactRetentionService",
+    ),
     "ApplicationConfig": ("src.application.composition", "ApplicationConfig"),
     "create_development_agent": (
         "src.application.composition",

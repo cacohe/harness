@@ -502,6 +502,18 @@ class _JournalPort:
     async def find_run_state(self, *_args):
         raise NotImplementedError
 
+    async def find_run_state_by_id(self, *_args):
+        raise NotImplementedError
+
+    async def load_artifact_attachments(self, *_args):
+        raise NotImplementedError
+
+    async def artifact_has_active_attachments(self, *_args):
+        raise NotImplementedError
+
+    async def load_artifact_facts(self, *_args):
+        raise NotImplementedError
+
 
 class _ExternalizerPort:
     async def externalize(self, *_args):
