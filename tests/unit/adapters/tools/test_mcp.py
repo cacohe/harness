@@ -706,6 +706,113 @@ def test_blocked_synchronous_close_fails_bounded_once_and_is_idempotent() -> Non
         watchdog.cancel()
 
 
+@pytest.mark.parametrize("idle_clients", [1, 3])
+def test_idle_sync_close_has_capacity_when_operation_workers_are_exhausted(idle_clients) -> None:
+    release_operations = threading.Event()
+    operation_workers: list[threading.Thread] = []
+
+    class SyncClose(Client):
+        def aclose(self):
+            self.closed += 1
+
+    clients = [SyncClose() for _ in range(idle_clients)]
+    late_clients = [SyncClose() for _ in range(4)]
+
+    def factory(source):
+        if source < idle_clients:
+            return clients[source]
+        operation_workers.append(threading.current_thread())
+        release_operations.wait()
+        return late_clients[source - idle_clients]
+
+    async def scenario():
+        gateway = _gateway(clients[0], timeout_seconds=0.1, factory=factory)
+        for index in range(idle_clients):
+            await gateway.add_server(f"idle-{index}", index)
+        outcomes = await asyncio.gather(
+            *(gateway.add_server(f"blocked-{index}", idle_clients + index) for index in range(4)),
+            return_exceptions=True,
+        )
+        assert all(isinstance(outcome, TimeoutError) for outcome in outcomes)
+        assert len(operation_workers) == 4
+        assert all(worker.is_alive() for worker in operation_workers)
+        # All four operations remain blocked until after shutdown and loop exit.
+        await asyncio.wait_for(asyncio.gather(*(gateway.aclose() for _ in range(12))), 0.8)
+        assert [client.closed for client in clients] == [1] * idle_clients
+        await gateway.aclose()
+        assert [client.closed for client in clients] == [1] * idle_clients
+        assert all(worker.is_alive() for worker in operation_workers)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release_operations.set()
+        for worker in operation_workers:
+            worker.join(1)
+    assert [client.closed for client in late_clients] == [1] * 4
+
+
+def test_cleanup_capacity_is_bounded_and_cannot_starve_operations() -> None:
+    release_cleanup = threading.Event()
+    cleanup_workers: list[threading.Thread] = []
+
+    class BlockingClose(Client):
+        def aclose(self):
+            self.closed += 1
+            cleanup_workers.append(threading.current_thread())
+            release_cleanup.wait()
+
+    clients = [BlockingClose() for _ in range(12)]
+    healthy = Client()
+
+    async def scenario():
+        async def factory(source):
+            return clients[source] if source < len(clients) else healthy
+
+        gateway = _gateway(healthy, timeout_seconds=0.1, factory=factory)
+        for index in range(len(clients)):
+            await gateway.add_server(f"blocked-{index}", index)
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(
+                *(gateway.remove_server(f"blocked-{index}") for index in range(len(clients))),
+                return_exceptions=True,
+            ),
+            0.8,
+        )
+        assert all(isinstance(outcome, TimeoutError) for outcome in outcomes)
+        assert len(cleanup_workers) == 4
+        assert all(worker.is_alive() for worker in cleanup_workers)
+
+        # A separate cleanup budget must leave ordinary synchronous work usable.
+        def sync_factory(_source):
+            return healthy
+
+        gateway._factory = sync_factory
+        await gateway.add_server("healthy", len(clients))
+        result = await gateway.execute(_request(gateway))
+        assert result.status is ToolResultStatus.SUCCESS
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(*(gateway.aclose() for _ in range(12)), return_exceptions=True),
+            0.8,
+        )
+        assert all(isinstance(outcome, TimeoutError) for outcome in outcomes)
+        assert all(outcome is outcomes[0] for outcome in outcomes)
+        with pytest.raises(TimeoutError) as repeated:
+            await gateway.aclose()
+        assert repeated.value is outcomes[0]
+        assert sum(client.closed for client in clients) == 4
+        assert all(client.closed <= 1 for client in clients)
+        assert healthy.closed == 1
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release_cleanup.set()
+        for worker in cleanup_workers:
+            worker.join(1)
+    assert sum(client.closed for client in clients) == 4
+
+
 def test_cancelled_synchronous_call_releases_lease_and_shutdown_completes() -> None:
     call_started = threading.Event()
     release_call = threading.Event()

@@ -16,6 +16,7 @@ from src.core.artifacts import ArtifactExternalizer
 from src.core.tools import ToolSpec
 
 _MAX_SYNC_CALLS_PER_GATEWAY = 4
+_MAX_SYNC_CLOSES_PER_GATEWAY = 4
 _late_cleanup_tasks: set[asyncio.Task[None]] = set()
 
 
@@ -71,6 +72,10 @@ class MCPToolGateway(LocalToolGateway):
         self._factory = client_factory
         self._sync_timeout = self._timeout
         self._sync_limiter = _SyncLimiter()
+        # Cleanup must remain available when all operation workers are stuck.
+        # Neither limiter queues work: at most eight daemon workers per gateway,
+        # even if operations and cleanup both block permanently.
+        self._cleanup_limiter = _SyncLimiter(_MAX_SYNC_CLOSES_PER_GATEWAY)
         self._workspace = workspace_id
         self._servers: dict[str, _Server] = {}
         self._lifecycle = asyncio.Lock()
@@ -100,7 +105,7 @@ class MCPToolGateway(LocalToolGateway):
                 late_result_cleanup=partial(
                     _close_once,
                     timeout=self._sync_timeout,
-                    limiter=self._sync_limiter,
+                    limiter=self._cleanup_limiter,
                 ),
             )
             discovery = _Invocation(
@@ -117,7 +122,7 @@ class MCPToolGateway(LocalToolGateway):
             async with self._lifecycle:
                 if self._closed or name in self._servers:
                     raise ValueError("MCP server cannot be added")
-                cleanup = _LiveClientCleanup(client, self._sync_timeout, self._sync_limiter)
+                cleanup = _LiveClientCleanup(client, self._sync_timeout, self._cleanup_limiter)
                 replacement = {**self._servers, name: _Server(client, generation, entries, cleanup)}
                 self._publish(replacement)
                 self._servers = replacement
@@ -126,7 +131,7 @@ class MCPToolGateway(LocalToolGateway):
                 if discovery is not None and discovery.abandoned:
                     self._defer_close_until_settled(client, discovery)
                 else:
-                    await _owned_close(client, self._sync_timeout, self._sync_limiter)
+                    await _owned_close(client, self._sync_timeout, self._cleanup_limiter)
             raise
         finally:
             async with self._lifecycle:
@@ -395,7 +400,7 @@ class MCPToolGateway(LocalToolGateway):
                 if failure is not None:
                     raise failure
             else:
-                await _close_once(client, self._sync_timeout, self._sync_limiter)
+                await _close_once(client, self._sync_timeout, self._cleanup_limiter)
 
         self._track_retired_close(asyncio.create_task(close_later()))
 
