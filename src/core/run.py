@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.core._run_driver import _Driver
+from src.core._run_driver import _CommittedRun, _Driver
 from src.core.artifacts import ArtifactExternalizer, ArtifactRef, ExternalizedContent
 from src.core.commands import (
     AdvanceRun,
@@ -125,6 +125,10 @@ class RunCoordinator:
         self._budget = context_budget
         self._counter = context_counter
 
+    @staticmethod
+    def _outcome(result: _CommittedRun) -> RunOutcome:
+        return RunOutcome(result.state, result.journal_version, result.sequence, result.events)
+
     async def advance(self, state: RunState, command: CoreCommand) -> RunOutcome:
         if type(state) is not RunState or command.run_id != state.run_id:
             raise InvalidTransition
@@ -147,9 +151,9 @@ class RunCoordinator:
         else:
             driver.apply(command)
             if driver.state.status.terminal:
-                return await driver.commit()
+                return self._outcome(await driver.commit())
         if isinstance(command, (CancelRun, DecideToolCall)):
-            return await driver.commit()
+            return self._outcome(await driver.commit())
         if isinstance(command, ResumeRun):
             return await self._continue_tools(driver)
         if not isinstance(command, (SubmitRun, AdvanceRun)):
@@ -162,7 +166,7 @@ class RunCoordinator:
         if driver.apply(
             StartStep(driver.run_id, driver.session_id, step_id, context=driver.context())
         ):
-            return await driver.commit()
+            return self._outcome(await driver.commit())
         if driver.apply(
             StartModelCall(
                 driver.run_id,
@@ -172,7 +176,7 @@ class RunCoordinator:
                 context=driver.context(),
             )
         ):
-            return await driver.commit()
+            return self._outcome(await driver.commit())
         try:
             window = await self._context.build(self._request, self._budget)
             estimate = self._counter.count(window.messages, window.tools)
@@ -188,26 +192,26 @@ class RunCoordinator:
             ):
                 raise ContextBudgetExceeded
         except ContextBudgetExceeded:
-            return await driver.fail(RunErrorCode.CONTEXT_BUDGET_EXCEEDED)
+            return self._outcome(await driver.fail(RunErrorCode.CONTEXT_BUDGET_EXCEEDED))
         except Exception:
-            return await driver.fail(RunErrorCode.INVARIANT_VIOLATION)
+            return self._outcome(await driver.fail(RunErrorCode.INVARIANT_VIOLATION))
         try:
             response = snapshot_model_response(
                 await self._model.complete(ModelRequest(window.messages, window.tools))
             )
         except Exception:
-            return await driver.fail(RunErrorCode.MODEL_FAILED)
+            return self._outcome(await driver.fail(RunErrorCode.MODEL_FAILED))
         try:
             requests = model_tool_requests(response, window.tools)
         except (InvalidTransition, ValueError):
-            return await driver.fail(RunErrorCode.MODEL_FAILED)
+            return self._outcome(await driver.fail(RunErrorCode.MODEL_FAILED))
         model_text = response.text or ""
         final_artifacts: tuple[ArtifactRef, ...] = ()
         if (
             requests
             and len(model_text.encode("utf-8")) > driver.state.limits.max_inline_result_bytes
         ):
-            return await driver.fail(RunErrorCode.MODEL_FAILED)
+            return self._outcome(await driver.fail(RunErrorCode.MODEL_FAILED))
         if not requests:
             try:
                 model_text, final_artifacts = await externalize_final_text(
@@ -215,7 +219,7 @@ class RunCoordinator:
                 )
                 driver.attach_refs(final_artifacts, ArtifactAttachmentRole.FINAL_OUTPUT, "final")
             except Exception:
-                return await driver.fail(RunErrorCode.ARTIFACT_FAILED)
+                return self._outcome(await driver.fail(RunErrorCode.ARTIFACT_FAILED))
         if driver.apply(
             FinishModelCall(
                 driver.run_id,
@@ -227,14 +231,14 @@ class RunCoordinator:
                 context=driver.context(),
             )
         ):
-            return await driver.commit()
+            return self._outcome(await driver.commit())
         driver.checkpoint = window.new_checkpoint
         if requests:
-            return await driver.commit()
+            return self._outcome(await driver.commit())
         if driver.apply(
             FinishStep(driver.run_id, driver.session_id, step_id, context=driver.context())
         ):
-            return await driver.commit()
+            return self._outcome(await driver.commit())
         driver.apply(
             CompleteRun(
                 driver.run_id,
@@ -245,7 +249,7 @@ class RunCoordinator:
             )
         )
         driver.transcript = (driver.entry("assistant", model_text),)
-        return await driver.commit()
+        return self._outcome(await driver.commit())
 
     async def _continue_tools(self, driver: _Driver) -> RunOutcome:
         step = driver.state.current_step
@@ -269,12 +273,12 @@ class RunCoordinator:
                         context=driver.context(),
                     )
                 ):
-                    return await driver.commit()
+                    return self._outcome(await driver.commit())
                 step = driver.state.current_step
                 assert step is not None
                 current = step.tool_calls[index]
                 if driver.state.status is RunStatus.WAITING_APPROVAL:
-                    return await driver.commit()
+                    return self._outcome(await driver.commit())
             result = await self._execute(driver, current)
             if driver.apply(
                 FinishToolCall(
@@ -287,15 +291,15 @@ class RunCoordinator:
                     context=driver.context(),
                 )
             ):
-                return await driver.commit()
+                return self._outcome(await driver.commit())
             step = driver.state.current_step
             assert step is not None
         driver.transcript = tool_transcript(driver.state)
         if driver.apply(
             FinishStep(driver.run_id, driver.session_id, step_id, context=driver.context())
         ):
-            return await driver.commit()
-        return await driver.commit()
+            return self._outcome(await driver.commit())
+        return self._outcome(await driver.commit())
 
     async def _execute(
         self, driver: _Driver, call: ToolCallState

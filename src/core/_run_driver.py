@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from src.core.artifacts import ArtifactRef
@@ -19,7 +19,15 @@ from src.core.run_receipt import validate_commit_receipt
 from src.core.state import RunState, StateTransition, TaskStateMachine
 
 if TYPE_CHECKING:
-    from src.core.run import RunCoordinator, RunOutcome
+    from src.core.run import RunCoordinator
+
+
+@dataclass(frozen=True, slots=True)
+class _CommittedRun:
+    state: RunState
+    journal_version: int
+    sequence: int
+    events: tuple[DomainEvent, ...] = ()
 
 
 class _Driver:
@@ -51,7 +59,7 @@ class _Driver:
         self.events.extend(transition.events)
         return self.state.status.terminal
 
-    async def fail(self, code: RunErrorCode) -> RunOutcome:
+    async def fail(self, code: RunErrorCode) -> _CommittedRun:
         self.checkpoint = None
         self.apply(FailRun(self.run_id, self.session_id, RunFailure(code), context=self.context()))
         return await self.commit()
@@ -81,9 +89,7 @@ class _Driver:
             for ref in refs
         )
 
-    async def commit(self) -> RunOutcome:
-        from src.core.run import RunOutcome
-
+    async def commit(self) -> _CommittedRun:
         expected = self.state.journal_version
         sequence = self.state.journal_sequence + len(self.events) + len(self.transcript)
         persisted = replace(self.state, journal_version=expected + 1, journal_sequence=sequence)
@@ -122,4 +128,4 @@ class _Driver:
             expected_version=expected,
             previous_sequence=self.state.journal_sequence,
         )
-        return RunOutcome(persisted, receipt.version, receipt.sequence, tuple(self.events))
+        return _CommittedRun(persisted, receipt.version, receipt.sequence, tuple(self.events))

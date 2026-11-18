@@ -83,6 +83,9 @@ LEGACY_DOCUMENT_TERMS = (
     "SQLite schema " + "v2",
     "Migration from " + "v1",
 )
+ALLOWED_CORE_IMPORT_CYCLES = {
+    ("src.core.state", "src.core.state_validation"),
+}
 
 
 def _resolved_imports(path: Path, root: Path) -> list[tuple[int, str]]:
@@ -145,6 +148,55 @@ def _core_line_counts(root: Path) -> dict[str, int]:
     }
 
 
+def _core_runtime_dependencies(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    dependencies: set[str] = set()
+
+    class RuntimeImportVisitor(ast.NodeVisitor):
+        def visit_If(self, node: ast.If) -> None:
+            is_type_checking = isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING"
+            if is_type_checking:
+                for child in node.orelse:
+                    self.visit(child)
+                return
+            self.generic_visit(node)
+
+        def visit_Import(self, node: ast.Import) -> None:
+            dependencies.update(
+                alias.name for alias in node.names if alias.name.startswith("src.core.")
+            )
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            if node.level == 0 and node.module and node.module.startswith("src.core."):
+                dependencies.add(node.module)
+
+    RuntimeImportVisitor().visit(tree)
+    return dependencies
+
+
+def _core_import_cycles(root: Path) -> list[tuple[str, ...]]:
+    graph = {
+        f"src.core.{path.stem}": _core_runtime_dependencies(path)
+        for path in (root / "src" / "core").glob("*.py")
+    }
+    cycles: set[tuple[str, ...]] = set()
+
+    def visit(module: str, path: tuple[str, ...]) -> None:
+        if module in path:
+            start = path.index(module)
+            cycle = path[start:] + (module,)
+            rotations = [cycle[index:-1] + cycle[:index] for index in range(len(cycle) - 1)]
+            cycles.add(min(rotations))
+            return
+        for dependency in graph.get(module, set()):
+            if dependency in graph:
+                visit(dependency, path + (module,))
+
+    for module in graph:
+        visit(module, ())
+    return sorted(cycles)
+
+
 @pytest.mark.architecture
 def test_core_contains_only_harness_mechanism_and_extension_ports():
     assert {path.name for path in (ROOT / "src" / "core").glob("*.py")} == EXPECTED_CORE_MODULES
@@ -156,6 +208,12 @@ def test_core_modules_stay_within_reviewable_size_limits():
     line_counts = _core_line_counts(ROOT)
     assert line_counts["run.py"] <= 350
     assert {name: count for name, count in line_counts.items() if count > 500} == {}
+
+
+@pytest.mark.architecture
+def test_core_runtime_import_graph_is_acyclic():
+    cycles = set(_core_import_cycles(ROOT))
+    assert cycles - ALLOWED_CORE_IMPORT_CYCLES == set()
 
 
 @pytest.mark.architecture
