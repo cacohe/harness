@@ -12,6 +12,9 @@ from src.core.errors import RunErrorCode, RunFailure
 from src.core.events import DomainEvent, DomainEventType
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 from src.core.journal import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
+    ArtifactAttachmentRole,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalEvent,
@@ -50,11 +53,20 @@ _RECORDS: dict[str, type[Any]] = {
         SubmissionRecord,
         TranscriptEntry,
         ConversationSummaryCheckpoint,
+        ArtifactAttachmentFact,
     )
 }
 _IDS = {cls.__name__: cls for cls in (EventId, ProfileId, RunId, SessionId, SubmissionId)}
 _ENUMS = {
-    cls.__name__: cls for cls in (RunStatus, RunErrorCode, DomainEventType, TranscriptEntryType)
+    cls.__name__: cls
+    for cls in (
+        RunStatus,
+        RunErrorCode,
+        DomainEventType,
+        TranscriptEntryType,
+        ArtifactAttachmentRole,
+        ArtifactAttachmentAction,
+    )
 }
 
 

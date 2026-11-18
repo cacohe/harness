@@ -16,6 +16,9 @@ from src.core.errors import RunErrorCode, RunFailure
 from src.core.events import DomainEvent, DomainEventType
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId, _Id
 from src.core.journal import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
+    ArtifactAttachmentRole,
     ConversationSummaryCheckpoint,
     JournalEvent,
     JournalSnapshot,
@@ -51,6 +54,9 @@ def snapshot_journal_snapshot(value: object) -> JournalSnapshot:
     sequence = _exact_int(_raw(value, "sequence"))
     if version < 0 or sequence < 0:
         raise ValueError
+    artifact_facts = _raw_tuple(
+        value, "artifact_facts", ArtifactAttachmentFact, snapshot_artifact_attachment
+    )
     return JournalSnapshot(
         _snapshot_id(_raw(value, "session_id"), SessionId),
         version,
@@ -60,6 +66,24 @@ def snapshot_journal_snapshot(value: object) -> JournalSnapshot:
         transcript,
         summaries,
         submission,
+        artifact_facts,
+    )
+
+
+def snapshot_artifact_attachment(value: object) -> ArtifactAttachmentFact:
+    _require_type(value, ArtifactAttachmentFact)
+    role = _raw(value, "role")
+    action = _raw(value, "action")
+    if type(role) is not ArtifactAttachmentRole or type(action) is not ArtifactAttachmentAction:
+        raise ValueError
+    return ArtifactAttachmentFact(
+        _snapshot_id(_raw(value, "session_id"), SessionId),
+        _snapshot_id(_raw(value, "run_id"), RunId),
+        _snapshot_id(_raw(value, "submission_id"), SubmissionId),
+        _exact_text(_raw(value, "owner_id")),
+        role,
+        action,
+        _snapshot_artifact(_raw(value, "artifact")),
     )
 
 

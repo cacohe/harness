@@ -21,6 +21,9 @@ from src.core.errors import RunErrorCode, RunFailure
 from src.core.events import DomainEvent, DomainEventType, _is_canonical_timestamp
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 from src.core.journal import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
+    ArtifactAttachmentRole,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,
@@ -44,6 +47,7 @@ from src.core.state import (
 _IntentValue: TypeAlias = tuple[str, object]
 _ID_TYPES = (EventId, ProfileId, RunId, SessionId, SubmissionId)
 _RECORD_TYPES = (
+    ArtifactAttachmentFact,
     JournalCommit,
     JournalSnapshot,
     JournalEvent,
@@ -76,6 +80,9 @@ class _Session:
     )
     summary_order: tuple[tuple[str, str, int], ...] = ()
     submissions: Mapping[str, tuple[_IntentValue, JournalSnapshot]] = field(default_factory=dict)
+    artifact_attachments: Mapping[tuple[str, str, str, str], ArtifactAttachmentFact] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)
@@ -159,6 +166,7 @@ class InMemoryRunJournal:
                 transcript=transcript,
                 summaries=(summary,) if summary is not None else (),
                 submission=batch.submission,
+                artifact_facts=batch.artifact_facts,
             )
             result = _canonical_copy(receipt)
             summaries = session.summaries
@@ -198,6 +206,24 @@ class InMemoryRunJournal:
                     **run_inputs,
                     input_key: (*run_inputs.get(input_key, ()), entry),
                 }
+            attachments = dict(session.artifact_attachments)
+            for fact in batch.artifact_facts:
+                if (
+                    fact.session_id != state.session_id
+                    or fact.run_id != state.run_id
+                    or fact.submission_id != state.submission_id
+                ):
+                    raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+                key = (fact.run_id.value, *fact.key)
+                prior = attachments.get(key)
+                if fact.action is ArtifactAttachmentAction.ATTACHED:
+                    if prior is not None and prior.artifact != fact.artifact:
+                        raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+                    attachments[key] = fact
+                elif prior is None or prior.artifact != fact.artifact:
+                    raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+                else:
+                    del attachments[key]
             next_session = _Session(
                 version=receipt.version,
                 sequence=receipt.sequence,
@@ -209,6 +235,7 @@ class InMemoryRunJournal:
                 summaries=summaries,
                 summary_order=summary_order,
                 submissions=submissions,
+                artifact_attachments=attachments,
             )
             self._store = _Store(
                 sessions={**store.sessions, session_key: next_session},
@@ -453,6 +480,30 @@ class InMemoryRunJournal:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
         return state
 
+    async def load_artifact_attachments(
+        self, session_id: SessionId, run_id: RunId
+    ) -> tuple[ArtifactAttachmentFact, ...]:
+        if type(session_id) is not SessionId or type(run_id) is not RunId:
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        with self._lock:
+            session = self._store.sessions.get(session_id.value)
+            result = () if session is None else tuple(
+                fact
+                for key, fact in sorted(session.artifact_attachments.items())
+                if key[0] == run_id.value
+            )
+        return _canonical_copy(result)
+
+    async def artifact_has_active_attachments(self, artifact_id: str) -> bool:
+        if type(artifact_id) is not str or not artifact_id:
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        with self._lock:
+            return any(
+                fact.artifact.artifact_id == artifact_id
+                for session in self._store.sessions.values()
+                for fact in session.artifact_attachments.values()
+            )
+
 
 def _validate_aggregate_request(
     session_id: SessionId,
@@ -520,6 +571,8 @@ def _rebuild(value: object) -> Any:
         or type(value) is RunErrorCode
         or type(value) is DomainEventType
         or type(value) is TranscriptEntryType
+        or type(value) is ArtifactAttachmentRole
+        or type(value) is ArtifactAttachmentAction
     ):
         return value
     if type(value) is datetime and _is_canonical_timestamp(value):
@@ -622,6 +675,8 @@ def _intent_value(value: object) -> _IntentValue:
         or type(value) is RunErrorCode
         or type(value) is DomainEventType
         or type(value) is TranscriptEntryType
+            or type(value) is ArtifactAttachmentRole
+            or type(value) is ArtifactAttachmentAction
     ):
         return ("enum", (type(value).__name__, value.value))
     if (

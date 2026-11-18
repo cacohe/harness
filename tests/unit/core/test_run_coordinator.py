@@ -28,7 +28,7 @@ from src.core.context import (
 )
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import ConversationSummaryCheckpoint, JournalError
+from src.core.journal import ArtifactAttachmentRole, ConversationSummaryCheckpoint, JournalError
 from src.core.model import ModelMessage, ModelResponse, ModelRole, ModelToolCall
 from src.core.run import RunCoordinator
 from src.core.state import RunState, RunStatus
@@ -493,6 +493,8 @@ def test_large_direct_answer_becomes_final_artifact_reference_and_bounded_summar
     assert len(outcome.state.final_artifacts) == 1
     ref = outcome.state.final_artifacts[0]
     assert run(repository.stat(ref.artifact_id)) == ref
+    fact = journal.batches[0][0].artifact_facts[0]
+    assert fact.role is ArtifactAttachmentRole.FINAL_OUTPUT and fact.artifact == ref
     assert answer not in journal.batches[0][0].transcript[0].content
 
 
@@ -770,7 +772,12 @@ def test_large_tool_result_is_externalized_before_journal_reference():
     assert "x" * 80 not in tool_entry.content
     assert calls[-1] == "journal"
     artifact_id = "sha256:" + tool_entry.content.split("sha256:", 1)[1][:64]
-    assert run(repository.stat(artifact_id)) is not None
+    ref = run(repository.stat(artifact_id))
+    assert ref is not None
+    facts = journal.batches[-1][0].artifact_facts
+    assert len(facts) == 1
+    assert facts[0].role is ArtifactAttachmentRole.TOOL_RESULT
+    assert facts[0].owner_id == "call" and facts[0].artifact == ref
 
 
 def test_terminal_repeat_returns_without_any_port_io():

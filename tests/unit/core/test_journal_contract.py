@@ -11,6 +11,9 @@ from src.core.errors import RunErrorCode, RunFailure
 from src.core.events import DomainEvent, DomainEventType
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 from src.core.journal import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
+    ArtifactAttachmentRole,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,
@@ -74,6 +77,68 @@ def acceptance(
             artifacts=(artifact_ref(),),
         ),
     )
+
+
+def test_artifact_attachment_is_durable_indexed_and_blocks_retirement(
+    journal: RunJournal,
+) -> None:
+    batch = acceptance("attachment")
+    ref = artifact_ref("b")
+    fact = ArtifactAttachmentFact(
+        batch.state.session_id,
+        batch.state.run_id,
+        batch.state.submission_id,
+        "tool-call-1",
+        ArtifactAttachmentRole.TOOL_RESULT,
+        ArtifactAttachmentAction.ATTACHED,
+        ref,
+    )
+    asyncio.run(journal.commit(replace(batch, artifact_facts=(fact,)), 0))
+
+    assert asyncio.run(
+        journal.load_artifact_attachments(batch.state.session_id, batch.state.run_id)
+    ) == (fact,)
+    assert asyncio.run(journal.artifact_has_active_attachments(ref.artifact_id))
+
+    detach = replace(fact, action=ArtifactAttachmentAction.DETACHED)
+    next_state = replace(batch.state, version=2, journal_version=2)
+    asyncio.run(journal.commit(JournalCommit(next_state, artifact_facts=(detach,)), 1))
+    assert not asyncio.run(
+        journal.load_artifact_attachments(batch.state.session_id, batch.state.run_id)
+    )
+    assert not asyncio.run(journal.artifact_has_active_attachments(ref.artifact_id))
+
+
+@pytest.mark.parametrize("mode", ("conflict", "detach-missing"))
+def test_artifact_attachment_lifecycle_rejects_invalid_transitions(
+    journal: RunJournal, mode: str
+) -> None:
+    batch = acceptance(f"attachment-{mode}")
+    ref = artifact_ref("c")
+    fact = ArtifactAttachmentFact(
+        batch.state.session_id,
+        batch.state.run_id,
+        batch.state.submission_id,
+        "owner",
+        ArtifactAttachmentRole.TOOL_RESULT,
+        ArtifactAttachmentAction.ATTACHED,
+        ref,
+    )
+    if mode == "conflict":
+        asyncio.run(journal.commit(replace(batch, artifact_facts=(fact,)), 0))
+        changed = ArtifactRef(ref.artifact_id, "text/plain", ref.size_bytes, ref.sha256)
+        invalid = replace(fact, artifact=changed)
+        state = replace(batch.state, version=2, journal_version=2)
+        expected_version = 1
+    else:
+        invalid = replace(fact, action=ArtifactAttachmentAction.DETACHED)
+        state = batch.state
+        expected_version = 0
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(
+            journal.commit(JournalCommit(state, artifact_facts=(invalid,)), expected_version)
+        )
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
 
 
 def test_context_summary_lookup_is_bounded_to_the_expected_authenticated_head(

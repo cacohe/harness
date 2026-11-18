@@ -4,6 +4,7 @@ from src.adapters.persistence.sqlite_codec import encode
 from src.core.errors import RunErrorCode
 from src.core.ids import ProfileId, RunId, SessionId, SubmissionId
 from src.core.journal import (
+    ArtifactAttachmentFact,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,
@@ -82,3 +83,11 @@ class BoundedRunJournal:
         submission_id: SubmissionId,
     ) -> RunState | None:
         return await self._delegate.find_run_state(session_id, run_id, submission_id)
+
+    async def load_artifact_attachments(
+        self, session_id: SessionId, run_id: RunId
+    ) -> tuple[ArtifactAttachmentFact, ...]:
+        return await self._delegate.load_artifact_attachments(session_id, run_id)
+
+    async def artifact_has_active_attachments(self, artifact_id: str) -> bool:
+        return await self._delegate.artifact_has_active_attachments(artifact_id)

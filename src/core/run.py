@@ -32,6 +32,9 @@ from src.core.errors import InvalidTransition, RunErrorCode, RunFailure
 from src.core.events import DomainEvent
 from src.core.ids import Clock, IdGenerator
 from src.core.journal import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
+    ArtifactAttachmentRole,
     ConversationSummaryCheckpoint,
     JournalCommit,
     RunJournal,
@@ -217,6 +220,9 @@ class RunCoordinator:
                 model_text, final_artifacts = await externalize_final_text(
                     model_text, driver.state.limits.max_inline_result_bytes, self._artifacts
                 )
+                driver.attach_refs(
+                    final_artifacts, ArtifactAttachmentRole.FINAL_OUTPUT, "final"
+                )
             except Exception:
                 return await driver.fail(RunErrorCode.ARTIFACT_FAILED)
         if driver.apply(
@@ -329,9 +335,15 @@ class RunCoordinator:
             driver.checkpoint = None
             return tool_failure(result)
         try:
-            return await externalize_tool_result(
+            externalized = await externalize_tool_result(
                 result, driver.state.limits.max_inline_result_bytes, self._artifacts
             )
+            driver.attach_refs(
+                externalized.artifacts,
+                ArtifactAttachmentRole.TOOL_RESULT,
+                call.request.tool_call_id,
+            )
+            return externalized
         except Exception:
             driver.checkpoint = None
             return RunFailure(RunErrorCode.ARTIFACT_FAILED)
@@ -344,6 +356,7 @@ class _Driver:
         self.events: list[DomainEvent] = []
         self.transcript: tuple[TranscriptEntry, ...] = ()
         self.checkpoint: ConversationSummaryCheckpoint | None = None
+        self.artifact_facts: list[ArtifactAttachmentFact] = []
         self.base_elapsed = supplied.elapsed_seconds
         self.started = owner._clock.monotonic()
 
@@ -379,16 +392,54 @@ class _Driver:
             content,
         )
 
+    def attach_refs(
+        self, refs: tuple[ArtifactRef, ...], role: ArtifactAttachmentRole, owner_id: str
+    ) -> None:
+        self.artifact_facts.extend(
+            ArtifactAttachmentFact(
+                self.state.session_id,
+                self.state.run_id,
+                self.state.submission_id,
+                owner_id,
+                role,
+                ArtifactAttachmentAction.ATTACHED,
+                ref,
+            )
+            for ref in refs
+        )
+
     async def commit(self) -> RunOutcome:
         expected = self.state.journal_version
         sequence = self.state.journal_sequence + len(self.events) + len(self.transcript)
         persisted = replace(self.state, journal_version=expected + 1, journal_sequence=sequence)
+        facts = list(self.artifact_facts)
+        if self.checkpoint is not None:
+            owner = (
+                f"{self.checkpoint.policy_version}:"
+                f"{self.checkpoint.covered_from_sequence}-{self.checkpoint.covered_through_sequence}"
+            )
+            known = {(fact.role, fact.owner_id, fact.artifact.artifact_id) for fact in facts}
+            for ref in self.checkpoint.artifacts:
+                key = (ArtifactAttachmentRole.SUMMARY, owner, ref.artifact_id)
+                if key not in known:
+                    facts.append(
+                        ArtifactAttachmentFact(
+                            persisted.session_id,
+                            persisted.run_id,
+                            persisted.submission_id,
+                            owner,
+                            ArtifactAttachmentRole.SUMMARY,
+                            ArtifactAttachmentAction.ATTACHED,
+                            ref,
+                        )
+                    )
         receipt = await self.owner._journal.commit(
             JournalCommit(
                 persisted,
                 events=tuple(self.events),
                 transcript=self.transcript,
                 summary=self.checkpoint,
+                artifact_facts=tuple(facts),
             ),
             expected,
         )
@@ -399,6 +450,7 @@ class _Driver:
                 events=tuple(self.events),
                 transcript=self.transcript,
                 summary=self.checkpoint,
+                artifact_facts=tuple(facts),
             ),
             expected_version=expected,
             previous_sequence=self.state.journal_sequence,

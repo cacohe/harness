@@ -6,6 +6,7 @@ from src.core.journal import (
     JournalSnapshot,
 )
 from src.core.receipt_snapshot import (
+    snapshot_artifact_attachment,
     snapshot_domain_event,
     snapshot_journal_snapshot,
     snapshot_run_state,
@@ -49,6 +50,7 @@ def validate_commit_receipt(
             expected_transcript,
             expected_summaries,
             expected_submission,
+            tuple(snapshot_artifact_attachment(fact) for fact in batch.artifact_facts),
         )
         if receipt != expected:
             raise ValueError

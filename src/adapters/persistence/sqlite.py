@@ -28,6 +28,10 @@ from src.adapters.persistence.sqlite_integrity import (
     coverage_parent_hash,
     genesis_hash,
     record_hash,
+    run_empty_hash,
+    run_leaf_hash,
+    run_parent_hash,
+    state_record_hash,
     summary_empty_hash,
     summary_leaf_hash,
     summary_parent_hash,
@@ -42,6 +46,8 @@ from src.core.context import (
 from src.core.errors import RunErrorCode
 from src.core.ids import ProfileId, RunId, SessionId, SubmissionId
 from src.core.journal import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,
@@ -55,10 +61,12 @@ from src.core.journal import (
 from src.core.run_receipt import validate_commit_receipt
 from src.core.state import RunState
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 _COVERAGE_BLOCK_SIZE = 128
 _COVERAGE_DEPTH = 32
 _SUMMARY_DEPTH = 32
+_RUN_DEPTH = 32
+_MAX_ARTIFACT_FACTS_PER_LOOKUP = 1_000_000
 _T = TypeVar("_T")
 _IdT = TypeVar("_IdT", SessionId, RunId, SubmissionId, ProfileId)
 
@@ -73,6 +81,9 @@ CREATE TABLE sessions (
   transcript_count INTEGER NOT NULL CHECK(transcript_count >= 0),
   summary_hash TEXT NOT NULL,
   summary_count INTEGER NOT NULL CHECK(summary_count >= 0),
+  session_state_hash TEXT NOT NULL,
+  run_projection_hash TEXT NOT NULL,
+  run_count INTEGER NOT NULL CHECK(run_count >= 0),
   authenticated_root TEXT NOT NULL
 ) STRICT;
 CREATE TABLE journal_entries (
@@ -90,11 +101,30 @@ CREATE TABLE runs (
   profile_id TEXT NOT NULL,
   status TEXT NOT NULL,
   state_version INTEGER NOT NULL CHECK(state_version >= 0),
+  run_index INTEGER NOT NULL CHECK(run_index >= 0),
+  state_hash TEXT NOT NULL,
   state_json TEXT NOT NULL,
   PRIMARY KEY(session_id, run_id),
   UNIQUE(session_id, submission_id)
 ) STRICT;
 CREATE INDEX runs_active_by_session ON runs(session_id, status);
+CREATE TRIGGER runs_identity_immutable BEFORE UPDATE OF session_id, run_id, submission_id, profile_id, run_index ON runs BEGIN
+  SELECT RAISE(ABORT, 'Run projection identity is immutable');
+END;
+CREATE TRIGGER runs_no_delete BEFORE DELETE ON runs BEGIN
+  SELECT RAISE(ABORT, 'Run projections cannot be deleted');
+END;
+CREATE TRIGGER sessions_no_delete BEFORE DELETE ON sessions BEGIN
+  SELECT RAISE(ABORT, 'Sessions cannot be deleted');
+END;
+CREATE TABLE run_projection_nodes (
+  session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+  level INTEGER NOT NULL CHECK(level >= 0 AND level <= 32),
+  node_index INTEGER NOT NULL CHECK(node_index >= 0),
+  digest TEXT NOT NULL,
+  item_count INTEGER NOT NULL CHECK(item_count >= 0),
+  PRIMARY KEY(session_id, level, node_index)
+) STRICT;
 CREATE TABLE events (
   event_id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
@@ -271,6 +301,52 @@ CREATE TABLE submissions (
   PRIMARY KEY(session_id, submission_id)
 ) STRICT;
 CREATE INDEX submissions_by_identity ON submissions(session_id, submission_id, digest);
+CREATE TABLE artifact_attachment_facts (
+  session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+  fact_index INTEGER NOT NULL CHECK(fact_index >= 0),
+  run_id TEXT NOT NULL,
+  submission_id TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  role TEXT NOT NULL CHECK(role IN ('tool_result', 'final_output', 'summary')),
+  action TEXT NOT NULL CHECK(action IN ('attached', 'detached')),
+  artifact_id TEXT NOT NULL,
+  fact_json TEXT NOT NULL,
+  PRIMARY KEY(session_id, fact_index)
+) STRICT;
+CREATE TABLE artifact_attachments (
+  session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL,
+  submission_id TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  role TEXT NOT NULL CHECK(role IN ('tool_result', 'final_output', 'summary')),
+  artifact_id TEXT NOT NULL,
+  fact_json TEXT NOT NULL,
+  PRIMARY KEY(session_id, run_id, owner_id, role, artifact_id)
+) STRICT;
+CREATE INDEX artifact_facts_by_artifact ON artifact_attachment_facts(artifact_id);
+CREATE INDEX artifact_attachments_by_artifact ON artifact_attachments(artifact_id);
+CREATE TRIGGER artifact_facts_insert_guard BEFORE INSERT ON artifact_attachment_facts
+WHEN harness_journal_append_allowed() != 1 BEGIN
+  SELECT RAISE(ABORT, 'artifact facts require the commit append channel');
+END;
+CREATE TRIGGER artifact_facts_update_violation AFTER UPDATE ON artifact_attachment_facts BEGIN
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason) VALUES(OLD.session_id, 'artifact fact updated');
+END;
+CREATE TRIGGER artifact_facts_delete_violation AFTER DELETE ON artifact_attachment_facts BEGIN
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason) VALUES(OLD.session_id, 'artifact fact deleted');
+END;
+CREATE TRIGGER artifact_attachments_write_guard BEFORE INSERT ON artifact_attachments
+WHEN harness_journal_append_allowed() != 1 BEGIN
+  SELECT RAISE(ABORT, 'artifact attachments require the commit channel');
+END;
+CREATE TRIGGER artifact_attachments_update_violation AFTER UPDATE ON artifact_attachments
+WHEN harness_journal_append_allowed() != 1 BEGIN
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason) VALUES(OLD.session_id, 'artifact attachment updated');
+END;
+CREATE TRIGGER artifact_attachments_delete_violation AFTER DELETE ON artifact_attachments
+WHEN harness_journal_append_allowed() != 1 BEGIN
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason) VALUES(OLD.session_id, 'artifact attachment deleted');
+END;
 """
 
 _EXPECTED_COLUMNS = {
@@ -284,6 +360,9 @@ _EXPECTED_COLUMNS = {
         "transcript_count",
         "summary_hash",
         "summary_count",
+        "session_state_hash",
+        "run_projection_hash",
+        "run_count",
         "authenticated_root",
     ),
     "journal_entries": ("session_id", "sequence", "kind", "previous_hash", "record_hash"),
@@ -294,8 +373,11 @@ _EXPECTED_COLUMNS = {
         "profile_id",
         "status",
         "state_version",
+        "run_index",
+        "state_hash",
         "state_json",
     ),
+    "run_projection_nodes": ("session_id", "level", "node_index", "digest", "item_count"),
     "events": ("event_id", "session_id", "sequence", "run_id", "event_json"),
     "transcript": (
         "session_id",
@@ -347,6 +429,14 @@ _EXPECTED_COLUMNS = {
         "acceptance_state_json",
         "acceptance_version",
     ),
+    "artifact_attachment_facts": (
+        "session_id", "fact_index", "run_id", "submission_id", "owner_id", "role",
+        "action", "artifact_id", "fact_json",
+    ),
+    "artifact_attachments": (
+        "session_id", "run_id", "submission_id", "owner_id", "role", "artifact_id",
+        "fact_json",
+    ),
 }
 _EXPECTED_INDEXES = {
     "runs_active_by_session": ("session_id", "status"),
@@ -372,6 +462,8 @@ _EXPECTED_INDEXES = {
         "summary_index",
     ),
     "submissions_by_identity": ("session_id", "submission_id", "digest"),
+    "artifact_attachments_by_artifact": ("artifact_id",),
+    "artifact_facts_by_artifact": ("artifact_id",),
 }
 
 
@@ -389,7 +481,7 @@ def _typed_id_key(value: object, expected: type[_IdT]) -> str:
 
 
 class SQLiteRunJournal:
-    """SQLite v5 Session-scoped CAS journal using one connection per operation."""
+    """SQLite v6 Session-scoped CAS journal using one connection per operation."""
 
     def __init__(self, path: Path, timeout_seconds: float = 5.0) -> None:
         if not isinstance(path, Path) or not path.is_absolute():
@@ -543,6 +635,22 @@ class SQLiteRunJournal:
             lambda _cancelled: self._find_run_state_sync(session_key, run_key, submission_key)
         )
 
+    async def load_artifact_attachments(
+        self, session_id: SessionId, run_id: RunId
+    ) -> tuple[ArtifactAttachmentFact, ...]:
+        session_key = self._session_key(session_id)
+        run_key = _typed_id_key(run_id, RunId)
+        return await self._run(
+            lambda _cancelled: self._load_artifact_attachments_sync(session_key, run_key)
+        )
+
+    async def artifact_has_active_attachments(self, artifact_id: str) -> bool:
+        if type(artifact_id) is not str or not artifact_id:
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        return await self._run(
+            lambda _cancelled: self._artifact_has_active_attachments_sync(artifact_id)
+        )
+
     async def _run(self, operation: Callable[[Event], _T]) -> _T:
         cancelled = Event()
         task = asyncio.create_task(asyncio.to_thread(operation, cancelled))
@@ -574,7 +682,7 @@ class SQLiteRunJournal:
                     + f"\nPRAGMA user_version = {_SCHEMA_VERSION};\nCOMMIT;"
                 )
             elif version != _SCHEMA_VERSION:
-                raise ValueError("SQLite journal requires an exact schema v5 database")
+                raise ValueError("SQLite journal requires an exact schema v6 database")
             self._validate_schema(connection)
             if str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() != "wal":
                 raise ValueError("SQLite journal requires WAL mode")
@@ -624,6 +732,16 @@ class SQLiteRunJournal:
                 else summary_empty_hash(session_key, _SUMMARY_DEPTH, 0)
             )
             summary_count = int(row["summary_count"]) if row is not None else 0
+            state_json = encode(state)
+            session_state_hash = (
+                row["session_state_hash"] if row is not None else
+                state_record_hash(session_key, state.run_id.value, state.submission_id.value, state_json)
+            )
+            run_projection_hash = (
+                row["run_projection_hash"] if row is not None else
+                run_empty_hash(session_key, _RUN_DEPTH, 0)
+            )
+            run_count = int(row["run_count"]) if row is not None else 0
             if not 0 <= summary_count < (1 << _SUMMARY_DEPTH):
                 raise ValueError("SQLite summary capacity is exhausted")
             authenticated_root = authenticated_root_hash(
@@ -633,6 +751,9 @@ class SQLiteRunJournal:
                 transcript_count,
                 summary_hash,
                 summary_count,
+                session_state_hash,
+                run_projection_hash,
+                run_count,
             )
             existing = connection.execute(
                 "SELECT session_id, submission_id, run_id, digest, intent_json, receipt_json, "
@@ -659,7 +780,7 @@ class SQLiteRunJournal:
                 raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
             _validate_members(batch, previous_sequence, expected_version)
             prior_run_row = connection.execute(
-                "SELECT session_id, run_id, submission_id, profile_id, status, state_version, state_json "
+                "SELECT session_id, run_id, submission_id, profile_id, status, state_version, run_index, state_hash, state_json "
                 "FROM runs WHERE session_id = ? AND run_id = ?",
                 (session_key, state.run_id.value),
             ).fetchone()
@@ -676,12 +797,13 @@ class SQLiteRunJournal:
             cursor = previous_sequence
             final_sequence = previous_sequence + len(batch.events) + len(batch.transcript)
             persisted_version = version + 1
-            state_json = encode(state)
             connection.execute(
                 "INSERT INTO sessions(session_id, version, sequence, state_json, ledger_hash, "
-                "coverage_hash, transcript_count, summary_hash, summary_count, authenticated_root) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(session_id) DO UPDATE SET version=excluded.version, sequence=excluded.sequence, state_json=excluded.state_json",
+                "coverage_hash, transcript_count, summary_hash, summary_count, session_state_hash, "
+                "run_projection_hash, run_count, authenticated_root) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET version=excluded.version, sequence=excluded.sequence, "
+                "state_json=excluded.state_json, session_state_hash=excluded.session_state_hash",
                 (
                     session_key,
                     persisted_version,
@@ -692,12 +814,21 @@ class SQLiteRunJournal:
                     transcript_count,
                     summary_hash,
                     summary_count,
+                    session_state_hash,
+                    run_projection_hash,
+                    run_count,
                     authenticated_root,
                 ),
             )
+            run_index = int(prior_run_row["run_index"]) if prior_run_row is not None else run_count
+            if prior_run_row is None:
+                run_count += 1
+            current_state_hash = state_record_hash(
+                session_key, state.run_id.value, state.submission_id.value, state_json
+            )
             connection.execute(
-                "INSERT INTO runs(session_id, run_id, submission_id, profile_id, status, state_version, state_json) VALUES (?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(session_id, run_id) DO UPDATE SET status=excluded.status, state_version=excluded.state_version, state_json=excluded.state_json",
+                "INSERT INTO runs(session_id, run_id, submission_id, profile_id, status, state_version, run_index, state_hash, state_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(session_id, run_id) DO UPDATE SET status=excluded.status, state_version=excluded.state_version, state_hash=excluded.state_hash, state_json=excluded.state_json",
                 (
                     session_key,
                     state.run_id.value,
@@ -705,9 +836,73 @@ class SQLiteRunJournal:
                     state.profile_id.value,
                     state.status.value,
                     state.version,
+                    run_index,
+                    current_state_hash,
                     state_json,
                 ),
             )
+            run_projection_hash = _set_run_projection_leaf(
+                connection, session_key, run_index, current_state_hash
+            )
+            session_state_hash = current_state_hash
+            fact_index = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(fact_index) + 1, 0) FROM artifact_attachment_facts WHERE session_id=?",
+                    (session_key,),
+                ).fetchone()[0]
+            )
+            for fact in batch.artifact_facts:
+                if (
+                    fact.session_id != state.session_id
+                    or fact.run_id != state.run_id
+                    or fact.submission_id != state.submission_id
+                ):
+                    raise ValueError("Artifact attachment identity disagrees")
+                fact_json = encode(fact)
+                values = (
+                    session_key, fact.run_id.value, fact.submission_id.value, fact.owner_id,
+                    fact.role.value, fact.artifact.artifact_id, fact_json,
+                )
+                connection.execute(
+                    "INSERT INTO artifact_attachment_facts(session_id, fact_index, run_id, submission_id, owner_id, role, action, artifact_id, fact_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (session_key, fact_index, fact.run_id.value, fact.submission_id.value,
+                     fact.owner_id, fact.role.value, fact.action.value,
+                     fact.artifact.artifact_id, fact_json),
+                )
+                fact_index += 1
+                if fact.action is ArtifactAttachmentAction.ATTACHED:
+                    existing_attachment = connection.execute(
+                        "SELECT fact_json FROM artifact_attachments WHERE session_id=? AND run_id=? AND owner_id=? AND role=? AND artifact_id=?",
+                        (session_key, fact.run_id.value, fact.owner_id, fact.role.value,
+                         fact.artifact.artifact_id),
+                    ).fetchone()
+                    if existing_attachment is not None:
+                        attached = decode(
+                            existing_attachment["fact_json"], ArtifactAttachmentFact
+                        )
+                        if attached.artifact != fact.artifact:
+                            raise ValueError("Artifact attachment descriptor disagrees")
+                    connection.execute(
+                        "INSERT INTO artifact_attachments(session_id, run_id, submission_id, owner_id, role, artifact_id, fact_json) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(session_id, run_id, owner_id, role, artifact_id) DO UPDATE SET fact_json=excluded.fact_json",
+                        values,
+                    )
+                else:
+                    row_to_detach = connection.execute(
+                        "SELECT fact_json FROM artifact_attachments WHERE session_id=? AND run_id=? AND owner_id=? AND role=? AND artifact_id=?",
+                        (session_key, fact.run_id.value, fact.owner_id, fact.role.value,
+                         fact.artifact.artifact_id),
+                    ).fetchone()
+                    if row_to_detach is None:
+                        raise ValueError("Artifact attachment does not exist")
+                    attached = decode(row_to_detach["fact_json"], ArtifactAttachmentFact)
+                    if attached.artifact != fact.artifact:
+                        raise ValueError("Artifact attachment descriptor disagrees")
+                    connection.execute(
+                        "DELETE FROM artifact_attachments WHERE session_id=? AND run_id=? AND owner_id=? AND role=? AND artifact_id=?",
+                        (session_key, fact.run_id.value, fact.owner_id, fact.role.value,
+                         fact.artifact.artifact_id),
+                    )
             events: list[JournalEvent] = []
             for event in batch.events:
                 cursor += 1
@@ -760,14 +955,20 @@ class SQLiteRunJournal:
                 transcript_count,
                 summary_hash,
                 summary_count,
+                session_state_hash,
+                run_projection_hash,
+                run_count,
             )
             connection.execute(
                 "UPDATE sessions SET ledger_hash=?, coverage_hash=?, transcript_count=?, "
-                "authenticated_root=? WHERE session_id=?",
+                "session_state_hash=?, run_projection_hash=?, run_count=?, authenticated_root=? WHERE session_id=?",
                 (
                     ledger_hash,
                     coverage_hash,
                     transcript_count,
+                    session_state_hash,
+                    run_projection_hash,
+                    run_count,
                     authenticated_root,
                     session_key,
                 ),
@@ -781,6 +982,7 @@ class SQLiteRunJournal:
                 tuple(transcript),
                 (batch.summary,) if batch.summary is not None else (),
                 batch.submission,
+                batch.artifact_facts,
             )
             if batch.summary is not None:
                 summary = batch.summary
@@ -838,6 +1040,9 @@ class SQLiteRunJournal:
                 transcript_count,
                 summary_hash,
                 summary_count,
+                session_state_hash,
+                run_projection_hash,
+                run_count,
             )
             connection.execute(
                 "UPDATE sessions SET summary_hash=?, summary_count=?, authenticated_root=? "
@@ -893,7 +1098,7 @@ class SQLiteRunJournal:
             _reject_integrity_violation(connection, session_key)
             row = connection.execute(
                 "SELECT session_id, version, sequence, state_json, ledger_hash, coverage_hash, "
-                "transcript_count, summary_hash, summary_count, authenticated_root "
+                "transcript_count, summary_hash, summary_count, session_state_hash, run_projection_hash, run_count, authenticated_root "
                 "FROM sessions WHERE session_id = ?",
                 (session_key,),
             ).fetchone()
@@ -902,7 +1107,7 @@ class SQLiteRunJournal:
             state = decode(row["state_json"], RunState)
             version, sequence = _validate_session_row(row, session_key, state)
             run_row = connection.execute(
-                "SELECT session_id, run_id, submission_id, profile_id, status, state_version, state_json "
+                "SELECT session_id, run_id, submission_id, profile_id, status, state_version, run_index, state_hash, state_json "
                 "FROM runs WHERE session_id = ? AND run_id = ?",
                 (session_key, state.run_id.value),
             ).fetchone()
@@ -910,6 +1115,12 @@ class SQLiteRunJournal:
                 raise ValueError
             _validate_run_row(run_row, state)
             _verify_authenticated_root(row, session_key)
+            if validate_hash(row["session_state_hash"]) != validate_hash(run_row["state_hash"]):
+                raise ValueError("SQLite Session state hash disagrees with current Run")
+            _verify_run_projection_path(
+                connection, session_key, run_row["run_index"], run_row["state_hash"],
+                row["run_projection_hash"],
+            )
             _verify_ledger_tail(connection, session_key, sequence, row["ledger_hash"])
             return JournalHead(version, sequence, state)
         except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
@@ -988,7 +1199,7 @@ class SQLiteRunJournal:
             _reject_integrity_violation(connection, session_key)
             row = connection.execute(
                 "SELECT session_id, version, sequence, state_json, ledger_hash, coverage_hash, "
-                "transcript_count, summary_hash, summary_count, authenticated_root "
+                "transcript_count, summary_hash, summary_count, session_state_hash, run_projection_hash, run_count, authenticated_root "
                 "FROM sessions WHERE session_id = ?",
                 (session_key,),
             ).fetchone()
@@ -1132,7 +1343,7 @@ class SQLiteRunJournal:
             _reject_integrity_violation(connection, session_key)
             session = connection.execute(
                 "SELECT sequence, ledger_hash, coverage_hash, transcript_count, summary_hash, "
-                "summary_count, authenticated_root "
+                "summary_count, session_state_hash, run_projection_hash, run_count, authenticated_root "
                 "FROM sessions WHERE session_id=?",
                 (session_key,),
             ).fetchone()
@@ -1236,7 +1447,7 @@ class SQLiteRunJournal:
                 raise ValueError("SQLite Run input identity disagrees")
             run_row = connection.execute(
                 "SELECT session_id, run_id, submission_id, profile_id, status, state_version, "
-                "state_json FROM runs WHERE session_id=? AND run_id=?",
+                "run_index, state_hash, state_json FROM runs WHERE session_id=? AND run_id=?",
                 (session_key, run_key),
             ).fetchone()
             if run_row is None:
@@ -1260,7 +1471,7 @@ class SQLiteRunJournal:
             connection.execute("BEGIN")
             row = connection.execute(
                 "SELECT session_id, run_id, submission_id, profile_id, status, state_version, "
-                "state_json FROM runs WHERE session_id=? AND run_id=?",
+                "run_index, state_hash, state_json FROM runs WHERE session_id=? AND run_id=?",
                 (session_key, run_key),
             ).fetchone()
             if row is None:
@@ -1269,6 +1480,19 @@ class SQLiteRunJournal:
             _validate_run_row(row, state)
             if state.submission_id.value != submission_key:
                 raise ValueError("SQLite Run identity disagrees")
+            session_row = connection.execute(
+                "SELECT session_id, version, sequence, state_json, ledger_hash, coverage_hash, "
+                "transcript_count, summary_hash, summary_count, session_state_hash, "
+                "run_projection_hash, run_count, authenticated_root FROM sessions WHERE session_id=?",
+                (session_key,),
+            ).fetchone()
+            if session_row is None:
+                raise ValueError("SQLite Run has no Session")
+            _verify_authenticated_root(session_row, session_key)
+            _verify_run_projection_path(
+                connection, session_key, row["run_index"], row["state_hash"],
+                session_row["run_projection_hash"],
+            )
             submission_row = connection.execute(
                 "SELECT session_id, submission_id, run_id, digest, intent_json, receipt_json, "
                 "acceptance_state_json, acceptance_version FROM submissions "
@@ -1293,6 +1517,151 @@ class SQLiteRunJournal:
         finally:
             connection.close()
 
+    def _load_artifact_attachments_sync(
+        self, session_key: str, run_key: str
+    ) -> tuple[ArtifactAttachmentFact, ...]:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            _reject_integrity_violation(connection, session_key)
+            result: list[ArtifactAttachmentFact] = []
+            for row in connection.execute(
+                "SELECT session_id, run_id, submission_id, owner_id, role, artifact_id, fact_json "
+                "FROM artifact_attachments WHERE session_id=? AND run_id=? "
+                "ORDER BY owner_id, role, artifact_id",
+                (session_key, run_key),
+            ):
+                fact = decode(row["fact_json"], ArtifactAttachmentFact)
+                if (
+                    fact.action is not ArtifactAttachmentAction.ATTACHED
+                    or row["session_id"] != fact.session_id.value
+                    or row["run_id"] != fact.run_id.value
+                    or row["submission_id"] != fact.submission_id.value
+                    or row["owner_id"] != fact.owner_id
+                    or row["role"] != fact.role.value
+                    or row["artifact_id"] != fact.artifact.artifact_id
+                ):
+                    raise ValueError("Artifact attachment row disagrees")
+                lifecycle = connection.execute(
+                    "SELECT fact_json FROM artifact_attachment_facts WHERE session_id=? AND run_id=? "
+                    "AND owner_id=? AND role=? AND artifact_id=? ORDER BY fact_index DESC LIMIT 1",
+                    (session_key, run_key, fact.owner_id, fact.role.value,
+                     fact.artifact.artifact_id),
+                ).fetchone()
+                if lifecycle is None or decode(
+                    lifecycle["fact_json"], ArtifactAttachmentFact
+                ) != fact:
+                    raise ValueError("Artifact active index disagrees with lifecycle facts")
+                result.append(fact)
+            expected: dict[tuple[str, str, str], ArtifactAttachmentFact] = {}
+            fact_count = 0
+            for fact_row in connection.execute(
+                "SELECT session_id, run_id, submission_id, owner_id, role, action, artifact_id, fact_json "
+                "FROM artifact_attachment_facts WHERE session_id=? AND run_id=? ORDER BY fact_index LIMIT ?",
+                (session_key, run_key, _MAX_ARTIFACT_FACTS_PER_LOOKUP + 1),
+            ):
+                fact_count += 1
+                if fact_count > _MAX_ARTIFACT_FACTS_PER_LOOKUP:
+                    raise ValueError("Artifact lifecycle exceeds its lookup bound")
+                lifecycle_fact = decode(fact_row["fact_json"], ArtifactAttachmentFact)
+                if (
+                    fact_row["session_id"] != lifecycle_fact.session_id.value
+                    or fact_row["run_id"] != lifecycle_fact.run_id.value
+                    or fact_row["submission_id"] != lifecycle_fact.submission_id.value
+                    or fact_row["owner_id"] != lifecycle_fact.owner_id
+                    or fact_row["role"] != lifecycle_fact.role.value
+                    or fact_row["action"] != lifecycle_fact.action.value
+                    or fact_row["artifact_id"] != lifecycle_fact.artifact.artifact_id
+                ):
+                    raise ValueError("Artifact lifecycle fact row disagrees")
+                key = lifecycle_fact.key
+                if lifecycle_fact.action is ArtifactAttachmentAction.ATTACHED:
+                    prior = expected.get(key)
+                    if prior is not None and prior.artifact != lifecycle_fact.artifact:
+                        raise ValueError("Artifact lifecycle descriptor changed")
+                    expected[key] = lifecycle_fact
+                elif key not in expected or expected[key].artifact != lifecycle_fact.artifact:
+                    raise ValueError("Artifact detach has no matching active fact")
+                else:
+                    del expected[key]
+            actual = {fact.key: fact for fact in result}
+            if actual != expected:
+                raise ValueError("Artifact active index disagrees with lifecycle facts")
+            return tuple(result)
+        except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        finally:
+            connection.close()
+
+    def _artifact_has_active_attachments_sync(self, artifact_id: str) -> bool:
+        connection = self._connect()
+        try:
+            expected: dict[tuple[str, str, str, str, str], ArtifactAttachmentFact] = {}
+            fact_count = 0
+            for row in connection.execute(
+                "SELECT session_id, run_id, submission_id, owner_id, role, action, artifact_id, fact_json "
+                "FROM artifact_attachment_facts WHERE artifact_id=? ORDER BY session_id, fact_index LIMIT ?",
+                (artifact_id, _MAX_ARTIFACT_FACTS_PER_LOOKUP + 1),
+            ):
+                fact_count += 1
+                if fact_count > _MAX_ARTIFACT_FACTS_PER_LOOKUP:
+                    raise ValueError("Artifact lifecycle exceeds its lookup bound")
+                _reject_integrity_violation(connection, str(row["session_id"]))
+                fact = decode(row["fact_json"], ArtifactAttachmentFact)
+                if (
+                    row["session_id"] != fact.session_id.value
+                    or row["run_id"] != fact.run_id.value
+                    or row["submission_id"] != fact.submission_id.value
+                    or row["owner_id"] != fact.owner_id
+                    or row["role"] != fact.role.value
+                    or row["action"] != fact.action.value
+                    or row["artifact_id"] != fact.artifact.artifact_id
+                ):
+                    raise ValueError("Artifact lifecycle fact row disagrees")
+                key = (
+                    fact.session_id.value, fact.run_id.value, fact.owner_id,
+                    fact.role.value, fact.artifact.artifact_id,
+                )
+                if fact.action is ArtifactAttachmentAction.ATTACHED:
+                    prior = expected.get(key)
+                    if prior is not None and prior.artifact != fact.artifact:
+                        raise ValueError("Artifact lifecycle descriptor changed")
+                    expected[key] = fact
+                elif key not in expected or expected[key].artifact != fact.artifact:
+                    raise ValueError("Artifact detach has no matching active fact")
+                else:
+                    del expected[key]
+            actual: dict[tuple[str, str, str, str, str], ArtifactAttachmentFact] = {}
+            for row in connection.execute(
+                "SELECT session_id, run_id, submission_id, owner_id, role, artifact_id, fact_json "
+                "FROM artifact_attachments WHERE artifact_id=?",
+                (artifact_id,),
+            ):
+                _reject_integrity_violation(connection, str(row["session_id"]))
+                fact = decode(row["fact_json"], ArtifactAttachmentFact)
+                key = (
+                    str(row["session_id"]), str(row["run_id"]), str(row["owner_id"]),
+                    str(row["role"]), str(row["artifact_id"]),
+                )
+                if (
+                    fact.action is not ArtifactAttachmentAction.ATTACHED
+                    or fact.session_id.value != key[0]
+                    or fact.run_id.value != key[1]
+                    or fact.submission_id.value != row["submission_id"]
+                    or fact.owner_id != key[2]
+                    or fact.role.value != key[3]
+                    or fact.artifact.artifact_id != key[4]
+                ):
+                    raise ValueError("Artifact active index row disagrees")
+                actual[key] = fact
+            if actual != expected:
+                raise ValueError("Artifact active index disagrees with lifecycle facts")
+            return bool(expected)
+        except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        finally:
+            connection.close()
+
     @staticmethod
     def _session_key(session_id: SessionId) -> str:
         return _typed_id_key(session_id, SessionId)
@@ -1309,13 +1678,13 @@ class SQLiteRunJournal:
     @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:
         if _schema_signature(connection) != _expected_schema_signature():
-            raise ValueError("SQLite journal schema v5 definition has drifted")
+            raise ValueError("SQLite journal schema v6 definition has drifted")
         for table, expected in _EXPECTED_COLUMNS.items():
             columns = tuple(
                 str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")
             )
             if columns != expected:
-                raise ValueError("SQLite journal schema v5 has drifted")
+                raise ValueError("SQLite journal schema v6 has drifted")
         indexes = {
             str(row[0])
             for row in connection.execute(
@@ -1323,16 +1692,17 @@ class SQLiteRunJournal:
             )
         }
         if not set(_EXPECTED_INDEXES) <= indexes:
-            raise ValueError("SQLite journal schema v5 is missing required indexes")
+            raise ValueError("SQLite journal schema v6 is missing required indexes")
         for index, expected_columns in _EXPECTED_INDEXES.items():
             actual_columns = tuple(
                 str(row[2]) for row in connection.execute(f"PRAGMA index_info({index})")
             )
             if actual_columns != expected_columns:
-                raise ValueError("SQLite journal schema v5 index has drifted")
+                raise ValueError("SQLite journal schema v6 index has drifted")
         for table in (
             "journal_entries",
             "runs",
+            "run_projection_nodes",
             "events",
             "transcript",
             "transcript_coverage_blocks",
@@ -1341,6 +1711,8 @@ class SQLiteRunJournal:
             "summary_checkpoints",
             "summary_nodes",
             "submissions",
+            "artifact_attachment_facts",
+            "artifact_attachments",
         ):
             foreign = tuple(connection.execute(f"PRAGMA foreign_key_list({table})"))
             if not any(
@@ -1350,7 +1722,7 @@ class SQLiteRunJournal:
                 and str(row[6]).upper() == "CASCADE"
                 for row in foreign
             ):
-                raise ValueError("SQLite journal schema v5 is missing a Session foreign key")
+                raise ValueError("SQLite journal schema v6 is missing a Session foreign key")
 
 
 def _schema_signature(connection: sqlite3.Connection) -> tuple[tuple[str, str, str, str], ...]:
@@ -1533,6 +1905,85 @@ def _coverage_root(connection: sqlite3.Connection, session_key: str):
     return _read_coverage_node(connection, session_key, _COVERAGE_DEPTH, 0)
 
 
+def _run_node_value(
+    row: sqlite3.Row | None, session_key: str, level: int, node_index: int
+) -> tuple[str, int]:
+    if row is None:
+        return run_empty_hash(session_key, level, node_index), 0
+    digest = validate_hash(row["digest"])
+    count = row["item_count"]
+    if type(count) is not int or count < 0:
+        raise ValueError("SQLite Run projection node is invalid")
+    return digest, count
+
+
+def _read_run_node(
+    connection: sqlite3.Connection, session_key: str, level: int, node_index: int
+) -> tuple[str, int]:
+    row = connection.execute(
+        "SELECT digest, item_count FROM run_projection_nodes "
+        "WHERE session_id=? AND level=? AND node_index=?",
+        (session_key, level, node_index),
+    ).fetchone()
+    return _run_node_value(row, session_key, level, node_index)
+
+
+def _write_run_node(
+    connection: sqlite3.Connection, session_key: str, level: int, node_index: int,
+    value: tuple[str, int]
+) -> None:
+    connection.execute(
+        "INSERT INTO run_projection_nodes(session_id, level, node_index, digest, item_count) "
+        "VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id, level, node_index) DO UPDATE "
+        "SET digest=excluded.digest, item_count=excluded.item_count",
+        (session_key, level, node_index, *value),
+    )
+
+
+def _set_run_projection_leaf(
+    connection: sqlite3.Connection, session_key: str, run_index: int, state_hash: str
+) -> str:
+    if not 0 <= run_index < (1 << _RUN_DEPTH):
+        raise ValueError("SQLite Run projection index exceeds capacity")
+    index = run_index
+    value = (run_leaf_hash(session_key, run_index, state_hash), 1)
+    _write_run_node(connection, session_key, 0, index, value)
+    for level in range(1, _RUN_DEPTH + 1):
+        sibling = _read_run_node(connection, session_key, level - 1, index ^ 1)
+        left, right = (value, sibling) if index % 2 == 0 else (sibling, value)
+        parent_index = index // 2
+        value = (
+            run_parent_hash(session_key, level, parent_index, left, right),
+            left[1] + right[1],
+        )
+        _write_run_node(connection, session_key, level, parent_index, value)
+        index = parent_index
+    return value[0]
+
+
+def _verify_run_projection_path(
+    connection: sqlite3.Connection, session_key: str, run_index: int,
+    state_hash: str, expected_root: str
+) -> None:
+    index = run_index
+    value = (run_leaf_hash(session_key, run_index, state_hash), 1)
+    if _read_run_node(connection, session_key, 0, index) != value:
+        raise ValueError("SQLite Run projection leaf disagrees")
+    for level in range(1, _RUN_DEPTH + 1):
+        sibling = _read_run_node(connection, session_key, level - 1, index ^ 1)
+        left, right = (value, sibling) if index % 2 == 0 else (sibling, value)
+        parent_index = index // 2
+        value = (
+            run_parent_hash(session_key, level, parent_index, left, right),
+            left[1] + right[1],
+        )
+        if _read_run_node(connection, session_key, level, parent_index) != value:
+            raise ValueError("SQLite Run projection Merkle path is invalid")
+        index = parent_index
+    if value[0] != validate_hash(expected_root):
+        raise ValueError("SQLite Run projection path disagrees with Session root")
+
+
 def _summary_node_value(
     row: sqlite3.Row | None, session_key: str, level: int, node_index: int
 ) -> tuple[str, int]:
@@ -1634,8 +2085,14 @@ def _verify_authenticated_root(row: sqlite3.Row, session_key: str) -> None:
         or not 0 <= summary_count <= (1 << _SUMMARY_DEPTH)
     ):
         raise ValueError("SQLite summary count is invalid")
+    run_count = row["run_count"]
+    if type(run_count) is not int or not 0 <= run_count <= (1 << _RUN_DEPTH):
+        raise ValueError("SQLite Run projection count is invalid")
     expected = authenticated_root_hash(
-        session_key, ledger, coverage, count, summary, summary_count
+        session_key, ledger, coverage, count, summary, summary_count,
+        validate_hash(row["session_state_hash"]),
+        validate_hash(row["run_projection_hash"]),
+        run_count,
     )
     if validate_hash(row["authenticated_root"]) != expected:
         raise ValueError("SQLite authenticated Session root disagrees")
@@ -1867,7 +2324,7 @@ def _verify_point_anchor(connection: sqlite3.Connection, session_key: str, seque
     """Authenticate one indexed record and its immediate ledger boundary in O(1)."""
     session = connection.execute(
         "SELECT sequence, ledger_hash, coverage_hash, transcript_count, summary_hash, "
-        "summary_count, authenticated_root "
+        "summary_count, session_state_hash, run_projection_hash, run_count, authenticated_root "
         "FROM sessions WHERE session_id=?",
         (session_key,),
     ).fetchone()
@@ -1907,7 +2364,7 @@ def _preflight_existing_ledger(
     """Validate one Session's immutable ledger before a commit reads its CAS counters."""
     row = connection.execute(
         "SELECT session_id, version, sequence, state_json, ledger_hash, coverage_hash, "
-        "transcript_count, summary_hash, summary_count, authenticated_root "
+        "transcript_count, summary_hash, summary_count, session_state_hash, run_projection_hash, run_count, authenticated_root "
         "FROM sessions WHERE session_id = ?",
         (session_key,),
     ).fetchone()
@@ -1942,13 +2399,19 @@ def _preflight_existing_ledger(
         raise ValueError("SQLite coverage root disagrees with its Session")
     _, head_sequence = _validate_session_row(row, session_key, state)
     current_run_row = connection.execute(
-        "SELECT session_id, run_id, submission_id, profile_id, status, state_version, state_json "
+        "SELECT session_id, run_id, submission_id, profile_id, status, state_version, run_index, state_hash, state_json "
         "FROM runs WHERE session_id = ? AND run_id = ?",
         (session_key, state.run_id.value),
     ).fetchone()
     if current_run_row is None or decode(current_run_row["state_json"], RunState) != state:
         raise ValueError("SQLite Session head disagrees with its Run projection")
     _validate_run_row(current_run_row, state)
+    if validate_hash(row["session_state_hash"]) != validate_hash(current_run_row["state_hash"]):
+        raise ValueError("SQLite Session state hash disagrees with current Run")
+    _verify_run_projection_path(
+        connection, session_key, current_run_row["run_index"],
+        current_run_row["state_hash"], row["run_projection_hash"],
+    )
 
     minimum = anchor_stats[1]
     maximum = anchor_stats[2]
@@ -2060,6 +2523,15 @@ def _validate_run_row(row: sqlite3.Row, state: RunState) -> None:
         or row["status"] != state.status.value
         or type(row["state_version"]) is not int
         or row["state_version"] != state.version
+        or type(row["run_index"]) is not int
+        or row["run_index"] < 0
+        or validate_hash(row["state_hash"])
+        != state_record_hash(
+            state.session_id.value,
+            state.run_id.value,
+            state.submission_id.value,
+            row["state_json"],
+        )
     ):
         raise ValueError("SQLite Run row disagrees with its state")
 

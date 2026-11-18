@@ -12,6 +12,9 @@ from src.adapters.persistence.sqlite_codec import decode, encode
 from src.core.errors import RunErrorCode
 from src.core.ids import EventId, ProfileId, RunId, SessionId
 from src.core.journal import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
+    ArtifactAttachmentRole,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,
@@ -21,11 +24,60 @@ from src.core.journal import (
     TranscriptEntryType,
 )
 from src.core.state import RunState, RunStatus
-from tests.unit.core.test_journal_contract import acceptance
+from tests.unit.core.test_journal_contract import acceptance, artifact_ref
+from tests.unit.core.test_run_state import (
+    advance,
+    ask_approval,
+    begin_step,
+    decide,
+    initial,
+    submit,
+)
 
 
 def make_journal(tmp_path: Path) -> SQLiteRunJournal:
     return SQLiteRunJournal((tmp_path / "journal.sqlite3").resolve())
+
+
+@pytest.mark.parametrize("attack", ("fact", "active-update", "active-delete", "active-insert"))
+def test_artifact_fact_and_active_index_tamper_is_rejected(
+    tmp_path: Path, attack: str
+) -> None:
+    journal = make_journal(tmp_path)
+    batch = acceptance(f"artifact-tamper-{attack}")
+    fact = ArtifactAttachmentFact(
+        batch.state.session_id,
+        batch.state.run_id,
+        batch.state.submission_id,
+        "owner",
+        ArtifactAttachmentRole.TOOL_RESULT,
+        ArtifactAttachmentAction.ATTACHED,
+        artifact_ref("d"),
+    )
+    asyncio.run(journal.commit(replace(batch, artifact_facts=(fact,)), 0))
+    with sqlite3.connect(journal.path) as connection:
+        connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
+        if attack == "fact":
+            connection.execute("DELETE FROM artifact_attachment_facts")
+        elif attack == "active-update":
+            connection.execute("UPDATE artifact_attachments SET owner_id='moved'")
+        elif attack == "active-delete":
+            connection.execute("DELETE FROM artifact_attachments")
+        else:
+            connection.execute(
+                "INSERT INTO artifact_attachments(session_id, run_id, submission_id, owner_id, role, artifact_id, fact_json) "
+                "SELECT session_id, run_id, submission_id, 'forged', role, artifact_id, fact_json "
+                "FROM artifact_attachments"
+            )
+
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(
+            journal.load_artifact_attachments(batch.state.session_id, batch.state.run_id)
+        )
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    with pytest.raises(JournalError) as retirement:
+        asyncio.run(journal.artifact_has_active_attachments(fact.artifact.artifact_id))
+    assert retirement.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
 
 
 def _coverage_history(journal: SQLiteRunJournal):
@@ -398,7 +450,7 @@ def test_conversation_aggregate_rejects_full_block_and_witness_corruption(
     assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
 
 
-def test_sqlite_v5_round_trips_and_reopens(tmp_path: Path) -> None:
+def test_sqlite_v6_round_trips_and_reopens(tmp_path: Path) -> None:
     journal = make_journal(tmp_path)
     batch = acceptance("first")
     receipt = asyncio.run(journal.commit(batch, 0))
@@ -554,7 +606,8 @@ def _append_summary_fixture(
         connection.execute("BEGIN IMMEDIATE")
         connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
         row = connection.execute(
-            "SELECT ledger_hash, coverage_hash, transcript_count, summary_count "
+            "SELECT ledger_hash, coverage_hash, transcript_count, summary_count, "
+            "session_state_hash, run_projection_hash, run_count "
             "FROM sessions WHERE session_id=?",
             (session_key,),
         ).fetchone()
@@ -602,6 +655,9 @@ def _append_summary_fixture(
             row["transcript_count"],
             summary_hash,
             through_count,
+            row["session_state_hash"],
+            row["run_projection_hash"],
+            row["run_count"],
         )
         connection.execute(
             "UPDATE sessions SET summary_hash=?, summary_count=?, authenticated_root=? "
@@ -763,10 +819,10 @@ def test_two_connections_can_advance_different_sessions(tmp_path: Path) -> None:
     assert [(item.version, item.sequence) for item in receipts] == [(1, 2), (1, 2)]
 
 
-def test_schema_is_exact_v5_and_has_required_indexes(tmp_path: Path) -> None:
+def test_schema_is_exact_v6_and_has_required_indexes(tmp_path: Path) -> None:
     journal = make_journal(tmp_path)
     with sqlite3.connect(journal.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         tables = {
             row[0]
             for row in connection.execute(
@@ -777,6 +833,7 @@ def test_schema_is_exact_v5_and_has_required_indexes(tmp_path: Path) -> None:
             "sessions",
             "journal_entries",
             "runs",
+            "run_projection_nodes",
             "events",
             "submissions",
             "transcript",
@@ -785,6 +842,8 @@ def test_schema_is_exact_v5_and_has_required_indexes(tmp_path: Path) -> None:
             "integrity_violations",
             "summary_checkpoints",
             "summary_nodes",
+            "artifact_attachment_facts",
+            "artifact_attachments",
         }
         indexes = {
             row[0]
@@ -797,10 +856,11 @@ def test_schema_is_exact_v5_and_has_required_indexes(tmp_path: Path) -> None:
             "submissions_by_identity",
             "transcript_coverage_blocks_by_sequence",
             "summary_context_lookup",
+            "artifact_attachments_by_artifact",
         } <= indexes
 
 
-@pytest.mark.parametrize("version", [1, 2, 4, 6])
+@pytest.mark.parametrize("version", [1, 2, 4, 5, 7])
 def test_old_or_future_schema_is_rejected_without_mutation(tmp_path: Path, version: int) -> None:
     path = (tmp_path / "old.sqlite3").resolve()
     with sqlite3.connect(path) as connection:
@@ -836,7 +896,7 @@ def test_version_zero_unknown_objects_are_rejected_without_mutation(
             )
         )
 
-    with pytest.raises(ValueError, match="schema v5"):
+    with pytest.raises(ValueError, match="schema v6"):
         SQLiteRunJournal(path)
 
     assert path.read_bytes() == before_bytes
@@ -905,8 +965,8 @@ def test_schema_definition_drift_is_rejected(tmp_path: Path, changed_ddl: str) -
     path = (tmp_path / "drift.sqlite3").resolve()
     with sqlite3.connect(path) as connection:
         connection.executescript(changed_ddl)
-        connection.execute("PRAGMA user_version=4")
-    with pytest.raises(ValueError, match="schema v5"):
+        connection.execute("PRAGMA user_version=5")
+    with pytest.raises(ValueError, match="schema v6"):
         SQLiteRunJournal(path)
 
 
@@ -995,6 +1055,100 @@ def test_state_journal_metadata_must_match_session_and_run_rows(tmp_path: Path) 
     with pytest.raises(JournalError) as caught:
         asyncio.run(journal.load_head(batch.state.session_id))
     assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+def test_synchronized_session_and_run_state_payload_tamper_is_rejected(tmp_path: Path) -> None:
+    journal = make_journal(tmp_path)
+    batch = acceptance("synchronized-state")
+    asyncio.run(journal.commit(batch, 0))
+    forged = replace(batch.state, elapsed_seconds=0.5)
+    try:
+        with sqlite3.connect(journal.path) as connection:
+            connection.execute("UPDATE sessions SET state_json=?", (encode(forged),))
+            connection.execute("UPDATE runs SET state_json=?", (encode(forged),))
+    except sqlite3.OperationalError:
+        return
+
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(journal.load_head(batch.state.session_id))
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+@pytest.mark.parametrize("attack", ("payload", "state_hash", "node", "root", "count"))
+def test_historical_run_projection_point_proof_rejects_tamper(
+    tmp_path: Path, attack: str
+) -> None:
+    journal = make_journal(tmp_path)
+    first = acceptance("history-first")
+    asyncio.run(journal.commit(first, 0))
+    second = acceptance("history-second")
+    second = replace(
+        second,
+        state=replace(second.state, journal_version=2, journal_sequence=4),
+        summary=None,
+    )
+    asyncio.run(journal.commit(second, 1))
+    with sqlite3.connect(journal.path) as connection:
+        if attack == "payload":
+            forged = replace(first.state, elapsed_seconds=0.5)
+            connection.execute(
+                "UPDATE runs SET state_json=? WHERE run_id=?",
+                (encode(forged), first.state.run_id.value),
+            )
+        elif attack == "state_hash":
+            connection.execute(
+                "UPDATE runs SET state_hash=? WHERE run_id=?",
+                ("0" * 64, first.state.run_id.value),
+            )
+        elif attack == "node":
+            connection.execute(
+                "UPDATE run_projection_nodes SET digest=? WHERE level=0 AND node_index=0",
+                ("0" * 64,),
+            )
+        elif attack == "root":
+            connection.execute("UPDATE sessions SET run_projection_hash=?", ("0" * 64,))
+        else:
+            connection.execute("UPDATE sessions SET run_count=99")
+
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(
+            journal.find_run_state(
+                first.state.session_id, first.state.run_id, first.state.submission_id
+            )
+        )
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+def test_synchronized_approval_binding_tamper_is_rejected(tmp_path: Path) -> None:
+    journal = make_journal(tmp_path)
+    state = advance(initial(), submit(), *begin_step(), ask_approval(), decide(True))
+    state = replace(state, journal_version=1, journal_sequence=0)
+    asyncio.run(journal.commit(JournalCommit(state), 0))
+    step = state.current_step
+    assert step is not None and step.tool_calls and step.tool_calls[0].approval is not None
+    tool = replace(
+        step.tool_calls[0], approval=replace(step.tool_calls[0].approval, approved=False)
+    )
+    forged = replace(state, current_step=replace(step, tool_calls=(tool,)))
+    with sqlite3.connect(journal.path) as connection:
+        connection.execute("UPDATE sessions SET state_json=?", (encode(forged),))
+        connection.execute("UPDATE runs SET state_json=?", (encode(forged),))
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(journal.load_head(state.session_id))
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+def test_run_projection_cannot_be_moved_across_sessions(tmp_path: Path) -> None:
+    journal = make_journal(tmp_path)
+    first = acceptance("cross-one", session="one")
+    second = acceptance("cross-two", session="two")
+    asyncio.run(journal.commit(first, 0))
+    asyncio.run(journal.commit(second, 0))
+    with sqlite3.connect(journal.path) as connection, pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "UPDATE runs SET session_id=? WHERE session_id=? AND run_id=?",
+            (second.state.session_id.value, first.state.session_id.value, first.state.run_id.value),
+        )
 
 
 @pytest.mark.parametrize("corruption", ["gap", "cross_table_reorder"])

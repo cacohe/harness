@@ -44,7 +44,9 @@ class RecoveryService:
         if state is None:
             return RecoveryOutcome(None, False)
         snapshot = await self._journal.load_session(session_id)
+        attachments = await self._journal.load_artifact_attachments(session_id, state.run_id)
         refs = (
+            *(fact.artifact for fact in attachments),
             *_state_artifacts(state),
             *(ref for summary in snapshot.summaries for ref in summary.artifacts),
         )

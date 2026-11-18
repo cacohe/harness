@@ -7,7 +7,7 @@ An administrator able to rewrite every anchor and the root can forge a new chain
 
 from hashlib import sha256
 
-_DOMAIN = "agent-harness/sqlite-journal/schema-5/hash-1/sha256"
+_DOMAIN = "agent-harness/sqlite-journal/schema-6/hash-1/sha256"
 
 
 def _digest(*fields: str) -> str:
@@ -94,6 +94,9 @@ def authenticated_root_hash(
     transcript_count: int,
     summary_hash: str,
     summary_count: int,
+    session_state_hash: str,
+    run_projection_hash: str,
+    run_count: int,
 ) -> str:
     return _digest(
         "authenticated-root",
@@ -103,6 +106,36 @@ def authenticated_root_hash(
         str(transcript_count),
         validate_hash(summary_hash),
         str(summary_count),
+        validate_hash(session_state_hash),
+        validate_hash(run_projection_hash),
+        str(run_count),
+    )
+
+
+def state_record_hash(
+    session_key: str, run_key: str, submission_key: str, canonical_json: str
+) -> str:
+    return _digest("state-record", session_key, run_key, submission_key, canonical_json)
+
+
+def run_empty_hash(session_key: str, level: int, node_index: int) -> str:
+    return _digest("run-empty", session_key, str(level), str(node_index))
+
+
+def run_leaf_hash(session_key: str, run_index: int, state_hash: str) -> str:
+    return _digest("run-leaf", session_key, str(run_index), validate_hash(state_hash))
+
+
+def run_parent_hash(
+    session_key: str,
+    level: int,
+    node_index: int,
+    left: tuple[str, int],
+    right: tuple[str, int],
+) -> str:
+    return _digest(
+        "run-parent", session_key, str(level), str(node_index), validate_hash(left[0]),
+        str(left[1]), validate_hash(right[0]), str(right[1])
     )
 
 

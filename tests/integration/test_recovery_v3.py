@@ -13,7 +13,13 @@ from src.core.commands import RunLimits
 from src.core.errors import RunErrorCode
 from src.core.events import DomainEvent, DomainEventType
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import ConversationSummaryCheckpoint, JournalCommit
+from src.core.journal import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
+    ArtifactAttachmentRole,
+    ConversationSummaryCheckpoint,
+    JournalCommit,
+)
 from src.core.state import RunState, RunStatus
 from tests.unit.core.test_journal_contract import acceptance
 from tests.unit.core.test_run_state import (
@@ -151,6 +157,43 @@ def test_terminal_dangling_artifact_is_repository_corruption(tmp_path: Path) -> 
     )
     asyncio.run(journal.commit(JournalCommit(terminal), 0))
 
+    with pytest.raises(RecoveryCorruption) as caught:
+        asyncio.run(recovery.recover_session(terminal.session_id))
+    assert caught.value.failure.code is RunErrorCode.ARTIFACT_FAILED
+
+
+def test_completed_tool_attachment_survives_state_cleanup_and_restart(tmp_path: Path) -> None:
+    path = (tmp_path / "tool-attachment.sqlite3").resolve()
+    journal = SQLiteRunJournal(path)
+    batch = acceptance("settled-tool")
+    assert batch.summary is not None
+    ref = batch.summary.artifacts[0]
+    terminal = replace(
+        batch.state,
+        version=2,
+        status=RunStatus.COMPLETED,
+        final_text="done",
+        final_artifacts=(),
+        current_step=None,
+    )
+    fact = ArtifactAttachmentFact(
+        terminal.session_id,
+        terminal.run_id,
+        terminal.submission_id,
+        "tool-call-1",
+        ArtifactAttachmentRole.TOOL_RESULT,
+        ArtifactAttachmentAction.ATTACHED,
+        ref,
+    )
+    asyncio.run(journal.commit(replace(batch, state=terminal, artifact_facts=(fact,)), 0))
+
+    reopened = SQLiteRunJournal(path)
+    recovery = RecoveryService(
+        journal=reopened,
+        artifacts=InMemoryArtifactRepository(1024),
+        clock=FixedClock(),
+        ids=RecoveryIds(),
+    )
     with pytest.raises(RecoveryCorruption) as caught:
         asyncio.run(recovery.recover_session(terminal.session_id))
     assert caught.value.failure.code is RunErrorCode.ARTIFACT_FAILED

@@ -9,6 +9,9 @@ from src.core.errors import RunErrorCode, RunFailure
 from src.core.events import DomainEvent, DomainEventType
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 from src.core.journal import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
+    ArtifactAttachmentRole,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,
@@ -72,12 +75,22 @@ def direct_batch():
         SESSION, 2, "v1", PROFILE, "summary", artifacts=(artifact(),)
     )
     submission = SubmissionRecord(SESSION, RUN, SUBMISSION, "digest")
+    fact = ArtifactAttachmentFact(
+        SESSION,
+        RUN,
+        SUBMISSION,
+        "final",
+        ArtifactAttachmentRole.FINAL_OUTPUT,
+        ArtifactAttachmentAction.ATTACHED,
+        artifact(),
+    )
     return JournalCommit(
         state,
         events=(event,),
         transcript=(transcript,),
         summary=summary,
         submission=submission,
+        artifact_facts=(fact,),
     )
 
 
@@ -279,3 +292,13 @@ def test_receipt_rebuild_returns_an_independent_trusted_snapshot():
     assert rebuilt.transcript[0] is not original.transcript[0]
     assert rebuilt.summaries[0] is not original.summaries[0]
     assert rebuilt.submission is not original.submission
+    assert rebuilt.artifact_facts == original.artifact_facts
+    assert rebuilt.artifact_facts[0] is not original.artifact_facts[0]
+
+
+def test_receipt_rejects_tampered_artifact_attachment_descriptor() -> None:
+    batch = direct_batch()
+    forged = receipt(batch)
+    object.__setattr__(forged.artifact_facts[0].artifact, "size_bytes", 99)
+    with pytest.raises(JournalError):
+        validate_commit_receipt(forged, batch, expected_version=0, previous_sequence=0)
