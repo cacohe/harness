@@ -33,12 +33,23 @@ class AcceptedRun:
 
 class SubmissionService:
     def __init__(
-        self, journal: RunJournal, ids: IdGenerator, clock: Clock, limits: RunLimits
+        self,
+        journal: RunJournal,
+        ids: IdGenerator,
+        clock: Clock,
+        limits: RunLimits,
+        max_user_message_bytes: int = 1_048_576,
     ) -> None:
+        if (
+            type(max_user_message_bytes) is not int
+            or not 1 <= max_user_message_bytes <= 64 * 1_048_576
+        ):
+            raise ValueError("Submission message limit is invalid")
         self._journal = journal
         self._ids = ids
         self._clock = clock
         self._limits = limits
+        self._max_user_message_bytes = max_user_message_bytes
 
     async def accept(
         self,
@@ -47,7 +58,9 @@ class SubmissionService:
         submission_id: SubmissionId,
         profile_id: ProfileId,
     ) -> AcceptedRun:
-        digest = _message_digest(session_id, submission_id, profile_id, message)
+        digest = _message_digest(
+            session_id, submission_id, profile_id, message, self._max_user_message_bytes
+        )
         head = await self._journal.load_head(session_id)
         accepted = await self._replay(session_id, submission_id, profile_id, digest, head)
         if accepted is not None:
@@ -234,7 +247,11 @@ def _same_initial_state(left: RunState, right: RunState) -> bool:
 
 
 def _message_digest(
-    session_id: SessionId, submission_id: SubmissionId, profile_id: ProfileId, message: str
+    session_id: SessionId,
+    submission_id: SubmissionId,
+    profile_id: ProfileId,
+    message: str,
+    max_user_message_bytes: int,
 ) -> str:
     """Hash the UTF-8 JSON tuple of identities and exact user text."""
     if (
@@ -242,6 +259,8 @@ def _message_digest(
         or type(submission_id) is not SubmissionId
         or type(profile_id) is not ProfileId
         or type(message) is not str
+        or type(max_user_message_bytes) is not int
+        or max_user_message_bytes < 1
     ):
         raise InvalidTransition
     try:
@@ -249,11 +268,18 @@ def _message_digest(
             if type(identifier.value) is not str:
                 raise ValueError
             type(identifier)(identifier.value)
+        size = 0
+        for offset in range(0, len(message), 4096):
+            size += len(message[offset : offset + 4096].encode("utf-8"))
+            if size > max_user_message_bytes:
+                raise InvalidTransition(RunErrorCode.LIMIT_EXCEEDED)
         payload = json.dumps(
             [session_id.value, submission_id.value, profile_id.value, message],
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
-    except (AttributeError, ValueError):
+    except InvalidTransition:
+        raise
+    except (AttributeError, UnicodeEncodeError, ValueError):
         raise InvalidTransition from None
     return hashlib.sha256(payload).hexdigest()

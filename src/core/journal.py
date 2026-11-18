@@ -216,3 +216,15 @@ class RunJournal(Protocol):
         anchor; this operation does not certify unrelated history.
         """
         ...
+
+    def find_run_state(
+        self,
+        session_id: SessionId,
+        run_id: RunId,
+        submission_id: SubmissionId,
+    ) -> Awaitable[RunState | None]:
+        """Read the latest durable projection for one complete Run identity.
+
+        This is a bounded point lookup and must not materialize Session history.
+        """
+        ...

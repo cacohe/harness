@@ -87,6 +87,22 @@ def test_recovery_preserves_valid_waiting_approval(tmp_path: Path) -> None:
     assert asyncio.run(journal.load_head(waiting.session_id)).version == 1
 
 
+@pytest.mark.parametrize("approved", [True, False])
+def test_recovery_preserves_durable_decision_for_runtime_resume(
+    tmp_path: Path, approved: bool
+) -> None:
+    journal, recovery = service(tmp_path / f"decided-{approved}.sqlite3")
+    decided = advance(initial(), submit(), *begin_step(), ask_approval(), decide(approved))
+    decided = replace(decided, journal_version=1, journal_sequence=0)
+    asyncio.run(journal.commit(JournalCommit(decided), 0))
+
+    outcome = asyncio.run(recovery.recover_session(decided.session_id))
+
+    assert not outcome.changed
+    assert outcome.state == decided
+    assert outcome.state.status is RunStatus.WAITING_APPROVAL
+
+
 def test_recovery_settles_durable_unexecuted_tool_batch_without_gateway(tmp_path: Path) -> None:
     journal, recovery = service(tmp_path / "tool-batch.sqlite3")
     pending = advance(initial(), submit(), *begin_step())

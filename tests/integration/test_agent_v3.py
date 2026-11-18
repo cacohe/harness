@@ -11,6 +11,7 @@ from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactEx
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.context.tokenizers import ExactTokenCounter
 from src.adapters.persistence.memory import InMemoryRunJournal
+from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.application.composition import ApplicationConfig, create_development_agent
 from src.core.artifacts import InlineContent
 from src.core.commands import RunLimits
@@ -124,6 +125,13 @@ class Model:
             )
         if round_number == 0 and message in {"approval", "reject", "cancel", "restart"}:
             return ModelResponse(tool_calls=(ModelToolCall("call-guarded", "guarded", "{}"),))
+        if round_number == 0 and message == "approval-batch":
+            return ModelResponse(
+                tool_calls=(
+                    ModelToolCall("call-guarded-first", "guarded", "{}"),
+                    ModelToolCall("call-guarded-second", "guarded", "{}"),
+                )
+            )
         if round_number == 0 and message == "tool-timeout":
             return ModelResponse(tool_calls=(ModelToolCall("call-slow", "slow", "{}"),))
         return ModelResponse(f"answer:{message}")
@@ -174,7 +182,7 @@ def request_factory(state, message: str) -> ContextRequest:
     )
 
 
-async def rig(*, journal=None, model=None, tools=None, ids=None):
+async def rig(*, journal=None, model=None, tools=None, ids=None, observer=None):
     selected_journal = journal or InMemoryRunJournal()
     selected_model = model or Model()
     selected_tools = tools or Tools()
@@ -205,6 +213,7 @@ async def rig(*, journal=None, model=None, tools=None, ids=None):
         profile_id=ProfileId("profile"),
         journal=selected_journal,
         artifacts=externalizer,
+        observer=observer,
     )
     return agent, selected_journal, selected_model, selected_tools
 
@@ -269,6 +278,59 @@ def test_cancel_waiting_run_is_durable_and_never_executes_tool():
     assert tools.effects["call-guarded"] == 0
 
 
+@pytest.mark.parametrize("blocked_adapter", ["model", "tool"])
+def test_cancel_interrupts_blocked_model_or_tool_adapter(blocked_adapter):
+    class BlockingModel(Model):
+        entered = asyncio.Event()
+        interrupted = asyncio.Event()
+
+        async def complete(self, request):
+            self.entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.interrupted.set()
+                raise
+
+    class BlockingTools(Tools):
+        entered = asyncio.Event()
+        interrupted = asyncio.Event()
+
+        async def execute(self, request):
+            self.entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.interrupted.set()
+                raise
+
+    async def scenario():
+        model = BlockingModel() if blocked_adapter == "model" else Model()
+        tools = BlockingTools() if blocked_adapter == "tool" else Tools()
+        agent, journal, _, _ = await rig(model=model, tools=tools)
+        session_id = SessionId(f"blocked-{blocked_adapter}")
+        session = await agent.open_session(session_id)
+        submit = asyncio.create_task(
+            session.submit(
+                "direct" if blocked_adapter == "model" else "tools",
+                SubmissionId(f"blocked-{blocked_adapter}"),
+            )
+        )
+        blocker = model if blocked_adapter == "model" else tools
+        await blocker.entered.wait()
+        head = await journal.load_head(session_id)
+        assert head.state is not None
+        cancelled = await asyncio.wait_for(session.cancel(head.state.run_id), 1)
+        with pytest.raises(asyncio.CancelledError):
+            await submit
+        await agent.close()
+        return cancelled, blocker
+
+    cancelled, blocker = asyncio.run(scenario())
+    assert cancelled.status is RunStatus.CANCELLED
+    assert blocker.interrupted.is_set()
+
+
 def test_model_and_tool_timeout_are_stably_classified():
     async def scenario():
         agent, journal, _, _ = await rig()
@@ -313,6 +375,79 @@ def test_restart_recovers_waiting_approval_and_submission_replay_is_idempotent()
     assert tools.effects["call-guarded"] == 1
     assert sum(first_model.calls.values()) == 1
     assert sum(second_model.calls.values()) == 1
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_historical_submission_replay_returns_original_terminal_outcome_after_restart(
+    backend, tmp_path
+):
+    async def scenario():
+        path = (tmp_path / "historical.sqlite3").resolve()
+        first_journal = InMemoryRunJournal() if backend == "memory" else SQLiteRunJournal(path)
+        model = Model()
+        first_agent, _, _, _ = await rig(journal=first_journal, model=model)
+        session = await first_agent.open_session(SessionId("historical-session"))
+        first = await session.submit("first", SubmissionId("first"))
+        second = await session.submit("second", SubmissionId("second"))
+        head_before = await first_journal.load_head(SessionId("historical-session"))
+        await first_agent.close()
+
+        restarted_journal = first_journal if backend == "memory" else SQLiteRunJournal(path)
+        second_agent, _, _, _ = await rig(journal=restarted_journal, model=model)
+        restored = await second_agent.open_session(SessionId("historical-session"))
+        replay = await restored.submit("first", SubmissionId("first"))
+        head_after = await restarted_journal.load_head(SessionId("historical-session"))
+        await second_agent.close()
+        return first, second, replay, head_before, head_after, model
+
+    first, second, replay, head_before, head_after, model = asyncio.run(scenario())
+    assert first.final_text == "answer:first"
+    assert second.final_text == "answer:second"
+    assert replay == first
+    assert head_after == head_before
+    assert sum(model.calls.values()) == 2
+
+
+def test_restart_resumes_durable_decision_in_multi_tool_batch_without_repeating_effects():
+    class CrashAfterDecision:
+        armed = False
+
+        async def observe(self, observation):
+            if self.armed and observation.status == RunStatus.WAITING_APPROVAL.value:
+                self.armed = False
+                raise asyncio.CancelledError
+
+    async def scenario():
+        journal = InMemoryRunJournal()
+        tools = Tools()
+        observer = CrashAfterDecision()
+        first_agent, _, _, _ = await rig(
+            journal=journal, tools=tools, ids=Ids("batch-before"), observer=observer
+        )
+        first = await first_agent.open_session(SessionId("approval-batch-session"))
+        waiting = await first.submit("approval-batch", SubmissionId("approval-batch"))
+        observer.armed = True
+        with pytest.raises(asyncio.CancelledError):
+            await first.decide_tool_call(waiting.run_id, "call-guarded-first", True)
+        decided_head = await journal.load_head(SessionId("approval-batch-session"))
+        await first_agent.close()
+
+        second_agent, _, _, _ = await rig(journal=journal, tools=tools, ids=Ids("batch-after"))
+        restored = await second_agent.open_session(SessionId("approval-batch-session"))
+        next_waiting = await restored.submit("approval-batch", SubmissionId("approval-batch"))
+        completed = await restored.decide_tool_call(waiting.run_id, "call-guarded-second", False)
+        replay = await restored.submit("approval-batch", SubmissionId("approval-batch"))
+        await second_agent.close()
+        return decided_head, next_waiting, completed, replay, tools
+
+    decided_head, next_waiting, completed, replay, tools = asyncio.run(scenario())
+    assert decided_head.state is not None
+    assert decided_head.state.status is RunStatus.WAITING_APPROVAL
+    assert next_waiting.status is RunStatus.WAITING_APPROVAL
+    assert completed.status is RunStatus.COMPLETED
+    assert replay == completed
+    assert tools.effects["call-guarded-first"] == 1
+    assert tools.effects["call-guarded-second"] == 0
 
 
 def test_different_sessions_execute_concurrently_without_state_leakage():

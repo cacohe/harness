@@ -13,6 +13,7 @@ from src.core.journal import (
     SubmissionAcceptance,
     TranscriptEntry,
 )
+from src.core.state import RunState
 
 
 class BoundedRunJournal:
@@ -73,3 +74,11 @@ class BoundedRunJournal:
         submission_id: SubmissionId,
     ) -> TranscriptEntry | None:
         return await self._delegate.find_run_input(session_id, run_id, submission_id)
+
+    async def find_run_state(
+        self,
+        session_id: SessionId,
+        run_id: RunId,
+        submission_id: SubmissionId,
+    ) -> RunState | None:
+        return await self._delegate.find_run_state(session_id, run_id, submission_id)

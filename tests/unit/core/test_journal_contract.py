@@ -283,6 +283,28 @@ def test_find_run_input_is_bounded_to_one_canonical_user_entry(journal: RunJourn
     )
 
 
+def test_find_run_state_returns_latest_projection_by_complete_identity(
+    journal: RunJournal,
+) -> None:
+    batch = acceptance("run-state")
+    asyncio.run(journal.commit(batch, 0))
+    latest = replace(batch.state, version=2, journal_version=2)
+    asyncio.run(journal.commit(JournalCommit(latest), 1))
+
+    assert (
+        asyncio.run(journal.find_run_state(latest.session_id, latest.run_id, latest.submission_id))
+        == latest
+    )
+    assert (
+        asyncio.run(
+            journal.find_run_state(latest.session_id, RunId("missing"), latest.submission_id)
+        )
+        is None
+    )
+    with pytest.raises(JournalError):
+        asyncio.run(journal.find_run_state(latest.session_id, latest.run_id, SubmissionId("wrong")))
+
+
 def test_find_run_input_rejects_duplicate_user_entries(journal: RunJournal) -> None:
     batch = acceptance("duplicate-input")
     asyncio.run(journal.commit(batch, 0))

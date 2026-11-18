@@ -48,6 +48,7 @@ class ApplicationConfig:
     max_inline_artifact_bytes: int = 65_536
     max_artifact_summary_bytes: int = 16_384
     max_serialized_run_state_bytes: int = 16 * 1_048_576
+    max_user_message_bytes: int = 1_048_576
     sqlite_path: Path | None = None
     artifact_root: Path | None = None
     observer_timeout_seconds: float = 0.1
@@ -61,6 +62,7 @@ class ApplicationConfig:
             object.__getattribute__(self, "max_inline_artifact_bytes"),
             object.__getattribute__(self, "max_artifact_summary_bytes"),
             object.__getattribute__(self, "max_serialized_run_state_bytes"),
+            object.__getattribute__(self, "max_user_message_bytes"),
         )
         limits = _snapshot_limits(object.__getattribute__(self, "limits"))
         context_budget = _snapshot_context_budget(object.__getattribute__(self, "context_budget"))
@@ -74,6 +76,7 @@ class ApplicationConfig:
             or not 0 <= integers[4] <= integers[3]
             or not 1 <= integers[5] <= 1_048_576
             or not 1_024 <= integers[6] <= 16 * 1_048_576
+            or not 1 <= integers[7] <= 64 * 1_048_576
             or isinstance(observer_timeout, bool)
             or type(observer_timeout) not in (int, float)
             or not math.isfinite(observer_timeout)
@@ -253,7 +256,9 @@ def _compose(
     observer: PostCommitObserver | None,
 ) -> Agent:
     bounded_journal = BoundedRunJournal(journal, config.max_serialized_run_state_bytes)
-    submissions = SubmissionService(bounded_journal, ids, clock, config.limits)
+    submissions = SubmissionService(
+        bounded_journal, ids, clock, config.limits, config.max_user_message_bytes
+    )
 
     async def coordinator_factory(state: RunState, user_input: str) -> RunCoordinator:
         request = context_request_factory(state, user_input)
@@ -349,6 +354,7 @@ _JOURNAL_METHODS = (
     "load_context_summaries",
     "find_submission",
     "find_run_input",
+    "find_run_state",
 )
 
 
@@ -401,6 +407,7 @@ def _snapshot_application_config(value: object) -> ApplicationConfig:
             max_serialized_run_state_bytes=object.__getattribute__(
                 value, "max_serialized_run_state_bytes"
             ),
+            max_user_message_bytes=object.__getattribute__(value, "max_user_message_bytes"),
             sqlite_path=object.__getattribute__(value, "sqlite_path"),
             artifact_root=object.__getattribute__(value, "artifact_root"),
             observer_timeout_seconds=object.__getattribute__(value, "observer_timeout_seconds"),

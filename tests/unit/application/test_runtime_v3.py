@@ -10,6 +10,7 @@ import pytest
 from src.application.submissions import AcceptedRun
 from src.core.commands import (
     AdvanceRun,
+    CancelRun,
     CommandContext,
     DecideToolCall,
     FinishModelCall,
@@ -20,6 +21,7 @@ from src.core.commands import (
     StartToolCall,
     ToolCallRequest,
 )
+from src.core.errors import RunErrorCode, RunFailure
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 from src.core.journal import JournalHead, JournalSnapshot, TranscriptEntry
 from src.core.run import RunOutcome
@@ -98,6 +100,7 @@ class Submissions:
         self.calls += 1
         current = state(session_id, submission_id)
         self.journal.heads[session_id.value] = current
+        self.journal.runs[current.run_id.value] = current
         self.journal.messages[current.run_id.value] = message
         return AcceptedRun(current, 1, True)
 
@@ -106,6 +109,7 @@ class Journal:
     def __init__(self) -> None:
         self.heads: dict[str, RunState] = {}
         self.messages: dict[str, str] = {}
+        self.runs: dict[str, RunState] = {}
 
     async def load_head(self, session_id):
         current = self.heads.get(session_id.value)
@@ -150,6 +154,12 @@ class Journal:
             2,
         )
 
+    async def find_run_state(self, session_id, run_id, submission_id):
+        value = self.runs.get(run_id.value)
+        if value is None or value.session_id != session_id or value.submission_id != submission_id:
+            return None
+        return value
+
 
 class CompletingCoordinator:
     def __init__(self, journal: Journal, run: RunState, calls: list[str], gate=None) -> None:
@@ -170,6 +180,7 @@ class CompletingCoordinator:
             journal_version=state.journal_version + 1,
         )
         self.journal.heads[state.session_id.value] = completed
+        self.journal.runs[state.run_id.value] = completed
         return RunOutcome(completed, completed.journal_version, completed.journal_sequence)
 
 
@@ -195,7 +206,7 @@ async def test_post_commit_observer_runs_after_acceptance_and_advance_and_is_iso
         coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, []),
         ids=Ids(),
         clock=Clock(),
-        max_sessions=1,
+        max_sessions=2,
         max_waiters_per_session=0,
         observer=Observer(),
     )
@@ -583,6 +594,85 @@ async def test_approval_decides_resumes_and_drives_one_step_at_a_time():
 
 
 @async_test
+async def test_durable_approval_decision_resumes_after_observer_cancellation_and_restart():
+    from src.application.runtime import RuntimeCoordinator
+
+    journal = Journal()
+    current = waiting_state(SessionId("a"), SubmissionId("submission"))
+    journal.heads["a"] = current
+    journal.runs[current.run_id.value] = current
+    journal.messages[current.run_id.value] = "hello"
+    commands: list[type[object]] = []
+
+    class ApprovalCoordinator:
+        async def advance(self, run, command):
+            commands.append(type(command))
+            step = run.current_step
+            assert step is not None
+            tool = step.tool_calls[0]
+            if isinstance(command, DecideToolCall):
+                tool = replace(tool, approval=replace(tool.approval, approved=True))
+                next_state = replace(run, current_step=replace(step, tool_calls=(tool,)))
+            elif isinstance(command, ResumeRun):
+                tool = replace(tool, approval=replace(tool.approval, resumed=True))
+                next_state = replace(
+                    run,
+                    status=RunStatus.RUNNING,
+                    current_step=replace(step, tool_calls=(tool,)),
+                )
+            else:
+                assert isinstance(command, AdvanceRun)
+                next_state = replace(
+                    run, status=RunStatus.COMPLETED, current_step=None, final_text="done"
+                )
+            next_state = replace(
+                next_state,
+                version=run.version + 1,
+                journal_version=run.journal_version + 1,
+            )
+            journal.heads["a"] = next_state
+            journal.runs[run.run_id.value] = next_state
+            return RunOutcome(next_state, next_state.journal_version, next_state.journal_sequence)
+
+    class CancelObserver:
+        async def observe(self, _observation):
+            raise asyncio.CancelledError
+
+    first = RuntimeCoordinator(
+        submissions=Submissions(journal),
+        journal=journal,
+        coordinator_factory=lambda *_args: ApprovalCoordinator(),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=1,
+        observer=CancelObserver(),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await first.decide_tool_call(SessionId("a"), current.run_id, "tool-call", True)
+    assert journal.heads["a"].status is RunStatus.WAITING_APPROVAL
+
+    class Replay:
+        async def accept(self, *_args):
+            return AcceptedRun(state(SessionId("a"), SubmissionId("submission")), 1, False)
+
+    restarted = RuntimeCoordinator(
+        submissions=Replay(),
+        journal=journal,
+        coordinator_factory=lambda *_args: ApprovalCoordinator(),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=1,
+    )
+    result = await restarted.submit(
+        SessionId("a"), ProfileId("profile"), "hello", SubmissionId("submission")
+    )
+    assert result.status is RunStatus.COMPLETED
+    assert commands == [DecideToolCall, ResumeRun, AdvanceRun]
+
+
+@async_test
 async def test_duplicate_terminal_submission_does_not_drive_or_append_again():
     from src.application.runtime import RuntimeCoordinator
 
@@ -613,6 +703,144 @@ async def test_duplicate_terminal_submission_does_not_drive_or_append_again():
     second = await runtime.submit(*args)
     assert first.status is second.status is RunStatus.COMPLETED
     assert coordinator_calls == ["a"]
+
+
+@async_test
+async def test_cancel_interrupts_blocked_drive_and_commits_once():
+    from src.application.runtime import RuntimeCoordinator
+
+    journal = Journal()
+    entered = asyncio.Event()
+    interrupted = asyncio.Event()
+    cancel_entered = asyncio.Event()
+    allow_cancel_commit = asyncio.Event()
+    commands: list[type[object]] = []
+
+    class InterruptibleCoordinator:
+        async def advance(self, run, command):
+            commands.append(type(command))
+            if isinstance(command, AdvanceRun):
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    interrupted.set()
+                    raise
+            assert isinstance(command, CancelRun)
+            cancel_entered.set()
+            await allow_cancel_commit.wait()
+            cancelled = replace(
+                run,
+                status=RunStatus.CANCELLED,
+                failure=RunFailure(RunErrorCode.CANCELLED),
+                version=run.version + 1,
+                journal_version=run.journal_version + 1,
+            )
+            journal.heads[run.session_id.value] = cancelled
+            journal.runs[run.run_id.value] = cancelled
+            return RunOutcome(cancelled, cancelled.journal_version, cancelled.journal_sequence)
+
+    runtime = RuntimeCoordinator(
+        submissions=Submissions(journal),
+        journal=journal,
+        coordinator_factory=lambda _run, _message: InterruptibleCoordinator(),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=2,
+        max_waiters_per_session=1,
+    )
+    submit = asyncio.create_task(
+        runtime.submit(SessionId("a"), ProfileId("profile"), "hello", SubmissionId("one"))
+    )
+    await entered.wait()
+    run_id = journal.heads["a"].run_id
+    from src.application.runtime import SessionOwnershipError
+
+    with pytest.raises(SessionOwnershipError):
+        await runtime.cancel_run(SessionId("a"), RunId("wrong"))
+    with pytest.raises(SessionOwnershipError):
+        await runtime.cancel_run(SessionId("other"), run_id)
+    assert not interrupted.is_set()
+    caller = asyncio.create_task(runtime.cancel_run(SessionId("a"), run_id))
+    await cancel_entered.wait()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    allow_cancel_commit.set()
+    cancelled = await asyncio.wait_for(runtime.cancel_run(SessionId("a"), run_id), 1)
+    with pytest.raises(asyncio.CancelledError):
+        await submit
+    assert interrupted.is_set()
+    assert cancelled.status is RunStatus.CANCELLED
+    assert commands.count(CancelRun) == 1
+
+
+@async_test
+async def test_cancel_completion_race_returns_the_existing_terminal_outcome():
+    from src.application.runtime import RuntimeCoordinator
+
+    journal = Journal()
+    completed = replace(
+        state(SessionId("a"), SubmissionId("one")),
+        status=RunStatus.COMPLETED,
+        final_text="won race",
+    )
+    journal.heads["a"] = completed
+    journal.runs[completed.run_id.value] = completed
+    runtime = RuntimeCoordinator(
+        submissions=Submissions(journal),
+        journal=journal,
+        coordinator_factory=lambda *_args: pytest.fail("terminal cancellation must not drive"),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=1,
+    )
+    assert await runtime.cancel_run(SessionId("a"), completed.run_id) == completed
+
+
+@async_test
+async def test_historical_submission_replay_returns_its_terminal_run_without_driving():
+    from src.application.runtime import RuntimeCoordinator
+
+    journal = Journal()
+    original = state(SessionId("a"), SubmissionId("first"), RunId("original"))
+    original_done = replace(
+        original,
+        status=RunStatus.COMPLETED,
+        final_text="original result",
+        version=2,
+        journal_version=2,
+    )
+    newer = replace(
+        state(SessionId("a"), SubmissionId("second"), RunId("newer")),
+        status=RunStatus.COMPLETED,
+        final_text="newer result",
+        journal_version=4,
+    )
+    journal.heads["a"] = newer
+    journal.runs[original.run_id.value] = original_done
+    journal.runs[newer.run_id.value] = newer
+    journal.messages[original.run_id.value] = "old"
+
+    class Replay:
+        async def accept(self, *_args):
+            return AcceptedRun(original, 1, False)
+
+    runtime = RuntimeCoordinator(
+        submissions=Replay(),
+        journal=journal,
+        coordinator_factory=lambda *_args: pytest.fail("historical replay must not drive"),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=1,
+    )
+    result = await runtime.submit(
+        SessionId("a"), ProfileId("profile"), "old", SubmissionId("first")
+    )
+    assert result == original_done
+    assert journal.heads["a"] == newer
 
 
 @async_test

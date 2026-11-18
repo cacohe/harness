@@ -81,10 +81,50 @@ def service(
     *,
     timestamp: datetime = NOW,
     limits: RunLimits = LIMITS,
+    max_user_message_bytes: int = 1_048_576,
 ) -> SubmissionService:
     return SubmissionService(
-        journal=journal, ids=SequenceIds(prefix), clock=FixedClock(timestamp), limits=limits
+        journal=journal,
+        ids=SequenceIds(prefix),
+        clock=FixedClock(timestamp),
+        limits=limits,
+        max_user_message_bytes=max_user_message_bytes,
     )
+
+
+def test_message_utf8_limit_is_checked_before_canonical_json(monkeypatch) -> None:
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("oversized input reached json.dumps")
+
+    monkeypatch.setattr("src.application.submissions.json.dumps", forbidden)
+    with pytest.raises(InvalidTransition) as error:
+        asyncio.run(
+            service(InMemoryRunJournal(), max_user_message_bytes=8).accept(
+                SESSION, "😀😀😀", FIRST, PROFILE
+            )
+        )
+    assert error.value.failure.code is RunErrorCode.LIMIT_EXCEEDED
+
+
+def test_message_utf8_limit_accepts_exact_multibyte_boundary() -> None:
+    accepted = asyncio.run(
+        service(InMemoryRunJournal(), max_user_message_bytes=8).accept(
+            SESSION, "😀😀", FIRST, PROFILE
+        )
+    )
+    assert accepted.state.status is RunStatus.RUNNING
+
+
+@pytest.mark.parametrize("limit", [True, 0, 64 * 1_048_576 + 1])
+def test_message_limit_rejects_invalid_numeric_values(limit: object) -> None:
+    with pytest.raises(ValueError):
+        SubmissionService(
+            InMemoryRunJournal(),
+            SequenceIds("invalid"),
+            FixedClock(NOW),
+            LIMITS,
+            cast(int, limit),
+        )
 
 
 async def finish(journal: RunJournal, accepted: AcceptedRun) -> None:

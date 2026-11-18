@@ -111,6 +111,10 @@ class _Gate:
 @dataclass(slots=True, eq=False)
 class _SessionSlot:
     gate: _Gate
+    active_task: asyncio.Task[object] | None = None
+    active_run_id: str | None = None
+    cancel_task: asyncio.Task[RunState] | None = None
+    cancel_run_id: str | None = None
 
 
 class RuntimeCoordinator:
@@ -211,7 +215,8 @@ class RuntimeCoordinator:
                 state = await self._accepted_head(accepted)
                 if accepted.committed:
                     await self._observe("submission.accepted", state)
-                return await self._drive(state, message)
+                async with self._active_run(slot, state.run_id):
+                    return await self._drive(state, message)
 
     async def decide_tool_call(
         self,
@@ -232,36 +237,53 @@ class RuntimeCoordinator:
                 if call_id != tool_call_id:
                     raise SessionOwnershipError("Tool call is not owned by this Session and Run")
                 message = await self._user_input(state)
-                coordinator = await self._coordinator(state, message)
-                outcome = await coordinator.advance(
-                    state,
-                    DecideToolCall(
-                        state.run_id,
-                        state.session_id,
-                        tool_call_id,
-                        approved,
-                        context=self._context(state),
-                    ),
-                )
-                decided = _outcome_state(outcome, state)
-                await self._observe("run.advanced", decided)
-                resumed_coordinator = await self._coordinator(decided, message)
-                resumed = await resumed_coordinator.advance(
-                    decided,
-                    ResumeRun(
-                        decided.run_id,
-                        decided.session_id,
-                        context=self._context(decided),
-                    ),
-                )
-                resumed_state = _outcome_state(resumed, decided)
-                await self._observe("run.advanced", resumed_state)
-                return await self._drive(resumed_state, message)
+                async with self._active_run(slot, state.run_id):
+                    coordinator = await self._coordinator(state, message)
+                    outcome = await coordinator.advance(
+                        state,
+                        DecideToolCall(
+                            state.run_id,
+                            state.session_id,
+                            tool_call_id,
+                            approved,
+                            context=self._context(state),
+                        ),
+                    )
+                    decided = _outcome_state(outcome, state)
+                    await self._observe("run.advanced", decided)
+                    return await self._drive(decided, message)
 
     async def cancel_run(self, session_id: SessionId, run_id: RunId) -> RunState:
         session_id = _canonical_id(session_id, SessionId, "Cancellation identity is invalid")
         run_id = _canonical_id(run_id, RunId, "Cancellation identity is invalid")
         slot = await self._slot(session_id)
+        run_key = _id_value(run_id)
+        async with self._lifecycle_lock:
+            task = slot.cancel_task
+            if task is None or slot.cancel_run_id != run_key:
+                task = asyncio.create_task(self._cancel_run_impl(session_id, run_id, slot))
+                slot.cancel_task = task
+                slot.cancel_run_id = run_key
+        return await asyncio.shield(task)
+
+    async def _cancel_run_impl(
+        self, session_id: SessionId, run_id: RunId, slot: _SessionSlot
+    ) -> RunState:
+        state = await self._head_state(session_id)
+        if state.session_id != session_id or state.run_id != run_id:
+            raise SessionOwnershipError("Run is not owned by this Session")
+        if state.status.terminal:
+            return state
+        async with self._lifecycle_lock:
+            active = (
+                slot.active_task
+                if slot.active_run_id == _id_value(run_id)
+                and slot.active_task is not asyncio.current_task()
+                else None
+            )
+        if active is not None and not active.done():
+            active.cancel()
+            await asyncio.gather(active, return_exceptions=True)
         async with slot.gate.enter():
             async with self._operation(session_id, slot):
                 state = await self._head_state(session_id)
@@ -351,9 +373,34 @@ class RuntimeCoordinator:
         initial = snapshot_run_state(object.__getattribute__(accepted, "state"))
         head = await self._journal.load_head(initial.session_id)
         state = _head(head, initial.session_id)
-        if state.run_id != initial.run_id or state.submission_id != initial.submission_id:
+        if state.run_id == initial.run_id and state.submission_id == initial.submission_id:
+            return state
+        historical = await self._journal.find_run_state(
+            initial.session_id, initial.run_id, initial.submission_id
+        )
+        if (
+            historical is None
+            or historical.profile_id != initial.profile_id
+            or not historical.status.terminal
+        ):
             raise SessionOwnershipError("Submission is no longer the active Run")
-        return state
+        return historical
+
+    @asynccontextmanager
+    async def _active_run(self, slot: _SessionSlot, run_id: RunId):
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("Application operation requires an asyncio Task")
+        async with self._lifecycle_lock:
+            slot.active_task = task
+            slot.active_run_id = _id_value(run_id)
+        try:
+            yield
+        finally:
+            async with self._lifecycle_lock:
+                if slot.active_task is task:
+                    slot.active_task = None
+                    slot.active_run_id = None
 
     async def _head_state(self, session_id: SessionId) -> RunState:
         state = _head(await self._journal.load_head(session_id), session_id)
@@ -381,8 +428,26 @@ class RuntimeCoordinator:
 
     async def _drive(self, state: RunState, message: str) -> RunState:
         for _ in range(self._max_advances):
-            if state.status.terminal or state.status is RunStatus.WAITING_APPROVAL:
+            if state.status.terminal:
                 return state
+            if state.status is RunStatus.WAITING_APPROVAL:
+                if not _has_durable_decision(state):
+                    return state
+                coordinator = await self._coordinator(state, message)
+                outcome = await coordinator.advance(
+                    state,
+                    ResumeRun(
+                        state.run_id,
+                        state.session_id,
+                        context=self._context(state),
+                    ),
+                )
+                next_state = _outcome_state(outcome, state)
+                await self._observe("run.advanced", next_state)
+                if next_state.version <= state.version:
+                    raise RuntimeError("Run coordinator did not advance the state")
+                state = next_state
+                continue
             coordinator = await self._coordinator(state, message)
             outcome = await coordinator.advance(
                 state,
@@ -504,6 +569,14 @@ def _pending_call(state: RunState, session_id: SessionId, run_id: RunId) -> str:
     if tool.approval is None or tool.approval.approved is not None:
         raise SessionOwnershipError("Tool call is not awaiting a decision")
     return tool.tool_call_id
+
+
+def _has_durable_decision(state: RunState) -> bool:
+    step = state.current_step
+    if step is None or step.next_tool_index >= len(step.tool_calls):
+        return False
+    approval = step.tool_calls[step.next_tool_index].approval
+    return approval is not None and approval.approved is not None and not approval.resumed
 
 
 def _outcome_state(value: object, previous: RunState) -> RunState:

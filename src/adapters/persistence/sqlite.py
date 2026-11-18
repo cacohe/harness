@@ -530,6 +530,19 @@ class SQLiteRunJournal:
             lambda _cancelled: self._find_run_input_sync(session_key, run_key, submission_key)
         )
 
+    async def find_run_state(
+        self,
+        session_id: SessionId,
+        run_id: RunId,
+        submission_id: SubmissionId,
+    ) -> RunState | None:
+        session_key = self._session_key(session_id)
+        run_key = _typed_id_key(run_id, RunId)
+        submission_key = _typed_id_key(submission_id, SubmissionId)
+        return await self._run(
+            lambda _cancelled: self._find_run_state_sync(session_key, run_key, submission_key)
+        )
+
     async def _run(self, operation: Callable[[Event], _T]) -> _T:
         cancelled = Event()
         task = asyncio.create_task(asyncio.to_thread(operation, cancelled))
@@ -1234,6 +1247,47 @@ class SQLiteRunJournal:
                 raise ValueError("SQLite Run input disagrees with Run projection")
             _verify_point_anchor(connection, session_key, entry.sequence)
             return entry
+        except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        finally:
+            connection.close()
+
+    def _find_run_state_sync(
+        self, session_key: str, run_key: str, submission_key: str
+    ) -> RunState | None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            row = connection.execute(
+                "SELECT session_id, run_id, submission_id, profile_id, status, state_version, "
+                "state_json FROM runs WHERE session_id=? AND run_id=?",
+                (session_key, run_key),
+            ).fetchone()
+            if row is None:
+                return None
+            state = decode(row["state_json"], RunState)
+            _validate_run_row(row, state)
+            if state.submission_id.value != submission_key:
+                raise ValueError("SQLite Run identity disagrees")
+            submission_row = connection.execute(
+                "SELECT session_id, submission_id, run_id, digest, intent_json, receipt_json, "
+                "acceptance_state_json, acceptance_version FROM submissions "
+                "WHERE session_id=? AND submission_id=?",
+                (session_key, submission_key),
+            ).fetchone()
+            if submission_row is None:
+                raise ValueError("SQLite Run has no acceptance")
+            receipt, _, _ = _decode_submission_row(
+                submission_row, session_key, submission_key
+            )
+            if (
+                receipt.submission is None
+                or receipt.submission.run_id.value != run_key
+                or len(receipt.transcript) != 1
+            ):
+                raise ValueError("SQLite Run acceptance identity disagrees")
+            _verify_point_anchor(connection, session_key, receipt.transcript[0].sequence)
+            return state
         except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
         finally:

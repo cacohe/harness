@@ -419,6 +419,40 @@ class InMemoryRunJournal:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
         return None if not matches else _canonical_copy(matches[0])
 
+    async def find_run_state(
+        self,
+        session_id: SessionId,
+        run_id: RunId,
+        submission_id: SubmissionId,
+    ) -> RunState | None:
+        if (
+            type(session_id) is not SessionId
+            or type(run_id) is not RunId
+            or type(submission_id) is not SubmissionId
+        ):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        session_id = _canonical_copy(session_id)
+        run_id = _canonical_copy(run_id)
+        submission_id = _canonical_copy(submission_id)
+        with self._lock:
+            session = self._store.sessions.get(session_id.value)
+            state = None if session is None else session.runs.get(run_id.value)
+            accepted = (
+                None if session is None else session.submissions.get(submission_id.value)
+            )
+        if state is None:
+            return None
+        state = _canonical_copy(state)
+        if (
+            state.session_id != session_id
+            or state.submission_id != submission_id
+            or accepted is None
+            or accepted[1].submission is None
+            or accepted[1].submission.run_id != run_id
+        ):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        return state
+
 
 def _validate_aggregate_request(
     session_id: SessionId,

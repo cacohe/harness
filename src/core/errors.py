@@ -39,6 +39,6 @@ class RunFailure:
 
 
 class InvalidTransition(ValueError):
-    def __init__(self) -> None:
-        self.failure = RunFailure(RunErrorCode.INVARIANT_VIOLATION)
+    def __init__(self, code: RunErrorCode = RunErrorCode.INVARIANT_VIOLATION) -> None:
+        self.failure = RunFailure(code)
         super().__init__(self.failure.message)

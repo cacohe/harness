@@ -499,6 +499,9 @@ class _JournalPort:
     async def find_run_input(self, *_args):
         raise NotImplementedError
 
+    async def find_run_state(self, *_args):
+        raise NotImplementedError
+
 
 class _ExternalizerPort:
     async def externalize(self, *_args):
