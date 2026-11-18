@@ -14,6 +14,7 @@ from src.core.journal import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,
+    ArtifactRetirementState,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,
@@ -117,6 +118,50 @@ def test_artifact_attachment_is_durable_indexed_and_blocks_retirement(
     )
     assert first_page[0].fact == fact
     assert second_page[0].fact == detach
+
+
+def test_retirement_reservation_atomically_blocks_new_attachment(journal: RunJournal) -> None:
+    batch = acceptance("retirement-reservation")
+    ref = artifact_ref("d")
+    reservation = asyncio.run(journal.reserve_artifact_retirement(ref.artifact_id))
+    assert reservation is not None
+    assert reservation.state is ArtifactRetirementState.RETIRING
+    fact = ArtifactAttachmentFact(
+        batch.state.session_id,
+        batch.state.run_id,
+        batch.state.submission_id,
+        "owner",
+        ArtifactAttachmentRole.TOOL_RESULT,
+        ArtifactAttachmentAction.ATTACHED,
+        ref,
+    )
+    with pytest.raises(JournalError):
+        asyncio.run(journal.commit(replace(batch, artifact_facts=(fact,)), 0))
+    aborted = asyncio.run(journal.abort_artifact_retirement(reservation))
+    assert aborted.state is ArtifactRetirementState.ABORTED
+    asyncio.run(journal.commit(replace(batch, artifact_facts=(fact,)), 0))
+    assert asyncio.run(journal.reserve_artifact_retirement(ref.artifact_id)) is None
+
+
+def test_completed_retirement_allows_a_new_content_generation(journal: RunJournal) -> None:
+    batch = acceptance("retirement-generation")
+    ref = artifact_ref("f")
+    first = asyncio.run(journal.reserve_artifact_retirement(ref.artifact_id))
+    assert first is not None
+    completed = asyncio.run(journal.complete_artifact_retirement(first))
+    assert completed.state is ArtifactRetirementState.RETIRED
+    fact = ArtifactAttachmentFact(
+        batch.state.session_id,
+        batch.state.run_id,
+        batch.state.submission_id,
+        "owner",
+        ArtifactAttachmentRole.FINAL_OUTPUT,
+        ArtifactAttachmentAction.ATTACHED,
+        ref,
+    )
+    asyncio.run(journal.commit(replace(batch, artifact_facts=(fact,)), 0))
+    assert asyncio.run(journal.artifact_has_active_attachments(ref.artifact_id))
+    assert asyncio.run(journal.reserve_artifact_retirement(ref.artifact_id)) is None
 
 
 @pytest.mark.parametrize("mode", ("conflict", "detach-missing"))

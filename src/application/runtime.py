@@ -264,12 +264,7 @@ class RuntimeCoordinator:
         run_key = _id_value(run_id)
         async with self._lifecycle_lock:
             task = slot.cancel_task
-            if (
-                task is None
-                or task.done()
-                or task.cancelling()
-                or slot.cancel_run_id != run_key
-            ):
+            if task is None or task.done() or task.cancelling() or slot.cancel_run_id != run_key:
                 task = asyncio.create_task(self._cancel_run_impl(session_id, run_id, slot))
                 slot.cancel_task = task
                 slot.cancel_run_id = run_key

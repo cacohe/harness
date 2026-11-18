@@ -134,8 +134,14 @@ def run_parent_hash(
     right: tuple[str, int],
 ) -> str:
     return _digest(
-        "run-parent", session_key, str(level), str(node_index), validate_hash(left[0]),
-        str(left[1]), validate_hash(right[0]), str(right[1])
+        "run-parent",
+        session_key,
+        str(level),
+        str(node_index),
+        validate_hash(left[0]),
+        str(left[1]),
+        validate_hash(right[0]),
+        str(right[1]),
     )
 
 
@@ -148,9 +154,7 @@ def summary_record_hash(session_key: str, summary_index: int, canonical_json: st
 
 
 def summary_leaf_hash(session_key: str, summary_index: int, record_digest: str) -> str:
-    return _digest(
-        "summary-leaf", session_key, str(summary_index), validate_hash(record_digest)
-    )
+    return _digest("summary-leaf", session_key, str(summary_index), validate_hash(record_digest))
 
 
 def summary_parent_hash(

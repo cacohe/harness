@@ -40,9 +40,7 @@ def make_journal(tmp_path: Path) -> SQLiteRunJournal:
 
 
 @pytest.mark.parametrize("attack", ("fact", "active-update", "active-delete", "active-insert"))
-def test_artifact_fact_and_active_index_tamper_is_rejected(
-    tmp_path: Path, attack: str
-) -> None:
+def test_artifact_fact_and_active_index_tamper_is_rejected(tmp_path: Path, attack: str) -> None:
     journal = make_journal(tmp_path)
     batch = acceptance(f"artifact-tamper-{attack}")
     fact = ArtifactAttachmentFact(
@@ -71,9 +69,7 @@ def test_artifact_fact_and_active_index_tamper_is_rejected(
             )
 
     with pytest.raises(JournalError) as caught:
-        asyncio.run(
-            journal.load_artifact_attachments(batch.state.session_id, batch.state.run_id)
-        )
+        asyncio.run(journal.load_artifact_attachments(batch.state.session_id, batch.state.run_id))
     assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
     with pytest.raises(JournalError) as retirement:
         asyncio.run(journal.artifact_has_active_attachments(fact.artifact.artifact_id))
@@ -542,9 +538,7 @@ def test_context_summary_lookup_filters_bounds_and_survives_restart(tmp_path: Pa
 
 
 @pytest.mark.parametrize("table", ("summary_checkpoints", "summary_nodes"))
-def test_context_summary_lookup_rejects_known_summary_tampering(
-    tmp_path: Path, table: str
-) -> None:
+def test_context_summary_lookup_rejects_known_summary_tampering(tmp_path: Path, table: str) -> None:
     journal = make_journal(tmp_path)
     batch = acceptance("summary-tamper")
     receipt = asyncio.run(journal.commit(batch, 0))
@@ -844,6 +838,7 @@ def test_schema_is_exact_v6_and_has_required_indexes(tmp_path: Path) -> None:
             "summary_nodes",
             "artifact_attachment_facts",
             "artifact_attachments",
+            "artifact_retirements",
         }
         indexes = {
             row[0]
@@ -1075,9 +1070,7 @@ def test_synchronized_session_and_run_state_payload_tamper_is_rejected(tmp_path:
 
 
 @pytest.mark.parametrize("attack", ("payload", "state_hash", "node", "root", "count"))
-def test_historical_run_projection_point_proof_rejects_tamper(
-    tmp_path: Path, attack: str
-) -> None:
+def test_historical_run_projection_point_proof_rejects_tamper(tmp_path: Path, attack: str) -> None:
     journal = make_journal(tmp_path)
     first = acceptance("history-first")
     asyncio.run(journal.commit(first, 0))

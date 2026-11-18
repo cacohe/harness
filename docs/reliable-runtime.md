@@ -118,6 +118,18 @@ access directly.
 
 Referenced objects are retired only after explicit detach. `ArtifactRetentionService` rejects a
 delete while any durable owner remains; after the last owner detaches, retirement becomes reachable.
+Recovery validates only the authoritative active attachment set for the target Run. Historical
+terminal outcome, tool, final-answer, and summary refs that were explicitly detached may remain as
+audit data without keeping the repository object alive.
+
+Retirement is a journal-coordinated saga rather than a cross-store transaction. The journal
+atomically reserves `RETIRING` only when no active owner exists, and attachment commits reject that
+generation until delete completes. Successful delete records `RETIRED`; a confirmed failed delete
+with the object still present records `ABORTED`. Repeating retirement after a crash resumes safely.
+After a content-addressed object is put again, a new attachment atomically opens the next generation.
+SQLite persists these reservations; the memory journal uses the same state machine under one lock.
+Memory lifecycle paging keeps a per-Run ordered index and performs `bisect + limit` access, so its
+lookup cost is `O(log F_run + limit)` and does not scan other Runs or copy full fact history.
 
 ## Observability and shutdown
 

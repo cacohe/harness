@@ -2,12 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from src.core.artifacts import (
-    ArtifactRef,
-    ArtifactRepository,
-    ExternalizedContent,
-    snapshot_artifact_ref,
-)
+from src.core.artifacts import ArtifactRef, ArtifactRepository, snapshot_artifact_ref
 from src.core.commands import CommandContext, FailRun
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.ids import Clock, IdGenerator, SessionId
@@ -43,13 +38,8 @@ class RecoveryService:
         state = head.state
         if state is None:
             return RecoveryOutcome(None, False)
-        snapshot = await self._journal.load_session(session_id)
         attachments = await self._journal.load_artifact_attachments(session_id, state.run_id)
-        refs = (
-            *(fact.artifact for fact in attachments),
-            *_state_artifacts(state),
-            *(ref for summary in snapshot.summaries for ref in summary.artifacts),
-        )
+        refs = tuple(fact.artifact for fact in attachments)
         missing = await self._has_dangling_ref(refs)
         if state.status.terminal:
             if missing:
@@ -121,14 +111,3 @@ def _interrupted_code(state: RunState) -> RunErrorCode:
     if step is not None and step.model_call is not None and step.model_call.tool_requests:
         return RunErrorCode.TOOL_FAILED
     return RunErrorCode.MODEL_FAILED
-
-
-def _state_artifacts(state: RunState) -> tuple[ArtifactRef, ...]:
-    refs = list(state.final_artifacts)
-    step = state.current_step
-    if step is not None:
-        for tool in step.tool_calls:
-            result = tool.result
-            if type(result) is ExternalizedContent:
-                refs.extend(result.artifacts)
-    return tuple(refs)

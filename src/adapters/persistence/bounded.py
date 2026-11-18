@@ -6,6 +6,7 @@ from src.core.ids import ProfileId, RunId, SessionId, SubmissionId
 from src.core.journal import (
     ArtifactAttachmentFact,
     ArtifactFactRecord,
+    ArtifactRetirementReservation,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,
@@ -85,9 +86,7 @@ class BoundedRunJournal:
     ) -> RunState | None:
         return await self._delegate.find_run_state(session_id, run_id, submission_id)
 
-    async def find_run_state_by_id(
-        self, session_id: SessionId, run_id: RunId
-    ) -> RunState | None:
+    async def find_run_state_by_id(self, session_id: SessionId, run_id: RunId) -> RunState | None:
         return await self._delegate.find_run_state_by_id(session_id, run_id)
 
     async def load_artifact_attachments(
@@ -98,6 +97,21 @@ class BoundedRunJournal:
     async def artifact_has_active_attachments(self, artifact_id: str) -> bool:
         return await self._delegate.artifact_has_active_attachments(artifact_id)
 
+    async def reserve_artifact_retirement(
+        self, artifact_id: str
+    ) -> ArtifactRetirementReservation | None:
+        return await self._delegate.reserve_artifact_retirement(artifact_id)
+
+    async def complete_artifact_retirement(
+        self, reservation: ArtifactRetirementReservation
+    ) -> ArtifactRetirementReservation:
+        return await self._delegate.complete_artifact_retirement(reservation)
+
+    async def abort_artifact_retirement(
+        self, reservation: ArtifactRetirementReservation
+    ) -> ArtifactRetirementReservation:
+        return await self._delegate.abort_artifact_retirement(reservation)
+
     async def load_artifact_facts(
         self,
         session_id: SessionId,
@@ -105,6 +119,4 @@ class BoundedRunJournal:
         after_index: int,
         limit: int,
     ) -> tuple[ArtifactFactRecord, ...]:
-        return await self._delegate.load_artifact_facts(
-            session_id, run_id, after_index, limit
-        )
+        return await self._delegate.load_artifact_facts(session_id, run_id, after_index, limit)

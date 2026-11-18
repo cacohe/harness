@@ -220,9 +220,7 @@ class RunCoordinator:
                 model_text, final_artifacts = await externalize_final_text(
                     model_text, driver.state.limits.max_inline_result_bytes, self._artifacts
                 )
-                driver.attach_refs(
-                    final_artifacts, ArtifactAttachmentRole.FINAL_OUTPUT, "final"
-                )
+                driver.attach_refs(final_artifacts, ArtifactAttachmentRole.FINAL_OUTPUT, "final")
             except Exception:
                 return await driver.fail(RunErrorCode.ARTIFACT_FAILED)
         if driver.apply(

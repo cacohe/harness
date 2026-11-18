@@ -52,6 +52,30 @@ class ArtifactAttachmentAction(StrEnum):
     DETACHED = "detached"
 
 
+class ArtifactRetirementState(StrEnum):
+    AVAILABLE = "available"
+    RETIRING = "retiring"
+    RETIRED = "retired"
+    ABORTED = "aborted"
+
+
+@dataclass(frozen=True)
+class ArtifactRetirementReservation:
+    artifact_id: str
+    generation: int
+    state: ArtifactRetirementState
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.artifact_id) is not str
+            or not self.artifact_id
+            or type(self.generation) is not int
+            or self.generation < 1
+            or type(self.state) is not ArtifactRetirementState
+        ):
+            raise ValueError("Artifact retirement reservation is invalid")
+
+
 @dataclass(frozen=True)
 class ArtifactAttachmentFact:
     """Durable lifecycle fact for one Artifact descriptor; never stores payloads or paths."""
@@ -94,7 +118,11 @@ class ArtifactFactRecord:
     fact: ArtifactAttachmentFact
 
     def __post_init__(self) -> None:
-        if type(self.index) is not int or self.index < 0 or type(self.fact) is not ArtifactAttachmentFact:
+        if (
+            type(self.index) is not int
+            or self.index < 0
+            or type(self.fact) is not ArtifactAttachmentFact
+        ):
             raise ValueError("Artifact fact record is invalid")
 
 
@@ -302,6 +330,24 @@ class RunJournal(Protocol):
 
     def artifact_has_active_attachments(self, artifact_id: str) -> Awaitable[bool]:
         """Return whether retirement is forbidden by any active durable attachment."""
+        ...
+
+    def reserve_artifact_retirement(
+        self, artifact_id: str
+    ) -> Awaitable[ArtifactRetirementReservation | None]:
+        """Atomically reserve retirement only when no active attachment exists."""
+        ...
+
+    def complete_artifact_retirement(
+        self, reservation: ArtifactRetirementReservation
+    ) -> Awaitable[ArtifactRetirementReservation]:
+        """Complete the exact active retirement generation."""
+        ...
+
+    def abort_artifact_retirement(
+        self, reservation: ArtifactRetirementReservation
+    ) -> Awaitable[ArtifactRetirementReservation]:
+        """Release the exact active generation after a confirmed failed delete."""
         ...
 
     def load_artifact_facts(

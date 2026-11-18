@@ -49,6 +49,8 @@ from src.core.journal import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
     ArtifactFactRecord,
+    ArtifactRetirementReservation,
+    ArtifactRetirementState,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,
@@ -327,6 +329,11 @@ CREATE TABLE artifact_attachments (
 CREATE INDEX artifact_facts_by_artifact ON artifact_attachment_facts(artifact_id);
 CREATE INDEX artifact_facts_by_run ON artifact_attachment_facts(session_id, run_id, fact_index);
 CREATE INDEX artifact_attachments_by_artifact ON artifact_attachments(artifact_id);
+CREATE TABLE artifact_retirements (
+  artifact_id TEXT PRIMARY KEY,
+  generation INTEGER NOT NULL CHECK(generation > 0),
+  state TEXT NOT NULL CHECK(state IN ('available', 'retiring', 'retired', 'aborted'))
+) STRICT;
 CREATE TRIGGER artifact_facts_insert_guard BEFORE INSERT ON artifact_attachment_facts
 WHEN harness_journal_append_allowed() != 1 BEGIN
   SELECT RAISE(ABORT, 'artifact facts require the commit append channel');
@@ -348,6 +355,17 @@ END;
 CREATE TRIGGER artifact_attachments_delete_violation AFTER DELETE ON artifact_attachments
 WHEN harness_journal_append_allowed() != 1 BEGIN
   INSERT OR IGNORE INTO integrity_violations(session_id, reason) VALUES(OLD.session_id, 'artifact attachment deleted');
+END;
+CREATE TRIGGER artifact_retirements_insert_guard BEFORE INSERT ON artifact_retirements
+WHEN harness_journal_append_allowed() != 1 BEGIN
+  SELECT RAISE(ABORT, 'artifact retirements require the lifecycle channel');
+END;
+CREATE TRIGGER artifact_retirements_update_guard BEFORE UPDATE ON artifact_retirements
+WHEN harness_journal_append_allowed() != 1 BEGIN
+  SELECT RAISE(ABORT, 'artifact retirements require the lifecycle channel');
+END;
+CREATE TRIGGER artifact_retirements_delete_guard BEFORE DELETE ON artifact_retirements BEGIN
+  SELECT RAISE(ABORT, 'artifact retirements are append-only');
 END;
 """
 
@@ -432,13 +450,26 @@ _EXPECTED_COLUMNS = {
         "acceptance_version",
     ),
     "artifact_attachment_facts": (
-        "session_id", "fact_index", "run_id", "submission_id", "owner_id", "role",
-        "action", "artifact_id", "fact_json",
-    ),
-    "artifact_attachments": (
-        "session_id", "run_id", "submission_id", "owner_id", "role", "artifact_id",
+        "session_id",
+        "fact_index",
+        "run_id",
+        "submission_id",
+        "owner_id",
+        "role",
+        "action",
+        "artifact_id",
         "fact_json",
     ),
+    "artifact_attachments": (
+        "session_id",
+        "run_id",
+        "submission_id",
+        "owner_id",
+        "role",
+        "artifact_id",
+        "fact_json",
+    ),
+    "artifact_retirements": ("artifact_id", "generation", "state"),
 }
 _EXPECTED_INDEXES = {
     "runs_active_by_session": ("session_id", "status"),
@@ -638,9 +669,7 @@ class SQLiteRunJournal:
             lambda _cancelled: self._find_run_state_sync(session_key, run_key, submission_key)
         )
 
-    async def find_run_state_by_id(
-        self, session_id: SessionId, run_id: RunId
-    ) -> RunState | None:
+    async def find_run_state_by_id(self, session_id: SessionId, run_id: RunId) -> RunState | None:
         session_key = self._session_key(session_id)
         run_key = _typed_id_key(run_id, RunId)
         return await self._run(
@@ -661,6 +690,33 @@ class SQLiteRunJournal:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
         return await self._run(
             lambda _cancelled: self._artifact_has_active_attachments_sync(artifact_id)
+        )
+
+    async def reserve_artifact_retirement(
+        self, artifact_id: str
+    ) -> ArtifactRetirementReservation | None:
+        if type(artifact_id) is not str or not artifact_id:
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        return await self._run(
+            lambda _cancelled: self._reserve_artifact_retirement_sync(artifact_id)
+        )
+
+    async def complete_artifact_retirement(
+        self, reservation: ArtifactRetirementReservation
+    ) -> ArtifactRetirementReservation:
+        return await self._run(
+            lambda _cancelled: self._finish_artifact_retirement_sync(
+                reservation, ArtifactRetirementState.RETIRED
+            )
+        )
+
+    async def abort_artifact_retirement(
+        self, reservation: ArtifactRetirementReservation
+    ) -> ArtifactRetirementReservation:
+        return await self._run(
+            lambda _cancelled: self._finish_artifact_retirement_sync(
+                reservation, ArtifactRetirementState.ABORTED
+            )
         )
 
     async def load_artifact_facts(
@@ -768,12 +824,16 @@ class SQLiteRunJournal:
             summary_count = int(row["summary_count"]) if row is not None else 0
             state_json = encode(state)
             session_state_hash = (
-                row["session_state_hash"] if row is not None else
-                state_record_hash(session_key, state.run_id.value, state.submission_id.value, state_json)
+                row["session_state_hash"]
+                if row is not None
+                else state_record_hash(
+                    session_key, state.run_id.value, state.submission_id.value, state_json
+                )
             )
             run_projection_hash = (
-                row["run_projection_hash"] if row is not None else
-                run_empty_hash(session_key, _RUN_DEPTH, 0)
+                row["run_projection_hash"]
+                if row is not None
+                else run_empty_hash(session_key, _RUN_DEPTH, 0)
             )
             run_count = int(row["run_count"]) if row is not None else 0
             if not 0 <= summary_count < (1 << _SUMMARY_DEPTH):
@@ -898,26 +958,62 @@ class SQLiteRunJournal:
                     raise ValueError("Artifact attachment identity disagrees")
                 fact_json = encode(fact)
                 values = (
-                    session_key, fact.run_id.value, fact.submission_id.value, fact.owner_id,
-                    fact.role.value, fact.artifact.artifact_id, fact_json,
+                    session_key,
+                    fact.run_id.value,
+                    fact.submission_id.value,
+                    fact.owner_id,
+                    fact.role.value,
+                    fact.artifact.artifact_id,
+                    fact_json,
                 )
                 connection.execute(
                     "INSERT INTO artifact_attachment_facts(session_id, fact_index, run_id, submission_id, owner_id, role, action, artifact_id, fact_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (session_key, fact_index, fact.run_id.value, fact.submission_id.value,
-                     fact.owner_id, fact.role.value, fact.action.value,
-                     fact.artifact.artifact_id, fact_json),
+                    (
+                        session_key,
+                        fact_index,
+                        fact.run_id.value,
+                        fact.submission_id.value,
+                        fact.owner_id,
+                        fact.role.value,
+                        fact.action.value,
+                        fact.artifact.artifact_id,
+                        fact_json,
+                    ),
                 )
                 fact_index += 1
                 if fact.action is ArtifactAttachmentAction.ATTACHED:
+                    retirement = connection.execute(
+                        "SELECT state FROM artifact_retirements WHERE artifact_id=?",
+                        (fact.artifact.artifact_id,),
+                    ).fetchone()
+                    if retirement is not None and retirement["state"] == (
+                        ArtifactRetirementState.RETIRING.value
+                    ):
+                        raise ValueError("Artifact retirement blocks attachment")
+                    if retirement is not None and retirement["state"] == (
+                        ArtifactRetirementState.RETIRED.value
+                    ):
+                        connection.execute(
+                            "UPDATE artifact_retirements SET generation=generation+1, state=? "
+                            "WHERE artifact_id=? AND state=?",
+                            (
+                                ArtifactRetirementState.AVAILABLE.value,
+                                fact.artifact.artifact_id,
+                                ArtifactRetirementState.RETIRED.value,
+                            ),
+                        )
                     existing_attachment = connection.execute(
                         "SELECT fact_json FROM artifact_attachments WHERE session_id=? AND run_id=? AND owner_id=? AND role=? AND artifact_id=?",
-                        (session_key, fact.run_id.value, fact.owner_id, fact.role.value,
-                         fact.artifact.artifact_id),
+                        (
+                            session_key,
+                            fact.run_id.value,
+                            fact.owner_id,
+                            fact.role.value,
+                            fact.artifact.artifact_id,
+                        ),
                     ).fetchone()
                     if existing_attachment is not None:
-                        attached = decode(
-                            existing_attachment["fact_json"], ArtifactAttachmentFact
-                        )
+                        attached = decode(existing_attachment["fact_json"], ArtifactAttachmentFact)
                         if attached.artifact != fact.artifact:
                             raise ValueError("Artifact attachment descriptor disagrees")
                     connection.execute(
@@ -928,8 +1024,13 @@ class SQLiteRunJournal:
                 else:
                     row_to_detach = connection.execute(
                         "SELECT fact_json FROM artifact_attachments WHERE session_id=? AND run_id=? AND owner_id=? AND role=? AND artifact_id=?",
-                        (session_key, fact.run_id.value, fact.owner_id, fact.role.value,
-                         fact.artifact.artifact_id),
+                        (
+                            session_key,
+                            fact.run_id.value,
+                            fact.owner_id,
+                            fact.role.value,
+                            fact.artifact.artifact_id,
+                        ),
                     ).fetchone()
                     if row_to_detach is None:
                         raise ValueError("Artifact attachment does not exist")
@@ -938,8 +1039,13 @@ class SQLiteRunJournal:
                         raise ValueError("Artifact attachment descriptor disagrees")
                     connection.execute(
                         "DELETE FROM artifact_attachments WHERE session_id=? AND run_id=? AND owner_id=? AND role=? AND artifact_id=?",
-                        (session_key, fact.run_id.value, fact.owner_id, fact.role.value,
-                         fact.artifact.artifact_id),
+                        (
+                            session_key,
+                            fact.run_id.value,
+                            fact.owner_id,
+                            fact.role.value,
+                            fact.artifact.artifact_id,
+                        ),
                     )
             events: list[JournalEvent] = []
             for event in batch.events:
@@ -1038,9 +1144,7 @@ class SQLiteRunJournal:
                     ),
                 ).fetchone()
                 if prior_summary is None:
-                    checkpoint_hash = summary_record_hash(
-                        session_key, summary_count, summary_json
-                    )
+                    checkpoint_hash = summary_record_hash(session_key, summary_count, summary_json)
                     connection.execute(
                         "INSERT INTO summary_checkpoints(session_id, summary_index, "
                         "covered_from_sequence, covered_through_sequence, policy_version, "
@@ -1156,7 +1260,10 @@ class SQLiteRunJournal:
             if validate_hash(row["session_state_hash"]) != validate_hash(run_row["state_hash"]):
                 raise ValueError("SQLite Session state hash disagrees with current Run")
             _verify_run_projection_path(
-                connection, session_key, run_row["run_index"], run_row["state_hash"],
+                connection,
+                session_key,
+                run_row["run_index"],
+                run_row["state_hash"],
                 row["run_projection_hash"],
             )
             _verify_ledger_tail(connection, session_key, sequence, row["ledger_hash"])
@@ -1273,10 +1380,7 @@ class SQLiteRunJournal:
             for item in rows:
                 summary = _decode_summary_row(item, session_key)
                 summary_index = item["summary_index"]
-                if (
-                    type(summary_index) is not int
-                    or not 0 <= summary_index < (1 << _SUMMARY_DEPTH)
-                ):
+                if type(summary_index) is not int or not 0 <= summary_index < (1 << _SUMMARY_DEPTH):
                     raise ValueError("SQLite summary index is invalid")
                 digest = summary_record_hash(session_key, summary_index, item["checkpoint_json"])
                 if validate_hash(item["checkpoint_hash"]) != digest:
@@ -1528,7 +1632,10 @@ class SQLiteRunJournal:
                 raise ValueError("SQLite Run has no Session")
             _verify_authenticated_root(session_row, session_key)
             _verify_run_projection_path(
-                connection, session_key, row["run_index"], row["state_hash"],
+                connection,
+                session_key,
+                row["run_index"],
+                row["state_hash"],
                 session_row["run_projection_hash"],
             )
             submission_row = connection.execute(
@@ -1539,9 +1646,7 @@ class SQLiteRunJournal:
             ).fetchone()
             if submission_row is None:
                 raise ValueError("SQLite Run has no acceptance")
-            receipt, _, _ = _decode_submission_row(
-                submission_row, session_key, submission_key
-            )
+            receipt, _, _ = _decode_submission_row(submission_row, session_key, submission_key)
             if (
                 receipt.submission is None
                 or receipt.submission.run_id.value != run_key
@@ -1555,9 +1660,7 @@ class SQLiteRunJournal:
         finally:
             connection.close()
 
-    def _find_run_state_by_id_sync(
-        self, session_key: str, run_key: str
-    ) -> RunState | None:
+    def _find_run_state_by_id_sync(self, session_key: str, run_key: str) -> RunState | None:
         connection = self._connect()
         try:
             connection.execute("BEGIN")
@@ -1657,12 +1760,18 @@ class SQLiteRunJournal:
                 lifecycle = connection.execute(
                     "SELECT fact_json FROM artifact_attachment_facts WHERE session_id=? AND run_id=? "
                     "AND owner_id=? AND role=? AND artifact_id=? ORDER BY fact_index DESC LIMIT 1",
-                    (session_key, run_key, fact.owner_id, fact.role.value,
-                     fact.artifact.artifact_id),
+                    (
+                        session_key,
+                        run_key,
+                        fact.owner_id,
+                        fact.role.value,
+                        fact.artifact.artifact_id,
+                    ),
                 ).fetchone()
-                if lifecycle is None or decode(
-                    lifecycle["fact_json"], ArtifactAttachmentFact
-                ) != fact:
+                if (
+                    lifecycle is None
+                    or decode(lifecycle["fact_json"], ArtifactAttachmentFact) != fact
+                ):
                     raise ValueError("Artifact active index disagrees with lifecycle facts")
                 result.append(fact)
             expected: dict[tuple[str, str, str], ArtifactAttachmentFact] = {}
@@ -1731,8 +1840,11 @@ class SQLiteRunJournal:
                 ):
                     raise ValueError("Artifact lifecycle fact row disagrees")
                 key = (
-                    fact.session_id.value, fact.run_id.value, fact.owner_id,
-                    fact.role.value, fact.artifact.artifact_id,
+                    fact.session_id.value,
+                    fact.run_id.value,
+                    fact.owner_id,
+                    fact.role.value,
+                    fact.artifact.artifact_id,
                 )
                 if fact.action is ArtifactAttachmentAction.ATTACHED:
                     prior = expected.get(key)
@@ -1752,8 +1864,11 @@ class SQLiteRunJournal:
                 _reject_integrity_violation(connection, str(row["session_id"]))
                 fact = decode(row["fact_json"], ArtifactAttachmentFact)
                 key = (
-                    str(row["session_id"]), str(row["run_id"]), str(row["owner_id"]),
-                    str(row["role"]), str(row["artifact_id"]),
+                    str(row["session_id"]),
+                    str(row["run_id"]),
+                    str(row["owner_id"]),
+                    str(row["role"]),
+                    str(row["artifact_id"]),
                 )
                 if (
                     fact.action is not ArtifactAttachmentAction.ATTACHED
@@ -1770,6 +1885,105 @@ class SQLiteRunJournal:
                 raise ValueError("Artifact active index disagrees with lifecycle facts")
             return bool(expected)
         except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        finally:
+            connection.close()
+
+    def _reserve_artifact_retirement_sync(
+        self, artifact_id: str
+    ) -> ArtifactRetirementReservation | None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if (
+                connection.execute("SELECT 1 FROM integrity_violations LIMIT 1").fetchone()
+                is not None
+            ):
+                raise ValueError("SQLite journal has an integrity violation")
+            if (
+                connection.execute(
+                    "SELECT 1 FROM artifact_attachments WHERE artifact_id=? LIMIT 1",
+                    (artifact_id,),
+                ).fetchone()
+                is not None
+            ):
+                connection.rollback()
+                return None
+            row = connection.execute(
+                "SELECT generation, state FROM artifact_retirements WHERE artifact_id=?",
+                (artifact_id,),
+            ).fetchone()
+            if row is not None and row["state"] in (
+                ArtifactRetirementState.RETIRING.value,
+                ArtifactRetirementState.RETIRED.value,
+            ):
+                connection.rollback()
+                return ArtifactRetirementReservation(
+                    artifact_id,
+                    int(row["generation"]),
+                    ArtifactRetirementState(str(row["state"])),
+                )
+            generation = (
+                1
+                if row is None
+                else int(row["generation"])
+                if row["state"] == ArtifactRetirementState.AVAILABLE.value
+                else int(row["generation"]) + 1
+            )
+            connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
+            connection.execute(
+                "INSERT INTO artifact_retirements(artifact_id, generation, state) VALUES (?, ?, ?) "
+                "ON CONFLICT(artifact_id) DO UPDATE SET generation=excluded.generation, state=excluded.state",
+                (artifact_id, generation, ArtifactRetirementState.RETIRING.value),
+            )
+            connection.commit()
+            return ArtifactRetirementReservation(
+                artifact_id, generation, ArtifactRetirementState.RETIRING
+            )
+        except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
+            connection.rollback()
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        finally:
+            connection.close()
+
+    def _finish_artifact_retirement_sync(
+        self,
+        reservation: ArtifactRetirementReservation,
+        target: ArtifactRetirementState,
+    ) -> ArtifactRetirementReservation:
+        if type(reservation) is not ArtifactRetirementReservation:
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT generation, state FROM artifact_retirements WHERE artifact_id=?",
+                (reservation.artifact_id,),
+            ).fetchone()
+            if row is None or int(row["generation"]) != reservation.generation:
+                raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
+            current = ArtifactRetirementState(str(row["state"]))
+            if current is target:
+                connection.rollback()
+                return ArtifactRetirementReservation(
+                    reservation.artifact_id, reservation.generation, target
+                )
+            if current is not ArtifactRetirementState.RETIRING:
+                raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
+            connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
+            connection.execute(
+                "UPDATE artifact_retirements SET state=? WHERE artifact_id=? AND generation=?",
+                (target.value, reservation.artifact_id, reservation.generation),
+            )
+            connection.commit()
+            return ArtifactRetirementReservation(
+                reservation.artifact_id, reservation.generation, target
+            )
+        except JournalError:
+            connection.rollback()
+            raise
+        except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
+            connection.rollback()
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
         finally:
             connection.close()
@@ -2041,8 +2255,11 @@ def _read_run_node(
 
 
 def _write_run_node(
-    connection: sqlite3.Connection, session_key: str, level: int, node_index: int,
-    value: tuple[str, int]
+    connection: sqlite3.Connection,
+    session_key: str,
+    level: int,
+    node_index: int,
+    value: tuple[str, int],
 ) -> None:
     connection.execute(
         "INSERT INTO run_projection_nodes(session_id, level, node_index, digest, item_count) "
@@ -2074,8 +2291,11 @@ def _set_run_projection_leaf(
 
 
 def _verify_run_projection_path(
-    connection: sqlite3.Connection, session_key: str, run_index: int,
-    state_hash: str, expected_root: str
+    connection: sqlite3.Connection,
+    session_key: str,
+    run_index: int,
+    state_hash: str,
+    expected_root: str,
 ) -> None:
     index = run_index
     value = (run_leaf_hash(session_key, run_index, state_hash), 1)
@@ -2192,16 +2412,18 @@ def _verify_authenticated_root(row: sqlite3.Row, session_key: str) -> None:
         raise ValueError("SQLite transcript coverage count is invalid")
     summary = validate_hash(row["summary_hash"])
     summary_count = row["summary_count"]
-    if (
-        type(summary_count) is not int
-        or not 0 <= summary_count <= (1 << _SUMMARY_DEPTH)
-    ):
+    if type(summary_count) is not int or not 0 <= summary_count <= (1 << _SUMMARY_DEPTH):
         raise ValueError("SQLite summary count is invalid")
     run_count = row["run_count"]
     if type(run_count) is not int or not 0 <= run_count <= (1 << _RUN_DEPTH):
         raise ValueError("SQLite Run projection count is invalid")
     expected = authenticated_root_hash(
-        session_key, ledger, coverage, count, summary, summary_count,
+        session_key,
+        ledger,
+        coverage,
+        count,
+        summary,
+        summary_count,
         validate_hash(row["session_state_hash"]),
         validate_hash(row["run_projection_hash"]),
         run_count,
@@ -2521,8 +2743,11 @@ def _preflight_existing_ledger(
     if validate_hash(row["session_state_hash"]) != validate_hash(current_run_row["state_hash"]):
         raise ValueError("SQLite Session state hash disagrees with current Run")
     _verify_run_projection_path(
-        connection, session_key, current_run_row["run_index"],
-        current_run_row["state_hash"], row["run_projection_hash"],
+        connection,
+        session_key,
+        current_run_row["run_index"],
+        current_run_row["state_hash"],
+        row["run_projection_hash"],
     )
 
     minimum = anchor_stats[1]

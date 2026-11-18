@@ -358,6 +358,9 @@ _JOURNAL_METHODS = (
     "find_run_state_by_id",
     "load_artifact_attachments",
     "artifact_has_active_attachments",
+    "reserve_artifact_retirement",
+    "complete_artifact_retirement",
+    "abort_artifact_retirement",
     "load_artifact_facts",
 )
 

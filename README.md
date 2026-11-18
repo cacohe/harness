@@ -98,6 +98,13 @@ terminal Run 的 ownership 不会随 Session handle 关闭而隐式消失。调�
 `DETACHED` facts；重复或并发调用幂等。共享 digest 只有在所有 owner 都 detach 后才允许
 `ArtifactRetentionService.retire()`。
 
+Recovery 只把 journal 中仍然 active 的 attachment 当作待校验权威；已经显式 detach 的历史
+`RunState`、tool result、final output 或 summary 引用不会因对象随后被回收而被误判为损坏。
+retire 先在 journal 中原子取得 `RETIRING` reservation：该步骤与“没有 active owner”的判断
+处于同一事务，并阻止新的 attachment；repository delete 成功后再标记 `RETIRED`，明确失败且
+对象仍存在时标记 `ABORTED`。进程可在任一阶段重启并通过重复 retire 收敛。content-addressed
+对象重新 `put()` 后，同 descriptor 的新 attachment 会开启下一 generation，不会永久封禁 digest。
+
 `FilesystemArtifactRepository` 使用 content-addressed 路径、临时写入、原子 finalize、大小/hash
 校验和路径防护；它是单机 reference adapter，不宣称支持多节点共享。
 

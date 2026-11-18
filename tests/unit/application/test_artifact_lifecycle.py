@@ -54,14 +54,18 @@ def test_detach_uses_authoritative_descriptors_filters_roles_and_is_idempotent()
             roles=(ArtifactAttachmentRole.TOOL_RESULT,),
         )
         assert detached == (replace(tool, action=ArtifactAttachmentAction.DETACHED),)
-        assert await journal.load_artifact_attachments(
-            terminal.session_id, terminal.run_id
-        ) == (final, summary)
-        assert await lifecycle.detach(
-            terminal.session_id,
-            terminal.run_id,
-            roles=(ArtifactAttachmentRole.TOOL_RESULT,),
-        ) == ()
+        assert await journal.load_artifact_attachments(terminal.session_id, terminal.run_id) == (
+            final,
+            summary,
+        )
+        assert (
+            await lifecycle.detach(
+                terminal.session_id,
+                terminal.run_id,
+                roles=(ArtifactAttachmentRole.TOOL_RESULT,),
+            )
+            == ()
+        )
 
         remaining = await lifecycle.detach(terminal.session_id, terminal.run_id)
         assert remaining == (
@@ -104,9 +108,7 @@ def test_sqlite_restart_detaches_historical_owner_without_releasing_shared_diges
             ArtifactAttachmentAction.ATTACHED,
             shared,
         )
-        await journal.commit(
-            replace(first, state=first_state, artifact_facts=(first_fact,)), 0
-        )
+        await journal.commit(replace(first, state=first_state, artifact_facts=(first_fact,)), 0)
         second = acceptance("shared-second")
         second_state = replace(
             second.state,
@@ -134,9 +136,7 @@ def test_sqlite_restart_detaches_historical_owner_without_releasing_shared_diges
         reopened = SQLiteRunJournal(path)
         lifecycle = ArtifactLifecycleService(journal=reopened)
         detached = await lifecycle.detach(first_state.session_id, first_state.run_id)
-        assert detached == (
-            replace(first_fact, action=ArtifactAttachmentAction.DETACHED),
-        )
+        assert detached == (replace(first_fact, action=ArtifactAttachmentAction.DETACHED),)
         assert await reopened.load_artifact_attachments(
             second_state.session_id, second_state.run_id
         ) == (second_fact,)
@@ -167,9 +167,7 @@ def test_concurrent_detach_is_single_commit_and_retry_is_idempotent() -> None:
             second.detach(terminal.session_id, terminal.run_id),
         )
         assert sorted(len(result) for result in results) == [0, 1]
-        history = await journal.load_artifact_facts(
-            terminal.session_id, terminal.run_id, -1, 16
-        )
+        history = await journal.load_artifact_facts(terminal.session_id, terminal.run_id, -1, 16)
         assert [record.fact.action for record in history].count(
             ArtifactAttachmentAction.DETACHED
         ) == 1

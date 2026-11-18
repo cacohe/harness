@@ -7,6 +7,7 @@ from typing import cast
 import pytest
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.persistence.sqlite import SQLiteRunJournal
+from src.application.artifact_lifecycle import ArtifactLifecycleService
 from src.application.recovery import RecoveryCorruption, RecoveryService
 from src.core.artifacts import ArtifactRef, ArtifactRepository, ExternalizedContent
 from src.core.commands import RunLimits
@@ -60,6 +61,23 @@ def service(path: Path):
         artifacts=InMemoryArtifactRepository(1024),
         clock=FixedClock(),
         ids=RecoveryIds(),
+    )
+
+
+def active_fact(
+    state: RunState,
+    artifact: ArtifactRef,
+    role: ArtifactAttachmentRole,
+    owner_id: str,
+) -> ArtifactAttachmentFact:
+    return ArtifactAttachmentFact(
+        state.session_id,
+        state.run_id,
+        state.submission_id,
+        owner_id,
+        role,
+        ArtifactAttachmentAction.ATTACHED,
+        artifact,
     )
 
 
@@ -155,11 +173,52 @@ def test_terminal_dangling_artifact_is_repository_corruption(tmp_path: Path) -> 
         final_artifacts=batch.summary.artifacts,
         journal_sequence=0,
     )
-    asyncio.run(journal.commit(JournalCommit(terminal), 0))
+    fact = active_fact(
+        terminal, terminal.final_artifacts[0], ArtifactAttachmentRole.FINAL_OUTPUT, "final"
+    )
+    asyncio.run(journal.commit(JournalCommit(terminal, artifact_facts=(fact,)), 0))
 
     with pytest.raises(RecoveryCorruption) as caught:
         asyncio.run(recovery.recover_session(terminal.session_id))
     assert caught.value.failure.code is RunErrorCode.ARTIFACT_FAILED
+
+
+def test_detached_terminal_final_ref_is_not_recovery_corruption(tmp_path: Path) -> None:
+    path = (tmp_path / "detached-final.sqlite3").resolve()
+    journal = SQLiteRunJournal(path)
+    batch = acceptance("detached-final")
+    assert batch.summary is not None
+    ref = batch.summary.artifacts[0]
+    terminal = replace(
+        batch.state,
+        version=2,
+        status=RunStatus.COMPLETED,
+        final_text="summary",
+        final_artifacts=(ref,),
+    )
+    fact = ArtifactAttachmentFact(
+        terminal.session_id,
+        terminal.run_id,
+        terminal.submission_id,
+        "final",
+        ArtifactAttachmentRole.FINAL_OUTPUT,
+        ArtifactAttachmentAction.ATTACHED,
+        ref,
+    )
+    asyncio.run(journal.commit(replace(batch, state=terminal, artifact_facts=(fact,)), 0))
+    asyncio.run(
+        ArtifactLifecycleService(journal=journal).detach(terminal.session_id, terminal.run_id)
+    )
+    reopened = SQLiteRunJournal(path)
+    recovery = RecoveryService(
+        journal=reopened,
+        artifacts=InMemoryArtifactRepository(1024),
+        clock=FixedClock(),
+        ids=RecoveryIds(),
+    )
+    outcome = asyncio.run(recovery.recover_session(terminal.session_id))
+    assert outcome.state is not None and outcome.state.status is RunStatus.COMPLETED
+    assert not outcome.changed
 
 
 def test_completed_tool_attachment_survives_state_cleanup_and_restart(tmp_path: Path) -> None:
@@ -202,7 +261,14 @@ def test_completed_tool_attachment_survives_state_cleanup_and_restart(tmp_path: 
 def test_active_dangling_artifact_settles_once_then_is_idempotent(tmp_path: Path) -> None:
     journal, recovery = service(tmp_path / "active-corrupt.sqlite3")
     batch = acceptance("artifact-active")
-    asyncio.run(journal.commit(batch, 0))
+    assert batch.summary is not None
+    fact = active_fact(
+        batch.state,
+        batch.summary.artifacts[0],
+        ArtifactAttachmentRole.SUMMARY,
+        "summary",
+    )
+    asyncio.run(journal.commit(replace(batch, artifact_facts=(fact,)), 0))
 
     first = asyncio.run(recovery.recover_session(batch.state.session_id))
     second = asyncio.run(recovery.recover_session(batch.state.session_id))
@@ -228,7 +294,10 @@ def test_untrusted_artifact_stat_maps_to_stable_corruption(tmp_path: Path, mode:
         final_artifacts=batch.summary.artifacts,
         journal_sequence=0,
     )
-    asyncio.run(journal.commit(JournalCommit(terminal), 0))
+    fact = active_fact(
+        terminal, terminal.final_artifacts[0], ArtifactAttachmentRole.FINAL_OUTPUT, "final"
+    )
+    asyncio.run(journal.commit(JournalCommit(terminal, artifact_facts=(fact,)), 0))
     expected = terminal.final_artifacts[0]
 
     class BadRepository:
@@ -292,7 +361,16 @@ def test_final_and_summary_same_id_with_conflicting_descriptors_is_stable_corrup
         final_text="done",
         final_artifacts=(_conflicting_ref(expected),),
     )
-    asyncio.run(journal.commit(replace(batch, state=terminal), 0))
+    facts = (
+        active_fact(
+            terminal,
+            terminal.final_artifacts[0],
+            ArtifactAttachmentRole.FINAL_OUTPUT,
+            "final",
+        ),
+        active_fact(terminal, expected, ArtifactAttachmentRole.SUMMARY, "summary"),
+    )
+    asyncio.run(journal.commit(replace(batch, state=terminal, artifact_facts=facts), 0))
     repository = _OneDescriptorRepository(terminal.final_artifacts[0])
     recovery = RecoveryService(
         journal=journal,
@@ -347,7 +425,15 @@ def test_tool_and_summary_same_id_with_conflicting_descriptors_settles_once(
         "summary",
         artifacts=(expected,),
     )
-    asyncio.run(journal.commit(JournalCommit(state, events=(event,), summary=summary), 0))
+    facts = (
+        active_fact(state, tool_ref, ArtifactAttachmentRole.TOOL_RESULT, "tool"),
+        active_fact(state, expected, ArtifactAttachmentRole.SUMMARY, "summary"),
+    )
+    asyncio.run(
+        journal.commit(
+            JournalCommit(state, events=(event,), summary=summary, artifact_facts=facts), 0
+        )
+    )
     repository = _OneDescriptorRepository(tool_ref)
     recovery = RecoveryService(
         journal=journal,
@@ -362,4 +448,4 @@ def test_tool_and_summary_same_id_with_conflicting_descriptors_settles_once(
     assert first.changed and first.state is not None and first.state.failure is not None
     assert first.state.failure.code is RunErrorCode.ARTIFACT_FAILED
     assert second == replace(first, changed=False)
-    assert repository.stat_calls == 1
+    assert repository.stat_calls == 0

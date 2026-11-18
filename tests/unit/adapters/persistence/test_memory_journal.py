@@ -5,12 +5,79 @@ from threading import Barrier
 from typing import cast
 
 import pytest
-from src.adapters.persistence.memory import InMemoryRunJournal
+from src.adapters.persistence.memory import InMemoryRunJournal, _Store
 from src.core.errors import RunErrorCode
 from src.core.events import DomainEvent, JsonValue
-from src.core.ids import EventId, SessionId
-from src.core.journal import JournalCommit, JournalError, JournalSnapshot
-from tests.unit.core.test_journal_contract import acceptance
+from src.core.ids import EventId, RunId, SessionId
+from src.core.journal import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
+    ArtifactAttachmentRole,
+    ArtifactFactRecord,
+    JournalCommit,
+    JournalError,
+    JournalSnapshot,
+)
+from tests.unit.core.test_journal_contract import acceptance, artifact_ref
+
+
+def test_artifact_fact_page_does_not_iterate_full_history() -> None:
+    class IndexedOnly:
+        def __init__(self, values):
+            self.values = values
+            self.accesses = 0
+
+        def __iter__(self):
+            raise AssertionError("full lifecycle history was scanned")
+
+        def __getitem__(self, index):
+            self.accesses += 1
+            return self.values[index]
+
+        def __len__(self):
+            return len(self.values)
+
+    journal = InMemoryRunJournal()
+    batch = acceptance("memory-fact-page")
+    ref = artifact_ref("e")
+    attached = ArtifactAttachmentFact(
+        batch.state.session_id,
+        batch.state.run_id,
+        batch.state.submission_id,
+        "owner",
+        ArtifactAttachmentRole.TOOL_RESULT,
+        ArtifactAttachmentAction.ATTACHED,
+        ref,
+    )
+    asyncio.run(journal.commit(replace(batch, artifact_facts=(attached,)), 0))
+    session = journal._store.sessions[batch.state.session_id.value]
+    other_run = RunId("other-run")
+    records = tuple(
+        ArtifactFactRecord(
+            index,
+            replace(attached, run_id=batch.state.run_id if index % 2 == 0 else other_run),
+        )
+        for index in range(100_000)
+    )
+    guarded = IndexedOnly(records)
+    journal._store = _Store(
+        sessions={
+            batch.state.session_id.value: replace(
+                session,
+                artifact_facts=guarded,
+                artifact_fact_indexes={
+                    batch.state.run_id.value: tuple(range(0, 100_000, 2)),
+                    other_run.value: tuple(range(1, 100_000, 2)),
+                },
+            )
+        },
+        event_ids=journal._store.event_ids,
+    )
+    page = asyncio.run(
+        journal.load_artifact_facts(batch.state.session_id, batch.state.run_id, 99_980, 5)
+    )
+    assert tuple(record.index for record in page) == (99_982, 99_984, 99_986, 99_988, 99_990)
+    assert guarded.accesses <= 5
 
 
 def test_instance_copy_hook_is_ignored_for_exact_journal_records() -> None:

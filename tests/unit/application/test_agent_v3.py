@@ -511,6 +511,15 @@ class _JournalPort:
     async def artifact_has_active_attachments(self, *_args):
         raise NotImplementedError
 
+    async def reserve_artifact_retirement(self, *_args):
+        raise NotImplementedError
+
+    async def complete_artifact_retirement(self, *_args):
+        raise NotImplementedError
+
+    async def abort_artifact_retirement(self, *_args):
+        raise NotImplementedError
+
     async def load_artifact_facts(self, *_args):
         raise NotImplementedError
 

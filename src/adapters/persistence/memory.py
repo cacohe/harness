@@ -25,6 +25,8 @@ from src.core.journal import (
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,
     ArtifactFactRecord,
+    ArtifactRetirementReservation,
+    ArtifactRetirementState,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,
@@ -86,12 +88,14 @@ class _Session:
         default_factory=dict
     )
     artifact_facts: tuple[ArtifactFactRecord, ...] = ()
+    artifact_fact_indexes: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class _Store:
     sessions: Mapping[str, _Session] = field(default_factory=dict)
     event_ids: frozenset[str] = frozenset()
+    artifact_retirements: Mapping[str, ArtifactRetirementReservation] = field(default_factory=dict)
 
 
 class InMemoryRunJournal:
@@ -211,8 +215,12 @@ class InMemoryRunJournal:
                 }
             attachments = dict(session.artifact_attachments)
             fact_history = list(session.artifact_facts)
+            fact_indexes = dict(session.artifact_fact_indexes)
+            retirements = dict(store.artifact_retirements)
             for fact in batch.artifact_facts:
-                target = state if fact.run_id == state.run_id else session.runs.get(fact.run_id.value)
+                target = (
+                    state if fact.run_id == state.run_id else session.runs.get(fact.run_id.value)
+                )
                 if (
                     fact.session_id != state.session_id
                     or target is None
@@ -222,6 +230,21 @@ class InMemoryRunJournal:
                 key = (fact.run_id.value, *fact.key)
                 prior = attachments.get(key)
                 if fact.action is ArtifactAttachmentAction.ATTACHED:
+                    retirement = retirements.get(fact.artifact.artifact_id)
+                    if (
+                        retirement is not None
+                        and retirement.state is ArtifactRetirementState.RETIRING
+                    ):
+                        raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+                    if (
+                        retirement is not None
+                        and retirement.state is ArtifactRetirementState.RETIRED
+                    ):
+                        retirements[fact.artifact.artifact_id] = ArtifactRetirementReservation(
+                            fact.artifact.artifact_id,
+                            retirement.generation + 1,
+                            ArtifactRetirementState.AVAILABLE,
+                        )
                     if prior is not None and prior.artifact != fact.artifact:
                         raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
                     attachments[key] = fact
@@ -229,7 +252,12 @@ class InMemoryRunJournal:
                     raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
                 else:
                     del attachments[key]
-                fact_history.append(ArtifactFactRecord(len(fact_history), fact))
+                record_index = len(fact_history)
+                fact_history.append(ArtifactFactRecord(record_index, fact))
+                fact_indexes[fact.run_id.value] = (
+                    *fact_indexes.get(fact.run_id.value, ()),
+                    record_index,
+                )
             next_session = _Session(
                 version=receipt.version,
                 sequence=receipt.sequence,
@@ -243,10 +271,12 @@ class InMemoryRunJournal:
                 submissions=submissions,
                 artifact_attachments=attachments,
                 artifact_facts=tuple(fact_history),
+                artifact_fact_indexes=fact_indexes,
             )
             self._store = _Store(
                 sessions={**store.sessions, session_key: next_session},
                 event_ids=store.event_ids.union(event_ids),
+                artifact_retirements=retirements,
             )
             return result
 
@@ -471,9 +501,7 @@ class InMemoryRunJournal:
         with self._lock:
             session = self._store.sessions.get(session_id.value)
             state = None if session is None else session.runs.get(run_id.value)
-            accepted = (
-                None if session is None else session.submissions.get(submission_id.value)
-            )
+            accepted = None if session is None else session.submissions.get(submission_id.value)
         if state is None:
             return None
         state = _canonical_copy(state)
@@ -487,9 +515,7 @@ class InMemoryRunJournal:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
         return state
 
-    async def find_run_state_by_id(
-        self, session_id: SessionId, run_id: RunId
-    ) -> RunState | None:
+    async def find_run_state_by_id(self, session_id: SessionId, run_id: RunId) -> RunState | None:
         if type(session_id) is not SessionId or type(run_id) is not RunId:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
         with self._lock:
@@ -504,10 +530,14 @@ class InMemoryRunJournal:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
         with self._lock:
             session = self._store.sessions.get(session_id.value)
-            result = () if session is None else tuple(
-                fact
-                for key, fact in sorted(session.artifact_attachments.items())
-                if key[0] == run_id.value
+            result = (
+                ()
+                if session is None
+                else tuple(
+                    fact
+                    for key, fact in sorted(session.artifact_attachments.items())
+                    if key[0] == run_id.value
+                )
             )
         return _canonical_copy(result)
 
@@ -520,6 +550,79 @@ class InMemoryRunJournal:
                 for session in self._store.sessions.values()
                 for fact in session.artifact_attachments.values()
             )
+
+    async def reserve_artifact_retirement(
+        self, artifact_id: str
+    ) -> ArtifactRetirementReservation | None:
+        if type(artifact_id) is not str or not artifact_id:
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        with self._lock:
+            store = self._store
+            if any(
+                fact.artifact.artifact_id == artifact_id
+                for session in store.sessions.values()
+                for fact in session.artifact_attachments.values()
+            ):
+                return None
+            prior = store.artifact_retirements.get(artifact_id)
+            if prior is not None and prior.state in (
+                ArtifactRetirementState.RETIRING,
+                ArtifactRetirementState.RETIRED,
+            ):
+                return prior
+            generation = (
+                1
+                if prior is None
+                else prior.generation
+                if prior.state is ArtifactRetirementState.AVAILABLE
+                else prior.generation + 1
+            )
+            reservation = ArtifactRetirementReservation(
+                artifact_id,
+                generation,
+                ArtifactRetirementState.RETIRING,
+            )
+            self._store = replace(
+                store,
+                artifact_retirements={**store.artifact_retirements, artifact_id: reservation},
+            )
+            return reservation
+
+    async def complete_artifact_retirement(
+        self, reservation: ArtifactRetirementReservation
+    ) -> ArtifactRetirementReservation:
+        return self._finish_artifact_retirement(reservation, ArtifactRetirementState.RETIRED)
+
+    async def abort_artifact_retirement(
+        self, reservation: ArtifactRetirementReservation
+    ) -> ArtifactRetirementReservation:
+        return self._finish_artifact_retirement(reservation, ArtifactRetirementState.ABORTED)
+
+    def _finish_artifact_retirement(
+        self,
+        reservation: ArtifactRetirementReservation,
+        state: ArtifactRetirementState,
+    ) -> ArtifactRetirementReservation:
+        if type(reservation) is not ArtifactRetirementReservation:
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        with self._lock:
+            store = self._store
+            current = store.artifact_retirements.get(reservation.artifact_id)
+            if current is None or current.generation != reservation.generation:
+                raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
+            if current.state is state:
+                return current
+            if current.state is not ArtifactRetirementState.RETIRING:
+                raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
+            completed = replace(current, state=state)
+            self._store = replace(
+                store,
+                artifact_retirements={
+                    **store.artifact_retirements,
+                    reservation.artifact_id: completed,
+                },
+            )
+            return completed
 
     async def load_artifact_facts(
         self,
@@ -541,11 +644,10 @@ class InMemoryRunJournal:
             session = self._store.sessions.get(session_id.value)
             if session is None:
                 return ()
-            result = tuple(
-                record
-                for record in session.artifact_facts
-                if record.index > after_index and record.fact.run_id == run_id
-            )[:limit]
+            indexes = session.artifact_fact_indexes.get(run_id.value, ())
+            start = bisect_right(indexes, after_index)
+            selected = indexes[start : start + limit]
+            result = tuple(session.artifact_facts[index] for index in selected)
         return _canonical_copy(result)
 
 
@@ -719,8 +821,8 @@ def _intent_value(value: object) -> _IntentValue:
         or type(value) is RunErrorCode
         or type(value) is DomainEventType
         or type(value) is TranscriptEntryType
-            or type(value) is ArtifactAttachmentRole
-            or type(value) is ArtifactAttachmentAction
+        or type(value) is ArtifactAttachmentRole
+        or type(value) is ArtifactAttachmentAction
     ):
         return ("enum", (type(value).__name__, value.value))
     if (

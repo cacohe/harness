@@ -249,19 +249,13 @@ def test_agent_session_publicly_detaches_production_generated_artifacts() -> Non
     async def scenario():
         agent, journal, _, _ = await rig()
         session = await agent.open_session(SessionId("artifact-lifecycle"))
-        state = await session.submit(
-            "artifact-lifecycle", SubmissionId("artifact-lifecycle")
-        )
+        state = await session.submit("artifact-lifecycle", SubmissionId("artifact-lifecycle"))
         assert state.status is RunStatus.COMPLETED
         assert state.final_artifacts
         active = await journal.load_artifact_attachments(state.session_id, state.run_id)
-        detached = await session.detach_artifacts(
-            state.run_id, roles=(active[0].role,)
-        )
+        detached = await session.detach_artifacts(state.run_id, roles=(active[0].role,))
         repeated = await session.detach_artifacts(state.run_id)
-        facts = await journal.load_artifact_facts(
-            state.session_id, state.run_id, -1, 16
-        )
+        facts = await journal.load_artifact_facts(state.session_id, state.run_id, -1, 16)
         await agent.close()
         return active, detached, repeated, facts
 
@@ -283,9 +277,7 @@ def test_detach_commit_survives_observer_failure_and_retry() -> None:
     async def scenario():
         agent, journal, _, _ = await rig(observer=Observer())
         session = await agent.open_session(SessionId("artifact-observer"))
-        state = await session.submit(
-            "artifact-lifecycle", SubmissionId("artifact-observer")
-        )
+        state = await session.submit("artifact-lifecycle", SubmissionId("artifact-observer"))
         first = await session.detach_artifacts(state.run_id)
         retry = await session.detach_artifacts(state.run_id)
         active = await journal.load_artifact_attachments(state.session_id, state.run_id)

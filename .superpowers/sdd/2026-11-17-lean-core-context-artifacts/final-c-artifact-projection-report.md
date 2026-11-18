@@ -115,3 +115,32 @@ Session/Agent close 不隐式释放 durable ownership。
 | Ruff `src tests` | `All checks passed!` |
 | mypy `src` | `Success: no issues found in 59 source files` |
 | CPython 3.11 全仓 | `1269 passed, 2 skipped in 461.19s` |
+
+## Fix round 2/5：active-only Recovery、retirement reservation 与有界分页
+
+三个 RED 分别确认：detached final ref 在 SQLite reopen 后仍被 Recovery 当成 dangling；Memory
+和 SQLite 都没有原子 retirement reservation；Memory `load_artifact_facts()` 在应用 limit 前
+迭代完整 lifecycle history。
+
+Recovery 现在只验证目标 Run 的 durable active attachments。RunState、tool terminal outcome、
+final output 与 summary checkpoint 中保留的历史 ref 在明确 detach/retire 后只作为审计数据，
+不再要求 repository 对象继续存在；未 detach 的 active descriptor 缺失或篡改仍稳定失败。
+
+journal 新增 generation-bound retirement saga：`reserve` 在同一 Memory lock 或 SQLite
+`BEGIN IMMEDIATE` 中检查所有 active owners 并写入 `RETIRING`，ATTACHED commit 同一原子边界
+拒绝 `RETIRING`；delete 成功后 `complete` 为 `RETIRED`，明确失败且对象仍存在时 `abort` 为
+`ABORTED`。reserve/delete/complete 任一点崩溃后重复 retire 都能收敛，重复完成幂等。content-
+addressed payload 再次 put 后，ATTACHED 会原子开启下一 generation 的 `AVAILABLE`，因此不会
+永久 tombstone 某 digest；共享 digest 仍必须逐 owner detach。
+
+Memory journal 为每个 `(session, run)` 维护有序 fact-index tuple，cursor 用 `bisect_right`，先
+slice `limit` 再 canonical copy，复杂度为 `O(log F_run + limit)`，不扫描其他 Run 或完整事实
+历史。100,000 条、两个 Run 的 guard 测试观测到只访问 5 条记录。
+
+RED/GREEN 证据：Recovery RED `1 failed`；reservation contract RED `2 failed`；分页 guard RED
+`1 failed`。最小实现后四项参数化用例 `4 passed`；Recovery/generation `20 passed`；retirement
+竞态、delete failure、restart 与重复调用 `7 passed`；schema/retention/Recovery focused
+`23 passed`。最终验证：wide contract/SQLite `293 passed in 362.24s`；Artifact/runtime/load
+E2E `39 passed in 46.93s`；Ruff lint 与 format check 通过；mypy `src` 为
+`Success: no issues found in 59 source files`；CPython 3.11 全仓
+`1279 passed, 2 skipped in 446.90s`。
