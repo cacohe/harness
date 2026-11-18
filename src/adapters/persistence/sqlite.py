@@ -2313,11 +2313,20 @@ def _verify_artifact_active_index(connection: sqlite3.Connection, artifact_id: s
 
 
 def _retirement_node_value(row: sqlite3.Row | None, level: int, node_index: int) -> tuple[str, int]:
+    if not 0 <= level <= _RETIREMENT_DEPTH or not 0 <= node_index < (
+        1 << (_RETIREMENT_DEPTH - level)
+    ):
+        raise ValueError("SQLite retirement projection node is out of range")
+    empty_digest = retirement_empty_hash(level, node_index)
     if row is None:
-        return retirement_empty_hash(level, node_index), 0
+        return empty_digest, 0
     digest = validate_hash(row["digest"])
     count = row["item_count"]
-    if type(count) is not int or count < 0:
+    if (
+        type(count) is not int
+        or not 0 <= count <= (1 << level)
+        or (count == 0) != (digest == empty_digest)
+    ):
         raise ValueError("SQLite retirement projection node is invalid")
     return digest, count
 
@@ -2385,7 +2394,7 @@ def _verify_retirement_meta(connection: sqlite3.Connection) -> tuple[str, int]:
         return retirement_empty_hash(_RETIREMENT_DEPTH, 0), 0
     projection_root = validate_hash(row["projection_root"])
     artifact_count = row["artifact_count"]
-    if type(artifact_count) is not int or not 0 <= artifact_count < (1 << _RETIREMENT_DEPTH):
+    if type(artifact_count) is not int or not 0 <= artifact_count <= (1 << _RETIREMENT_DEPTH):
         raise ValueError("SQLite retirement artifact count is invalid")
     if row["authenticated_root"] != retirement_authenticated_root_hash(
         projection_root, artifact_count
@@ -2400,26 +2409,65 @@ def _verify_retirement_meta(connection: sqlite3.Connection) -> tuple[str, int]:
 def _verify_retirement_path(
     connection: sqlite3.Connection,
     artifact_index: int,
-    state_digest: str,
+    state_digest: str | None,
     expected_root: str,
+    artifact_count: int,
 ) -> None:
     index = artifact_index
-    value = (retirement_leaf_hash(artifact_index, state_digest), 1)
+    value = (
+        (retirement_empty_hash(0, index), 0)
+        if state_digest is None
+        else (retirement_leaf_hash(artifact_index, state_digest), 1)
+    )
     if _read_retirement_node(connection, 0, index) != value:
         raise ValueError("SQLite retirement projection leaf disagrees")
     for level in range(1, _RETIREMENT_DEPTH + 1):
         sibling = _read_retirement_node(connection, level - 1, index ^ 1)
+        size = 1 << (level - 1)
+        if sibling[1] != min(size, max(0, artifact_count - (index ^ 1) * size)):
+            raise ValueError("SQLite retirement projection subtree count disagrees")
         left, right = (value, sibling) if index % 2 == 0 else (sibling, value)
         parent_index = index // 2
+        count = left[1] + right[1]
         value = (
-            retirement_parent_hash(level, parent_index, left, right),
-            left[1] + right[1],
+            retirement_empty_hash(level, parent_index)
+            if count == 0
+            else retirement_parent_hash(level, parent_index, left, right),
+            count,
         )
         if _read_retirement_node(connection, level, parent_index) != value:
             raise ValueError("SQLite retirement projection Merkle path is invalid")
         index = parent_index
-    if value[0] != validate_hash(expected_root):
+    if value != (validate_hash(expected_root), artifact_count):
         raise ValueError("SQLite retirement projection path disagrees with root")
+
+
+def _verify_retirement_allocation(
+    connection: sqlite3.Connection, projection_root: str, artifact_count: int
+) -> None:
+    if artifact_count >= (1 << _RETIREMENT_DEPTH):
+        raise ValueError("SQLite retirement projection index exceeds capacity")
+    # Allocation is a dense prefix. Indexed tail probes reject unreachable nodes,
+    # including descendants hidden below an absent empty-subtree root, without a scan.
+    last = connection.execute(
+        "SELECT artifact_index FROM artifact_retirements ORDER BY artifact_index DESC LIMIT 1"
+    ).fetchone()
+    if (None if last is None else last["artifact_index"]) != (
+        None if artifact_count == 0 else artifact_count - 1
+    ):
+        raise ValueError("SQLite retirement allocation frontier disagrees")
+    for level in range(_RETIREMENT_DEPTH + 1):
+        size = 1 << level
+        first_empty = (artifact_count + size - 1) // size
+        if (
+            connection.execute(
+                "SELECT 1 FROM artifact_retirement_nodes WHERE level=? AND node_index>=? LIMIT 1",
+                (level, first_empty),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("SQLite retirement projection has an orphan node")
+    _verify_retirement_path(connection, artifact_count, None, projection_root, artifact_count)
 
 
 def _load_verified_retirement(
@@ -2460,7 +2508,9 @@ def _load_verified_retirement(
     )
     if row["state_hash"] != state_digest:
         raise ValueError("SQLite retirement state hash disagrees")
-    _verify_retirement_path(connection, artifact_index, state_digest, projection_root)
+    _verify_retirement_path(
+        connection, artifact_index, state_digest, projection_root, artifact_count
+    )
     previous = retirement_genesis_hash(artifact_id)
     facts = connection.execute(
         "SELECT fact_index, generation, state, previous_hash, fact_hash, fact_json "
@@ -2504,13 +2554,14 @@ def _append_retirement_transition(
     generation: int,
     state: ArtifactRetirementState,
 ) -> ArtifactRetirementReservation:
-    _projection_root, artifact_count = _verify_retirement_meta(connection)
+    projection_root, artifact_count = _verify_retirement_meta(connection)
     current = connection.execute(
         "SELECT artifact_index, fact_count, fact_root FROM artifact_retirements "
         "WHERE artifact_id=?",
         (artifact_id,),
     ).fetchone()
     if current is None:
+        _verify_retirement_allocation(connection, projection_root, artifact_count)
         artifact_index = artifact_count
         fact_index = 0
         previous = retirement_genesis_hash(artifact_id)
@@ -2520,6 +2571,8 @@ def _append_retirement_transition(
         fact_index = int(current["fact_count"])
         previous = validate_hash(current["fact_root"])
         next_count = artifact_count
+    if fact_index >= _MAX_ARTIFACT_FACTS_PER_LOOKUP:
+        raise ValueError("Artifact retirement exceeds its transition bound")
     reservation = ArtifactRetirementReservation(artifact_id, generation, state)
     fact_digest = retirement_fact_hash(artifact_id, fact_index, generation, state.value, previous)
     connection.execute(

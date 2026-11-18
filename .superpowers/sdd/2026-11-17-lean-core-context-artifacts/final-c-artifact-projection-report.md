@@ -171,3 +171,54 @@ projection，再增量追加 transition 并更新一条 Merkle path。普通 SQL
 `8 passed`；focused lifecycle/race `14 passed`。最终 wide 为
 `287 passed in 370.08s`，E2E 为 `39 passed in 38.74s`；Ruff lint/format 与 mypy `src`
 通过；CPython 3.11 全仓为 `1290 passed, 2 skipped in 468.07s`。
+
+## Fix round 4/5：新 Artifact 的空路径认证与 transition 上限
+
+本轮从 `1460392` 接手，只处理两个开放 Important 及其相邻容量边界。RED 为
+`165 failed, 6 passed in 170.22s`：每层 orphan/empty digest-count/超容量节点都可被正常
+新 reservation 吸入；删除旧路径节点也可被覆盖修复；reserve、complete、abort、re-put
+四条追加路径在 `fact_count == MAX` 时都会错误提交 `MAX + 1`。另外的 frontier RED 为
+`3 failed, 3 passed in 12.98s`，确认远端孤儿、树范围外节点和 allocation index gap 也未拒绝。
+
+新 artifact 现在必须在同一 `BEGIN IMMEDIATE` 内证明 `artifact_index == artifact_count`
+对应的叶子在旧 root 下为空。每一层验证旧节点和 sibling、连续分配前缀对应的精确 subtree
+count，以及最终 root/count；缺失的空子树使用 canonical empty digest/count，空父节点也
+按 canonical empty 规则折叠。显式节点必须满足该层容量和 empty digest/count 一致性。
+allocation 还检查 `artifact_index` 索引的末值，并按每层 `(level, node_index)` 索引执行
+`LIMIT 1` 尾部探测，拒绝藏在缺失空子树根之下的孤儿和越界节点。验证不依赖全表扫描，
+固定 32 层证明与 33 次有界索引探测使用常量内存；`_set_retirement_leaf` 只在认证后写入。
+
+所有 retirement transition 共用的 append 入口在任何 retirement 写入前拒绝
+`fact_index >= _MAX_ARTIFACT_FACTS_PER_LOOKUP`。`MAX - 1 -> MAX` 仍可提交并重启读取，
+`MAX -> MAX + 1` 稳定返回 `INVARIANT_VIOLATION`，事务内已暂写的 Session、attachment
+facts/index 也一起回滚。重复 reserve/complete/abort 不追加事实，保持幂等。相邻树容量
+测试还发现最后一个合法叶子会使旧 meta 验证器自拒绝：现在允许 `artifact_count == capacity`
+读取及更新已有叶子，只在下一次新分配前拒绝。
+
+新增 `test_sqlite_retirement_boundaries.py` 覆盖 0..31 每层空路径攻击、0..32 每层旧路径
+缺失、root/count/meta、远端孤儿和 index gap、完整数据库快照零变化、重复拒绝/reopen、
+四类 transition 的小 limit、两新 artifact 并发分配，以及小树满容量后的读取/完成。
+现有 attachment facts/index 双向核对、generation、restart、saga 和 lookup 上限保持不变。
+
+最终验证：
+
+| 检查 | 结果 |
+| --- | --- |
+| 新 retirement 边界 targeted | `177 passed in 285.63s` |
+| schema/SQLite/shared journal/Memory/retention/lifecycle/recovery wide | `304 passed in 698.93s` |
+| Artifact/Agent/bounded growth/load E2E | `23 passed in 54.87s` |
+| Ruff `check --no-cache src tests` | `All checks passed!` |
+| Ruff `format --check src tests` | `95 files already formatted` |
+| mypy `src` | `Success: no issues found in 59 source files` |
+| CPython 3.11 全仓 | `1467 passed, 2 skipped in 891.03s` |
+| `git diff --check` | 通过，仅 LF/CRLF 提示 |
+
+全仓两个 skip 均来自 `test_filesystem_artifacts.py:44`：
+`Windows symlink privilege is unavailable`。测试使用真实
+`cpython-3.11.16-windows-x86_64-none/python.exe` 与 worktree `.venv/Lib/site-packages`；
+全仓命令为 `python -m pytest -q -p no:cacheprovider --basetemp .superpowers/c4-full --tb=short -rs`。
+wide 覆盖 `test_journal_contract.py`、`test_sqlite_journal.py`、`test_memory_journal.py`、
+`test_artifact_retention.py`、`test_artifact_lifecycle.py` 和 `test_recovery_v3.py`；
+E2E 覆盖 integration 的 `test_artifact_flow.py`、`test_agent_v3.py`、`test_bounded_growth.py`
+以及 `tests/load/test_shared_agent_load.py`。原始输出保留于 `.superpowers/c4-{red,frontier-red,
+green,wide,e2e,full}.log`。本轮未修改 attachment 重放/index 双向核对或 saga/generation 状态机。
