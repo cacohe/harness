@@ -12,12 +12,27 @@ from typing import TypeVar
 from src.adapters.context.journal_history import transcript_interaction
 from src.adapters.persistence.memory import (
     _canonical_copy,
+    _coverage_ranges,
     _validate_aggregate_request,
     _validate_members,
 )
 from src.adapters.persistence.sqlite_codec import decode, encode
-from src.adapters.persistence.sqlite_integrity import genesis_hash, record_hash, validate_hash
-from src.core.context import ConversationPage, OmittedContextRef
+from src.adapters.persistence.sqlite_integrity import (
+    authenticated_root_hash,
+    coverage_block_content_hash,
+    coverage_empty_hash,
+    coverage_leaf_hash,
+    coverage_parent_hash,
+    genesis_hash,
+    record_hash,
+    validate_hash,
+)
+from src.core.context import (
+    ConversationCoverage,
+    ConversationCoverageSegment,
+    ConversationPage,
+    OmittedContextRef,
+)
 from src.core.errors import RunErrorCode
 from src.core.ids import RunId, SessionId, SubmissionId
 from src.core.journal import (
@@ -34,6 +49,8 @@ from src.core.run_receipt import validate_commit_receipt
 from src.core.state import RunState
 
 _SCHEMA_VERSION = 3
+_COVERAGE_BLOCK_SIZE = 128
+_COVERAGE_DEPTH = 32
 _T = TypeVar("_T")
 _IdT = TypeVar("_IdT", SessionId, RunId, SubmissionId)
 
@@ -43,7 +60,10 @@ CREATE TABLE sessions (
   version INTEGER NOT NULL CHECK(version >= 0),
   sequence INTEGER NOT NULL CHECK(sequence >= 0),
   state_json TEXT NOT NULL,
-  ledger_hash TEXT NOT NULL
+  ledger_hash TEXT NOT NULL,
+  coverage_hash TEXT NOT NULL,
+  transcript_count INTEGER NOT NULL CHECK(transcript_count >= 0),
+  authenticated_root TEXT NOT NULL
 ) STRICT;
 CREATE TABLE journal_entries (
   session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
@@ -86,6 +106,62 @@ CREATE TABLE transcript (
 ) STRICT;
 CREATE INDEX transcript_by_session_sequence ON transcript(session_id, sequence);
 CREATE INDEX transcript_run_input ON transcript(session_id, run_id, submission_id, role, sequence);
+CREATE TABLE transcript_coverage_blocks (
+  session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+  block_index INTEGER NOT NULL CHECK(block_index >= 0),
+  first_sequence INTEGER NOT NULL CHECK(first_sequence > 0),
+  last_sequence INTEGER NOT NULL CHECK(last_sequence >= first_sequence),
+  item_count INTEGER NOT NULL CHECK(item_count > 0 AND item_count <= 128),
+  content_hash TEXT NOT NULL,
+  PRIMARY KEY(session_id, block_index)
+) STRICT;
+CREATE INDEX transcript_coverage_blocks_by_sequence
+ON transcript_coverage_blocks(session_id, first_sequence, last_sequence);
+CREATE TABLE transcript_coverage_nodes (
+  session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+  level INTEGER NOT NULL CHECK(level >= 0 AND level <= 32),
+  node_index INTEGER NOT NULL CHECK(node_index >= 0),
+  digest TEXT NOT NULL,
+  item_count INTEGER NOT NULL CHECK(item_count >= 0),
+  first_sequence INTEGER NOT NULL CHECK(first_sequence >= 0),
+  last_sequence INTEGER NOT NULL CHECK(last_sequence >= 0),
+  PRIMARY KEY(session_id, level, node_index)
+) STRICT;
+CREATE TABLE integrity_violations (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+  reason TEXT NOT NULL
+) STRICT;
+CREATE TRIGGER journal_entries_update_violation AFTER UPDATE ON journal_entries
+BEGIN
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason)
+  VALUES (NEW.session_id, 'journal_entries updated');
+END;
+CREATE TRIGGER journal_entries_delete_violation AFTER DELETE ON journal_entries
+BEGIN
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason)
+  VALUES (OLD.session_id, 'journal_entries deleted');
+END;
+CREATE TRIGGER transcript_update_violation AFTER UPDATE ON transcript
+BEGIN
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason)
+  VALUES (NEW.session_id, 'transcript updated');
+END;
+CREATE TRIGGER transcript_delete_violation AFTER DELETE ON transcript
+BEGIN
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason)
+  VALUES (OLD.session_id, 'transcript deleted');
+END;
+CREATE TRIGGER sealed_coverage_block_update_violation
+AFTER UPDATE ON transcript_coverage_blocks WHEN OLD.item_count = 128
+BEGIN
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason)
+  VALUES (OLD.session_id, 'sealed coverage block updated');
+END;
+CREATE TRIGGER coverage_block_delete_violation AFTER DELETE ON transcript_coverage_blocks
+BEGIN
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason)
+  VALUES (OLD.session_id, 'coverage block deleted');
+END;
 CREATE TABLE summary_checkpoints (
   session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
   covered_from_sequence INTEGER NOT NULL,
@@ -110,7 +186,16 @@ CREATE INDEX submissions_by_identity ON submissions(session_id, submission_id, d
 """
 
 _EXPECTED_COLUMNS = {
-    "sessions": ("session_id", "version", "sequence", "state_json", "ledger_hash"),
+    "sessions": (
+        "session_id",
+        "version",
+        "sequence",
+        "state_json",
+        "ledger_hash",
+        "coverage_hash",
+        "transcript_count",
+        "authenticated_root",
+    ),
     "journal_entries": ("session_id", "sequence", "kind", "previous_hash", "record_hash"),
     "runs": (
         "session_id",
@@ -131,6 +216,24 @@ _EXPECTED_COLUMNS = {
         "content",
         "entry_json",
     ),
+    "transcript_coverage_blocks": (
+        "session_id",
+        "block_index",
+        "first_sequence",
+        "last_sequence",
+        "item_count",
+        "content_hash",
+    ),
+    "transcript_coverage_nodes": (
+        "session_id",
+        "level",
+        "node_index",
+        "digest",
+        "item_count",
+        "first_sequence",
+        "last_sequence",
+    ),
+    "integrity_violations": ("session_id", "reason"),
     "summary_checkpoints": (
         "session_id",
         "covered_from_sequence",
@@ -160,6 +263,11 @@ _EXPECTED_INDEXES = {
         "submission_id",
         "role",
         "sequence",
+    ),
+    "transcript_coverage_blocks_by_sequence": (
+        "session_id",
+        "first_sequence",
+        "last_sequence",
     ),
     "submissions_by_identity": ("session_id", "submission_id", "digest"),
 }
@@ -243,7 +351,7 @@ class SQLiteRunJournal:
         before_sequence: int,
         excluded_from_sequence: int | None = None,
         excluded_through_sequence: int | None = None,
-    ) -> tuple[OmittedContextRef, ...]:
+    ) -> ConversationCoverage:
         _validate_aggregate_request(
             session_id,
             before_sequence,
@@ -347,6 +455,15 @@ class SQLiteRunJournal:
             version = int(row["version"]) if row is not None else 0
             previous_sequence = int(row["sequence"]) if row is not None else 0
             ledger_hash = row["ledger_hash"] if row is not None else genesis_hash(session_key)
+            coverage_hash = (
+                row["coverage_hash"]
+                if row is not None
+                else coverage_empty_hash(session_key, _COVERAGE_DEPTH, 0)
+            )
+            transcript_count = int(row["transcript_count"]) if row is not None else 0
+            authenticated_root = authenticated_root_hash(
+                session_key, ledger_hash, coverage_hash, transcript_count
+            )
             existing = connection.execute(
                 "SELECT session_id, submission_id, run_id, digest, intent_json, receipt_json, "
                 "acceptance_state_json, acceptance_version FROM submissions "
@@ -391,9 +508,19 @@ class SQLiteRunJournal:
             persisted_version = version + 1
             state_json = encode(state)
             connection.execute(
-                "INSERT INTO sessions(session_id, version, sequence, state_json, ledger_hash) VALUES (?, ?, ?, ?, ?) "
+                "INSERT INTO sessions(session_id, version, sequence, state_json, ledger_hash, "
+                "coverage_hash, transcript_count, authenticated_root) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(session_id) DO UPDATE SET version=excluded.version, sequence=excluded.sequence, state_json=excluded.state_json",
-                (session_key, persisted_version, final_sequence, state_json, ledger_hash),
+                (
+                    session_key,
+                    persisted_version,
+                    final_sequence,
+                    state_json,
+                    ledger_hash,
+                    coverage_hash,
+                    transcript_count,
+                    authenticated_root,
+                ),
             )
             connection.execute(
                 "INSERT INTO runs(session_id, run_id, submission_id, profile_id, status, state_version, state_json) VALUES (?, ?, ?, ?, ?, ?, ?) "
@@ -442,8 +569,26 @@ class SQLiteRunJournal:
                     connection, session_key, cursor, "transcript", record_json, ledger_hash
                 )
                 transcript.append(transcript_record)
+            if transcript:
+                first_block = transcript_count // _COVERAGE_BLOCK_SIZE
+                transcript_count += len(transcript)
+                last_block = (transcript_count - 1) // _COVERAGE_BLOCK_SIZE
+                for block_index in range(first_block, last_block + 1):
+                    _refresh_coverage_block(connection, session_key, block_index)
+                coverage_hash = _coverage_root(connection, session_key)[0]
+            authenticated_root = authenticated_root_hash(
+                session_key, ledger_hash, coverage_hash, transcript_count
+            )
             connection.execute(
-                "UPDATE sessions SET ledger_hash=? WHERE session_id=?", (ledger_hash, session_key)
+                "UPDATE sessions SET ledger_hash=?, coverage_hash=?, transcript_count=?, "
+                "authenticated_root=? WHERE session_id=?",
+                (
+                    ledger_hash,
+                    coverage_hash,
+                    transcript_count,
+                    authenticated_root,
+                    session_key,
+                ),
             )
             receipt = JournalSnapshot(
                 state.session_id,
@@ -535,7 +680,8 @@ class SQLiteRunJournal:
         try:
             connection.execute("BEGIN")
             row = connection.execute(
-                "SELECT session_id, version, sequence, state_json, ledger_hash "
+                "SELECT session_id, version, sequence, state_json, ledger_hash, coverage_hash, "
+                "transcript_count, authenticated_root "
                 "FROM sessions WHERE session_id = ?",
                 (session_key,),
             ).fetchone()
@@ -551,6 +697,7 @@ class SQLiteRunJournal:
             if run_row is None or decode(run_row["state_json"], RunState) != state:
                 raise ValueError
             _validate_run_row(run_row, state)
+            _verify_authenticated_root(row, session_key)
             _verify_ledger_tail(connection, session_key, sequence, row["ledger_hash"])
             return JournalHead(version, sequence, state)
         except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
@@ -665,34 +812,61 @@ class SQLiteRunJournal:
         before_sequence: int,
         excluded_from_sequence: int | None,
         excluded_through_sequence: int | None,
-    ) -> tuple[OmittedContextRef, ...]:
+    ) -> ConversationCoverage:
         connection = self._connect()
         try:
             connection.execute("BEGIN")
-            result: tuple[OmittedContextRef, ...]
-            if excluded_from_sequence is None:
-                omission = _aggregate_transcript_range(connection, session_key, 1, before_sequence)
-                result = (omission,) if omission is not None else ()
+            if connection.execute(
+                "SELECT EXISTS(SELECT 1 FROM integrity_violations WHERE session_id=?)",
+                (session_key,),
+            ).fetchone()[0]:
+                raise ValueError("SQLite immutable journal history was modified")
+            session = connection.execute(
+                "SELECT sequence, ledger_hash, coverage_hash, transcript_count, authenticated_root "
+                "FROM sessions WHERE session_id=?",
+                (session_key,),
+            ).fetchone()
+            if session is None:
+                if connection.execute(
+                    "SELECT EXISTS(SELECT 1 FROM transcript WHERE session_id=?)",
+                    (session_key,),
+                ).fetchone()[0]:
+                    raise ValueError("SQLite transcript rows exist without a Session")
+                coverage_root = coverage_empty_hash(session_key, _COVERAGE_DEPTH, 0)
             else:
-                assert excluded_through_sequence is not None
-                result = tuple(
-                    item
-                    for item in (
-                        _aggregate_transcript_range(
+                _verify_authenticated_root(session, session_key)
+                _verify_ledger_tail(
+                    connection, session_key, session["sequence"], session["ledger_hash"]
+                )
+                coverage = _coverage_root(connection, session_key)
+                coverage_root = validate_hash(session["coverage_hash"])
+                if coverage[0] != coverage_root or coverage[1] != session["transcript_count"]:
+                    raise ValueError("SQLite coverage root disagrees with its Session")
+            segments = []
+            for first, last in _coverage_ranges(
+                before_sequence,
+                excluded_from_sequence,
+                excluded_through_sequence,
+            ):
+                segments.append(
+                    ConversationCoverageSegment(
+                        first,
+                        last,
+                        _authenticated_transcript_count(
                             connection,
                             session_key,
-                            excluded_through_sequence + 1,
-                            before_sequence,
-                        ),
-                        _aggregate_transcript_range(
-                            connection,
-                            session_key,
-                            1,
-                            min(excluded_from_sequence, before_sequence),
+                            first,
+                            last,
+                            coverage_root,
                         ),
                     )
-                    if item is not None
                 )
+            result = ConversationCoverage(
+                before_sequence,
+                excluded_from_sequence,
+                excluded_through_sequence,
+                tuple(segments),
+            )
             connection.commit()
             return result
         except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
@@ -809,6 +983,9 @@ class SQLiteRunJournal:
             "runs",
             "events",
             "transcript",
+            "transcript_coverage_blocks",
+            "transcript_coverage_nodes",
+            "integrity_violations",
             "summary_checkpoints",
             "submissions",
         ):
@@ -889,6 +1066,307 @@ def _verify_anchor(anchor: sqlite3.Row, session_key: str, previous_hash: str) ->
     return digest
 
 
+def _node_value(row: sqlite3.Row | None, session_key: str, level: int, node_index: int):
+    if row is None:
+        return coverage_empty_hash(session_key, level, node_index), 0, 0, 0
+    digest = validate_hash(row["digest"])
+    count = row["item_count"]
+    first = row["first_sequence"]
+    last = row["last_sequence"]
+    if (
+        type(count) is not int
+        or type(first) is not int
+        or type(last) is not int
+        or count < 0
+        or (count == 0 and (first != 0 or last != 0))
+        or (count > 0 and not 1 <= first <= last)
+    ):
+        raise ValueError("SQLite coverage node is invalid")
+    return digest, count, first, last
+
+
+def _read_coverage_node(
+    connection: sqlite3.Connection, session_key: str, level: int, node_index: int
+):
+    row = connection.execute(
+        "SELECT digest, item_count, first_sequence, last_sequence "
+        "FROM transcript_coverage_nodes WHERE session_id=? AND level=? AND node_index=?",
+        (session_key, level, node_index),
+    ).fetchone()
+    return _node_value(row, session_key, level, node_index)
+
+
+def _write_coverage_node(
+    connection: sqlite3.Connection,
+    session_key: str,
+    level: int,
+    node_index: int,
+    value: tuple[str, int, int, int],
+) -> None:
+    connection.execute(
+        "INSERT INTO transcript_coverage_nodes(session_id, level, node_index, digest, "
+        "item_count, first_sequence, last_sequence) VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(session_id, level, node_index) DO UPDATE SET digest=excluded.digest, "
+        "item_count=excluded.item_count, first_sequence=excluded.first_sequence, "
+        "last_sequence=excluded.last_sequence",
+        (session_key, level, node_index, *value),
+    )
+
+
+def _refresh_coverage_block(
+    connection: sqlite3.Connection, session_key: str, block_index: int
+) -> None:
+    first_row = connection.execute(
+        "SELECT sequence FROM transcript WHERE session_id=? ORDER BY sequence LIMIT 1 OFFSET ?",
+        (session_key, block_index * _COVERAGE_BLOCK_SIZE),
+    ).fetchone()
+    if first_row is None or type(first_row["sequence"]) is not int:
+        raise ValueError("SQLite coverage block has no first transcript row")
+    rows = tuple(
+        connection.execute(
+            "SELECT t.session_id, t.sequence, t.run_id, t.submission_id, t.role, t.content, "
+            "t.entry_json, j.record_hash FROM transcript AS t JOIN journal_entries AS j "
+            "ON j.session_id=t.session_id AND j.sequence=t.sequence AND j.kind='transcript' "
+            "WHERE t.session_id=? AND t.sequence>=? ORDER BY t.sequence LIMIT ?",
+            (session_key, first_row["sequence"], _COVERAGE_BLOCK_SIZE),
+        )
+    )
+    records = []
+    for row in rows:
+        _decode_transcript_row(row, session_key)
+        records.append((row["sequence"], validate_hash(row["record_hash"]), row["entry_json"]))
+    if not records:
+        raise ValueError("SQLite coverage block is empty")
+    content_hash = coverage_block_content_hash(session_key, block_index, tuple(records))
+    first = records[0][0]
+    last = records[-1][0]
+    count = len(records)
+    connection.execute(
+        "INSERT INTO transcript_coverage_blocks(session_id, block_index, first_sequence, "
+        "last_sequence, item_count, content_hash) VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(session_id, block_index) DO UPDATE SET first_sequence=excluded.first_sequence, "
+        "last_sequence=excluded.last_sequence, item_count=excluded.item_count, "
+        "content_hash=excluded.content_hash",
+        (session_key, block_index, first, last, count, content_hash),
+    )
+    index = block_index
+    value = (
+        coverage_leaf_hash(session_key, block_index, first, last, count, content_hash),
+        count,
+        first,
+        last,
+    )
+    _write_coverage_node(connection, session_key, 0, index, value)
+    for level in range(1, _COVERAGE_DEPTH + 1):
+        sibling = _read_coverage_node(connection, session_key, level - 1, index ^ 1)
+        left, right = (value, sibling) if index % 2 == 0 else (sibling, value)
+        parent_index = index // 2
+        parent_count = left[1] + right[1]
+        parent_first = left[2] if left[1] else right[2]
+        parent_last = right[3] if right[1] else left[3]
+        value = (
+            coverage_parent_hash(session_key, level, parent_index, left, right),
+            parent_count,
+            parent_first,
+            parent_last,
+        )
+        _write_coverage_node(connection, session_key, level, parent_index, value)
+        index = parent_index
+
+
+def _coverage_root(connection: sqlite3.Connection, session_key: str):
+    return _read_coverage_node(connection, session_key, _COVERAGE_DEPTH, 0)
+
+
+def _verify_authenticated_root(row: sqlite3.Row, session_key: str) -> None:
+    ledger = validate_hash(row["ledger_hash"])
+    coverage = validate_hash(row["coverage_hash"])
+    count = row["transcript_count"]
+    if type(count) is not int or count < 0:
+        raise ValueError("SQLite transcript coverage count is invalid")
+    expected = authenticated_root_hash(session_key, ledger, coverage, count)
+    if validate_hash(row["authenticated_root"]) != expected:
+        raise ValueError("SQLite authenticated Session root disagrees")
+
+
+def _verify_coverage_path(
+    connection: sqlite3.Connection,
+    session_key: str,
+    block_index: int,
+    leaf: tuple[str, int, int, int],
+    expected_root: str,
+) -> None:
+    index = block_index
+    value = leaf
+    if _read_coverage_node(connection, session_key, 0, index) != value:
+        raise ValueError("SQLite coverage leaf disagrees with its block")
+    for level in range(1, _COVERAGE_DEPTH + 1):
+        sibling = _read_coverage_node(connection, session_key, level - 1, index ^ 1)
+        left, right = (value, sibling) if index % 2 == 0 else (sibling, value)
+        parent_index = index // 2
+        count = left[1] + right[1]
+        value = (
+            coverage_parent_hash(session_key, level, parent_index, left, right),
+            count,
+            left[2] if left[1] else right[2],
+            right[3] if right[1] else left[3],
+        )
+        if _read_coverage_node(connection, session_key, level, parent_index) != value:
+            raise ValueError("SQLite coverage Merkle path is invalid")
+        index = parent_index
+    if value[0] != expected_root:
+        raise ValueError("SQLite coverage path disagrees with its Session root")
+
+
+def _verify_physical_coverage_block(
+    connection: sqlite3.Connection,
+    session_key: str,
+    block_index: int,
+    expected_root: str,
+) -> tuple[int, ...]:
+    block = connection.execute(
+        "SELECT first_sequence, last_sequence, item_count, content_hash "
+        "FROM transcript_coverage_blocks WHERE session_id=? AND block_index=?",
+        (session_key, block_index),
+    ).fetchone()
+    if block is None:
+        raise ValueError("SQLite coverage block is missing")
+    rows = tuple(
+        connection.execute(
+            "SELECT t.session_id, t.sequence, t.run_id, t.submission_id, t.role, t.content, "
+            "t.entry_json, j.record_hash FROM transcript AS t JOIN journal_entries AS j "
+            "ON j.session_id=t.session_id AND j.sequence=t.sequence AND j.kind='transcript' "
+            "WHERE t.session_id=? AND t.sequence>=? ORDER BY t.sequence LIMIT ?",
+            (session_key, block["first_sequence"], _COVERAGE_BLOCK_SIZE),
+        )
+    )
+    records = []
+    for row in rows:
+        _decode_transcript_row(row, session_key)
+        _verify_point_anchor(connection, session_key, row["sequence"])
+        records.append((row["sequence"], validate_hash(row["record_hash"]), row["entry_json"]))
+    if (
+        not records
+        or records[0][0] != block["first_sequence"]
+        or records[-1][0] != block["last_sequence"]
+        or len(records) != block["item_count"]
+    ):
+        raise ValueError("SQLite coverage block disagrees with physical transcript rows")
+    content_hash = coverage_block_content_hash(session_key, block_index, tuple(records))
+    if validate_hash(block["content_hash"]) != content_hash:
+        raise ValueError("SQLite coverage block content hash disagrees")
+    leaf = (
+        coverage_leaf_hash(
+            session_key,
+            block_index,
+            records[0][0],
+            records[-1][0],
+            len(records),
+            content_hash,
+        ),
+        len(records),
+        records[0][0],
+        records[-1][0],
+    )
+    _verify_coverage_path(connection, session_key, block_index, leaf, expected_root)
+    return tuple(record[0] for record in records)
+
+
+def _coverage_range_count(
+    connection: sqlite3.Connection,
+    session_key: str,
+    level: int,
+    node_index: int,
+    first_block: int,
+    last_block: int,
+) -> tuple[tuple[str, int, int, int], int]:
+    value = _read_coverage_node(connection, session_key, level, node_index)
+    node_first = node_index << level
+    node_last = node_first + (1 << level) - 1
+    if node_last < first_block or node_first > last_block:
+        return value, 0
+    if first_block <= node_first and node_last <= last_block:
+        return value, value[1]
+    if level == 0:
+        return value, value[1]
+    left, left_count = _coverage_range_count(
+        connection, session_key, level - 1, node_index * 2, first_block, last_block
+    )
+    right, right_count = _coverage_range_count(
+        connection, session_key, level - 1, node_index * 2 + 1, first_block, last_block
+    )
+    expected = (
+        coverage_parent_hash(session_key, level, node_index, left, right),
+        left[1] + right[1],
+        left[2] if left[1] else right[2],
+        right[3] if right[1] else left[3],
+    )
+    if value != expected:
+        raise ValueError("SQLite coverage range proof is invalid")
+    return value, left_count + right_count
+
+
+def _authenticated_transcript_count(
+    connection: sqlite3.Connection,
+    session_key: str,
+    first_sequence: int,
+    last_sequence: int,
+    coverage_root: str,
+) -> int:
+    first_row = connection.execute(
+        "SELECT block_index FROM transcript_coverage_blocks WHERE session_id=? "
+        "AND last_sequence>=? AND first_sequence<=? ORDER BY block_index LIMIT 1",
+        (session_key, first_sequence, last_sequence),
+    ).fetchone()
+    last_row = connection.execute(
+        "SELECT block_index FROM transcript_coverage_blocks WHERE session_id=? "
+        "AND last_sequence>=? AND first_sequence<=? ORDER BY block_index DESC LIMIT 1",
+        (session_key, first_sequence, last_sequence),
+    ).fetchone()
+    physical = connection.execute(
+        "SELECT MIN(sequence) AS first_sequence, MAX(sequence) AS last_sequence "
+        "FROM transcript WHERE session_id=? AND sequence>=? AND sequence<=?",
+        (session_key, first_sequence, last_sequence),
+    ).fetchone()
+    if first_row is None or last_row is None:
+        if physical is None or physical["first_sequence"] is not None:
+            raise ValueError("SQLite coverage index omitted physical transcript rows")
+        return 0
+    first_block = int(first_row["block_index"])
+    last_block = int(last_row["block_index"])
+    first_sequences = _verify_physical_coverage_block(
+        connection, session_key, first_block, coverage_root
+    )
+    last_sequences = (
+        first_sequences
+        if last_block == first_block
+        else _verify_physical_coverage_block(connection, session_key, last_block, coverage_root)
+    )
+    if (
+        physical is None
+        or physical["first_sequence"] not in first_sequences
+        or physical["last_sequence"] not in last_sequences
+    ):
+        raise ValueError("SQLite coverage boundary blocks disagree with physical history")
+    if first_block == last_block:
+        return sum(first_sequence <= sequence <= last_sequence for sequence in first_sequences)
+    count = sum(sequence >= first_sequence for sequence in first_sequences)
+    count += sum(sequence <= last_sequence for sequence in last_sequences)
+    if first_block + 1 <= last_block - 1:
+        root, interior = _coverage_range_count(
+            connection,
+            session_key,
+            _COVERAGE_DEPTH,
+            0,
+            first_block + 1,
+            last_block - 1,
+        )
+        if root[0] != coverage_root:
+            raise ValueError("SQLite coverage range root disagrees with its Session")
+        count += interior
+    return count
+
+
 def _verify_ledger_tail(
     connection: sqlite3.Connection, session_key: str, sequence: int, ledger_hash: object
 ) -> None:
@@ -917,10 +1395,13 @@ def _verify_ledger_tail(
 def _verify_point_anchor(connection: sqlite3.Connection, session_key: str, sequence: int) -> None:
     """Authenticate one indexed record and its immediate ledger boundary in O(1)."""
     session = connection.execute(
-        "SELECT sequence, ledger_hash FROM sessions WHERE session_id=?", (session_key,)
+        "SELECT sequence, ledger_hash, coverage_hash, transcript_count, authenticated_root "
+        "FROM sessions WHERE session_id=?",
+        (session_key,),
     ).fetchone()
     if session is None or type(session["sequence"]) is not int or sequence > session["sequence"]:
         raise ValueError("SQLite point anchor is outside its Session")
+    _verify_authenticated_root(session, session_key)
     previous_hash = genesis_hash(session_key)
     if sequence > 1:
         previous = connection.execute(
@@ -981,10 +1462,16 @@ def _preflight_existing_ledger(
 ) -> tuple[sqlite3.Row | None, RunState | None]:
     """Validate one Session's immutable ledger before a commit reads its CAS counters."""
     row = connection.execute(
-        "SELECT session_id, version, sequence, state_json, ledger_hash "
+        "SELECT session_id, version, sequence, state_json, ledger_hash, coverage_hash, "
+        "transcript_count, authenticated_root "
         "FROM sessions WHERE session_id = ?",
         (session_key,),
     ).fetchone()
+    if connection.execute(
+        "SELECT EXISTS(SELECT 1 FROM integrity_violations WHERE session_id=?)",
+        (session_key,),
+    ).fetchone()[0]:
+        raise ValueError("SQLite immutable journal history was modified")
     anchor_stats = connection.execute(
         "SELECT COUNT(*), MIN(sequence), MAX(sequence) FROM journal_entries WHERE session_id = ?",
         (session_key,),
@@ -1006,6 +1493,13 @@ def _preflight_existing_ledger(
         return None, None
 
     state = decode(row["state_json"], RunState)
+    _verify_authenticated_root(row, session_key)
+    coverage_root = _coverage_root(connection, session_key)
+    if (
+        coverage_root[0] != validate_hash(row["coverage_hash"])
+        or coverage_root[1] != row["transcript_count"]
+    ):
+        raise ValueError("SQLite coverage root disagrees with its Session")
     _, head_sequence = _validate_session_row(row, session_key, state)
     current_run_row = connection.execute(
         "SELECT session_id, run_id, submission_id, profile_id, status, state_version, state_json "

@@ -30,6 +30,78 @@ def record_hash(
     return _digest("record", session_key, str(sequence), kind, canonical_json, previous_hash)
 
 
+def coverage_empty_hash(session_key: str, level: int, node_index: int) -> str:
+    return _digest("coverage-empty", session_key, str(level), str(node_index))
+
+
+def coverage_block_content_hash(
+    session_key: str,
+    block_index: int,
+    records: tuple[tuple[int, str, str], ...],
+) -> str:
+    fields = ["coverage-block-content", session_key, str(block_index), str(len(records))]
+    for sequence, anchor_hash, canonical_json in records:
+        fields.extend((str(sequence), validate_hash(anchor_hash), canonical_json))
+    return _digest(*fields)
+
+
+def coverage_leaf_hash(
+    session_key: str,
+    block_index: int,
+    first_sequence: int,
+    last_sequence: int,
+    item_count: int,
+    content_hash: str,
+) -> str:
+    return _digest(
+        "coverage-leaf",
+        session_key,
+        str(block_index),
+        str(first_sequence),
+        str(last_sequence),
+        str(item_count),
+        validate_hash(content_hash),
+    )
+
+
+def coverage_parent_hash(
+    session_key: str,
+    level: int,
+    node_index: int,
+    left: tuple[str, int, int, int],
+    right: tuple[str, int, int, int],
+) -> str:
+    return _digest(
+        "coverage-parent",
+        session_key,
+        str(level),
+        str(node_index),
+        validate_hash(left[0]),
+        str(left[1]),
+        str(left[2]),
+        str(left[3]),
+        validate_hash(right[0]),
+        str(right[1]),
+        str(right[2]),
+        str(right[3]),
+    )
+
+
+def authenticated_root_hash(
+    session_key: str,
+    ledger_hash: str,
+    coverage_hash: str,
+    transcript_count: int,
+) -> str:
+    return _digest(
+        "authenticated-root",
+        session_key,
+        validate_hash(ledger_hash),
+        validate_hash(coverage_hash),
+        str(transcript_count),
+    )
+
+
 def validate_hash(value: object) -> str:
     if (
         type(value) is not str

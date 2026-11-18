@@ -23,6 +23,8 @@ from src.core.commands import RunLimits
 from src.core.context import (
     ContextBudget,
     ContextRequest,
+    ConversationCoverage,
+    ConversationCoverageSegment,
     ConversationInteraction,
     ConversationPage,
     OmittedContextRef,
@@ -129,6 +131,49 @@ class PagedJournalReader:
             )
         self.calls.append((before_sequence, limit, len(selected)))
         return ConversationPage(selected, next_cursor, remaining_omission=remaining)
+
+    async def summarize_before(
+        self,
+        session_id,
+        before_sequence,
+        excluded_from_sequence=None,
+        excluded_through_sequence=None,
+    ):
+        assert session_id == SessionId("bounded-session")
+        target_last = before_sequence - 1
+        ranges = []
+        if target_last > 0:
+            if excluded_from_sequence is None or excluded_from_sequence > target_last:
+                ranges.append((1, target_last))
+            else:
+                assert excluded_through_sequence is not None
+                if excluded_through_sequence < target_last:
+                    ranges.append((excluded_through_sequence + 1, target_last))
+                if excluded_from_sequence > 1:
+                    ranges.append((1, excluded_from_sequence - 1))
+        segments = tuple(
+            ConversationCoverageSegment(
+                first,
+                last,
+                bisect_left(
+                    self._interactions,
+                    last + 1,
+                    key=lambda item: item.sequence_through,
+                )
+                - bisect_left(
+                    self._interactions,
+                    first,
+                    key=lambda item: item.sequence_through,
+                ),
+            )
+            for first, last in ranges
+        )
+        return ConversationCoverage(
+            before_sequence,
+            excluded_from_sequence,
+            excluded_through_sequence,
+            segments,
+        )
 
 
 class CountingJournalReader:
@@ -365,7 +410,7 @@ def test_production_journal_reader_bounds_partial_checkpoint_history(
     assert all(limit == 127 and returned <= 127 for _, limit, returned in reader.page_calls)
     assert reader.aggregate_calls == [(9_748, 4_001, 6_000)]
     transcript_omissions = tuple(item for item in window.omitted if item.source == "transcript")
-    assert transcript_omissions[0].first_sequence == 2
+    assert transcript_omissions[0].first_sequence == 1
     assert transcript_omissions[0].last_sequence == 4_000
     assert transcript_omissions[1].first_sequence == 6_001
     selected = tuple(

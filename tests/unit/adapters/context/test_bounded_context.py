@@ -8,6 +8,8 @@ from src.core.context import (
     ContextBudget,
     ContextBudgetExceeded,
     ContextRequest,
+    ConversationCoverage,
+    ConversationCoverageSegment,
     ConversationInteraction,
     ConversationPage,
     EstimateQuality,
@@ -49,36 +51,31 @@ class Reader:
         self.aggregate_calls.append(
             (before_sequence, excluded_from_sequence, excluded_through_sequence)
         )
-        end = bisect_left(self.items, before_sequence, key=lambda item: item.sequence_through)
-
-        def omission(start: int, stop: int):
-            if start >= stop:
-                return None
-            return OmittedContextRef(
-                "transcript",
-                self.items[start].sequence_from,
-                self.items[stop - 1].sequence_through,
-                stop - start,
+        target_last = before_sequence - 1
+        ranges = []
+        if target_last > 0:
+            if excluded_from_sequence is None or excluded_from_sequence > target_last:
+                ranges.append((1, target_last))
+            else:
+                assert excluded_through_sequence is not None
+                if excluded_through_sequence < target_last:
+                    ranges.append((excluded_through_sequence + 1, target_last))
+                if excluded_from_sequence > 1:
+                    ranges.append((1, excluded_from_sequence - 1))
+        segments = tuple(
+            ConversationCoverageSegment(
+                first,
+                last,
+                bisect_right(self.items, last, key=lambda item: item.sequence_through)
+                - bisect_left(self.items, first, key=lambda item: item.sequence_through),
             )
-
-        if excluded_from_sequence is None:
-            aggregate = omission(0, end)
-            return (aggregate,) if aggregate is not None else ()
-        assert excluded_through_sequence is not None
-        high_start = bisect_right(
-            self.items,
-            excluded_through_sequence,
-            hi=end,
-            key=lambda item: item.sequence_through,
+            for first, last in ranges
         )
-        low_end = bisect_left(
-            self.items,
+        return ConversationCoverage(
+            before_sequence,
             excluded_from_sequence,
-            hi=end,
-            key=lambda item: item.sequence_through,
-        )
-        return tuple(
-            item for item in (omission(high_start, end), omission(0, low_end)) if item is not None
+            excluded_through_sequence,
+            segments,
         )
 
 
@@ -245,6 +242,40 @@ def test_ten_thousand_records_with_partial_checkpoint_remain_bounded_and_determi
     ]
     assert len(reader.calls) <= 4
     assert len(reader.aggregate_calls) == 2
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ("empty", "missing-middle", "wrong-bound", "duplicate"),
+)
+def test_incomplete_custom_aggregate_cannot_silently_drop_history(mode: str) -> None:
+    class IncompleteReader(Reader):
+        async def summarize_before(self, *_args, **_kwargs):
+            if mode == "empty":
+                return ()
+            if mode == "missing-middle":
+                return (OmittedContextRef("transcript", 1, 50, 50),)
+            segment = ConversationCoverageSegment(1, 98, 50)
+            witness = ConversationCoverage(
+                98 if mode == "wrong-bound" else 99,
+                None,
+                None,
+                (segment,),
+            )
+            if mode == "duplicate":
+                object.__setattr__(witness, "segments", (segment, segment))
+            return witness
+
+    records = tuple(_interaction(index, "X" * 40) for index in range(1, 101))
+    provider = BoundedContextProvider(
+        IncompleteReader(records),
+        ExactTokenCounter(),
+        page_size=2,
+        max_compaction_interactions=2,
+    )
+
+    with pytest.raises(ValueError, match="aggregate"):
+        asyncio.run(provider.build(_request(), ContextBudget(40, 1, 0)))
 
 
 def test_tools_are_counted_in_the_budget() -> None:

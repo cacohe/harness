@@ -89,6 +89,65 @@ class OmittedContextRef:
 
 
 @dataclass(frozen=True, slots=True)
+class ConversationCoverageSegment:
+    """A fully inspected sequence interval and its transcript item count."""
+
+    first_sequence: int
+    last_sequence: int
+    item_count: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.first_sequence) is not int
+            or type(self.last_sequence) is not int
+            or not 1 <= self.first_sequence <= self.last_sequence <= _MAX_TOKEN_COUNT
+            or type(self.item_count) is not int
+            or not 0 <= self.item_count <= self.last_sequence - self.first_sequence + 1
+        ):
+            raise ValueError("Conversation coverage segment is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationCoverage:
+    """Reader witness for all sequences before a bound, optionally excluding one interval."""
+
+    before_sequence: int
+    excluded_from_sequence: int | None
+    excluded_through_sequence: int | None
+    segments: tuple[ConversationCoverageSegment, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.before_sequence) is not int
+            or not 1 <= self.before_sequence <= _MAX_TOKEN_COUNT
+            or (self.excluded_from_sequence is None) != (self.excluded_through_sequence is None)
+            or self.excluded_from_sequence is not None
+            and (
+                type(self.excluded_from_sequence) is not int
+                or type(self.excluded_through_sequence) is not int
+                or not 1 <= self.excluded_from_sequence <= self.excluded_through_sequence
+            )
+            or type(self.segments) is not tuple
+            or any(type(segment) is not ConversationCoverageSegment for segment in self.segments)
+        ):
+            raise ValueError("Conversation coverage witness is invalid")
+        snapshot = tuple(
+            ConversationCoverageSegment(
+                segment.first_sequence,
+                segment.last_sequence,
+                segment.item_count,
+            )
+            for segment in self.segments
+        )
+        if any(
+            newer.first_sequence <= older.last_sequence
+            for newer, older in zip(snapshot, snapshot[1:])
+        ):
+            raise ValueError("Conversation coverage segments must be newest first")
+        object.__setattr__(self, "segments", snapshot)
+
+
+@dataclass(frozen=True, slots=True)
 class ConversationInteraction:
     """One indivisible, settled transcript interaction."""
 
@@ -404,7 +463,7 @@ class ConversationAggregateReader(ConversationReader, Protocol):
         before_sequence: int,
         excluded_from_sequence: int | None = None,
         excluded_through_sequence: int | None = None,
-    ) -> Awaitable[tuple[OmittedContextRef, ...]]: ...
+    ) -> Awaitable[ConversationCoverage]: ...
 
 
 class TokenCounter(Protocol):

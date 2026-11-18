@@ -8,6 +8,7 @@ from src.core.context import (
     ContextBudgetExceeded,
     ContextRequest,
     ContextWindow,
+    ConversationCoverage,
     ConversationInteraction,
     ConversationReader,
     OmittedContextRef,
@@ -127,7 +128,6 @@ class BoundedContextProvider:
                     current_omission.include(item)
                 if compaction_open and len(compaction) < self._max_compaction_interactions:
                     compaction.append(item)
-            remaining = page.remaining_omission
             if (
                 not suffix_open
                 and len(compaction) >= self._max_compaction_interactions
@@ -155,22 +155,12 @@ class BoundedContextProvider:
                         durable.covered_from_sequence if durable is not None else None,
                         durable.covered_through_sequence if durable is not None else None,
                     )
-                    self._append_aggregate(
+                    self._append_coverage(
                         omission_segments,
                         current_omission,
                         older,
                         page.next_before_sequence,
                         durable,
-                    )
-                    cursor = None
-                    break
-                if durable is None and remaining is not None:
-                    self._append_aggregate(
-                        omission_segments,
-                        current_omission,
-                        (remaining,),
-                        page.next_before_sequence,
-                        None,
                     )
                     cursor = None
                     break
@@ -258,29 +248,36 @@ class BoundedContextProvider:
         )
 
     @staticmethod
-    def _append_aggregate(
+    def _append_coverage(
         omissions: list[_Omission],
         current: _Omission | None,
-        aggregate: object,
+        coverage: object,
         before_sequence: int,
         excluded: ConversationSummaryCheckpoint | None,
     ) -> None:
-        if type(aggregate) is not tuple:
-            raise ValueError("Conversation aggregate must be a tuple")
-        previous_first = before_sequence
-        for index, item in enumerate(aggregate):
-            if (
-                type(item) is not OmittedContextRef
-                or item.source != "transcript"
-                or item.last_sequence >= previous_first
-                or item.item_count > item.last_sequence - item.first_sequence + 1
-                or excluded is not None
-                and not (
-                    item.last_sequence < excluded.covered_from_sequence
-                    or item.first_sequence > excluded.covered_through_sequence
-                )
-            ):
-                raise ValueError("Conversation aggregate is inconsistent with its cursor")
+        excluded_from = excluded.covered_from_sequence if excluded is not None else None
+        excluded_through = excluded.covered_through_sequence if excluded is not None else None
+        if (
+            type(coverage) is not ConversationCoverage
+            or coverage.before_sequence != before_sequence
+            or coverage.excluded_from_sequence != excluded_from
+            or coverage.excluded_through_sequence != excluded_through
+        ):
+            raise ValueError("Conversation aggregate has the wrong coverage bound")
+        expected: list[tuple[int, int]] = []
+        target_last = before_sequence - 1
+        if target_last > 0:
+            if excluded_from is None or excluded_through is None or excluded_from > target_last:
+                expected.append((1, target_last))
+            else:
+                if excluded_through < target_last:
+                    expected.append((excluded_through + 1, target_last))
+                if excluded_from > 1:
+                    expected.append((1, excluded_from - 1))
+        actual = [(segment.first_sequence, segment.last_sequence) for segment in coverage.segments]
+        if actual != expected:
+            raise ValueError("Conversation aggregate does not completely cover its target")
+        for index, item in enumerate(coverage.segments):
             separated_by_checkpoint = (
                 current is not None
                 and excluded is not None
@@ -291,11 +288,10 @@ class BoundedContextProvider:
                 current.first = min(current.first, item.first_sequence)
                 current.last = max(current.last, item.last_sequence)
                 current.count += item.item_count
-            else:
+            elif item.item_count:
                 omissions.append(
                     _Omission(item.first_sequence, item.last_sequence, item.item_count)
                 )
-            previous_first = item.first_sequence
 
     @staticmethod
     def _checkpoint_relation(

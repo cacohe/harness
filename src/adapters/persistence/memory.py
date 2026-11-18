@@ -9,7 +9,12 @@ from typing import Any, TypeAlias, TypeVar
 from src.adapters.context.journal_history import transcript_interaction
 from src.core.artifacts import ArtifactRef, ExternalizedContent, snapshot_artifact_ref
 from src.core.commands import RunLimits, ToolCallRequest
-from src.core.context import ConversationPage, OmittedContextRef
+from src.core.context import (
+    ConversationCoverage,
+    ConversationCoverageSegment,
+    ConversationPage,
+    OmittedContextRef,
+)
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.events import DomainEvent, DomainEventType, _is_canonical_timestamp
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
@@ -267,7 +272,7 @@ class InMemoryRunJournal:
         before_sequence: int,
         excluded_from_sequence: int | None = None,
         excluded_through_sequence: int | None = None,
-    ) -> tuple[OmittedContextRef, ...]:
+    ) -> ConversationCoverage:
         _validate_aggregate_request(
             session_id,
             before_sequence,
@@ -278,24 +283,24 @@ class InMemoryRunJournal:
         with self._lock:
             session = self._store.sessions.get(key)
         transcript = () if session is None else session.transcript
-        end = bisect_left(transcript, before_sequence, key=lambda entry: entry.sequence)
-        if excluded_from_sequence is None:
-            omission = _transcript_omission(transcript, 0, end)
-            return (omission,) if omission is not None else ()
-        assert excluded_through_sequence is not None
-        high_start = bisect_right(
-            transcript, excluded_through_sequence, hi=end, key=lambda entry: entry.sequence
-        )
-        low_end = bisect_left(
-            transcript, excluded_from_sequence, hi=end, key=lambda entry: entry.sequence
-        )
-        return tuple(
-            item
-            for item in (
-                _transcript_omission(transcript, high_start, end),
-                _transcript_omission(transcript, 0, low_end),
+        segments = tuple(
+            ConversationCoverageSegment(
+                first,
+                last,
+                bisect_right(transcript, last, key=lambda entry: entry.sequence)
+                - bisect_left(transcript, first, key=lambda entry: entry.sequence),
             )
-            if item is not None
+            for first, last in _coverage_ranges(
+                before_sequence,
+                excluded_from_sequence,
+                excluded_through_sequence,
+            )
+        )
+        return ConversationCoverage(
+            before_sequence,
+            excluded_from_sequence,
+            excluded_through_sequence,
+            segments,
         )
 
     async def find_submission(
@@ -377,6 +382,28 @@ def _transcript_omission(
         transcript[end - 1].sequence,
         end - start,
     )
+
+
+def _coverage_ranges(
+    before_sequence: int,
+    excluded_from_sequence: int | None,
+    excluded_through_sequence: int | None,
+) -> tuple[tuple[int, int], ...]:
+    target_last = before_sequence - 1
+    if target_last < 1:
+        return ()
+    if (
+        excluded_from_sequence is None
+        or excluded_through_sequence is None
+        or excluded_from_sequence > target_last
+    ):
+        return ((1, target_last),)
+    ranges = []
+    if excluded_through_sequence < target_last:
+        ranges.append((excluded_through_sequence + 1, target_last))
+    if excluded_from_sequence > 1:
+        ranges.append((1, excluded_from_sequence - 1))
+    return tuple(ranges)
 
 
 _T = TypeVar("_T")

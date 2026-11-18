@@ -26,6 +26,114 @@ def make_journal(tmp_path: Path) -> SQLiteRunJournal:
     return SQLiteRunJournal((tmp_path / "journal.sqlite3").resolve())
 
 
+@pytest.mark.parametrize("corruption", ("record-hash", "payload"))
+def test_conversation_aggregate_rejects_authenticated_middle_corruption(
+    tmp_path: Path, corruption: str
+) -> None:
+    journal = make_journal(tmp_path)
+    batch = acceptance("aggregate-corruption")
+    transcript = tuple(
+        TranscriptEntry(
+            batch.state.session_id,
+            batch.state.run_id,
+            batch.state.submission_id,
+            "assistant",
+            f"history-{index}",
+        )
+        for index in range(20)
+    )
+    commit = replace(
+        batch,
+        state=replace(batch.state, journal_sequence=21),
+        submission=None,
+        transcript=transcript,
+        summary=None,
+    )
+    asyncio.run(journal.commit(commit, 0))
+    with sqlite3.connect(journal.path) as connection:
+        if corruption == "record-hash":
+            connection.execute(
+                "UPDATE journal_entries SET record_hash=? WHERE session_id=? AND sequence=10",
+                ("0" * 64, batch.state.session_id.value),
+            )
+        else:
+            changed = replace(transcript[8], sequence=10, content="tampered")
+            connection.execute(
+                "UPDATE transcript SET content=?, entry_json=? WHERE session_id=? AND sequence=10",
+                (changed.content, encode(changed), batch.state.session_id.value),
+            )
+
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(journal.summarize_before(batch.state.session_id, 22))
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ("middle-record", "middle-payload", "block", "node", "session-root"),
+)
+def test_conversation_aggregate_rejects_full_block_and_witness_corruption(
+    tmp_path: Path, corruption: str
+) -> None:
+    journal = make_journal(tmp_path)
+    batch = acceptance("coverage-witness")
+    transcript = tuple(
+        TranscriptEntry(
+            batch.state.session_id,
+            batch.state.run_id,
+            batch.state.submission_id,
+            "assistant",
+            f"history-{index}",
+        )
+        for index in range(400)
+    )
+    asyncio.run(
+        journal.commit(
+            replace(
+                batch,
+                state=replace(batch.state, journal_sequence=401),
+                submission=None,
+                transcript=transcript,
+                summary=None,
+            ),
+            0,
+        )
+    )
+    with sqlite3.connect(journal.path) as connection:
+        if corruption == "middle-record":
+            connection.execute(
+                "UPDATE journal_entries SET record_hash=? WHERE session_id=? AND sequence=200",
+                ("0" * 64, batch.state.session_id.value),
+            )
+        elif corruption == "middle-payload":
+            changed = replace(transcript[198], sequence=200, content="tampered")
+            connection.execute(
+                "UPDATE transcript SET content=?, entry_json=? WHERE session_id=? AND sequence=200",
+                (changed.content, encode(changed), batch.state.session_id.value),
+            )
+        elif corruption == "block":
+            connection.execute(
+                "UPDATE transcript_coverage_blocks SET content_hash=? "
+                "WHERE session_id=? AND block_index=1",
+                ("0" * 64, batch.state.session_id.value),
+            )
+        elif corruption == "node":
+            connection.execute(
+                "UPDATE transcript_coverage_nodes SET digest=? "
+                "WHERE session_id=? AND level=1 AND node_index=0",
+                ("0" * 64, batch.state.session_id.value),
+            )
+        else:
+            connection.execute(
+                "UPDATE sessions SET authenticated_root=? WHERE session_id=?",
+                ("0" * 64, batch.state.session_id.value),
+            )
+
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(journal.summarize_before(batch.state.session_id, 402))
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
 def test_sqlite_v3_round_trips_and_reopens(tmp_path: Path) -> None:
     journal = make_journal(tmp_path)
     batch = acceptance("first")
@@ -102,6 +210,9 @@ def test_schema_is_exact_v3_and_has_required_indexes(tmp_path: Path) -> None:
             "events",
             "submissions",
             "transcript",
+            "transcript_coverage_blocks",
+            "transcript_coverage_nodes",
+            "integrity_violations",
             "summary_checkpoints",
         }
         indexes = {
@@ -113,6 +224,7 @@ def test_schema_is_exact_v3_and_has_required_indexes(tmp_path: Path) -> None:
             "events_by_session_sequence",
             "transcript_by_session_sequence",
             "submissions_by_identity",
+            "transcript_coverage_blocks_by_sequence",
         } <= indexes
 
 
@@ -203,8 +315,8 @@ def test_corrupt_codec_version_is_rejected_without_rewriting_storage(tmp_path: P
             "  previous_hash TEXT NOT NULL,\n  record_hash TEXT NOT NULL,\n", ""
         ),
         sqlite_module._DDL.replace(
-            "  state_json TEXT NOT NULL,\n  ledger_hash TEXT NOT NULL\n",
-            "  state_json TEXT NOT NULL\n",
+            "  authenticated_root TEXT NOT NULL\n",
+            "  authenticated_root TEXT\n",
             1,
         ),
         sqlite_module._DDL.replace(
