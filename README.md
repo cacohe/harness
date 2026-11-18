@@ -104,6 +104,11 @@ retire 先在 journal 中原子取得 `RETIRING` reservation：该步骤与“�
 处于同一事务，并阻止新的 attachment；repository delete 成功后再标记 `RETIRED`，明确失败且
 对象仍存在时标记 `ABORTED`。进程可在任一阶段重启并通过重复 retire 收敛。content-addressed
 对象重新 `put()` 后，同 descriptor 的新 attachment 会开启下一 generation，不会永久封禁 digest。
+SQLite 不把 derived active index 或 retirement current row 当成单点权威：reserve 在同一
+`BEGIN IMMEDIATE` 中按 `artifact_id` 有界重放 append-only attachment facts 并与 index 双向
+核对；retirement transition 另有 append-only hash chain、固定深度 Merkle projection 与数据库
+authenticated root。普通 SQL 改写 current/fact/leaf/node/root/count 会在下一次生命周期操作时
+稳定拒绝。
 
 `FilesystemArtifactRepository` 使用 content-addressed 路径、临时写入、原子 finalize、大小/hash
 校验和路径防护；它是单机 reference adapter，不宣称支持多节点共享。

@@ -176,6 +176,79 @@ def summary_parent_hash(
     )
 
 
+def retirement_fact_hash(
+    artifact_id: str,
+    fact_index: int,
+    generation: int,
+    state: str,
+    previous_hash: str,
+) -> str:
+    return _digest(
+        "retirement-fact",
+        artifact_id,
+        str(fact_index),
+        str(generation),
+        state,
+        validate_hash(previous_hash),
+    )
+
+
+def retirement_genesis_hash(artifact_id: str) -> str:
+    return _digest("retirement-genesis", artifact_id)
+
+
+def retirement_state_hash(
+    artifact_id: str,
+    artifact_index: int,
+    generation: int,
+    state: str,
+    fact_count: int,
+    fact_root: str,
+) -> str:
+    return _digest(
+        "retirement-state",
+        artifact_id,
+        str(artifact_index),
+        str(generation),
+        state,
+        str(fact_count),
+        validate_hash(fact_root),
+    )
+
+
+def retirement_empty_hash(level: int, node_index: int) -> str:
+    return _digest("retirement-empty", str(level), str(node_index))
+
+
+def retirement_leaf_hash(artifact_index: int, state_hash: str) -> str:
+    return _digest("retirement-leaf", str(artifact_index), validate_hash(state_hash))
+
+
+def retirement_parent_hash(
+    level: int,
+    node_index: int,
+    left: tuple[str, int],
+    right: tuple[str, int],
+) -> str:
+    return _digest(
+        "retirement-parent",
+        str(level),
+        str(node_index),
+        validate_hash(left[0]),
+        str(left[1]),
+        validate_hash(right[0]),
+        str(right[1]),
+    )
+
+
+def retirement_authenticated_root_hash(projection_root: str, artifact_count: int) -> str:
+    return _digest(
+        "retirement-authenticated-root",
+        validate_hash(projection_root),
+        str(artifact_count),
+    )
+
+
 def validate_hash(value: object) -> str:
     if (
         type(value) is not str

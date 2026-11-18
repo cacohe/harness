@@ -144,3 +144,30 @@ RED/GREEN 证据：Recovery RED `1 failed`；reservation contract RED `2 failed`
 E2E `39 passed in 46.93s`；Ruff lint 与 format check 通过；mypy `src` 为
 `Success: no issues found in 59 source files`；CPython 3.11 全仓
 `1279 passed, 2 skipped in 446.90s`。
+
+## Fix round 3/5：retirement authenticated projection
+
+审查 RED 证明两个信任缺口：raw SQL 注册既有 lifecycle UDF 后删除 derived active row 并清除
+sticky violation，reserve 会错误成功；直接改写 retirement generation/state 后 reopen reserve
+会错误接受。两项复现为 `2 failed`。
+
+SQLite reserve 现在在同一个 `BEGIN IMMEDIATE` 内，使用
+`artifact_facts_by_artifact(artifact_id)` 有界读取（上限 1,000,000+1），重放 append-only
+attachment facts 得到 active owners，并与 derived index 做完整双向 descriptor/identity 核对；
+缺行、多行、跨 Session 移动或 descriptor 不一致均拒绝，owner 判断与 reservation 写入之间
+没有事务窗口。
+
+retirement transition 改为 per-artifact append-only canonical fact/hash chain。current projection
+绑定 `artifact_index/generation/state/fact_count/fact_root/state_hash`；每个 current state 是固定
+32 层 sparse Merkle tree 的 leaf，singleton database meta 用独立 authenticated root 绑定
+projection root 与 artifact count。reserve、complete、abort、restart，以及 retired digest
+re-put 后开启下一 generation，都会先验证 meta、32 层 point proof、目标完整事实链与 current
+projection，再增量追加 transition 并更新一条 Merkle path。普通 SQL 即使绕过现有 UDF guard，
+修改 fact/current/leaf/internal node/root/count/authenticated root 也不能成为权威。
+
+攻击测试覆盖 active index+sticky row 同删、retirement fact/current/leaf/node/root/count/auth-root、
+跨 Session authority、SQLite reserve-vs-attach 并发序列化、restart/rollback/re-put，以及 Memory
+等价 contract。审查两项 RED 与 generation contract 转为 `6 passed`；新增投影/跨 Session 攻击
+`8 passed`；focused lifecycle/race `14 passed`。最终 wide 为
+`287 passed in 370.08s`，E2E 为 `39 passed in 38.74s`；Ruff lint/format 与 mypy `src`
+通过；CPython 3.11 全仓为 `1290 passed, 2 skipped in 468.07s`。

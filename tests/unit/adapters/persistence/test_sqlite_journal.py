@@ -76,6 +76,172 @@ def test_artifact_fact_and_active_index_tamper_is_rejected(tmp_path: Path, attac
     assert retirement.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
 
 
+def test_retirement_reserve_replays_facts_when_active_index_and_sticky_row_are_deleted(
+    tmp_path: Path,
+) -> None:
+    journal = make_journal(tmp_path)
+    batch = acceptance("reserve-authority")
+    fact = ArtifactAttachmentFact(
+        batch.state.session_id,
+        batch.state.run_id,
+        batch.state.submission_id,
+        "owner",
+        ArtifactAttachmentRole.FINAL_OUTPUT,
+        ArtifactAttachmentAction.ATTACHED,
+        artifact_ref("9"),
+    )
+    asyncio.run(journal.commit(replace(batch, artifact_facts=(fact,)), 0))
+    with sqlite3.connect(journal.path) as connection:
+        connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
+        connection.execute(
+            "DELETE FROM artifact_attachments WHERE artifact_id=?", (fact.artifact.artifact_id,)
+        )
+        connection.execute("DELETE FROM integrity_violations")
+
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(journal.reserve_artifact_retirement(fact.artifact.artifact_id))
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+def test_retirement_state_raw_sql_rewrite_is_not_authoritative(tmp_path: Path) -> None:
+    journal = make_journal(tmp_path)
+    artifact_id = artifact_ref("8").artifact_id
+    reservation = asyncio.run(journal.reserve_artifact_retirement(artifact_id))
+    assert reservation is not None
+    with sqlite3.connect(journal.path) as connection:
+        connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
+        connection.execute(
+            "UPDATE artifact_retirements SET generation=generation+7, state='retired' "
+            "WHERE artifact_id=?",
+            (artifact_id,),
+        )
+
+    reopened = SQLiteRunJournal(journal.path)
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(reopened.reserve_artifact_retirement(artifact_id))
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+@pytest.mark.parametrize(
+    "attack",
+    ("fact", "current", "leaf", "node", "root", "count", "authenticated-root"),
+)
+def test_retirement_authenticated_projection_rejects_tamper(tmp_path: Path, attack: str) -> None:
+    journal = make_journal(tmp_path)
+    artifact_id = artifact_ref("7").artifact_id
+    assert asyncio.run(journal.reserve_artifact_retirement(artifact_id)) is not None
+    with sqlite3.connect(journal.path) as connection:
+        connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
+        if attack == "fact":
+            connection.execute(
+                "UPDATE artifact_retirement_facts SET fact_hash=? WHERE artifact_id=?",
+                ("0" * 64, artifact_id),
+            )
+        elif attack == "current":
+            connection.execute(
+                "UPDATE artifact_retirements SET generation=generation+1 WHERE artifact_id=?",
+                (artifact_id,),
+            )
+        elif attack == "leaf":
+            connection.execute(
+                "UPDATE artifact_retirement_nodes SET digest=? WHERE level=0",
+                ("0" * 64,),
+            )
+        elif attack == "node":
+            connection.execute(
+                "UPDATE artifact_retirement_nodes SET digest=? WHERE level=1",
+                ("0" * 64,),
+            )
+        elif attack == "root":
+            connection.execute(
+                "UPDATE artifact_retirement_meta SET projection_root=?",
+                ("0" * 64,),
+            )
+        elif attack == "count":
+            connection.execute(
+                "UPDATE artifact_retirement_meta SET artifact_count=artifact_count+1"
+            )
+        else:
+            connection.execute(
+                "UPDATE artifact_retirement_meta SET authenticated_root=?",
+                ("0" * 64,),
+            )
+
+    reopened = SQLiteRunJournal(journal.path)
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(reopened.reserve_artifact_retirement(artifact_id))
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+def test_retirement_reserve_rejects_cross_session_active_index_move(tmp_path: Path) -> None:
+    journal = make_journal(tmp_path)
+    first = acceptance("authority-first", session="first")
+    second = acceptance("authority-second", session="second")
+    fact = ArtifactAttachmentFact(
+        first.state.session_id,
+        first.state.run_id,
+        first.state.submission_id,
+        "owner",
+        ArtifactAttachmentRole.SUMMARY,
+        ArtifactAttachmentAction.ATTACHED,
+        artifact_ref("6"),
+    )
+    asyncio.run(journal.commit(replace(first, artifact_facts=(fact,)), 0))
+    asyncio.run(journal.commit(second, 0))
+    with sqlite3.connect(journal.path) as connection:
+        connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
+        connection.execute(
+            "UPDATE artifact_attachments SET session_id=? WHERE artifact_id=?",
+            (second.state.session_id.value, fact.artifact.artifact_id),
+        )
+        connection.execute("DELETE FROM integrity_violations")
+    with pytest.raises(JournalError):
+        asyncio.run(journal.reserve_artifact_retirement(fact.artifact.artifact_id))
+
+
+def test_retirement_reserve_and_attach_are_one_sqlite_serialization_order(
+    tmp_path: Path,
+) -> None:
+    path = (tmp_path / "retirement-race.sqlite3").resolve()
+    first = SQLiteRunJournal(path)
+    second = SQLiteRunJournal(path)
+    batch = acceptance("retirement-race")
+    fact = ArtifactAttachmentFact(
+        batch.state.session_id,
+        batch.state.run_id,
+        batch.state.submission_id,
+        "owner",
+        ArtifactAttachmentRole.TOOL_RESULT,
+        ArtifactAttachmentAction.ATTACHED,
+        artifact_ref("5"),
+    )
+    barrier = Barrier(2)
+
+    def reserve():
+        barrier.wait()
+        return asyncio.run(first.reserve_artifact_retirement(fact.artifact.artifact_id))
+
+    def attach():
+        barrier.wait()
+        try:
+            asyncio.run(second.commit(replace(batch, artifact_facts=(fact,)), 0))
+            return None
+        except JournalError as error:
+            return error.failure.code
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        reserved = executor.submit(reserve)
+        attached = executor.submit(attach)
+        reservation = reserved.result()
+        attach_error = attached.result()
+    if reservation is None:
+        assert attach_error is None
+        assert asyncio.run(first.artifact_has_active_attachments(fact.artifact.artifact_id))
+    else:
+        assert attach_error is RunErrorCode.INVARIANT_VIOLATION
+        assert not asyncio.run(first.artifact_has_active_attachments(fact.artifact.artifact_id))
+
+
 def _coverage_history(journal: SQLiteRunJournal):
     batch = acceptance("sticky-coverage")
     receipt = None
@@ -839,6 +1005,9 @@ def test_schema_is_exact_v6_and_has_required_indexes(tmp_path: Path) -> None:
             "artifact_attachment_facts",
             "artifact_attachments",
             "artifact_retirements",
+            "artifact_retirement_facts",
+            "artifact_retirement_nodes",
+            "artifact_retirement_meta",
         }
         indexes = {
             row[0]

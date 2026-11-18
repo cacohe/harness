@@ -28,6 +28,13 @@ from src.adapters.persistence.sqlite_integrity import (
     coverage_parent_hash,
     genesis_hash,
     record_hash,
+    retirement_authenticated_root_hash,
+    retirement_empty_hash,
+    retirement_fact_hash,
+    retirement_genesis_hash,
+    retirement_leaf_hash,
+    retirement_parent_hash,
+    retirement_state_hash,
     run_empty_hash,
     run_leaf_hash,
     run_parent_hash,
@@ -69,6 +76,7 @@ _COVERAGE_BLOCK_SIZE = 128
 _COVERAGE_DEPTH = 32
 _SUMMARY_DEPTH = 32
 _RUN_DEPTH = 32
+_RETIREMENT_DEPTH = 32
 _MAX_ARTIFACT_FACTS_PER_LOOKUP = 1_000_000
 _T = TypeVar("_T")
 _IdT = TypeVar("_IdT", SessionId, RunId, SubmissionId, ProfileId)
@@ -331,9 +339,38 @@ CREATE INDEX artifact_facts_by_run ON artifact_attachment_facts(session_id, run_
 CREATE INDEX artifact_attachments_by_artifact ON artifact_attachments(artifact_id);
 CREATE TABLE artifact_retirements (
   artifact_id TEXT PRIMARY KEY,
+  artifact_index INTEGER NOT NULL UNIQUE CHECK(artifact_index >= 0),
   generation INTEGER NOT NULL CHECK(generation > 0),
-  state TEXT NOT NULL CHECK(state IN ('available', 'retiring', 'retired', 'aborted'))
+  state TEXT NOT NULL CHECK(state IN ('available', 'retiring', 'retired', 'aborted')),
+  fact_count INTEGER NOT NULL CHECK(fact_count > 0),
+  fact_root TEXT NOT NULL,
+  state_hash TEXT NOT NULL
 ) STRICT;
+CREATE TABLE artifact_retirement_facts (
+  artifact_id TEXT NOT NULL,
+  fact_index INTEGER NOT NULL CHECK(fact_index >= 0),
+  generation INTEGER NOT NULL CHECK(generation > 0),
+  state TEXT NOT NULL CHECK(state IN ('available', 'retiring', 'retired', 'aborted')),
+  previous_hash TEXT NOT NULL,
+  fact_hash TEXT NOT NULL,
+  fact_json TEXT NOT NULL,
+  PRIMARY KEY(artifact_id, fact_index)
+) STRICT;
+CREATE TABLE artifact_retirement_nodes (
+  level INTEGER NOT NULL CHECK(level >= 0 AND level <= 32),
+  node_index INTEGER NOT NULL CHECK(node_index >= 0),
+  digest TEXT NOT NULL,
+  item_count INTEGER NOT NULL CHECK(item_count >= 0),
+  PRIMARY KEY(level, node_index)
+) STRICT;
+CREATE TABLE artifact_retirement_meta (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  projection_root TEXT NOT NULL,
+  artifact_count INTEGER NOT NULL CHECK(artifact_count >= 0),
+  authenticated_root TEXT NOT NULL
+) STRICT;
+CREATE INDEX artifact_retirement_facts_by_artifact
+ON artifact_retirement_facts(artifact_id, fact_index);
 CREATE TRIGGER artifact_facts_insert_guard BEFORE INSERT ON artifact_attachment_facts
 WHEN harness_journal_append_allowed() != 1 BEGIN
   SELECT RAISE(ABORT, 'artifact facts require the commit append channel');
@@ -364,8 +401,45 @@ CREATE TRIGGER artifact_retirements_update_guard BEFORE UPDATE ON artifact_retir
 WHEN harness_journal_append_allowed() != 1 BEGIN
   SELECT RAISE(ABORT, 'artifact retirements require the lifecycle channel');
 END;
-CREATE TRIGGER artifact_retirements_delete_guard BEFORE DELETE ON artifact_retirements BEGIN
+CREATE TRIGGER artifact_retirements_delete_guard BEFORE DELETE ON artifact_retirements
+WHEN harness_journal_append_allowed() != 1 BEGIN
   SELECT RAISE(ABORT, 'artifact retirements are append-only');
+END;
+CREATE TRIGGER artifact_retirement_facts_write_guard BEFORE INSERT ON artifact_retirement_facts
+WHEN harness_journal_append_allowed() != 1 BEGIN
+  SELECT RAISE(ABORT, 'artifact retirement facts require the lifecycle channel');
+END;
+CREATE TRIGGER artifact_retirement_facts_update_guard BEFORE UPDATE ON artifact_retirement_facts
+WHEN harness_journal_append_allowed() != 1 BEGIN
+  SELECT RAISE(ABORT, 'artifact retirement facts require the lifecycle channel');
+END;
+CREATE TRIGGER artifact_retirement_facts_delete_guard BEFORE DELETE ON artifact_retirement_facts
+WHEN harness_journal_append_allowed() != 1 BEGIN
+  SELECT RAISE(ABORT, 'artifact retirement facts require the lifecycle channel');
+END;
+CREATE TRIGGER artifact_retirement_nodes_write_guard BEFORE INSERT ON artifact_retirement_nodes
+WHEN harness_journal_append_allowed() != 1 BEGIN
+  SELECT RAISE(ABORT, 'artifact retirement nodes require the lifecycle channel');
+END;
+CREATE TRIGGER artifact_retirement_nodes_update_guard BEFORE UPDATE ON artifact_retirement_nodes
+WHEN harness_journal_append_allowed() != 1 BEGIN
+  SELECT RAISE(ABORT, 'artifact retirement nodes require the lifecycle channel');
+END;
+CREATE TRIGGER artifact_retirement_nodes_delete_guard BEFORE DELETE ON artifact_retirement_nodes
+WHEN harness_journal_append_allowed() != 1 BEGIN
+  SELECT RAISE(ABORT, 'artifact retirement nodes require the lifecycle channel');
+END;
+CREATE TRIGGER artifact_retirement_meta_write_guard BEFORE INSERT ON artifact_retirement_meta
+WHEN harness_journal_append_allowed() != 1 BEGIN
+  SELECT RAISE(ABORT, 'artifact retirement meta requires the lifecycle channel');
+END;
+CREATE TRIGGER artifact_retirement_meta_update_guard BEFORE UPDATE ON artifact_retirement_meta
+WHEN harness_journal_append_allowed() != 1 BEGIN
+  SELECT RAISE(ABORT, 'artifact retirement meta requires the lifecycle channel');
+END;
+CREATE TRIGGER artifact_retirement_meta_delete_guard BEFORE DELETE ON artifact_retirement_meta
+WHEN harness_journal_append_allowed() != 1 BEGIN
+  SELECT RAISE(ABORT, 'artifact retirement meta requires the lifecycle channel');
 END;
 """
 
@@ -469,7 +543,31 @@ _EXPECTED_COLUMNS = {
         "artifact_id",
         "fact_json",
     ),
-    "artifact_retirements": ("artifact_id", "generation", "state"),
+    "artifact_retirements": (
+        "artifact_id",
+        "artifact_index",
+        "generation",
+        "state",
+        "fact_count",
+        "fact_root",
+        "state_hash",
+    ),
+    "artifact_retirement_facts": (
+        "artifact_id",
+        "fact_index",
+        "generation",
+        "state",
+        "previous_hash",
+        "fact_hash",
+        "fact_json",
+    ),
+    "artifact_retirement_nodes": ("level", "node_index", "digest", "item_count"),
+    "artifact_retirement_meta": (
+        "singleton",
+        "projection_root",
+        "artifact_count",
+        "authenticated_root",
+    ),
 }
 _EXPECTED_INDEXES = {
     "runs_active_by_session": ("session_id", "status"),
@@ -498,6 +596,7 @@ _EXPECTED_INDEXES = {
     "artifact_attachments_by_artifact": ("artifact_id",),
     "artifact_facts_by_artifact": ("artifact_id",),
     "artifact_facts_by_run": ("session_id", "run_id", "fact_index"),
+    "artifact_retirement_facts_by_artifact": ("artifact_id", "fact_index"),
 }
 
 
@@ -982,25 +1081,21 @@ class SQLiteRunJournal:
                 )
                 fact_index += 1
                 if fact.action is ArtifactAttachmentAction.ATTACHED:
-                    retirement = connection.execute(
-                        "SELECT state FROM artifact_retirements WHERE artifact_id=?",
-                        (fact.artifact.artifact_id,),
-                    ).fetchone()
-                    if retirement is not None and retirement["state"] == (
-                        ArtifactRetirementState.RETIRING.value
+                    retirement = _load_verified_retirement(connection, fact.artifact.artifact_id)
+                    if (
+                        retirement is not None
+                        and retirement.state is ArtifactRetirementState.RETIRING
                     ):
                         raise ValueError("Artifact retirement blocks attachment")
-                    if retirement is not None and retirement["state"] == (
-                        ArtifactRetirementState.RETIRED.value
+                    if (
+                        retirement is not None
+                        and retirement.state is ArtifactRetirementState.RETIRED
                     ):
-                        connection.execute(
-                            "UPDATE artifact_retirements SET generation=generation+1, state=? "
-                            "WHERE artifact_id=? AND state=?",
-                            (
-                                ArtifactRetirementState.AVAILABLE.value,
-                                fact.artifact.artifact_id,
-                                ArtifactRetirementState.RETIRED.value,
-                            ),
+                        _append_retirement_transition(
+                            connection,
+                            fact.artifact.artifact_id,
+                            retirement.generation + 1,
+                            ArtifactRetirementState.AVAILABLE,
                         )
                     existing_attachment = connection.execute(
                         "SELECT fact_json FROM artifact_attachments WHERE session_id=? AND run_id=? AND owner_id=? AND role=? AND artifact_id=?",
@@ -1817,73 +1912,7 @@ class SQLiteRunJournal:
     def _artifact_has_active_attachments_sync(self, artifact_id: str) -> bool:
         connection = self._connect()
         try:
-            expected: dict[tuple[str, str, str, str, str], ArtifactAttachmentFact] = {}
-            fact_count = 0
-            for row in connection.execute(
-                "SELECT session_id, run_id, submission_id, owner_id, role, action, artifact_id, fact_json "
-                "FROM artifact_attachment_facts WHERE artifact_id=? ORDER BY session_id, fact_index LIMIT ?",
-                (artifact_id, _MAX_ARTIFACT_FACTS_PER_LOOKUP + 1),
-            ):
-                fact_count += 1
-                if fact_count > _MAX_ARTIFACT_FACTS_PER_LOOKUP:
-                    raise ValueError("Artifact lifecycle exceeds its lookup bound")
-                _reject_integrity_violation(connection, str(row["session_id"]))
-                fact = decode(row["fact_json"], ArtifactAttachmentFact)
-                if (
-                    row["session_id"] != fact.session_id.value
-                    or row["run_id"] != fact.run_id.value
-                    or row["submission_id"] != fact.submission_id.value
-                    or row["owner_id"] != fact.owner_id
-                    or row["role"] != fact.role.value
-                    or row["action"] != fact.action.value
-                    or row["artifact_id"] != fact.artifact.artifact_id
-                ):
-                    raise ValueError("Artifact lifecycle fact row disagrees")
-                key = (
-                    fact.session_id.value,
-                    fact.run_id.value,
-                    fact.owner_id,
-                    fact.role.value,
-                    fact.artifact.artifact_id,
-                )
-                if fact.action is ArtifactAttachmentAction.ATTACHED:
-                    prior = expected.get(key)
-                    if prior is not None and prior.artifact != fact.artifact:
-                        raise ValueError("Artifact lifecycle descriptor changed")
-                    expected[key] = fact
-                elif key not in expected or expected[key].artifact != fact.artifact:
-                    raise ValueError("Artifact detach has no matching active fact")
-                else:
-                    del expected[key]
-            actual: dict[tuple[str, str, str, str, str], ArtifactAttachmentFact] = {}
-            for row in connection.execute(
-                "SELECT session_id, run_id, submission_id, owner_id, role, artifact_id, fact_json "
-                "FROM artifact_attachments WHERE artifact_id=?",
-                (artifact_id,),
-            ):
-                _reject_integrity_violation(connection, str(row["session_id"]))
-                fact = decode(row["fact_json"], ArtifactAttachmentFact)
-                key = (
-                    str(row["session_id"]),
-                    str(row["run_id"]),
-                    str(row["owner_id"]),
-                    str(row["role"]),
-                    str(row["artifact_id"]),
-                )
-                if (
-                    fact.action is not ArtifactAttachmentAction.ATTACHED
-                    or fact.session_id.value != key[0]
-                    or fact.run_id.value != key[1]
-                    or fact.submission_id.value != row["submission_id"]
-                    or fact.owner_id != key[2]
-                    or fact.role.value != key[3]
-                    or fact.artifact.artifact_id != key[4]
-                ):
-                    raise ValueError("Artifact active index row disagrees")
-                actual[key] = fact
-            if actual != expected:
-                raise ValueError("Artifact active index disagrees with lifecycle facts")
-            return bool(expected)
+            return _verify_artifact_active_index(connection, artifact_id)
         except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
         finally:
@@ -1900,46 +1929,29 @@ class SQLiteRunJournal:
                 is not None
             ):
                 raise ValueError("SQLite journal has an integrity violation")
-            if (
-                connection.execute(
-                    "SELECT 1 FROM artifact_attachments WHERE artifact_id=? LIMIT 1",
-                    (artifact_id,),
-                ).fetchone()
-                is not None
-            ):
+            if _verify_artifact_active_index(connection, artifact_id):
                 connection.rollback()
                 return None
-            row = connection.execute(
-                "SELECT generation, state FROM artifact_retirements WHERE artifact_id=?",
-                (artifact_id,),
-            ).fetchone()
-            if row is not None and row["state"] in (
-                ArtifactRetirementState.RETIRING.value,
-                ArtifactRetirementState.RETIRED.value,
+            current = _load_verified_retirement(connection, artifact_id)
+            if current is not None and current.state in (
+                ArtifactRetirementState.RETIRING,
+                ArtifactRetirementState.RETIRED,
             ):
                 connection.rollback()
-                return ArtifactRetirementReservation(
-                    artifact_id,
-                    int(row["generation"]),
-                    ArtifactRetirementState(str(row["state"])),
-                )
+                return current
             generation = (
                 1
-                if row is None
-                else int(row["generation"])
-                if row["state"] == ArtifactRetirementState.AVAILABLE.value
-                else int(row["generation"]) + 1
+                if current is None
+                else current.generation
+                if current.state is ArtifactRetirementState.AVAILABLE
+                else current.generation + 1
             )
             connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
-            connection.execute(
-                "INSERT INTO artifact_retirements(artifact_id, generation, state) VALUES (?, ?, ?) "
-                "ON CONFLICT(artifact_id) DO UPDATE SET generation=excluded.generation, state=excluded.state",
-                (artifact_id, generation, ArtifactRetirementState.RETIRING.value),
+            reservation = _append_retirement_transition(
+                connection, artifact_id, generation, ArtifactRetirementState.RETIRING
             )
             connection.commit()
-            return ArtifactRetirementReservation(
-                artifact_id, generation, ArtifactRetirementState.RETIRING
-            )
+            return reservation
         except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
             connection.rollback()
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
@@ -1956,13 +1968,15 @@ class SQLiteRunJournal:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT generation, state FROM artifact_retirements WHERE artifact_id=?",
-                (reservation.artifact_id,),
-            ).fetchone()
-            if row is None or int(row["generation"]) != reservation.generation:
+            if _verify_artifact_active_index(connection, reservation.artifact_id):
+                raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+            current_reservation = _load_verified_retirement(connection, reservation.artifact_id)
+            if (
+                current_reservation is None
+                or current_reservation.generation != reservation.generation
+            ):
                 raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
-            current = ArtifactRetirementState(str(row["state"]))
+            current = current_reservation.state
             if current is target:
                 connection.rollback()
                 return ArtifactRetirementReservation(
@@ -1971,14 +1985,11 @@ class SQLiteRunJournal:
             if current is not ArtifactRetirementState.RETIRING:
                 raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
             connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
-            connection.execute(
-                "UPDATE artifact_retirements SET state=? WHERE artifact_id=? AND generation=?",
-                (target.value, reservation.artifact_id, reservation.generation),
+            completed = _append_retirement_transition(
+                connection, reservation.artifact_id, reservation.generation, target
             )
             connection.commit()
-            return ArtifactRetirementReservation(
-                reservation.artifact_id, reservation.generation, target
-            )
+            return completed
         except JournalError:
             connection.rollback()
             raise
@@ -2229,6 +2240,331 @@ def _refresh_coverage_block(
 
 def _coverage_root(connection: sqlite3.Connection, session_key: str):
     return _read_coverage_node(connection, session_key, _COVERAGE_DEPTH, 0)
+
+
+def _verify_artifact_active_index(connection: sqlite3.Connection, artifact_id: str) -> bool:
+    expected: dict[tuple[str, str, str, str, str], ArtifactAttachmentFact] = {}
+    fact_count = 0
+    for row in connection.execute(
+        "SELECT session_id, run_id, submission_id, owner_id, role, action, artifact_id, fact_json "
+        "FROM artifact_attachment_facts WHERE artifact_id=? ORDER BY session_id, fact_index LIMIT ?",
+        (artifact_id, _MAX_ARTIFACT_FACTS_PER_LOOKUP + 1),
+    ):
+        fact_count += 1
+        if fact_count > _MAX_ARTIFACT_FACTS_PER_LOOKUP:
+            raise ValueError("Artifact lifecycle exceeds its lookup bound")
+        _reject_integrity_violation(connection, str(row["session_id"]))
+        fact = decode(row["fact_json"], ArtifactAttachmentFact)
+        if (
+            row["session_id"] != fact.session_id.value
+            or row["run_id"] != fact.run_id.value
+            or row["submission_id"] != fact.submission_id.value
+            or row["owner_id"] != fact.owner_id
+            or row["role"] != fact.role.value
+            or row["action"] != fact.action.value
+            or row["artifact_id"] != fact.artifact.artifact_id
+        ):
+            raise ValueError("Artifact lifecycle fact row disagrees")
+        key = (
+            fact.session_id.value,
+            fact.run_id.value,
+            fact.owner_id,
+            fact.role.value,
+            fact.artifact.artifact_id,
+        )
+        if fact.action is ArtifactAttachmentAction.ATTACHED:
+            prior = expected.get(key)
+            if prior is not None and prior.artifact != fact.artifact:
+                raise ValueError("Artifact lifecycle descriptor changed")
+            expected[key] = fact
+        elif key not in expected or expected[key].artifact != fact.artifact:
+            raise ValueError("Artifact detach has no matching active fact")
+        else:
+            del expected[key]
+    actual: dict[tuple[str, str, str, str, str], ArtifactAttachmentFact] = {}
+    for row in connection.execute(
+        "SELECT session_id, run_id, submission_id, owner_id, role, artifact_id, fact_json "
+        "FROM artifact_attachments WHERE artifact_id=?",
+        (artifact_id,),
+    ):
+        _reject_integrity_violation(connection, str(row["session_id"]))
+        fact = decode(row["fact_json"], ArtifactAttachmentFact)
+        key = (
+            str(row["session_id"]),
+            str(row["run_id"]),
+            str(row["owner_id"]),
+            str(row["role"]),
+            str(row["artifact_id"]),
+        )
+        if (
+            fact.action is not ArtifactAttachmentAction.ATTACHED
+            or fact.session_id.value != key[0]
+            or fact.run_id.value != key[1]
+            or fact.submission_id.value != row["submission_id"]
+            or fact.owner_id != key[2]
+            or fact.role.value != key[3]
+            or fact.artifact.artifact_id != key[4]
+        ):
+            raise ValueError("Artifact active index row disagrees")
+        actual[key] = fact
+    if actual != expected:
+        raise ValueError("Artifact active index disagrees with lifecycle facts")
+    return bool(expected)
+
+
+def _retirement_node_value(row: sqlite3.Row | None, level: int, node_index: int) -> tuple[str, int]:
+    if row is None:
+        return retirement_empty_hash(level, node_index), 0
+    digest = validate_hash(row["digest"])
+    count = row["item_count"]
+    if type(count) is not int or count < 0:
+        raise ValueError("SQLite retirement projection node is invalid")
+    return digest, count
+
+
+def _read_retirement_node(
+    connection: sqlite3.Connection, level: int, node_index: int
+) -> tuple[str, int]:
+    row = connection.execute(
+        "SELECT digest, item_count FROM artifact_retirement_nodes WHERE level=? AND node_index=?",
+        (level, node_index),
+    ).fetchone()
+    return _retirement_node_value(row, level, node_index)
+
+
+def _write_retirement_node(
+    connection: sqlite3.Connection,
+    level: int,
+    node_index: int,
+    value: tuple[str, int],
+) -> None:
+    connection.execute(
+        "INSERT INTO artifact_retirement_nodes(level, node_index, digest, item_count) "
+        "VALUES (?, ?, ?, ?) ON CONFLICT(level, node_index) DO UPDATE "
+        "SET digest=excluded.digest, item_count=excluded.item_count",
+        (level, node_index, *value),
+    )
+
+
+def _set_retirement_leaf(
+    connection: sqlite3.Connection, artifact_index: int, state_digest: str
+) -> str:
+    if not 0 <= artifact_index < (1 << _RETIREMENT_DEPTH):
+        raise ValueError("SQLite retirement projection index exceeds capacity")
+    index = artifact_index
+    value = (retirement_leaf_hash(artifact_index, state_digest), 1)
+    _write_retirement_node(connection, 0, index, value)
+    for level in range(1, _RETIREMENT_DEPTH + 1):
+        sibling = _read_retirement_node(connection, level - 1, index ^ 1)
+        left, right = (value, sibling) if index % 2 == 0 else (sibling, value)
+        parent_index = index // 2
+        value = (
+            retirement_parent_hash(level, parent_index, left, right),
+            left[1] + right[1],
+        )
+        _write_retirement_node(connection, level, parent_index, value)
+        index = parent_index
+    return value[0]
+
+
+def _verify_retirement_meta(connection: sqlite3.Connection) -> tuple[str, int]:
+    row = connection.execute(
+        "SELECT projection_root, artifact_count, authenticated_root "
+        "FROM artifact_retirement_meta WHERE singleton=1"
+    ).fetchone()
+    if row is None:
+        if any(
+            connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+            for table in (
+                "artifact_retirements",
+                "artifact_retirement_facts",
+                "artifact_retirement_nodes",
+            )
+        ):
+            raise ValueError("SQLite retirement authenticated root is missing")
+        return retirement_empty_hash(_RETIREMENT_DEPTH, 0), 0
+    projection_root = validate_hash(row["projection_root"])
+    artifact_count = row["artifact_count"]
+    if type(artifact_count) is not int or not 0 <= artifact_count < (1 << _RETIREMENT_DEPTH):
+        raise ValueError("SQLite retirement artifact count is invalid")
+    if row["authenticated_root"] != retirement_authenticated_root_hash(
+        projection_root, artifact_count
+    ):
+        raise ValueError("SQLite retirement authenticated root disagrees")
+    root = _read_retirement_node(connection, _RETIREMENT_DEPTH, 0)
+    if root != (projection_root, artifact_count):
+        raise ValueError("SQLite retirement projection root disagrees")
+    return projection_root, artifact_count
+
+
+def _verify_retirement_path(
+    connection: sqlite3.Connection,
+    artifact_index: int,
+    state_digest: str,
+    expected_root: str,
+) -> None:
+    index = artifact_index
+    value = (retirement_leaf_hash(artifact_index, state_digest), 1)
+    if _read_retirement_node(connection, 0, index) != value:
+        raise ValueError("SQLite retirement projection leaf disagrees")
+    for level in range(1, _RETIREMENT_DEPTH + 1):
+        sibling = _read_retirement_node(connection, level - 1, index ^ 1)
+        left, right = (value, sibling) if index % 2 == 0 else (sibling, value)
+        parent_index = index // 2
+        value = (
+            retirement_parent_hash(level, parent_index, left, right),
+            left[1] + right[1],
+        )
+        if _read_retirement_node(connection, level, parent_index) != value:
+            raise ValueError("SQLite retirement projection Merkle path is invalid")
+        index = parent_index
+    if value[0] != validate_hash(expected_root):
+        raise ValueError("SQLite retirement projection path disagrees with root")
+
+
+def _load_verified_retirement(
+    connection: sqlite3.Connection, artifact_id: str
+) -> ArtifactRetirementReservation | None:
+    projection_root, artifact_count = _verify_retirement_meta(connection)
+    row = connection.execute(
+        "SELECT artifact_index, generation, state, fact_count, fact_root, state_hash "
+        "FROM artifact_retirements WHERE artifact_id=?",
+        (artifact_id,),
+    ).fetchone()
+    if row is None:
+        if (
+            connection.execute(
+                "SELECT 1 FROM artifact_retirement_facts WHERE artifact_id=? LIMIT 1",
+                (artifact_id,),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("SQLite retirement current projection is missing")
+        return None
+    artifact_index = row["artifact_index"]
+    generation = row["generation"]
+    fact_count = row["fact_count"]
+    state = ArtifactRetirementState(str(row["state"]))
+    if (
+        type(artifact_index) is not int
+        or not 0 <= artifact_index < artifact_count
+        or type(generation) is not int
+        or generation < 1
+        or type(fact_count) is not int
+        or not 1 <= fact_count <= _MAX_ARTIFACT_FACTS_PER_LOOKUP
+    ):
+        raise ValueError("SQLite retirement current projection is invalid")
+    fact_root = validate_hash(row["fact_root"])
+    state_digest = retirement_state_hash(
+        artifact_id, artifact_index, generation, state.value, fact_count, fact_root
+    )
+    if row["state_hash"] != state_digest:
+        raise ValueError("SQLite retirement state hash disagrees")
+    _verify_retirement_path(connection, artifact_index, state_digest, projection_root)
+    previous = retirement_genesis_hash(artifact_id)
+    facts = connection.execute(
+        "SELECT fact_index, generation, state, previous_hash, fact_hash, fact_json "
+        "FROM artifact_retirement_facts WHERE artifact_id=? ORDER BY fact_index LIMIT ?",
+        (artifact_id, _MAX_ARTIFACT_FACTS_PER_LOOKUP + 1),
+    ).fetchall()
+    if len(facts) != fact_count:
+        raise ValueError("SQLite retirement fact count disagrees")
+    last: ArtifactRetirementReservation | None = None
+    for expected_index, fact in enumerate(facts):
+        decoded = decode(fact["fact_json"], ArtifactRetirementReservation)
+        if (
+            fact["fact_index"] != expected_index
+            or decoded.artifact_id != artifact_id
+            or fact["generation"] != decoded.generation
+            or fact["state"] != decoded.state.value
+            or fact["previous_hash"] != previous
+        ):
+            raise ValueError("SQLite retirement fact disagrees")
+        expected_hash = retirement_fact_hash(
+            artifact_id,
+            expected_index,
+            decoded.generation,
+            decoded.state.value,
+            previous,
+        )
+        if fact["fact_hash"] != expected_hash:
+            raise ValueError("SQLite retirement fact hash disagrees")
+        previous = expected_hash
+        last = decoded
+    if previous != fact_root or last != ArtifactRetirementReservation(
+        artifact_id, generation, state
+    ):
+        raise ValueError("SQLite retirement fact root disagrees")
+    return last
+
+
+def _append_retirement_transition(
+    connection: sqlite3.Connection,
+    artifact_id: str,
+    generation: int,
+    state: ArtifactRetirementState,
+) -> ArtifactRetirementReservation:
+    _projection_root, artifact_count = _verify_retirement_meta(connection)
+    current = connection.execute(
+        "SELECT artifact_index, fact_count, fact_root FROM artifact_retirements "
+        "WHERE artifact_id=?",
+        (artifact_id,),
+    ).fetchone()
+    if current is None:
+        artifact_index = artifact_count
+        fact_index = 0
+        previous = retirement_genesis_hash(artifact_id)
+        next_count = artifact_count + 1
+    else:
+        artifact_index = int(current["artifact_index"])
+        fact_index = int(current["fact_count"])
+        previous = validate_hash(current["fact_root"])
+        next_count = artifact_count
+    reservation = ArtifactRetirementReservation(artifact_id, generation, state)
+    fact_digest = retirement_fact_hash(artifact_id, fact_index, generation, state.value, previous)
+    connection.execute(
+        "INSERT INTO artifact_retirement_facts(artifact_id, fact_index, generation, state, "
+        "previous_hash, fact_hash, fact_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            artifact_id,
+            fact_index,
+            generation,
+            state.value,
+            previous,
+            fact_digest,
+            encode(reservation),
+        ),
+    )
+    fact_count = fact_index + 1
+    state_digest = retirement_state_hash(
+        artifact_id, artifact_index, generation, state.value, fact_count, fact_digest
+    )
+    connection.execute(
+        "INSERT INTO artifact_retirements(artifact_id, artifact_index, generation, state, "
+        "fact_count, fact_root, state_hash) VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(artifact_id) DO UPDATE SET generation=excluded.generation, "
+        "state=excluded.state, fact_count=excluded.fact_count, fact_root=excluded.fact_root, "
+        "state_hash=excluded.state_hash",
+        (
+            artifact_id,
+            artifact_index,
+            generation,
+            state.value,
+            fact_count,
+            fact_digest,
+            state_digest,
+        ),
+    )
+    projection_root = _set_retirement_leaf(connection, artifact_index, state_digest)
+    authenticated_root = retirement_authenticated_root_hash(projection_root, next_count)
+    connection.execute(
+        "INSERT INTO artifact_retirement_meta(singleton, projection_root, artifact_count, "
+        "authenticated_root) VALUES (1, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET "
+        "projection_root=excluded.projection_root, artifact_count=excluded.artifact_count, "
+        "authenticated_root=excluded.authenticated_root",
+        (projection_root, next_count, authenticated_root),
+    )
+    return reservation
 
 
 def _run_node_value(

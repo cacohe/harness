@@ -15,6 +15,8 @@ from src.core.journal import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,
+    ArtifactRetirementReservation,
+    ArtifactRetirementState,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalEvent,
@@ -54,6 +56,7 @@ _RECORDS: dict[str, type[Any]] = {
         TranscriptEntry,
         ConversationSummaryCheckpoint,
         ArtifactAttachmentFact,
+        ArtifactRetirementReservation,
     )
 }
 _IDS = {cls.__name__: cls for cls in (EventId, ProfileId, RunId, SessionId, SubmissionId)}
@@ -66,6 +69,7 @@ _ENUMS = {
         TranscriptEntryType,
         ArtifactAttachmentRole,
         ArtifactAttachmentAction,
+        ArtifactRetirementState,
     )
 }
 

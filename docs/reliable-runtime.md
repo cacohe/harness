@@ -131,6 +131,17 @@ SQLite persists these reservations; the memory journal uses the same state machi
 Memory lifecycle paging keeps a per-Run ordered index and performs `bisect + limit` access, so its
 lookup cost is `O(log F_run + limit)` and does not scan other Runs or copy full fact history.
 
+The SQLite retirement gate does not trust the derived active-owner table. Inside the same
+`BEGIN IMMEDIATE`, it replays at most 1,000,000 lifecycle facts selected by `artifact_id` and
+requires exact bidirectional agreement with the index. Retirement transitions have their own
+per-artifact append-only canonical hash chain. The current state is a leaf in a fixed-depth sparse
+Merkle projection whose root and count are bound by a database retirement authenticated root.
+Reserve, complete, abort, restart, and content-generation reopening verify the selected chain and
+32-level proof before use. This detects partial raw-SQL rewrites of lifecycle facts, current state,
+generation, leaf, internal node, root, or count. As with the Session journal authentication model,
+an administrator that recomputes and rewrites every anchor is outside this corruption-detection
+boundary.
+
 ## Observability and shutdown
 
 Observers run only after a successful journal commit. Sink failure or timeout does not roll back
