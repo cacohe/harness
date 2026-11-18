@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import pytest
 from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactExternalizer
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
+from src.adapters.context.tokenizers import ExactTokenCounter
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.application.composition import ApplicationConfig, create_development_agent
 from src.core.artifacts import InlineContent
@@ -197,6 +198,7 @@ async def rig(*, journal=None, model=None, tools=None, ids=None):
         model=selected_model,
         tools=selected_tools,
         context=Context(),
+        context_counter=ExactTokenCounter(),
         context_request_factory=request_factory,
         ids=ids or Ids(),
         clock=Clock(),

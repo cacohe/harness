@@ -317,6 +317,7 @@ def test_ten_thousand_transcript_entries_are_paged_and_model_state_stays_bounded
             model=model,
             tools=Tools(),
             context=provider,
+            context_counter=ExactTokenCounter(),
             context_request_factory=request_factory,
             ids=Ids("bounded"),
             clock=Clock(),
@@ -416,7 +417,7 @@ def test_production_journal_reader_bounds_partial_checkpoint_history(
     selected = tuple(
         message
         for message in window.messages
-        if (message.content or "").startswith("Historical assistant:")
+        if message.role is ModelRole.ASSISTANT and (message.content or "").startswith("history-")
     )
     assert transcript_omissions[1].last_sequence == 10_001 - len(selected)
     assert sum(item.item_count for item in transcript_omissions) + 2_000 + len(selected) == 10_000
@@ -470,6 +471,7 @@ def test_configured_serialized_run_envelope_bounds_large_batch_and_artifact_resu
             model=BatchModel(),
             tools=ArtifactTools(),
             context=context,
+            context_counter=ExactTokenCounter(),
             context_request_factory=request_factory,
             ids=Ids(f"state-{max_state_bytes}"),
             clock=Clock(),

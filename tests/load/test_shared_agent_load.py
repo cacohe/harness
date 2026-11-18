@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactExternalizer
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
+from src.adapters.context.tokenizers import ExactTokenCounter
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.application.composition import ApplicationConfig, create_development_agent
 from src.core.commands import RunLimits
@@ -142,6 +143,7 @@ def test_shared_agent_isolates_64_sessions_and_same_session_submission_race():
             model=model,
             tools=NoTools(),
             context=PerSessionContext(),
+            context_counter=ExactTokenCounter(),
             context_request_factory=request_factory,
             ids=V3Ids(),
             clock=V3Clock(),

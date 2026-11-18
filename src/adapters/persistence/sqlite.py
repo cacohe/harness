@@ -9,7 +9,10 @@ from pathlib import Path
 from threading import Event
 from typing import TypeVar
 
-from src.adapters.context.journal_history import transcript_interaction
+from src.adapters.context.journal_history import (
+    MAX_TRANSCRIPT_ROWS_PER_INTERACTION,
+    newest_transcript_interactions,
+)
 from src.adapters.persistence.memory import (
     _canonical_copy,
     _coverage_ranges,
@@ -803,7 +806,7 @@ class SQLiteRunJournal:
                         "SELECT session_id, sequence, run_id, submission_id, role, content, "
                         "entry_json FROM transcript WHERE session_id=? "
                         "ORDER BY sequence DESC LIMIT ?",
-                        (session_key, limit + 1),
+                        (session_key, (limit + 1) * MAX_TRANSCRIPT_ROWS_PER_INTERACTION),
                     )
                 )
             else:
@@ -812,16 +815,33 @@ class SQLiteRunJournal:
                         "SELECT session_id, sequence, run_id, submission_id, role, content, "
                         "entry_json FROM transcript WHERE session_id=? AND sequence<? "
                         "ORDER BY sequence DESC LIMIT ?",
-                        (session_key, before_sequence, limit + 1),
+                        (
+                            session_key,
+                            before_sequence,
+                            (limit + 1) * MAX_TRANSCRIPT_ROWS_PER_INTERACTION,
+                        ),
                     )
                 )
-            selected = rows[:limit]
-            entries = tuple(_decode_transcript_row(row, session_key) for row in selected)
+            entries = tuple(_decode_transcript_row(row, session_key) for row in rows)
             for entry in entries:
                 _verify_point_anchor(connection, session_key, entry.sequence)
-            cursor = entries[-1].sequence if len(rows) > limit else None
+            chronological = tuple(reversed(entries))
+            raw_limit = (limit + 1) * MAX_TRANSCRIPT_ROWS_PER_INTERACTION
+            if len(rows) == raw_limit:
+                boundary = next(
+                    (index for index, entry in enumerate(chronological) if entry.role != "tool"),
+                    len(chronological),
+                )
+                chronological = chronological[boundary:]
+            interactions = newest_transcript_interactions(chronological, limit + 1)
+            selected = interactions[:limit]
+            cursor = (
+                selected[-1].sequence_from
+                if selected and (len(interactions) > limit or len(rows) == raw_limit)
+                else None
+            )
             result = ConversationPage(
-                tuple(transcript_interaction(entry) for entry in entries),
+                selected,
                 cursor,
             )
             connection.commit()

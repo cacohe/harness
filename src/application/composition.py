@@ -23,7 +23,7 @@ from src.application.runtime import RuntimeCoordinator, _close_resource
 from src.application.submissions import SubmissionService
 from src.core.artifacts import ArtifactExternalizer
 from src.core.commands import RunLimits
-from src.core.context import ContextBudget, ContextProvider, ContextRequest
+from src.core.context import ContextBudget, ContextProvider, ContextRequest, TokenCounter
 from src.core.ids import Clock, IdGenerator, ProfileId
 from src.core.journal import RunJournal
 from src.core.model import ModelGateway
@@ -101,6 +101,7 @@ async def create_development_agent(
     model: ModelGateway,
     tools: ToolGateway,
     context: ContextProvider,
+    context_counter: TokenCounter,
     context_request_factory: ContextRequestFactory,
     ids: IdGenerator,
     clock: Clock,
@@ -115,6 +116,7 @@ async def create_development_agent(
         model=model,
         tools=tools,
         context=context,
+        context_counter=context_counter,
         context_request_factory=context_request_factory,
         ids=ids,
         clock=clock,
@@ -143,6 +145,7 @@ async def create_development_agent(
             model=model,
             tools=tools,
             context=context,
+            context_counter=context_counter,
             context_request_factory=context_request_factory,
             ids=ids,
             clock=clock,
@@ -162,6 +165,7 @@ async def create_production_agent(
     model: ModelGateway,
     tools: ToolGateway,
     context: ContextProvider,
+    context_counter: TokenCounter,
     context_request_factory: ContextRequestFactory,
     ids: IdGenerator,
     clock: Clock,
@@ -176,6 +180,7 @@ async def create_production_agent(
         model=model,
         tools=tools,
         context=context,
+        context_counter=context_counter,
         context_request_factory=context_request_factory,
         ids=ids,
         clock=clock,
@@ -217,6 +222,7 @@ async def create_production_agent(
             model=model,
             tools=tools,
             context=context,
+            context_counter=context_counter,
             context_request_factory=context_request_factory,
             ids=ids,
             clock=clock,
@@ -236,6 +242,7 @@ def _compose(
     model: ModelGateway,
     tools: ToolGateway,
     context: ContextProvider,
+    context_counter: TokenCounter,
     context_request_factory: ContextRequestFactory,
     ids: IdGenerator,
     clock: Clock,
@@ -262,6 +269,7 @@ def _compose(
             ids=ids,
             context_request=request,
             context_budget=config.context_budget,
+            context_counter=context_counter,
         )
 
     runtime = RuntimeCoordinator(
@@ -286,6 +294,7 @@ def _validate_composition_inputs(
     model: ModelGateway,
     tools: ToolGateway,
     context: ContextProvider,
+    context_counter: TokenCounter,
     context_request_factory: ContextRequestFactory,
     ids: IdGenerator,
     clock: Clock,
@@ -306,6 +315,7 @@ def _validate_composition_inputs(
     _require_methods(model, ("complete",))
     _require_methods(tools, ("execute",))
     _require_methods(context, ("build",))
+    _require_methods(context_counter, ("count",))
     _require_callable(context_request_factory)
     _require_methods(
         ids, ("run", "session", "submission", "profile", "event", "step", "model_call")

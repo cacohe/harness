@@ -6,14 +6,16 @@ from datetime import datetime
 from threading import Lock
 from typing import Any, TypeAlias, TypeVar
 
-from src.adapters.context.journal_history import transcript_interaction
+from src.adapters.context.journal_history import (
+    MAX_TRANSCRIPT_ROWS_PER_INTERACTION,
+    newest_transcript_interactions,
+)
 from src.core.artifacts import ArtifactRef, ExternalizedContent, snapshot_artifact_ref
 from src.core.commands import RunLimits, ToolCallRequest
 from src.core.context import (
     ConversationCoverage,
     ConversationCoverageSegment,
     ConversationPage,
-    OmittedContextRef,
 )
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.events import DomainEvent, DomainEventType, _is_canonical_timestamp
@@ -259,12 +261,18 @@ class InMemoryRunJournal:
             if before_sequence is None
             else bisect_left(transcript, before_sequence, key=lambda entry: entry.sequence)
         )
-        start = max(0, end - limit)
+        start = max(0, end - (limit + 1) * MAX_TRANSCRIPT_ROWS_PER_INTERACTION)
         entries = transcript[start:end]
-        page = tuple(transcript_interaction(entry) for entry in reversed(entries))
-        cursor = entries[0].sequence if start else None
-        remaining = _transcript_omission(transcript, 0, start) if start else None
-        return ConversationPage(page, cursor, remaining)
+        if start:
+            boundary = next(
+                (index for index, entry in enumerate(entries) if entry.role != "tool"),
+                len(entries),
+            )
+            entries = entries[boundary:]
+        interactions = newest_transcript_interactions(entries, limit + 1)
+        page = interactions[:limit]
+        cursor = page[-1].sequence_from if page and (len(interactions) > limit or start) else None
+        return ConversationPage(page, cursor)
 
     async def summarize_before(
         self,
@@ -369,19 +377,6 @@ def _validate_aggregate_request(
         )
     ):
         raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
-
-
-def _transcript_omission(
-    transcript: tuple[TranscriptEntry, ...], start: int, end: int
-) -> OmittedContextRef | None:
-    if start >= end:
-        return None
-    return OmittedContextRef(
-        "transcript",
-        transcript[start].sequence,
-        transcript[end - 1].sequence,
-        end - start,
-    )
 
 
 def _coverage_ranges(

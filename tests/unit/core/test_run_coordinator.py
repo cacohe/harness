@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import pytest
 from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactExternalizer
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
+from src.adapters.context.tokenizers import ExactTokenCounter
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.core.artifacts import InlineContent
 from src.core.commands import (
@@ -171,7 +172,14 @@ def initial():
 
 
 def coordinator(
-    *, responses, specs=(), tool_results=(), context_failure=None, checkpoint=None, journal=None
+    *,
+    responses,
+    specs=(),
+    tool_results=(),
+    context_failure=None,
+    checkpoint=None,
+    journal=None,
+    context=None,
 ):
     calls = []
     journal = journal or Journal(calls)
@@ -182,7 +190,7 @@ def coordinator(
     )
     tools = Tools(calls, tool_results)
     result = RunCoordinator(
-        context=Context(calls, context_failure, checkpoint),
+        context=context or Context(calls, context_failure, checkpoint),
         model=Model(calls, responses),
         tools=tools,
         artifacts=externalizer,
@@ -191,8 +199,69 @@ def coordinator(
         ids=Ids(),
         context_request=request(specs),
         context_budget=BUDGET,
+        context_counter=ExactTokenCounter(),
     )
     return result, calls, journal, tools, repository
+
+
+def test_model_is_not_called_when_context_window_exceeds_core_owned_budget():
+    calls = []
+
+    class OverBudgetContext:
+        async def build(self, request_, _budget):
+            calls.append("context")
+            return ContextWindow(
+                (
+                    request_.system_message,
+                    ModelMessage(ModelRole.USER, "x" * 9999),
+                    request_.current_input,
+                ),
+                request_.tools,
+                TokenEstimate(9999, EstimateQuality.EXACT),
+                ContextBudget(10_000, 0, 0),
+                (),
+                request_.policy_version,
+            )
+
+    coordinator_, calls_, _, _, _ = coordinator(
+        responses=[ModelResponse("must-not-run")], context=OverBudgetContext()
+    )
+    calls = calls_
+
+    outcome = run(coordinator_.advance(initial(), submit()))
+
+    assert calls == ["context", "journal"]
+    assert outcome.state.status is RunStatus.FAILED
+    assert outcome.state.failure == RunFailure(RunErrorCode.CONTEXT_BUDGET_EXCEEDED)
+
+
+def test_model_is_not_called_when_context_window_changes_the_bound_tool_catalog():
+    calls = []
+
+    class DropsToolsContext:
+        async def build(self, request_, budget):
+            calls.append("context")
+            return ContextWindow(
+                (request_.system_message, request_.current_input),
+                (),
+                TokenEstimate(2, EstimateQuality.EXACT),
+                budget,
+                (),
+                request_.policy_version,
+            )
+
+    spec = ToolSpec("read", "read", "{}")
+    coordinator_, calls_, _, _, _ = coordinator(
+        responses=[ModelResponse("must-not-run")],
+        specs=(spec,),
+        context=DropsToolsContext(),
+    )
+    calls = calls_
+
+    outcome = run(coordinator_.advance(initial(), submit()))
+
+    assert calls == ["context", "journal"]
+    assert outcome.state.failure == RunFailure(RunErrorCode.INVARIANT_VIOLATION)
 
 
 def run(awaitable):

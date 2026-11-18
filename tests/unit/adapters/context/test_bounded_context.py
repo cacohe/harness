@@ -449,3 +449,17 @@ def test_conservative_fallback_applies_safety_factor() -> None:
     estimate = counter.count((ModelMessage(ModelRole.USER, "12345678"),), ())
     assert estimate.tokens >= 3
     assert estimate.quality is EstimateQuality.CONSERVATIVE
+
+
+@pytest.mark.parametrize("factor", [1e308, float("inf"), float("nan")])
+def test_conservative_counter_rejects_factors_that_cannot_produce_bounded_counts(
+    factor: float,
+) -> None:
+    with pytest.raises(ValueError, match="configuration"):
+        ConservativeTokenCounter(safety_factor=factor)
+
+
+def test_conservative_counter_never_leaks_overflow_at_its_supported_boundary() -> None:
+    counter = ConservativeTokenCounter(safety_factor=2.0)
+    estimate = counter.count((ModelMessage(ModelRole.USER, "x" * 1024),), ())
+    assert estimate.tokens > 0

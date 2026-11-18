@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactExternalizer
 from src.adapters.artifacts.filesystem import FilesystemArtifactRepository
+from src.adapters.context.tokenizers import ExactTokenCounter
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.adapters.persistence.sqlite_codec import encode
 from src.adapters.tools import (
@@ -195,6 +196,7 @@ def test_large_tool_result_is_referenced_read_in_bounded_slice_and_never_journal
             model=model,
             tools=gateway,
             context=JournalContext(journal),
+            context_counter=ExactTokenCounter(),
             context_request_factory=request_factory,
             ids=Ids(),
             clock=Clock(),

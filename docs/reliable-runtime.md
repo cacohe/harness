@@ -15,6 +15,7 @@ agent = await create_production_agent(
     model=model_gateway,
     tools=tool_gateway,
     context=context_provider,
+    context_counter=token_counter,
     context_request_factory=request_factory,
     ids=id_generator,
     clock=clock,

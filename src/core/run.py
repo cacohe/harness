@@ -20,7 +20,13 @@ from src.core.commands import (
     StartToolCall,
     SubmitRun,
 )
-from src.core.context import ContextBudget, ContextBudgetExceeded, ContextProvider, ContextRequest
+from src.core.context import (
+    ContextBudget,
+    ContextBudgetExceeded,
+    ContextProvider,
+    ContextRequest,
+    TokenCounter,
+)
 from src.core.errors import InvalidTransition, RunErrorCode, RunFailure
 from src.core.events import DomainEvent
 from src.core.ids import Clock, IdGenerator
@@ -67,6 +73,7 @@ class RunCoordinator:
         ids: IdGenerator,
         context_request: ContextRequest,
         context_budget: ContextBudget,
+        context_counter: TokenCounter,
     ) -> None:
         self._context = context
         self._model = model
@@ -77,6 +84,7 @@ class RunCoordinator:
         self._ids = ids
         self._request = context_request
         self._budget = context_budget
+        self._counter = context_counter
 
     async def advance(self, state: RunState, command: CoreCommand) -> RunOutcome:
         if type(state) is not RunState or command.run_id != state.run_id:
@@ -128,6 +136,19 @@ class RunCoordinator:
             return await driver.commit()
         try:
             window = await self._context.build(self._request, self._budget)
+            estimate = self._counter.count(window.messages, window.tools)
+            if (
+                window.policy_version != self._request.policy_version
+                or window.tools != self._request.tools
+                or window.messages[0] != self._request.system_message
+                or window.messages[-1] != self._request.current_input
+            ):
+                raise ValueError("Context window does not match its request binding")
+            if (
+                window.budget != self._budget
+                or estimate.tokens > self._budget.input_allowance_tokens
+            ):
+                raise ContextBudgetExceeded
         except ContextBudgetExceeded:
             return await driver.fail(RunErrorCode.CONTEXT_BUDGET_EXCEEDED)
         except Exception:

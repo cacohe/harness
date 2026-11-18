@@ -7,6 +7,9 @@ from src.core.context import EstimateQuality, TokenEstimate
 from src.core.model import ModelMessage
 from src.core.tools import ToolSpec
 
+_MAX_TOKEN_COUNT = (1 << 63) - 1
+_MAX_SAFETY_FACTOR = 1024.0
+
 
 def _wire_text(messages: tuple[ModelMessage, ...], tools: tuple[ToolSpec, ...]) -> Iterator[str]:
     for message in messages:
@@ -56,7 +59,7 @@ class ConservativeTokenCounter:
             or chars_per_token <= 0
             or type(safety_factor) is not float
             or not math.isfinite(safety_factor)
-            or safety_factor < 1.0
+            or not 1.0 <= safety_factor <= _MAX_SAFETY_FACTOR
         ):
             raise ValueError("Conservative counter configuration is invalid")
         self._chars_per_token = chars_per_token
@@ -67,5 +70,10 @@ class ConservativeTokenCounter:
     ) -> TokenEstimate:
         size = sum(len(value.encode("utf-8")) for value in _wire_text(messages, tools))
         envelope = 4 * len(messages) + 8 * len(tools)
-        count = math.ceil((size / self._chars_per_token + envelope) * self._safety_factor)
+        try:
+            count = math.ceil((size / self._chars_per_token + envelope) * self._safety_factor)
+        except OverflowError:
+            raise ValueError("Conservative token estimate exceeds its supported range") from None
+        if count > _MAX_TOKEN_COUNT:
+            raise ValueError("Conservative token estimate exceeds its supported range")
         return TokenEstimate(count, EstimateQuality.CONSERVATIVE)

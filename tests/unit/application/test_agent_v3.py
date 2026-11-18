@@ -109,6 +109,7 @@ def test_application_exports_do_not_reexport_legacy_harness_surface():
         "model",
         "tools",
         "context",
+        "context_counter",
         "context_request_factory",
         "ids",
         "clock",
@@ -129,6 +130,10 @@ def test_composition_rejects_invalid_ports_before_filesystem_side_effects(tmp_pa
 
     class Context:
         async def build(self, _request, _budget):
+            raise NotImplementedError
+
+    class Counter:
+        def count(self, _messages, _tools):
             raise NotImplementedError
 
     class RequestFactory:
@@ -161,6 +166,7 @@ def test_composition_rejects_invalid_ports_before_filesystem_side_effects(tmp_pa
         "model": Model(),
         "tools": Tools(),
         "context": Context(),
+        "context_counter": Counter(),
         "context_request_factory": RequestFactory(),
         "ids": Ids(),
         "clock": Clock(),
@@ -200,6 +206,7 @@ def test_composition_validation_does_not_execute_malicious_descriptors(tmp_path)
                 model=HostileModel(),  # type: ignore[arg-type]
                 tools=object(),  # type: ignore[arg-type]
                 context=object(),  # type: ignore[arg-type]
+                context_counter=object(),  # type: ignore[arg-type]
                 context_request_factory=object(),  # type: ignore[arg-type]
                 ids=Ids(),
                 clock=Clock(),
@@ -453,6 +460,10 @@ def _valid_composition_dependencies():
         async def build(self, _request, _budget):
             raise NotImplementedError
 
+    class Counter:
+        def count(self, _messages, _tools):
+            raise NotImplementedError
+
     class RequestFactory:
         def __call__(self, _state, _message):
             raise NotImplementedError
@@ -461,6 +472,7 @@ def _valid_composition_dependencies():
         "model": Model(),
         "tools": Tools(),
         "context": Context(),
+        "context_counter": Counter(),
         "context_request_factory": RequestFactory(),
         "ids": Ids(),
         "clock": Clock(),
