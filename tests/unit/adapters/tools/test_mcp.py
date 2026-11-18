@@ -939,3 +939,341 @@ def test_blocked_async_close_has_bounded_idempotent_failure() -> None:
         assert client.close_calls == 1
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("async_close", [False, True])
+def test_abandoned_discovery_closes_after_original_loop_exits(async_close) -> None:
+    release = threading.Event()
+    closed = threading.Event()
+
+    class Discovery:
+        def __init__(self):
+            self.close_count = 0
+            self.listing = False
+
+        def list_tools(self):
+            self.listing = True
+            try:
+                release.wait()
+                return []
+            finally:
+                self.listing = False
+
+        def close(self):
+            assert not self.listing
+            self.close_count += 1
+            closed.set()
+
+    class AsyncCloseDiscovery(Discovery):
+        async def aclose(self):
+            await asyncio.sleep(0)
+            self.close()
+
+    client = AsyncCloseDiscovery() if async_close else Discovery()
+
+    async def scenario():
+        gateway = _gateway(client, timeout_seconds=0.05)
+        with pytest.raises(TimeoutError):
+            await gateway.add_server("server", object())
+        with pytest.raises(TimeoutError):
+            await gateway.aclose()
+        assert client.close_count == 0
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+    assert closed.wait(1), "known client lost its cleanup owner when its loop exited"
+    assert client.close_count == 1
+
+
+def test_abandoned_sync_discovery_closes_async_client_on_live_original_loop() -> None:
+    release = threading.Event()
+
+    class Discovery(Client):
+        def list_tools(self):
+            release.wait()
+            return []
+
+        async def aclose(self):
+            assert asyncio.get_running_loop() is self.origin
+            await asyncio.sleep(0)
+            await super().aclose()
+
+    async def scenario():
+        client = Discovery()
+        client.origin = asyncio.get_running_loop()
+        gateway = _gateway(client, timeout_seconds=0.05)
+        with pytest.raises(TimeoutError):
+            await gateway.add_server("server", object())
+        release.set()
+        await gateway.aclose()
+        assert client.closed == 1
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+@pytest.mark.parametrize("shutdown", [False, True])
+@pytest.mark.parametrize("async_list", [False, True])
+def test_abandoned_refresh_recovers_only_live_server_after_settle(
+    cancel, fails, shutdown, async_list
+) -> None:
+    release = threading.Event()
+    started = threading.Event()
+
+    class Refreshing(Client):
+        def __init__(self):
+            super().__init__()
+            self.list_count = 0
+            self.listing = False
+
+        def list_tools(self):
+            self.list_count += 1
+            if self.list_count == 2:
+                self.listing = True
+                started.set()
+                try:
+                    release.wait()
+                    if fails:
+                        raise RuntimeError("late discovery failure")
+                finally:
+                    self.listing = False
+            return [{"name": "read", "inputSchema": {"type": "object"}}]
+
+        async def aclose(self):
+            assert not self.listing
+            await super().aclose()
+
+    sync_list = Refreshing.list_tools
+    if async_list:
+
+        async def list_tools(self):
+            if self.list_count == 1:
+                self.listing = True
+                started.set()
+                while not release.is_set():
+                    await asyncio.sleep(0.001)
+            return sync_list(self)
+
+        Refreshing.list_tools = list_tools
+
+    async def scenario():
+        client = Refreshing()
+        gateway = _gateway(client, timeout_seconds=0.05)
+        await gateway.add_server("server", object())
+        catalog = gateway._dynamic_catalog.specs
+        generation = gateway._servers["server"].generation
+        refresh = asyncio.create_task(gateway.refresh_server("server"))
+        assert await asyncio.to_thread(started.wait, 1)
+        if cancel:
+            refresh.cancel()
+        with pytest.raises(asyncio.CancelledError if cancel else TimeoutError):
+            await refresh
+        assert gateway._servers["server"].closing
+        if shutdown:
+            with pytest.raises(TimeoutError):
+                await gateway.aclose()
+        release.set()
+        for _ in range(100):
+            if client.closed or (not shutdown and not gateway._servers["server"].closing):
+                break
+            await asyncio.sleep(0.005)
+        if shutdown:
+            assert gateway._dynamic_catalog.specs == ()
+            assert "server" not in gateway._servers
+            assert client.closed == 1
+            with pytest.raises(TimeoutError):
+                await gateway.aclose()
+        else:
+            assert gateway._dynamic_catalog.specs == catalog
+            assert await gateway._call("server", generation, "read", {}) == {
+                "name": "read",
+                "arguments": {},
+            }
+            await gateway.refresh_server("server")
+            removing = asyncio.create_task(gateway.remove_server("server"))
+            outcomes = await asyncio.gather(removing, gateway.aclose(), return_exceptions=True)
+            assert outcomes[0] is None or isinstance(outcomes[0], RuntimeError)
+            assert outcomes[1] is None
+            assert client.closed == 1
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+
+
+def test_abandoned_sync_discovery_returning_awaitable_preserves_cleanup_owner() -> None:
+    release = threading.Event()
+
+    class Discovery(Client):
+        def list_tools(self):
+            release.wait()
+            return super().list_tools()
+
+    async def scenario():
+        client = Discovery()
+        gateway = _gateway(client, timeout_seconds=0.05)
+        with pytest.raises(TimeoutError):
+            await gateway.add_server("server", object())
+        await asyncio.sleep(0)
+        release.set()
+        await gateway.aclose()
+        assert client.closed == 1
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("operation", ["call", "refresh"])
+@pytest.mark.parametrize("async_close", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+def test_live_client_closes_after_timed_out_use_and_original_loop_exit(
+    operation, async_close, fails
+) -> None:
+    release = threading.Event()
+    closed = threading.Event()
+
+    class Live:
+        def __init__(self):
+            self.lists = 0
+            self.using = False
+            self.close_count = 0
+
+        def block(self):
+            self.using = True
+            try:
+                release.wait()
+                if fails:
+                    raise RuntimeError("late failure")
+            finally:
+                self.using = False
+
+        def list_tools(self):
+            self.lists += 1
+            if self.lists > 1:
+                self.block()
+            return [{"name": "read", "inputSchema": {"type": "object"}}]
+
+        def call_tool(self, _name, _arguments):
+            self.block()
+            return {}
+
+        def close(self):
+            assert not self.using
+            self.close_count += 1
+            closed.set()
+
+    class AsyncCloseLive(Live):
+        async def aclose(self):
+            await asyncio.sleep(0)
+            self.close()
+
+    client = AsyncCloseLive() if async_close else Live()
+
+    async def scenario():
+        gateway = _gateway(client, timeout_seconds=0.05)
+        await gateway.add_server("server", object())
+        generation = gateway._servers["server"].generation
+        with pytest.raises(TimeoutError):
+            if operation == "call":
+                await gateway._call("server", generation, "read", {})
+            else:
+                await gateway.refresh_server("server")
+        with pytest.raises(TimeoutError):
+            await gateway.aclose()
+        assert client.close_count == 0
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+    assert closed.wait(1), "live client cleanup depended on the closed loop"
+    assert client.close_count == 1
+
+
+def test_closed_loop_affine_client_close_failure_is_not_retried() -> None:
+    release = threading.Event()
+    attempted = threading.Event()
+
+    class LoopAffine(Client):
+        def call_tool(self, _name, _arguments):
+            release.wait()
+            return {}
+
+        async def aclose(self):
+            self.closed += 1
+            attempted.set()
+            if asyncio.get_running_loop() is not self.origin:
+                raise RuntimeError("client requires its destroyed original loop")
+
+    client = LoopAffine()
+    gateway = _gateway(client, timeout_seconds=0.05)
+
+    async def scenario():
+        client.origin = asyncio.get_running_loop()
+        await gateway.add_server("server", object())
+        generation = gateway._servers["server"].generation
+        with pytest.raises(TimeoutError):
+            await gateway._call("server", generation, "read", {})
+        with pytest.raises(TimeoutError):
+            await gateway.aclose()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+    assert attempted.wait(1)
+    with pytest.raises(TimeoutError):
+        asyncio.run(gateway.aclose())
+    assert client.closed == 1
+
+
+def test_closed_loop_cleanup_waits_for_all_underlying_calls() -> None:
+    releases = [threading.Event(), threading.Event()]
+    finished = [threading.Event(), threading.Event()]
+    closed = threading.Event()
+
+    class Concurrent(Client):
+        def call_tool(self, _name, arguments):
+            index = arguments["index"]
+            releases[index].wait()
+            finished[index].set()
+            return {}
+
+        async def aclose(self):
+            assert all(event.is_set() for event in finished)
+            await super().aclose()
+            closed.set()
+
+    client = Concurrent()
+
+    async def scenario():
+        gateway = _gateway(client, timeout_seconds=0.05)
+        await gateway.add_server("server", object())
+        generation = gateway._servers["server"].generation
+        outcomes = await asyncio.gather(
+            *(gateway._call("server", generation, "read", {"index": i}) for i in range(2)),
+            return_exceptions=True,
+        )
+        assert all(isinstance(outcome, TimeoutError) for outcome in outcomes)
+        with pytest.raises(TimeoutError):
+            await gateway.aclose()
+
+    try:
+        asyncio.run(scenario())
+        releases[0].set()
+        assert finished[0].wait(1)
+        assert not closed.wait(0.05)
+    finally:
+        for event in releases:
+            event.set()
+    assert closed.wait(1)
+    assert client.closed == 1
