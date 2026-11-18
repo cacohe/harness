@@ -1,9 +1,13 @@
 import ast
 import importlib.util
+import inspect
 import tomllib
 from pathlib import Path
 
 import pytest
+from src.application.agent import AgentSession
+from src.application.composition import create_development_agent, create_production_agent
+from src.core.journal import RunJournal
 
 ROOT = Path(__file__).resolve().parents[2]
 LEGACY_SOURCE_PATHS = (
@@ -68,6 +72,16 @@ LEGACY_SYMBOLS = (
     "Task" + "Repository",
     "src.core." + "loop",
 )
+LEGACY_DOCUMENT_TERMS = (
+    "Session" + "Event",
+    "AgentSession." + "chat",
+    "AgentSession." + "achat",
+    "Agent." + "aclose",
+    "Snapshot" + "ExecutionStore",
+    "Task" + "Repository",
+    "SQLite schema " + "v2",
+    "Migration from " + "v1",
+)
 
 
 def _resolved_imports(path: Path, root: Path) -> list[tuple[int, str]]:
@@ -119,6 +133,10 @@ def _core_violations(root: Path) -> list[str]:
     return violations
 
 
+def _present_legacy_paths(root: Path) -> list[str]:
+    return [name for name in LEGACY_SOURCE_PATHS if (root / "src" / name).exists()]
+
+
 @pytest.mark.architecture
 def test_core_contains_only_harness_mechanism_and_extension_ports():
     assert {path.name for path in (ROOT / "src" / "core").glob("*.py")} == EXPECTED_CORE_MODULES
@@ -126,9 +144,14 @@ def test_core_contains_only_harness_mechanism_and_extension_ports():
 
 
 @pytest.mark.architecture
-def test_legacy_architecture_has_no_source_files():
-    assert [name for name in LEGACY_SOURCE_PATHS if any((ROOT / "src" / name).rglob("*.py"))] == []
-    searchable = [ROOT / "src", ROOT / "tests", ROOT / "README.md"]
+def test_legacy_architecture_paths_are_physically_absent():
+    assert _present_legacy_paths(ROOT) == []
+    searchable = [
+        ROOT / "src",
+        ROOT / "tests",
+        ROOT / "README.md",
+        ROOT / "docs" / "reliable-runtime.md",
+    ]
     violations = []
     for target in searchable:
         paths = target.rglob("*.py") if target.is_dir() else (target,)
@@ -138,6 +161,31 @@ def test_legacy_architecture_has_no_source_files():
                 if symbol in text:
                     violations.append(f"{path.relative_to(ROOT)}:{symbol}")
     assert violations == []
+
+
+def test_legacy_path_gate_rejects_placeholder_namespaces(tmp_path: Path):
+    sandbox = tmp_path / "src" / "sandbox"
+    sandbox.mkdir(parents=True)
+    (sandbox / ".gitkeep").write_text("", encoding="utf-8")
+
+    assert _present_legacy_paths(tmp_path) == ["sandbox"]
+
+
+def test_reliable_runtime_documents_only_the_async_single_track_api():
+    text = (ROOT / "docs" / "reliable-runtime.md").read_text(encoding="utf-8")
+    assert [term for term in LEGACY_DOCUMENT_TERMS if term in text] == []
+    assert inspect.iscoroutinefunction(create_development_agent)
+    assert inspect.iscoroutinefunction(create_production_agent)
+    for method in ("submit", "decide_tool_call", "cancel", "close"):
+        assert inspect.iscoroutinefunction(getattr(AgentSession, method))
+    for removed in ("chat", "achat", "aclose"):
+        assert not hasattr(AgentSession, removed)
+    assert list(inspect.signature(RunJournal.commit).parameters) == [
+        "self",
+        "batch",
+        "expected_version",
+    ]
+    assert "RunJournal.commit(batch, expected_version)" in text
 
 
 @pytest.mark.parametrize(
