@@ -171,6 +171,24 @@ class RunJournal(Protocol):
         """
         ...
 
+    def load_context_summaries(
+        self,
+        session_id: SessionId,
+        profile_id: ProfileId,
+        policy_version: str,
+        covered_through_sequence: int,
+        limit: int,
+        expected_version: int,
+        expected_sequence: int,
+    ) -> Awaitable[tuple[ConversationSummaryCheckpoint, ...]]:
+        """Read newest matching checkpoints with work bounded by ``limit``.
+
+        The adapter must bind the lookup to the expected current Session head and
+        authenticate every returned checkpoint without materializing unrelated
+        journal or summary history. A changed head raises JOURNAL_CONFLICT.
+        """
+        ...
+
     def find_submission(
         self, session_id: SessionId, submission_id: SubmissionId
     ) -> Awaitable[SubmissionAcceptance | None]:

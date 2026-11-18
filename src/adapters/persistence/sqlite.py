@@ -28,6 +28,10 @@ from src.adapters.persistence.sqlite_integrity import (
     coverage_parent_hash,
     genesis_hash,
     record_hash,
+    summary_empty_hash,
+    summary_leaf_hash,
+    summary_parent_hash,
+    summary_record_hash,
     validate_hash,
 )
 from src.core.context import (
@@ -36,7 +40,7 @@ from src.core.context import (
     ConversationPage,
 )
 from src.core.errors import RunErrorCode
-from src.core.ids import RunId, SessionId, SubmissionId
+from src.core.ids import ProfileId, RunId, SessionId, SubmissionId
 from src.core.journal import (
     ConversationSummaryCheckpoint,
     JournalCommit,
@@ -51,11 +55,12 @@ from src.core.journal import (
 from src.core.run_receipt import validate_commit_receipt
 from src.core.state import RunState
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _COVERAGE_BLOCK_SIZE = 128
 _COVERAGE_DEPTH = 32
+_SUMMARY_DEPTH = 32
 _T = TypeVar("_T")
-_IdT = TypeVar("_IdT", SessionId, RunId, SubmissionId)
+_IdT = TypeVar("_IdT", SessionId, RunId, SubmissionId, ProfileId)
 
 _DDL = """
 CREATE TABLE sessions (
@@ -66,6 +71,8 @@ CREATE TABLE sessions (
   ledger_hash TEXT NOT NULL,
   coverage_hash TEXT NOT NULL,
   transcript_count INTEGER NOT NULL CHECK(transcript_count >= 0),
+  summary_hash TEXT NOT NULL,
+  summary_count INTEGER NOT NULL CHECK(summary_count >= 0),
   authenticated_root TEXT NOT NULL
 ) STRICT;
 CREATE TABLE journal_entries (
@@ -196,13 +203,62 @@ BEGIN
 END;
 CREATE TABLE summary_checkpoints (
   session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+  summary_index INTEGER NOT NULL CHECK(summary_index >= 0),
   covered_from_sequence INTEGER NOT NULL,
   covered_through_sequence INTEGER NOT NULL,
   policy_version TEXT NOT NULL,
   profile_id TEXT NOT NULL,
   checkpoint_json TEXT NOT NULL,
-  PRIMARY KEY(session_id, covered_through_sequence, policy_version, profile_id)
+  checkpoint_hash TEXT NOT NULL,
+  PRIMARY KEY(session_id, covered_through_sequence, policy_version, profile_id),
+  UNIQUE(session_id, summary_index)
 ) STRICT;
+CREATE INDEX summary_context_lookup ON summary_checkpoints(
+  session_id, profile_id, policy_version, covered_through_sequence DESC, summary_index DESC
+);
+CREATE TABLE summary_nodes (
+  session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+  level INTEGER NOT NULL CHECK(level >= 0 AND level <= 32),
+  node_index INTEGER NOT NULL CHECK(node_index >= 0),
+  digest TEXT NOT NULL,
+  item_count INTEGER NOT NULL CHECK(item_count >= 0),
+  PRIMARY KEY(session_id, level, node_index)
+) STRICT;
+CREATE TRIGGER summary_checkpoints_insert_guard BEFORE INSERT ON summary_checkpoints
+WHEN harness_journal_append_allowed() != 1
+BEGIN
+  SELECT RAISE(ABORT, 'summary checkpoints require the commit append channel');
+END;
+CREATE TRIGGER summary_checkpoints_update_violation AFTER UPDATE ON summary_checkpoints
+BEGIN
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason)
+  VALUES (OLD.session_id, 'summary checkpoint updated');
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason)
+  VALUES (NEW.session_id, 'summary checkpoint updated');
+END;
+CREATE TRIGGER summary_checkpoints_delete_violation AFTER DELETE ON summary_checkpoints
+BEGIN
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason)
+  VALUES (OLD.session_id, 'summary checkpoint deleted');
+END;
+CREATE TRIGGER summary_nodes_insert_guard BEFORE INSERT ON summary_nodes
+WHEN harness_journal_append_allowed() != 1
+BEGIN
+  SELECT RAISE(ABORT, 'summary nodes require the commit append channel');
+END;
+CREATE TRIGGER summary_nodes_update_violation AFTER UPDATE ON summary_nodes
+WHEN harness_journal_append_allowed() != 1
+BEGIN
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason)
+  VALUES (OLD.session_id, 'summary node updated');
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason)
+  VALUES (NEW.session_id, 'summary node updated');
+END;
+CREATE TRIGGER summary_nodes_delete_violation AFTER DELETE ON summary_nodes
+BEGIN
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason)
+  VALUES (OLD.session_id, 'summary node deleted');
+END;
 CREATE TABLE submissions (
   session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
   submission_id TEXT NOT NULL,
@@ -226,6 +282,8 @@ _EXPECTED_COLUMNS = {
         "ledger_hash",
         "coverage_hash",
         "transcript_count",
+        "summary_hash",
+        "summary_count",
         "authenticated_root",
     ),
     "journal_entries": ("session_id", "sequence", "kind", "previous_hash", "record_hash"),
@@ -270,12 +328,15 @@ _EXPECTED_COLUMNS = {
     "integrity_violations": ("session_id", "reason"),
     "summary_checkpoints": (
         "session_id",
+        "summary_index",
         "covered_from_sequence",
         "covered_through_sequence",
         "policy_version",
         "profile_id",
         "checkpoint_json",
+        "checkpoint_hash",
     ),
+    "summary_nodes": ("session_id", "level", "node_index", "digest", "item_count"),
     "submissions": (
         "session_id",
         "submission_id",
@@ -303,6 +364,13 @@ _EXPECTED_INDEXES = {
         "first_sequence",
         "last_sequence",
     ),
+    "summary_context_lookup": (
+        "session_id",
+        "profile_id",
+        "policy_version",
+        "covered_through_sequence",
+        "summary_index",
+    ),
     "submissions_by_identity": ("session_id", "submission_id", "digest"),
 }
 
@@ -321,7 +389,7 @@ def _typed_id_key(value: object, expected: type[_IdT]) -> str:
 
 
 class SQLiteRunJournal:
-    """SQLite v3 Session-scoped CAS journal using one connection per operation."""
+    """SQLite v5 Session-scoped CAS journal using one connection per operation."""
 
     def __init__(self, path: Path, timeout_seconds: float = 5.0) -> None:
         if not isinstance(path, Path) or not path.is_absolute():
@@ -365,6 +433,44 @@ class SQLiteRunJournal:
         if type(after_sequence) is not int or after_sequence < 0:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
         return await self._run(lambda _cancelled: self._load_session_sync(key, after_sequence))
+
+    async def load_context_summaries(
+        self,
+        session_id: SessionId,
+        profile_id: ProfileId,
+        policy_version: str,
+        covered_through_sequence: int,
+        limit: int,
+        expected_version: int,
+        expected_sequence: int,
+    ) -> tuple[ConversationSummaryCheckpoint, ...]:
+        key = self._session_key(session_id)
+        if (
+            type(profile_id) is not ProfileId
+            or not _valid_policy_version(policy_version)
+            or type(covered_through_sequence) is not int
+            or covered_through_sequence < 0
+            or type(limit) is not int
+            or not 1 <= limit <= 128
+            or type(expected_version) is not int
+            or expected_version < 0
+            or type(expected_sequence) is not int
+            or expected_sequence < 0
+            or covered_through_sequence > expected_sequence
+        ):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        profile_key = _typed_id_key(profile_id, ProfileId)
+        return await self._run(
+            lambda _cancelled: self._load_context_summaries_sync(
+                key,
+                profile_key,
+                policy_version,
+                covered_through_sequence,
+                limit,
+                expected_version,
+                expected_sequence,
+            )
+        )
 
     async def read_page(
         self, session_id: SessionId, before_sequence: int | None, limit: int
@@ -455,7 +561,7 @@ class SQLiteRunJournal:
                     + f"\nPRAGMA user_version = {_SCHEMA_VERSION};\nCOMMIT;"
                 )
             elif version != _SCHEMA_VERSION:
-                raise ValueError("SQLite journal requires an exact schema v4 database")
+                raise ValueError("SQLite journal requires an exact schema v5 database")
             self._validate_schema(connection)
             if str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() != "wal":
                 raise ValueError("SQLite journal requires WAL mode")
@@ -499,8 +605,21 @@ class SQLiteRunJournal:
                 else coverage_empty_hash(session_key, _COVERAGE_DEPTH, 0)
             )
             transcript_count = int(row["transcript_count"]) if row is not None else 0
+            summary_hash = (
+                row["summary_hash"]
+                if row is not None
+                else summary_empty_hash(session_key, _SUMMARY_DEPTH, 0)
+            )
+            summary_count = int(row["summary_count"]) if row is not None else 0
+            if not 0 <= summary_count < (1 << _SUMMARY_DEPTH):
+                raise ValueError("SQLite summary capacity is exhausted")
             authenticated_root = authenticated_root_hash(
-                session_key, ledger_hash, coverage_hash, transcript_count
+                session_key,
+                ledger_hash,
+                coverage_hash,
+                transcript_count,
+                summary_hash,
+                summary_count,
             )
             existing = connection.execute(
                 "SELECT session_id, submission_id, run_id, digest, intent_json, receipt_json, "
@@ -547,7 +666,8 @@ class SQLiteRunJournal:
             state_json = encode(state)
             connection.execute(
                 "INSERT INTO sessions(session_id, version, sequence, state_json, ledger_hash, "
-                "coverage_hash, transcript_count, authenticated_root) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "coverage_hash, transcript_count, summary_hash, summary_count, authenticated_root) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(session_id) DO UPDATE SET version=excluded.version, sequence=excluded.sequence, state_json=excluded.state_json",
                 (
                     session_key,
@@ -557,6 +677,8 @@ class SQLiteRunJournal:
                     ledger_hash,
                     coverage_hash,
                     transcript_count,
+                    summary_hash,
+                    summary_count,
                     authenticated_root,
                 ),
             )
@@ -619,7 +741,12 @@ class SQLiteRunJournal:
                     _refresh_coverage_block(connection, session_key, block_index)
                 coverage_hash = _coverage_root(connection, session_key)[0]
             authenticated_root = authenticated_root_hash(
-                session_key, ledger_hash, coverage_hash, transcript_count
+                session_key,
+                ledger_hash,
+                coverage_hash,
+                transcript_count,
+                summary_hash,
+                summary_count,
             )
             connection.execute(
                 "UPDATE sessions SET ledger_hash=?, coverage_hash=?, transcript_count=?, "
@@ -646,8 +773,9 @@ class SQLiteRunJournal:
                 summary = batch.summary
                 summary_json = encode(summary)
                 prior_summary = connection.execute(
-                    "SELECT session_id, covered_from_sequence, covered_through_sequence, "
-                    "policy_version, profile_id, checkpoint_json FROM summary_checkpoints WHERE session_id = ? "
+                    "SELECT session_id, summary_index, covered_from_sequence, "
+                    "covered_through_sequence, policy_version, profile_id, checkpoint_json, "
+                    "checkpoint_hash FROM summary_checkpoints WHERE session_id = ? "
                     "AND covered_through_sequence = ? AND policy_version = ? AND profile_id = ?",
                     (
                         session_key,
@@ -657,17 +785,32 @@ class SQLiteRunJournal:
                     ),
                 ).fetchone()
                 if prior_summary is None:
+                    checkpoint_hash = summary_record_hash(
+                        session_key, summary_count, summary_json
+                    )
                     connection.execute(
-                        "INSERT INTO summary_checkpoints(session_id, covered_from_sequence, covered_through_sequence, policy_version, profile_id, checkpoint_json) VALUES (?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO summary_checkpoints(session_id, summary_index, "
+                        "covered_from_sequence, covered_through_sequence, policy_version, "
+                        "profile_id, checkpoint_json, checkpoint_hash) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             session_key,
+                            summary_count,
                             summary.covered_from_sequence,
                             summary.covered_through_sequence,
                             summary.policy_version,
                             summary.profile_id.value,
                             summary_json,
+                            checkpoint_hash,
                         ),
                     )
+                    summary_hash = _append_summary_leaf(
+                        connection,
+                        session_key,
+                        summary_count,
+                        checkpoint_hash,
+                    )
+                    summary_count += 1
                 else:
                     persisted_summary = _decode_summary_row(prior_summary, session_key)
                     if (
@@ -675,6 +818,19 @@ class SQLiteRunJournal:
                         or prior_summary["checkpoint_json"] != summary_json
                     ):
                         raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+            authenticated_root = authenticated_root_hash(
+                session_key,
+                ledger_hash,
+                coverage_hash,
+                transcript_count,
+                summary_hash,
+                summary_count,
+            )
+            connection.execute(
+                "UPDATE sessions SET summary_hash=?, summary_count=?, authenticated_root=? "
+                "WHERE session_id=?",
+                (summary_hash, summary_count, authenticated_root, session_key),
+            )
             if batch.submission is not None and intent_json is not None:
                 connection.execute(
                     "INSERT INTO submissions(session_id, submission_id, run_id, digest, intent_json, receipt_json, acceptance_state_json, acceptance_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -724,7 +880,7 @@ class SQLiteRunJournal:
             _reject_integrity_violation(connection, session_key)
             row = connection.execute(
                 "SELECT session_id, version, sequence, state_json, ledger_hash, coverage_hash, "
-                "transcript_count, authenticated_root "
+                "transcript_count, summary_hash, summary_count, authenticated_root "
                 "FROM sessions WHERE session_id = ?",
                 (session_key,),
             ).fetchone()
@@ -799,6 +955,89 @@ class SQLiteRunJournal:
             return result
         except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
             connection.rollback()
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        finally:
+            connection.close()
+
+    def _load_context_summaries_sync(
+        self,
+        session_key: str,
+        profile_key: str,
+        policy_version: str,
+        covered_through_sequence: int,
+        limit: int,
+        expected_version: int,
+        expected_sequence: int,
+    ) -> tuple[ConversationSummaryCheckpoint, ...]:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            _reject_integrity_violation(connection, session_key)
+            row = connection.execute(
+                "SELECT session_id, version, sequence, state_json, ledger_hash, coverage_hash, "
+                "transcript_count, summary_hash, summary_count, authenticated_root "
+                "FROM sessions WHERE session_id = ?",
+                (session_key,),
+            ).fetchone()
+            if row is None:
+                if expected_version != 0 or expected_sequence != 0:
+                    raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
+                return ()
+            state = decode(row["state_json"], RunState)
+            version, sequence = _validate_session_row(row, session_key, state)
+            _verify_authenticated_root(row, session_key)
+            _verify_ledger_tail(connection, session_key, sequence, row["ledger_hash"])
+            if version != expected_version or sequence != expected_sequence:
+                raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
+            rows = tuple(
+                connection.execute(
+                    "SELECT session_id, summary_index, covered_from_sequence, "
+                    "covered_through_sequence, policy_version, profile_id, checkpoint_json, "
+                    "checkpoint_hash FROM summary_checkpoints "
+                    "WHERE session_id=? AND profile_id=? AND policy_version=? "
+                    "AND covered_through_sequence<=? "
+                    "ORDER BY covered_through_sequence DESC, summary_index DESC LIMIT ?",
+                    (
+                        session_key,
+                        profile_key,
+                        policy_version,
+                        covered_through_sequence,
+                        limit,
+                    ),
+                )
+            )
+            summaries = []
+            expected_root = validate_hash(row["summary_hash"])
+            for item in rows:
+                summary = _decode_summary_row(item, session_key)
+                summary_index = item["summary_index"]
+                if (
+                    type(summary_index) is not int
+                    or not 0 <= summary_index < (1 << _SUMMARY_DEPTH)
+                ):
+                    raise ValueError("SQLite summary index is invalid")
+                digest = summary_record_hash(session_key, summary_index, item["checkpoint_json"])
+                if validate_hash(item["checkpoint_hash"]) != digest:
+                    raise ValueError("SQLite summary record hash disagrees")
+                _verify_summary_path(
+                    connection,
+                    session_key,
+                    summary_index,
+                    (summary_leaf_hash(session_key, summary_index, digest), 1),
+                    expected_root,
+                )
+                summaries.append(summary)
+            return tuple(summaries)
+        except JournalError:
+            raise
+        except (
+            sqlite3.Error,
+            ValueError,
+            TypeError,
+            KeyError,
+            MemoryError,
+            RecursionError,
+        ):
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
         finally:
             connection.close()
@@ -879,7 +1118,8 @@ class SQLiteRunJournal:
             connection.execute("BEGIN")
             _reject_integrity_violation(connection, session_key)
             session = connection.execute(
-                "SELECT sequence, ledger_hash, coverage_hash, transcript_count, authenticated_root "
+                "SELECT sequence, ledger_hash, coverage_hash, transcript_count, summary_hash, "
+                "summary_count, authenticated_root "
                 "FROM sessions WHERE session_id=?",
                 (session_key,),
             ).fetchone()
@@ -1015,13 +1255,13 @@ class SQLiteRunJournal:
     @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:
         if _schema_signature(connection) != _expected_schema_signature():
-            raise ValueError("SQLite journal schema v4 definition has drifted")
+            raise ValueError("SQLite journal schema v5 definition has drifted")
         for table, expected in _EXPECTED_COLUMNS.items():
             columns = tuple(
                 str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")
             )
             if columns != expected:
-                raise ValueError("SQLite journal schema v4 has drifted")
+                raise ValueError("SQLite journal schema v5 has drifted")
         indexes = {
             str(row[0])
             for row in connection.execute(
@@ -1029,13 +1269,13 @@ class SQLiteRunJournal:
             )
         }
         if not set(_EXPECTED_INDEXES) <= indexes:
-            raise ValueError("SQLite journal schema v4 is missing required indexes")
+            raise ValueError("SQLite journal schema v5 is missing required indexes")
         for index, expected_columns in _EXPECTED_INDEXES.items():
             actual_columns = tuple(
                 str(row[2]) for row in connection.execute(f"PRAGMA index_info({index})")
             )
             if actual_columns != expected_columns:
-                raise ValueError("SQLite journal schema v4 index has drifted")
+                raise ValueError("SQLite journal schema v5 index has drifted")
         for table in (
             "journal_entries",
             "runs",
@@ -1045,6 +1285,7 @@ class SQLiteRunJournal:
             "transcript_coverage_nodes",
             "integrity_violations",
             "summary_checkpoints",
+            "summary_nodes",
             "submissions",
         ):
             foreign = tuple(connection.execute(f"PRAGMA foreign_key_list({table})"))
@@ -1055,7 +1296,7 @@ class SQLiteRunJournal:
                 and str(row[6]).upper() == "CASCADE"
                 for row in foreign
             ):
-                raise ValueError("SQLite journal schema v4 is missing a Session foreign key")
+                raise ValueError("SQLite journal schema v5 is missing a Session foreign key")
 
 
 def _schema_signature(connection: sqlite3.Connection) -> tuple[tuple[str, str, str, str], ...]:
@@ -1238,13 +1479,110 @@ def _coverage_root(connection: sqlite3.Connection, session_key: str):
     return _read_coverage_node(connection, session_key, _COVERAGE_DEPTH, 0)
 
 
+def _summary_node_value(
+    row: sqlite3.Row | None, session_key: str, level: int, node_index: int
+) -> tuple[str, int]:
+    if row is None:
+        return summary_empty_hash(session_key, level, node_index), 0
+    digest = validate_hash(row["digest"])
+    count = row["item_count"]
+    if type(count) is not int or count < 0:
+        raise ValueError("SQLite summary node count is invalid")
+    return digest, count
+
+
+def _read_summary_node(
+    connection: sqlite3.Connection, session_key: str, level: int, node_index: int
+) -> tuple[str, int]:
+    row = connection.execute(
+        "SELECT digest, item_count FROM summary_nodes "
+        "WHERE session_id=? AND level=? AND node_index=?",
+        (session_key, level, node_index),
+    ).fetchone()
+    return _summary_node_value(row, session_key, level, node_index)
+
+
+def _write_summary_node(
+    connection: sqlite3.Connection,
+    session_key: str,
+    level: int,
+    node_index: int,
+    value: tuple[str, int],
+) -> None:
+    connection.execute(
+        "INSERT INTO summary_nodes(session_id, level, node_index, digest, item_count) "
+        "VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id, level, node_index) DO UPDATE "
+        "SET digest=excluded.digest, item_count=excluded.item_count",
+        (session_key, level, node_index, *value),
+    )
+
+
+def _append_summary_leaf(
+    connection: sqlite3.Connection,
+    session_key: str,
+    summary_index: int,
+    checkpoint_hash: str,
+) -> str:
+    if type(summary_index) is not int or not 0 <= summary_index < (1 << _SUMMARY_DEPTH):
+        raise ValueError("SQLite summary index exceeds its authenticated tree")
+    index = summary_index
+    value = (summary_leaf_hash(session_key, summary_index, checkpoint_hash), 1)
+    _write_summary_node(connection, session_key, 0, index, value)
+    for level in range(1, _SUMMARY_DEPTH + 1):
+        sibling = _read_summary_node(connection, session_key, level - 1, index ^ 1)
+        left, right = (value, sibling) if index % 2 == 0 else (sibling, value)
+        parent_index = index // 2
+        value = (
+            summary_parent_hash(session_key, level, parent_index, left, right),
+            left[1] + right[1],
+        )
+        _write_summary_node(connection, session_key, level, parent_index, value)
+        index = parent_index
+    return value[0]
+
+
+def _verify_summary_path(
+    connection: sqlite3.Connection,
+    session_key: str,
+    summary_index: int,
+    leaf: tuple[str, int],
+    expected_root: str,
+) -> None:
+    index = summary_index
+    value = leaf
+    if _read_summary_node(connection, session_key, 0, index) != value:
+        raise ValueError("SQLite summary leaf disagrees with its checkpoint")
+    for level in range(1, _SUMMARY_DEPTH + 1):
+        sibling = _read_summary_node(connection, session_key, level - 1, index ^ 1)
+        left, right = (value, sibling) if index % 2 == 0 else (sibling, value)
+        parent_index = index // 2
+        value = (
+            summary_parent_hash(session_key, level, parent_index, left, right),
+            left[1] + right[1],
+        )
+        if _read_summary_node(connection, session_key, level, parent_index) != value:
+            raise ValueError("SQLite summary Merkle path is invalid")
+        index = parent_index
+    if value[0] != expected_root:
+        raise ValueError("SQLite summary path disagrees with its Session root")
+
+
 def _verify_authenticated_root(row: sqlite3.Row, session_key: str) -> None:
     ledger = validate_hash(row["ledger_hash"])
     coverage = validate_hash(row["coverage_hash"])
     count = row["transcript_count"]
     if type(count) is not int or count < 0:
         raise ValueError("SQLite transcript coverage count is invalid")
-    expected = authenticated_root_hash(session_key, ledger, coverage, count)
+    summary = validate_hash(row["summary_hash"])
+    summary_count = row["summary_count"]
+    if (
+        type(summary_count) is not int
+        or not 0 <= summary_count <= (1 << _SUMMARY_DEPTH)
+    ):
+        raise ValueError("SQLite summary count is invalid")
+    expected = authenticated_root_hash(
+        session_key, ledger, coverage, count, summary, summary_count
+    )
     if validate_hash(row["authenticated_root"]) != expected:
         raise ValueError("SQLite authenticated Session root disagrees")
 
@@ -1474,7 +1812,8 @@ def _verify_ledger_tail(
 def _verify_point_anchor(connection: sqlite3.Connection, session_key: str, sequence: int) -> None:
     """Authenticate one indexed record and its immediate ledger boundary in O(1)."""
     session = connection.execute(
-        "SELECT sequence, ledger_hash, coverage_hash, transcript_count, authenticated_root "
+        "SELECT sequence, ledger_hash, coverage_hash, transcript_count, summary_hash, "
+        "summary_count, authenticated_root "
         "FROM sessions WHERE session_id=?",
         (session_key,),
     ).fetchone()
@@ -1514,7 +1853,7 @@ def _preflight_existing_ledger(
     """Validate one Session's immutable ledger before a commit reads its CAS counters."""
     row = connection.execute(
         "SELECT session_id, version, sequence, state_json, ledger_hash, coverage_hash, "
-        "transcript_count, authenticated_root "
+        "transcript_count, summary_hash, summary_count, authenticated_root "
         "FROM sessions WHERE session_id = ?",
         (session_key,),
     ).fetchone()
@@ -1715,6 +2054,15 @@ def _decode_summary_row(row: sqlite3.Row, session_key: str) -> ConversationSumma
     ):
         raise ValueError("SQLite Summary row disagrees with its payload")
     return record
+
+
+def _valid_policy_version(value: object) -> bool:
+    if type(value) is not str or not value or value.strip() != value:
+        return False
+    try:
+        return len(value.encode("utf-8")) <= 256
+    except UnicodeEncodeError:
+        return False
 
 
 def _decode_submission_row(

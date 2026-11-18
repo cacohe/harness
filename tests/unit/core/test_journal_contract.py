@@ -76,6 +76,40 @@ def acceptance(
     )
 
 
+def test_context_summary_lookup_is_bounded_to_the_expected_authenticated_head(
+    journal: RunJournal,
+) -> None:
+    batch = acceptance("context-summary")
+    receipt = asyncio.run(journal.commit(batch, 0))
+
+    summaries = asyncio.run(
+        journal.load_context_summaries(
+            batch.state.session_id,
+            batch.state.profile_id,
+            "v1",
+            receipt.sequence,
+            128,
+            receipt.version,
+            receipt.sequence,
+        )
+    )
+
+    assert summaries == (batch.summary,)
+    with pytest.raises(JournalError) as stale:
+        asyncio.run(
+            journal.load_context_summaries(
+                batch.state.session_id,
+                batch.state.profile_id,
+                "v1",
+                receipt.sequence,
+                128,
+                receipt.version - 1,
+                receipt.sequence,
+            )
+        )
+    assert stale.value.failure.code is RunErrorCode.JOURNAL_CONFLICT
+
+
 @pytest.mark.parametrize(
     ("journal_version", "journal_sequence"),
     [(0, 2), (1, 0), (2, 2), (1, 3)],

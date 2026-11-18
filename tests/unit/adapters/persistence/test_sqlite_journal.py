@@ -10,8 +10,9 @@ import src.adapters.persistence.sqlite as sqlite_module
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.adapters.persistence.sqlite_codec import decode, encode
 from src.core.errors import RunErrorCode
-from src.core.ids import EventId, RunId, SessionId
+from src.core.ids import EventId, ProfileId, RunId, SessionId
 from src.core.journal import (
+    ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,
     JournalEvent,
@@ -397,7 +398,7 @@ def test_conversation_aggregate_rejects_full_block_and_witness_corruption(
     assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
 
 
-def test_sqlite_v4_round_trips_and_reopens(tmp_path: Path) -> None:
+def test_sqlite_v5_round_trips_and_reopens(tmp_path: Path) -> None:
     journal = make_journal(tmp_path)
     batch = acceptance("first")
     receipt = asyncio.run(journal.commit(batch, 0))
@@ -410,6 +411,260 @@ def test_sqlite_v4_round_trips_and_reopens(tmp_path: Path) -> None:
     found = asyncio.run(reopened.find_submission(batch.state.session_id, batch.state.submission_id))
     assert found is not None and (found.state, found.version) == (batch.state, 1)
     assert asyncio.run(reopened.commit(acceptance("first"), 0)) == receipt
+
+
+def test_context_summary_lookup_filters_bounds_and_survives_restart(tmp_path: Path) -> None:
+    journal = make_journal(tmp_path)
+    first = acceptance("summary-restart")
+    first_receipt = asyncio.run(journal.commit(first, 0))
+    second = _new_commit_after(
+        first_receipt.state,
+        version=first_receipt.version,
+        sequence=first_receipt.sequence,
+        with_records=True,
+    )
+    second_summary = ConversationSummaryCheckpoint(
+        second.state.session_id,
+        second.state.journal_sequence,
+        "v1",
+        second.state.profile_id,
+        "second",
+    )
+    second_receipt = asyncio.run(
+        journal.commit(replace(second, summary=second_summary), first_receipt.version)
+    )
+    third = _new_commit_after(
+        second_receipt.state,
+        version=second_receipt.version,
+        sequence=second_receipt.sequence,
+        with_records=True,
+    )
+    third_summary = ConversationSummaryCheckpoint(
+        third.state.session_id,
+        third.state.journal_sequence,
+        "v2",
+        third.state.profile_id,
+        "third",
+    )
+    receipt = asyncio.run(
+        journal.commit(replace(third, summary=third_summary), second_receipt.version)
+    )
+    reopened = make_journal(tmp_path)
+
+    assert asyncio.run(
+        reopened.load_context_summaries(
+            receipt.session_id,
+            receipt.state.profile_id,
+            "v1",
+            receipt.sequence,
+            128,
+            receipt.version,
+            receipt.sequence,
+        )
+    ) == (second_summary, first.summary)
+    assert asyncio.run(
+        reopened.load_context_summaries(
+            receipt.session_id,
+            receipt.state.profile_id,
+            "v1",
+            first_receipt.sequence,
+            128,
+            receipt.version,
+            receipt.sequence,
+        )
+    ) == (first.summary,)
+    assert (
+        asyncio.run(
+            reopened.load_context_summaries(
+                receipt.session_id,
+                ProfileId("other"),
+                "v1",
+                receipt.sequence,
+                128,
+                receipt.version,
+                receipt.sequence,
+            )
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize("table", ("summary_checkpoints", "summary_nodes"))
+def test_context_summary_lookup_rejects_known_summary_tampering(
+    tmp_path: Path, table: str
+) -> None:
+    journal = make_journal(tmp_path)
+    batch = acceptance("summary-tamper")
+    receipt = asyncio.run(journal.commit(batch, 0))
+    with sqlite3.connect(journal.path) as connection:
+        connection.execute(f"DELETE FROM {table} WHERE session_id=?", (receipt.session_id.value,))
+
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(
+            journal.load_context_summaries(
+                receipt.session_id,
+                receipt.state.profile_id,
+                "v1",
+                receipt.sequence,
+                128,
+                receipt.version,
+                receipt.sequence,
+            )
+        )
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+def _large_transcript_history(journal: SQLiteRunJournal, total: int = 20_000) -> JournalSnapshot:
+    template = acceptance("summary-scale")
+    state = template.state
+    receipt = None
+    sequence = 0
+    for version, chunk_start in enumerate(range(0, total, 4_000)):
+        chunk_size = min(4_000, total - chunk_start)
+        events = template.events if version == 0 else ()
+        transcript_count = chunk_size - len(events)
+        transcript = tuple(
+            replace(template.transcript[0], content=f"history-{chunk_start + index}")
+            for index in range(transcript_count)
+        )
+        sequence += chunk_size
+        state = replace(
+            state,
+            version=state.version + (1 if version else 0),
+            journal_version=version + 1,
+            journal_sequence=sequence,
+        )
+        receipt = asyncio.run(
+            journal.commit(
+                JournalCommit(state, events=events, transcript=transcript),
+                version,
+            )
+        )
+    assert receipt is not None
+    return receipt
+
+
+def _append_summary_fixture(
+    journal: SQLiteRunJournal,
+    receipt: JournalSnapshot,
+    through_count: int,
+) -> None:
+    session_key = receipt.session_id.value
+    with journal._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
+        row = connection.execute(
+            "SELECT ledger_hash, coverage_hash, transcript_count, summary_count "
+            "FROM sessions WHERE session_id=?",
+            (session_key,),
+        ).fetchone()
+        assert row is not None
+        start = int(row["summary_count"])
+        summary_hash = sqlite_module.summary_empty_hash(session_key, 32, 0)
+        if start:
+            summary_hash = connection.execute(
+                "SELECT summary_hash FROM sessions WHERE session_id=?", (session_key,)
+            ).fetchone()[0]
+        for summary_index in range(start, through_count):
+            checkpoint = ConversationSummaryCheckpoint(
+                receipt.session_id,
+                summary_index + 1,
+                "v-scale",
+                receipt.state.profile_id,
+                f"summary-{summary_index}",
+            )
+            checkpoint_json = encode(checkpoint)
+            checkpoint_hash = sqlite_module.summary_record_hash(
+                session_key, summary_index, checkpoint_json
+            )
+            connection.execute(
+                "INSERT INTO summary_checkpoints(session_id, summary_index, "
+                "covered_from_sequence, covered_through_sequence, policy_version, profile_id, "
+                "checkpoint_json, checkpoint_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_key,
+                    summary_index,
+                    checkpoint.covered_from_sequence,
+                    checkpoint.covered_through_sequence,
+                    checkpoint.policy_version,
+                    checkpoint.profile_id.value,
+                    checkpoint_json,
+                    checkpoint_hash,
+                ),
+            )
+            summary_hash = sqlite_module._append_summary_leaf(
+                connection, session_key, summary_index, checkpoint_hash
+            )
+        authenticated_root = sqlite_module.authenticated_root_hash(
+            session_key,
+            row["ledger_hash"],
+            row["coverage_hash"],
+            row["transcript_count"],
+            summary_hash,
+            through_count,
+        )
+        connection.execute(
+            "UPDATE sessions SET summary_hash=?, summary_count=?, authenticated_root=? "
+            "WHERE session_id=?",
+            (summary_hash, through_count, authenticated_root, session_key),
+        )
+
+
+def test_context_summary_lookup_vm_work_and_decoding_are_near_constant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, record_property
+) -> None:
+    journal = make_journal(tmp_path)
+    receipt = _large_transcript_history(journal)
+    real_connect = journal._connect
+    real_decode = sqlite_module.decode
+    measuring = False
+    steps = 0
+    decoded_summaries = 0
+
+    def measured_connect():
+        connection = real_connect()
+
+        def tick():
+            nonlocal steps
+            if measuring:
+                steps += 100
+            return 0
+
+        connection.set_progress_handler(tick, 100)
+        return connection
+
+    def measured_decode(payload, expected_type):
+        nonlocal decoded_summaries
+        if measuring and expected_type is ConversationSummaryCheckpoint:
+            decoded_summaries += 1
+        return real_decode(payload, expected_type)
+
+    monkeypatch.setattr(journal, "_connect", measured_connect)
+    monkeypatch.setattr(sqlite_module, "decode", measured_decode)
+    samples = []
+    for count in (400, 10_000, 20_000):
+        _append_summary_fixture(journal, receipt, count)
+        steps = 0
+        decoded_summaries = 0
+        measuring = True
+        selected = asyncio.run(
+            journal.load_context_summaries(
+                receipt.session_id,
+                receipt.state.profile_id,
+                "v-scale",
+                receipt.sequence,
+                128,
+                receipt.version,
+                receipt.sequence,
+            )
+        )
+        measuring = False
+        assert len(selected) == 128
+        assert decoded_summaries == 128
+        assert selected[0].covered_through_sequence == count
+        samples.append(steps)
+    record_property("context_summary_lookup_vm_steps", samples)
+    assert max(samples) <= min(samples) * 1.35 + 1_000
 
 
 def test_sqlite_reopen_preserves_structured_multi_tool_interaction(tmp_path: Path) -> None:
@@ -508,10 +763,10 @@ def test_two_connections_can_advance_different_sessions(tmp_path: Path) -> None:
     assert [(item.version, item.sequence) for item in receipts] == [(1, 2), (1, 2)]
 
 
-def test_schema_is_exact_v4_and_has_required_indexes(tmp_path: Path) -> None:
+def test_schema_is_exact_v5_and_has_required_indexes(tmp_path: Path) -> None:
     journal = make_journal(tmp_path)
     with sqlite3.connect(journal.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         tables = {
             row[0]
             for row in connection.execute(
@@ -529,6 +784,7 @@ def test_schema_is_exact_v4_and_has_required_indexes(tmp_path: Path) -> None:
             "transcript_coverage_nodes",
             "integrity_violations",
             "summary_checkpoints",
+            "summary_nodes",
         }
         indexes = {
             row[0]
@@ -540,10 +796,11 @@ def test_schema_is_exact_v4_and_has_required_indexes(tmp_path: Path) -> None:
             "transcript_by_session_sequence",
             "submissions_by_identity",
             "transcript_coverage_blocks_by_sequence",
+            "summary_context_lookup",
         } <= indexes
 
 
-@pytest.mark.parametrize("version", [1, 2, 4])
+@pytest.mark.parametrize("version", [1, 2, 4, 6])
 def test_old_or_future_schema_is_rejected_without_mutation(tmp_path: Path, version: int) -> None:
     path = (tmp_path / "old.sqlite3").resolve()
     with sqlite3.connect(path) as connection:
@@ -579,7 +836,7 @@ def test_version_zero_unknown_objects_are_rejected_without_mutation(
             )
         )
 
-    with pytest.raises(ValueError, match="schema v4"):
+    with pytest.raises(ValueError, match="schema v5"):
         SQLiteRunJournal(path)
 
     assert path.read_bytes() == before_bytes
@@ -649,7 +906,7 @@ def test_schema_definition_drift_is_rejected(tmp_path: Path, changed_ddl: str) -
     with sqlite3.connect(path) as connection:
         connection.executescript(changed_ddl)
         connection.execute("PRAGMA user_version=4")
-    with pytest.raises(ValueError, match="schema v4"):
+    with pytest.raises(ValueError, match="schema v5"):
         SQLiteRunJournal(path)
 
 

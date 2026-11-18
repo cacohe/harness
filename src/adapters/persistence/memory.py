@@ -74,6 +74,7 @@ class _Session:
     summaries: Mapping[tuple[str, int, str, str], ConversationSummaryCheckpoint] = field(
         default_factory=dict
     )
+    summary_order: tuple[tuple[str, str, int], ...] = ()
     submissions: Mapping[str, tuple[_IntentValue, JournalSnapshot]] = field(default_factory=dict)
 
 
@@ -161,6 +162,7 @@ class InMemoryRunJournal:
             )
             result = _canonical_copy(receipt)
             summaries = session.summaries
+            summary_order = session.summary_order
             if summary is not None:
                 summary_key = (
                     session_key,
@@ -173,6 +175,17 @@ class InMemoryRunJournal:
                     raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
                 if existing_summary is None:
                     summaries = {**summaries, summary_key: summary}
+                    order_key = (
+                        summary.profile_id.value,
+                        summary.policy_version,
+                        summary.covered_through_sequence,
+                    )
+                    position = bisect_right(summary_order, order_key)
+                    summary_order = (
+                        *summary_order[:position],
+                        order_key,
+                        *summary_order[position:],
+                    )
             submissions = session.submissions
             if intent is not None:
                 submissions = {**submissions, submission_key: (intent, receipt)}
@@ -194,6 +207,7 @@ class InMemoryRunJournal:
                 transcript=session.transcript + transcript,
                 run_inputs=run_inputs,
                 summaries=summaries,
+                summary_order=summary_order,
                 submissions=submissions,
             )
             self._store = _Store(
@@ -241,6 +255,53 @@ class InMemoryRunJournal:
                 tuple(session.summaries.values()),
             )
         )
+
+    async def load_context_summaries(
+        self,
+        session_id: SessionId,
+        profile_id: ProfileId,
+        policy_version: str,
+        covered_through_sequence: int,
+        limit: int,
+        expected_version: int,
+        expected_sequence: int,
+    ) -> tuple[ConversationSummaryCheckpoint, ...]:
+        if (
+            type(session_id) is not SessionId
+            or type(profile_id) is not ProfileId
+            or not _valid_policy_version(policy_version)
+            or type(covered_through_sequence) is not int
+            or covered_through_sequence < 0
+            or type(limit) is not int
+            or not 1 <= limit <= 128
+            or type(expected_version) is not int
+            or expected_version < 0
+            or type(expected_sequence) is not int
+            or expected_sequence < 0
+            or covered_through_sequence > expected_sequence
+        ):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        session_key = SessionId(session_id.value).value
+        profile_key = ProfileId(profile_id.value).value
+        with self._lock:
+            session = self._store.sessions.get(session_key)
+            version = 0 if session is None else session.version
+            sequence = 0 if session is None else session.sequence
+            if version != expected_version or sequence != expected_sequence:
+                raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
+            if session is None:
+                return ()
+            start = bisect_left(session.summary_order, (profile_key, policy_version, -1))
+            end = bisect_right(
+                session.summary_order,
+                (profile_key, policy_version, covered_through_sequence),
+            )
+            selected_keys = tuple(reversed(session.summary_order[max(start, end - limit) : end]))
+            selected = tuple(
+                session.summaries[(session_key, through, policy, profile)]
+                for profile, policy, through in selected_keys
+            )
+        return tuple(_canonical_copy(checkpoint) for checkpoint in selected)
 
     async def read_page(
         self, session_id: SessionId, before_sequence: int | None, limit: int
@@ -644,6 +705,15 @@ def _is_text(value: object) -> bool:
     except UnicodeEncodeError:
         return False
     return True
+
+
+def _valid_policy_version(value: object) -> bool:
+    return (
+        type(value) is str
+        and bool(value)
+        and value.strip() == value
+        and len(value.encode("utf-8")) <= 256
+    )
 
 
 def _valid_artifact_refs(value: object) -> bool:

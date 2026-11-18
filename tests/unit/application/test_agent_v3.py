@@ -490,6 +490,9 @@ class _JournalPort:
     async def load_session(self, *_args):
         raise NotImplementedError
 
+    async def load_context_summaries(self, *_args):
+        raise NotImplementedError
+
     async def find_submission(self, *_args):
         raise NotImplementedError
 

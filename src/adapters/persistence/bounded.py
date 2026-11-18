@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from src.adapters.persistence.sqlite_codec import encode
 from src.core.errors import RunErrorCode
-from src.core.ids import RunId, SessionId, SubmissionId
+from src.core.ids import ProfileId, RunId, SessionId, SubmissionId
 from src.core.journal import (
+    ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,
     JournalHead,
@@ -39,6 +40,26 @@ class BoundedRunJournal:
 
     async def load_session(self, session_id: SessionId, after_sequence: int = 0) -> JournalSnapshot:
         return await self._delegate.load_session(session_id, after_sequence)
+
+    async def load_context_summaries(
+        self,
+        session_id: SessionId,
+        profile_id: ProfileId,
+        policy_version: str,
+        covered_through_sequence: int,
+        limit: int,
+        expected_version: int,
+        expected_sequence: int,
+    ) -> tuple[ConversationSummaryCheckpoint, ...]:
+        return await self._delegate.load_context_summaries(
+            session_id,
+            profile_id,
+            policy_version,
+            covered_through_sequence,
+            limit,
+            expected_version,
+            expected_sequence,
+        )
 
     async def find_submission(
         self, session_id: SessionId, submission_id: SubmissionId
