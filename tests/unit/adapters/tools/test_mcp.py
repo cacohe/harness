@@ -394,3 +394,94 @@ def test_cancelled_add_waits_for_synchronous_discovery_before_close() -> None:
         assert client.closed == 1
 
     asyncio.run(scenario())
+
+
+def test_close_waits_for_concurrent_removed_server_close() -> None:
+    class BlockingClose(Client):
+        def __init__(self):
+            super().__init__()
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+
+        async def aclose(self):
+            self.close_started.set()
+            await self.release_close.wait()
+            self.closed += 1
+
+    async def scenario():
+        client = BlockingClose()
+        gateway = _gateway(client)
+        await gateway.add_server("server", object())
+        removing = asyncio.create_task(gateway.remove_server("server"))
+        await client.close_started.wait()
+        closing = asyncio.create_task(gateway.aclose())
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(closing), 0.05)
+        client.release_close.set()
+        assert await removing is None
+        assert await closing is None
+        assert await gateway.aclose() is None
+        assert client.closed == 1
+
+    asyncio.run(scenario())
+
+
+def test_close_observes_concurrent_removed_server_close_failure() -> None:
+    class FailingClose(Client):
+        def __init__(self):
+            super().__init__()
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+
+        async def aclose(self):
+            self.close_started.set()
+            await self.release_close.wait()
+            raise RuntimeError("close failed")
+
+    async def scenario():
+        client = FailingClose()
+        gateway = _gateway(client)
+        await gateway.add_server("server", object())
+        removing = asyncio.create_task(gateway.remove_server("server"))
+        await client.close_started.wait()
+        closing = asyncio.create_task(gateway.aclose())
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(closing), 0.05)
+        client.release_close.set()
+        outcomes = await asyncio.gather(removing, closing, return_exceptions=True)
+        assert all(isinstance(outcome, RuntimeError) for outcome in outcomes)
+        with pytest.raises(RuntimeError, match="close failed"):
+            await gateway.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_close_waits_for_removed_server_close_after_remove_is_cancelled() -> None:
+    class BlockingClose(Client):
+        def __init__(self):
+            super().__init__()
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+
+        async def aclose(self):
+            self.close_started.set()
+            await self.release_close.wait()
+            self.closed += 1
+
+    async def scenario():
+        client = BlockingClose()
+        gateway = _gateway(client)
+        await gateway.add_server("server", object())
+        removing = asyncio.create_task(gateway.remove_server("server"))
+        await client.close_started.wait()
+        removing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await removing
+        closing = asyncio.create_task(gateway.aclose())
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(closing), 0.05)
+        client.release_close.set()
+        assert await closing is None
+        assert client.closed == 1
+
+    asyncio.run(scenario())

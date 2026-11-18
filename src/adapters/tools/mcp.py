@@ -53,6 +53,8 @@ class MCPToolGateway(LocalToolGateway):
         self._pending_adds = 0
         self._adds_idle = asyncio.Event()
         self._adds_idle.set()
+        self._retired_closes: set[asyncio.Task[None]] = set()
+        self._retired_failure: BaseException | None = None
 
     async def add_server(self, name: str, source: object) -> None:
         _server_name(name)
@@ -125,6 +127,7 @@ class MCPToolGateway(LocalToolGateway):
                 raise KeyError("MCP server is unavailable")
             state.closing = True
         committed = False
+        close_task: asyncio.Task[None] | None = None
         try:
             await self._wait_idle(state)
             async with self._lifecycle:
@@ -134,8 +137,11 @@ class MCPToolGateway(LocalToolGateway):
                 del replacement[name]
                 self._publish(replacement)
                 self._servers = replacement
+                close_task = self._start_close(state)
+                self._retired_closes.add(close_task)
+                close_task.add_done_callback(self._retired_close_done)
                 committed = True
-            await self._shielded_close(state)
+            await asyncio.shield(close_task)
         finally:
             async with self._lifecycle:
                 if not committed and self._servers.get(name) is state:
@@ -151,13 +157,25 @@ class MCPToolGateway(LocalToolGateway):
                     state.closing = True
                 self._servers = {}
                 self._dynamic_catalog.replace(())
-                task = asyncio.create_task(self._close_all(states))
+                retired = tuple(self._retired_closes)
+                task = asyncio.create_task(self._close_all(states, retired, self._retired_failure))
                 self._close_task = task
         await asyncio.shield(task)
 
-    async def _close_all(self, states: tuple[_Server, ...]) -> None:
+    async def _close_all(
+        self,
+        states: tuple[_Server, ...],
+        retired: tuple[asyncio.Task[None], ...],
+        retired_failure: BaseException | None,
+    ) -> None:
         await self._adds_idle.wait()
-        failure: BaseException | None = None
+        failure = retired_failure
+        for task in retired:
+            try:
+                await asyncio.shield(task)
+            except BaseException as error:
+                if failure is None:
+                    failure = error
         for state in states:
             try:
                 await self._wait_idle(state)
@@ -237,12 +255,25 @@ class MCPToolGateway(LocalToolGateway):
             await state.condition.wait_for(lambda: state.active == expected)
 
     async def _shielded_close(self, state: _Server) -> None:
+        await asyncio.shield(self._start_close(state))
+
+    @staticmethod
+    def _start_close(state: _Server) -> asyncio.Task[None]:
         task = state.close_task
         if task is None:
             state.closed = True
             task = asyncio.create_task(_close_once(state.client))
             state.close_task = task
-        await asyncio.shield(task)
+        return task
+
+    def _retired_close_done(self, task: asyncio.Task[None]) -> None:
+        self._retired_closes.discard(task)
+        try:
+            failure = task.exception()
+        except BaseException as error:
+            failure = error
+        if failure is not None and self._retired_failure is None:
+            self._retired_failure = failure
 
     def _publish(self, servers: dict[str, _Server]) -> None:
         entries = tuple(entry for state in servers.values() for entry in state.entries)
