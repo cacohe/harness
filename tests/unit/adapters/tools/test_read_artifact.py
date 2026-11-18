@@ -19,8 +19,11 @@ def test_reads_only_bounded_slice() -> None:
         repo = InMemoryArtifactRepository(1024)
         ref = await repo.put(
             ArtifactWrite(
-                _stream(payload), "text/plain", expected_size_bytes=len(payload),
-                expected_sha256=digest, max_bytes=1024,
+                _stream(payload),
+                "text/plain",
+                expected_size_bytes=len(payload),
+                expected_sha256=digest,
+                max_bytes=1024,
             )
         )
         result = await ReadArtifactTool(repo, max_read_bytes=4)(
@@ -37,7 +40,9 @@ def test_binary_is_base64_and_reads_only_limit_plus_one() -> None:
     async def scenario():
         payload = b"\x00\x01\x02\x03\x04\x05"
         repo = InMemoryArtifactRepository(1024)
-        ref = await repo.put(ArtifactWrite(_stream(payload), "application/octet-stream", max_bytes=1024))
+        ref = await repo.put(
+            ArtifactWrite(_stream(payload), "application/octet-stream", max_bytes=1024)
+        )
         result = await ReadArtifactTool(repo, max_read_bytes=3)(
             {"artifact_id": ref.artifact_id, "offset": 1, "limit": 3}
         )
@@ -91,7 +96,11 @@ def test_untrusted_stat_and_stream_are_rejected() -> None:
             yield b"x"
 
     with pytest.raises(ValueError):
-        asyncio.run(ReadArtifactTool(BadRepository())({"artifact_id": "sha256:" + "0" * 64, "offset": 0, "limit": 1}))
+        asyncio.run(
+            ReadArtifactTool(BadRepository())(
+                {"artifact_id": "sha256:" + "0" * 64, "offset": 0, "limit": 1}
+            )
+        )
 
 
 @pytest.mark.parametrize("payload", [b"ab", b"abcdef"])
@@ -109,10 +118,15 @@ def test_declared_size_mismatch_is_rejected(payload: bytes) -> None:
         def open(self, _artifact_id):
             async def chunks():
                 yield payload
+
             return chunks()
 
     with pytest.raises(ValueError):
-        asyncio.run(ReadArtifactTool(Repository())({"artifact_id": ref.artifact_id, "offset": 0, "limit": 4}))
+        asyncio.run(
+            ReadArtifactTool(Repository())(
+                {"artifact_id": ref.artifact_id, "offset": 0, "limit": 4}
+            )
+        )
 
 
 def test_huge_chunk_is_rejected_and_iterator_is_closed() -> None:
@@ -145,5 +159,9 @@ def test_huge_chunk_is_rejected_and_iterator_is_closed() -> None:
             return Stream()
 
     with pytest.raises(ValueError):
-        asyncio.run(ReadArtifactTool(Repository(), max_chunk_bytes=3)({"artifact_id": ref.artifact_id, "offset": 0, "limit": 2}))
+        asyncio.run(
+            ReadArtifactTool(Repository(), max_chunk_bytes=3)(
+                {"artifact_id": ref.artifact_id, "offset": 0, "limit": 2}
+            )
+        )
     assert closed

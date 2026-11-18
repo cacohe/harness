@@ -17,7 +17,7 @@ from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.persistence.bounded import BoundedRunJournal
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.adapters.persistence.sqlite import SQLiteRunJournal
-from src.application.agent_v3 import Agent
+from src.application.agent import Agent
 from src.application.observability import PostCommitObserver
 from src.application.runtime import RuntimeCoordinator, _close_resource
 from src.application.submissions import SubmissionService

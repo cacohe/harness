@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from src.adapters.tools.catalog import ToolCatalog, ToolCatalogEntry
-from src.adapters.tools.idempotency import ToolExecutionStore
+from src.adapters.tools.execution_store import ToolExecutionStore
 from src.adapters.tools.local import LocalToolGateway
 from src.core.artifacts import ArtifactExternalizer
 from src.core.tools import ToolSpec
@@ -41,7 +41,9 @@ class MCPToolGateway(LocalToolGateway):
         if not callable(client_factory) or type(workspace_id) is not str or not workspace_id:
             raise ValueError("MCP configuration is invalid")
         self._dynamic_catalog = ToolCatalog(())
-        super().__init__(self._dynamic_catalog, store, externalizer, timeout_seconds=timeout_seconds)
+        super().__init__(
+            self._dynamic_catalog, store, externalizer, timeout_seconds=timeout_seconds
+        )
         self._factory = client_factory
         self._workspace = workspace_id
         self._servers: dict[str, _Server] = {}
@@ -153,7 +155,11 @@ class MCPToolGateway(LocalToolGateway):
             remote_name = _value(descriptor, "name")
             description = _value(descriptor, "description", "")
             schema = _value(descriptor, "inputSchema", _value(descriptor, "input_schema", {}))
-            if type(remote_name) is not str or type(description) is not str or type(schema) is not dict:
+            if (
+                type(remote_name) is not str
+                or type(description) is not str
+                or type(schema) is not dict
+            ):
                 raise ValueError("MCP tool descriptor is invalid")
             public_name = f"{name}.{remote_name}"
             annotations = _value(descriptor, "annotations", {})

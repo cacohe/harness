@@ -7,7 +7,7 @@ import math
 from collections.abc import Awaitable, Callable
 
 from src.adapters.tools.catalog import ToolCatalog, ToolCatalogEntry
-from src.adapters.tools.idempotency import ClaimState, ToolExecutionStore
+from src.adapters.tools.execution_store import ClaimState, ToolExecutionStore
 from src.core.artifacts import ArtifactExternalizer
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.tools import ToolApproval, ToolRequest, ToolResult, ToolResultStatus
@@ -94,9 +94,7 @@ class LocalToolGateway:
             if inspect.iscoroutinefunction(handler):
                 value = await asyncio.wait_for(handler(arguments), self._timeout)
             else:
-                value = await asyncio.wait_for(
-                    asyncio.to_thread(handler, arguments), self._timeout
-                )
+                value = await asyncio.wait_for(asyncio.to_thread(handler, arguments), self._timeout)
                 if inspect.isawaitable(value):
                     value = await asyncio.wait_for(value, self._timeout)
             content = await self._externalizer.externalize(value, "application/json")
@@ -125,13 +123,9 @@ class LocalToolGateway:
 
 def _authorize(request: ToolRequest, entry: ToolCatalogEntry | None) -> ToolResult | None:
     if request.approval is ToolApproval.DENIED:
-        return ToolResult(
-            ToolResultStatus.DENIED, execution_key=request.idempotency_key
-        )
+        return ToolResult(ToolResultStatus.DENIED, execution_key=request.idempotency_key)
     if request.approval is ToolApproval.UNDECIDED:
-        return ToolResult(
-            ToolResultStatus.PENDING_APPROVAL, execution_key=request.idempotency_key
-        )
+        return ToolResult(ToolResultStatus.PENDING_APPROVAL, execution_key=request.idempotency_key)
     if entry is None:
         return ToolResult(ToolResultStatus.DENIED, execution_key=request.idempotency_key)
     spec = entry.spec
@@ -141,13 +135,9 @@ def _authorize(request: ToolRequest, entry: ToolCatalogEntry | None) -> ToolResu
         return ToolResult(ToolResultStatus.DENIED, execution_key=request.idempotency_key)
     # A live policy may tighten, but it can never remove the persisted gate.
     if spec.requires_approval and request.approval is not ToolApproval.APPROVED:
-        return ToolResult(
-            ToolResultStatus.PENDING_APPROVAL, execution_key=request.idempotency_key
-        )
+        return ToolResult(ToolResultStatus.PENDING_APPROVAL, execution_key=request.idempotency_key)
     if request.approval_required and request.approval is not ToolApproval.APPROVED:
-        return ToolResult(
-            ToolResultStatus.PENDING_APPROVAL, execution_key=request.idempotency_key
-        )
+        return ToolResult(ToolResultStatus.PENDING_APPROVAL, execution_key=request.idempotency_key)
     return None
 
 

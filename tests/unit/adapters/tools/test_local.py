@@ -20,8 +20,12 @@ from src.core.tools import ToolApproval, ToolRequest, ToolSpec
 
 def _request(arguments: str = '{"value":1}') -> ToolRequest:
     call = ToolCallRequest(
-        "call-1", "increment", arguments,
-        requires_approval=False, approval_scope="execute", workspace_id="default",
+        "call-1",
+        "increment",
+        arguments,
+        requires_approval=False,
+        approval_scope="execute",
+        workspace_id="default",
     )
     return ToolRequest.from_call(
         call,
@@ -52,7 +56,9 @@ def test_concurrent_retry_has_one_effect_and_recovers_from_sqlite(tmp_path: Path
         gateway = LocalToolGateway(
             ToolCatalog((ToolCatalogEntry(spec, handler, False),)), store, externalizer
         )
-        first, second = await asyncio.gather(gateway.execute(_request()), gateway.execute(_request()))
+        first, second = await asyncio.gather(
+            gateway.execute(_request()), gateway.execute(_request())
+        )
         assert first == second
         assert first.execution_key == _request().idempotency_key
         recovered = await gateway.execute(_request())
@@ -80,7 +86,9 @@ def test_live_approval_tightening_prevents_claim_and_effect(tmp_path: Path) -> N
     async def scenario():
         store = SQLiteToolExecutionStore((tmp_path / "tools.db").resolve())
         spec = ToolSpec("increment", "x", "true", requires_approval=True)
-        gateway = LocalToolGateway(ToolCatalog((ToolCatalogEntry(spec, handler, True),)), store, _externalizer())
+        gateway = LocalToolGateway(
+            ToolCatalog((ToolCatalogEntry(spec, handler, True),)), store, _externalizer()
+        )
         result = await gateway.execute(_request())
         assert result.status.value == "pending_approval"
         assert result.execution_key == _request().idempotency_key
@@ -123,8 +131,11 @@ def test_timeout_exception_and_cancellation_are_stable(tmp_path: Path) -> None:
     async def scenario():
         slow_gateway = LocalToolGateway(
             ToolCatalog((ToolCatalogEntry(ToolSpec("increment", "x", "true"), slow, True),)),
-            SQLiteToolExecutionStore((tmp_path / "slow.db").resolve(), sqlite_busy_timeout_seconds=0.05),
-            _externalizer(), timeout_seconds=0.01,
+            SQLiteToolExecutionStore(
+                (tmp_path / "slow.db").resolve(), sqlite_busy_timeout_seconds=0.05
+            ),
+            _externalizer(),
+            timeout_seconds=0.01,
         )
         timed = await slow_gateway.execute(_request())
         assert timed.status.value == "timed_out"
@@ -132,7 +143,8 @@ def test_timeout_exception_and_cancellation_are_stable(tmp_path: Path) -> None:
 
         broken_gateway = LocalToolGateway(
             ToolCatalog((ToolCatalogEntry(ToolSpec("increment", "x", "true"), broken, True),)),
-            SQLiteToolExecutionStore((tmp_path / "broken.db").resolve()), _externalizer(),
+            SQLiteToolExecutionStore((tmp_path / "broken.db").resolve()),
+            _externalizer(),
         )
         failed = await broken_gateway.execute(_request())
         assert failed.status.value == "failed"
@@ -146,8 +158,11 @@ def test_timeout_exception_and_cancellation_are_stable(tmp_path: Path) -> None:
 
         cancel_gateway = LocalToolGateway(
             ToolCatalog((ToolCatalogEntry(ToolSpec("increment", "x", "true"), cancellable, True),)),
-            SQLiteToolExecutionStore((tmp_path / "cancel.db").resolve(), sqlite_busy_timeout_seconds=0.05),
-            _externalizer(), timeout_seconds=20,
+            SQLiteToolExecutionStore(
+                (tmp_path / "cancel.db").resolve(), sqlite_busy_timeout_seconds=0.05
+            ),
+            _externalizer(),
+            timeout_seconds=20,
         )
         task = asyncio.create_task(cancel_gateway.execute(_request()))
         await started.wait()
@@ -196,7 +211,8 @@ def test_sync_mutating_handler_is_rejected_at_registration() -> None:
     with pytest.raises(ValueError, match="Mutating local tools"):
         LocalToolGateway(
             ToolCatalog((ToolCatalogEntry(ToolSpec("increment", "x", "true"), handler, True),)),
-            InMemoryToolExecutionStore(), _externalizer(),
+            InMemoryToolExecutionStore(),
+            _externalizer(),
         )
 
 
@@ -209,15 +225,23 @@ def test_stale_workspace_binding_is_denied_before_claim(tmp_path: Path) -> None:
         store = SQLiteToolExecutionStore(path)
         gateway = LocalToolGateway(
             ToolCatalog((ToolCatalogEntry(ToolSpec("increment", "x", "true"), handler, False),)),
-            store, _externalizer(),
+            store,
+            _externalizer(),
         )
         call = ToolCallRequest(
-            "call-1", "increment", "{}", requires_approval=False,
-            approval_scope="execute", workspace_id="stale",
+            "call-1",
+            "increment",
+            "{}",
+            requires_approval=False,
+            approval_scope="execute",
+            workspace_id="stale",
         )
         request = ToolRequest.from_call(
-            call, run_id=RunId("run-1"), session_id=SessionId("session-1"),
-            step_id="step-1", approval=ToolApproval.NOT_REQUIRED,
+            call,
+            run_id=RunId("run-1"),
+            session_id=SessionId("session-1"),
+            step_id="step-1",
+            approval=ToolApproval.NOT_REQUIRED,
         )
         result = await gateway.execute(request)
         assert result.status.value == "denied"

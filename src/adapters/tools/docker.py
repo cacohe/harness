@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import cast
 
 from src.adapters.tools.catalog import ToolCatalog
-from src.adapters.tools.idempotency import ToolExecutionStore
+from src.adapters.tools.execution_store import ToolExecutionStore
 from src.adapters.tools.local import LocalToolGateway
 from src.core.artifacts import ArtifactExternalizer
 from src.core.errors import RunErrorCode, RunFailure
@@ -83,7 +83,12 @@ class DockerToolGateway(LocalToolGateway):
         numeric = (memory_bytes, pids_limit, max_output_bytes, tmpfs_bytes)
         if any(type(item) is not int or item <= 0 for item in numeric):
             raise ValueError("Docker resource limits are invalid")
-        if isinstance(cpus, bool) or type(cpus) not in (int, float) or not math.isfinite(cpus) or cpus <= 0:
+        if (
+            isinstance(cpus, bool)
+            or type(cpus) not in (int, float)
+            or not math.isfinite(cpus)
+            or cpus <= 0
+        ):
             raise ValueError("Docker CPU limit is invalid")
         if type(user) is not str or _USER.fullmatch(user) is None:
             raise ValueError("Docker user must be non-root")
@@ -92,9 +97,7 @@ class DockerToolGateway(LocalToolGateway):
         self._root = root
         self._host = host
         self._cleanup_timeout = _duration(cleanup_timeout_seconds, "Docker cleanup timeout")
-        self._builder_timeout = _duration(
-            builder_timeout_seconds, "Docker builder timeout"
-        )
+        self._builder_timeout = _duration(builder_timeout_seconds, "Docker builder timeout")
         self._output_limit = max_output_bytes
         self._memory = memory_bytes
         self._pids = pids_limit
@@ -120,11 +123,19 @@ class DockerToolGateway(LocalToolGateway):
                 execution_key=request.idempotency_key,
             )
         except TimeoutError:
-            return ToolResult(ToolResultStatus.TIMED_OUT, failure=RunFailure(RunErrorCode.TOOL_TIMED_OUT), execution_key=request.idempotency_key)
+            return ToolResult(
+                ToolResultStatus.TIMED_OUT,
+                failure=RunFailure(RunErrorCode.TOOL_TIMED_OUT),
+                execution_key=request.idempotency_key,
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
-            return ToolResult(ToolResultStatus.FAILED, failure=RunFailure(RunErrorCode.TOOL_FAILED), execution_key=request.idempotency_key)
+            return ToolResult(
+                ToolResultStatus.FAILED,
+                failure=RunFailure(RunErrorCode.TOOL_FAILED),
+                execution_key=request.idempotency_key,
+            )
 
     async def _build_invocation(
         self,
@@ -132,9 +143,7 @@ class DockerToolGateway(LocalToolGateway):
         arguments: dict[str, object],
     ) -> DockerInvocation:
         if asyncio.iscoroutinefunction(handler):
-            candidate = await asyncio.wait_for(
-                handler(arguments), timeout=self._builder_timeout
-            )
+            candidate = await asyncio.wait_for(handler(arguments), timeout=self._builder_timeout)
         else:
             candidate = await asyncio.wait_for(
                 asyncio.to_thread(handler, arguments), timeout=self._builder_timeout
@@ -152,7 +161,10 @@ class DockerToolGateway(LocalToolGateway):
             if result[0] != 0:
                 raise RuntimeError("Docker create failed")
             process = await asyncio.create_subprocess_exec(
-                *self._prefix(), "start", "--attach", name,
+                *self._prefix(),
+                "start",
+                "--attach",
+                name,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -173,9 +185,7 @@ class DockerToolGateway(LocalToolGateway):
             except BaseException:
                 process.kill()
                 await process.wait()
-                await asyncio.gather(
-                    stdout_task, stderr_task, wait_task, return_exceptions=True
-                )
+                await asyncio.gather(stdout_task, stderr_task, wait_task, return_exceptions=True)
                 raise
             return {
                 "exit_code": exit_code,
@@ -199,23 +209,57 @@ class DockerToolGateway(LocalToolGateway):
         if any(item in mount for item in (",", "\r", "\n", "\x00")):
             raise ValueError("Docker workspace cannot be mounted safely")
         return [
-            *self._prefix(), "create", "--name", name, "--pull=never", "--network", "none",
-            "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
-            "--init", "--pids-limit", str(self._pids), "--memory", str(self._memory),
-            "--memory-swap", str(self._memory), "--cpus", f"{self._cpus:g}",
-            "--ulimit", "nofile=1024:1024", "--user", self._user,
-            "--tmpfs", f"/tmp:rw,nosuid,nodev,size={self._tmpfs}",
-            "--mount", f"type=bind,source={mount},target=/workspace", "--workdir", container_cwd,
-            "--env", "HOME=/tmp", "--env", "TMPDIR=/tmp", "--entrypoint", "/bin/sh",
-            self._image, "-lc", invocation.command,
+            *self._prefix(),
+            "create",
+            "--name",
+            name,
+            "--pull=never",
+            "--network",
+            "none",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges:true",
+            "--init",
+            "--pids-limit",
+            str(self._pids),
+            "--memory",
+            str(self._memory),
+            "--memory-swap",
+            str(self._memory),
+            "--cpus",
+            f"{self._cpus:g}",
+            "--ulimit",
+            "nofile=1024:1024",
+            "--user",
+            self._user,
+            "--tmpfs",
+            f"/tmp:rw,nosuid,nodev,size={self._tmpfs}",
+            "--mount",
+            f"type=bind,source={mount},target=/workspace",
+            "--workdir",
+            container_cwd,
+            "--env",
+            "HOME=/tmp",
+            "--env",
+            "TMPDIR=/tmp",
+            "--entrypoint",
+            "/bin/sh",
+            self._image,
+            "-lc",
+            invocation.command,
         ]
+
     def _prefix(self) -> list[str]:
         return [self._docker, "--host", self._host]
 
     async def _command(self, args: list[str], timeout: float) -> tuple[int, bytes, bytes]:
         process = await asyncio.create_subprocess_exec(
-            *args, stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            *args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
         if process.stdout is None or process.stderr is None:
             process.kill()

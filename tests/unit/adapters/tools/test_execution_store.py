@@ -18,18 +18,26 @@ from src.core.tools import ToolApproval, ToolRequest, ToolResult, ToolResultStat
 
 def _request(arguments: str = "{}", *, call_id: str = "call") -> ToolRequest:
     call = ToolCallRequest(
-        call_id, "tool", arguments,
-        requires_approval=False, approval_scope="execute", workspace_id="default",
+        call_id,
+        "tool",
+        arguments,
+        requires_approval=False,
+        approval_scope="execute",
+        workspace_id="default",
     )
     return ToolRequest.from_call(
-        call, run_id=RunId("run"), session_id=SessionId("session"),
-        step_id="step", approval=ToolApproval.NOT_REQUIRED,
+        call,
+        run_id=RunId("run"),
+        session_id=SessionId("session"),
+        step_id="step",
+        approval=ToolApproval.NOT_REQUIRED,
     )
 
 
 def _result(request: ToolRequest) -> ToolResult:
     return ToolResult(
-        ToolResultStatus.FAILED, failure=RunFailure(RunErrorCode.TOOL_FAILED),
+        ToolResultStatus.FAILED,
+        failure=RunFailure(RunErrorCode.TOOL_FAILED),
         execution_key=request.idempotency_key,
     )
 
@@ -208,9 +216,7 @@ def test_corrupt_completed_payload_is_rejected(tmp_path: Path) -> None:
         store = SQLiteToolExecutionStore(path)
         assert (await store.claim(request)).state is ClaimState.OWNER
         with sqlite3.connect(path) as connection:
-            connection.execute(
-                "UPDATE executions SET state='completed', result_json='{}'"
-            )
+            connection.execute("UPDATE executions SET state='completed', result_json='{}'")
         with pytest.raises(ToolExecutionStoreError):
             await store.claim(request)
 

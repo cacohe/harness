@@ -103,7 +103,11 @@ class ReadArtifactTool:
             raise ValueError("Artifact stream ended before its declared size")
         payload = bytes(data[:limit])
         truncated = offset + len(payload) < ref.size_bytes
-        if ref.media_type.startswith("text/") or ref.media_type.endswith("+json") or ref.media_type == "application/json":
+        if (
+            ref.media_type.startswith("text/")
+            or ref.media_type.endswith("+json")
+            or ref.media_type == "application/json"
+        ):
             try:
                 content: str = payload.decode("utf-8", errors="strict")
                 encoding = "utf-8"

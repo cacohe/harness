@@ -39,11 +39,20 @@ def test_composite_preserves_order_and_event_has_no_content() -> None:
 
     async def scenario():
         observation = Observation("advanced", "s", "r", "running", 2, 3)
-        await CompositeObserver((Recorder("one"), Recorder("two"), EventObserver(events.append))).observe(observation)
+        await CompositeObserver(
+            (Recorder("one"), Recorder("two"), EventObserver(events.append))
+        ).observe(observation)
 
     asyncio.run(scenario())
     assert seen == [("one", "advanced"), ("two", "advanced")]
-    assert set(events[0]) == {"kind", "session_id", "run_id", "status", "journal_version", "journal_sequence"}
+    assert set(events[0]) == {
+        "kind",
+        "session_id",
+        "run_id",
+        "status",
+        "journal_version",
+        "journal_sequence",
+    }
 
 
 def test_metrics_is_async_safe_and_default_composition_has_no_observer() -> None:

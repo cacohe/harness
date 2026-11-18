@@ -20,8 +20,12 @@ def test_invocation_rejects_nul() -> None:
 def test_gateway_requires_digest_pinned_image() -> None:
     with pytest.raises((TypeError, ValueError)):
         DockerToolGateway(  # type: ignore[call-arg]
-            None, None, None,
-            docker_executable=Path("docker"), image="latest", workspace_root=Path("."),
+            None,
+            None,
+            None,
+            docker_executable=Path("docker"),
+            image="latest",
+            workspace_root=Path("."),
         )
 
 
@@ -31,7 +35,9 @@ def _gateway(tmp_path: Path) -> DockerToolGateway:
         ArtifactPolicy(512, 1024, 128, frozenset({"application/json"})),
     )
     return DockerToolGateway(
-        ToolCatalog(()), InMemoryToolExecutionStore(), externalizer,
+        ToolCatalog(()),
+        InMemoryToolExecutionStore(),
+        externalizer,
         docker_executable=Path(os.environ["COMSPEC"]),
         image="example.invalid/tool@sha256:" + "a" * 64,
         workspace_root=tmp_path.resolve(),
@@ -63,9 +69,16 @@ def test_create_argv_contains_all_hardening_and_no_shell(tmp_path: Path) -> None
     args = gateway._create_arguments("container", DockerInvocation("echo ok"))
     joined = " ".join(args)
     for required in (
-        "--network none", "--read-only", "--cap-drop ALL",
-        "no-new-privileges:true", "--pids-limit", "--memory", "--cpus",
-        "--user 65534:65534", "--tmpfs", "--pull=never",
+        "--network none",
+        "--read-only",
+        "--cap-drop ALL",
+        "no-new-privileges:true",
+        "--pids-limit",
+        "--memory",
+        "--cpus",
+        "--user 65534:65534",
+        "--tmpfs",
+        "--pull=never",
     ):
         assert required in joined
     assert args[-2:] == ["-lc", "echo ok"]
@@ -142,7 +155,8 @@ def test_ambiguous_create_always_attempts_confirmed_cleanup(tmp_path: Path) -> N
 def test_rejects_noncanonical_docker_hosts(tmp_path: Path, host: str) -> None:
     with pytest.raises(ValueError):
         DockerToolGateway(
-            ToolCatalog(()), InMemoryToolExecutionStore(),
+            ToolCatalog(()),
+            InMemoryToolExecutionStore(),
             PolicyArtifactExternalizer(
                 InMemoryArtifactRepository(1024),
                 ArtifactPolicy(512, 1024, 128, frozenset({"application/json"})),
@@ -158,9 +172,7 @@ def test_sync_mutating_invocation_builder_is_rejected(tmp_path: Path) -> None:
     def builder(_arguments):
         return DockerInvocation("echo unsafe")
 
-    catalog = ToolCatalog(
-        (ToolCatalogEntry(ToolSpec("docker", "docker", "true"), builder, True),)
-    )
+    catalog = ToolCatalog((ToolCatalogEntry(ToolSpec("docker", "docker", "true"), builder, True),))
     with pytest.raises(ValueError, match="Mutating Docker tools"):
         _configured_gateway(tmp_path, catalog)
 
@@ -174,9 +186,7 @@ def test_sync_nonmutating_builder_timeout_does_not_block_event_loop(tmp_path: Pa
 
     gateway = _configured_gateway(
         tmp_path,
-        ToolCatalog(
-            (ToolCatalogEntry(ToolSpec("docker", "docker", "true"), builder, False),)
-        ),
+        ToolCatalog((ToolCatalogEntry(ToolSpec("docker", "docker", "true"), builder, False),)),
         builder_timeout_seconds=0.01,
     )
 
@@ -201,9 +211,7 @@ def test_async_builder_timeout_and_caller_cancellation_are_bounded(tmp_path: Pat
 
     gateway = _configured_gateway(
         tmp_path,
-        ToolCatalog(
-            (ToolCatalogEntry(ToolSpec("docker", "docker", "true"), builder, True),)
-        ),
+        ToolCatalog((ToolCatalogEntry(ToolSpec("docker", "docker", "true"), builder, True),)),
         builder_timeout_seconds=0.01,
     )
 

@@ -75,7 +75,13 @@ class LiteLLMModelGateway:
         if options is not None and type(options) is not dict:
             raise ValueError("LiteLLM options are invalid")
         forbidden = {
-            "model", "messages", "tools", "stream", "api_key", "api_base", "timeout",
+            "model",
+            "messages",
+            "tools",
+            "stream",
+            "api_key",
+            "api_base",
+            "timeout",
             "max_tokens",
         }
         if options is not None and forbidden.intersection(options):
@@ -185,7 +191,12 @@ class LiteLLMModelGateway:
                 seen_indexes: set[int] = set()
                 for fragment in fragments:
                     index = _field(fragment, "index", None)
-                    if type(index) is not int or index < 0 or index > len(calls) or index in seen_indexes:
+                    if (
+                        type(index) is not int
+                        or index < 0
+                        or index > len(calls)
+                        or index in seen_indexes
+                    ):
                         raise ValueError
                     seen_indexes.add(index)
                     if index == len(calls):

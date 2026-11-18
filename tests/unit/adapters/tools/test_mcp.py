@@ -11,7 +11,14 @@ class Client:
         self.closed = 0
 
     async def list_tools(self):
-        return [{"name": "read", "description": "read", "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": True}}]
+        return [
+            {
+                "name": "read",
+                "description": "read",
+                "inputSchema": {"type": "object"},
+                "annotations": {"readOnlyHint": True},
+            }
+        ]
 
     async def call_tool(self, name, arguments):
         return {"name": name, "arguments": arguments}

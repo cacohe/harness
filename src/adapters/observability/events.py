@@ -34,9 +34,7 @@ class CompositeObserver:
             raise ValueError("Observation is invalid")
         for observer in self._observers:
             try:
-                await asyncio.wait_for(
-                    observer.observe(observation), timeout=self._timeout
-                )
+                await asyncio.wait_for(observer.observe(observation), timeout=self._timeout)
             except asyncio.CancelledError:
                 raise
             except Exception:

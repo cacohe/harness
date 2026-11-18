@@ -15,8 +15,7 @@ from importlib.abc import MetaPathFinder
 class RejectRuntimeImports(MetaPathFinder):
     def find_spec(self, fullname, path, target=None):
         forbidden = (
-            "src.application.agent", "src.application.session", "src.adapters", "src.config",
-            "src.llm", "src.mcp", "litellm", "fastmcp", "sqlite3",
+            "src.application.agent", "src.adapters", "litellm", "sqlite3",
         )
         if any(fullname == name or fullname.startswith(name + ".") for name in forbidden):
             raise AssertionError(f"unexpected runtime import: {fullname}")

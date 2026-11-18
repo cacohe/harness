@@ -230,8 +230,12 @@ async def test_replayed_acceptance_emits_no_acceptance_observation_and_hung_obse
         submissions=ReplaySubmissions(journal),
         journal=journal,
         coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, []),
-        ids=Ids(), clock=Clock(), max_sessions=1, max_waiters_per_session=0,
-        observer=Observer(), observer_timeout_seconds=0.01,
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=0,
+        observer=Observer(),
+        observer_timeout_seconds=0.01,
     )
     result = await asyncio.wait_for(
         runtime.submit(

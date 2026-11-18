@@ -16,9 +16,14 @@ class Observation:
 
     def __post_init__(self) -> None:
         texts = (self.kind, self.session_id, self.run_id, self.status)
-        if any(type(item) is not str or not item or len(item.encode("utf-8")) > 256 for item in texts):
+        if any(
+            type(item) is not str or not item or len(item.encode("utf-8")) > 256 for item in texts
+        ):
             raise ValueError("Observation identity is invalid")
-        if any(type(item) is not int or not 0 <= item <= (1 << 63) - 1 for item in (self.journal_version, self.journal_sequence)):
+        if any(
+            type(item) is not int or not 0 <= item <= (1 << 63) - 1
+            for item in (self.journal_version, self.journal_sequence)
+        ):
             raise ValueError("Observation position is invalid")
 
 

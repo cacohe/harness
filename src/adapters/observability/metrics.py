@@ -36,6 +36,8 @@ class MetricsObserver:
     async def snapshot(self) -> MetricsSnapshot:
         async with self._lock:
             return MetricsSnapshot(
-                tuple((kind, status, count) for (kind, status), count in sorted(self._counts.items())),
+                tuple(
+                    (kind, status, count) for (kind, status), count in sorted(self._counts.items())
+                ),
                 self._overflow,
             )

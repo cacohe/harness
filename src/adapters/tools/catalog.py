@@ -26,7 +26,9 @@ class ToolCatalogEntry:
 
 class ToolCatalog:
     def __init__(self, entries: tuple[ToolCatalogEntry, ...]) -> None:
-        if type(entries) is not tuple or any(type(item) is not ToolCatalogEntry for item in entries):
+        if type(entries) is not tuple or any(
+            type(item) is not ToolCatalogEntry for item in entries
+        ):
             raise ValueError("Tool catalog requires a tuple of entries")
         if len({item.spec.name for item in entries}) != len(entries):
             raise ValueError("Tool catalog names must be unique")
