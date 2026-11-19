@@ -82,9 +82,7 @@ def test_empty_stream_and_equivalent_metadata_deduplicate():
             )
         )
 
-        artifact_id = _address(
-            b"", name="same", metadata={"z": 1, "a": ["same"]}
-        )
+        artifact_id = _address(b"", name="same", metadata={"z": 1, "a": ["same"]})
         assert first == duplicate == await repo.stat(artifact_id)
         duplicate.metadata["z"] = 2
         assert (await repo.stat(artifact_id)).metadata == {"z": 1, "a": ["same"]}
@@ -97,9 +95,7 @@ def test_same_bytes_with_different_media_types_have_distinct_descriptor_ids():
     async def scenario():
         repo = InMemoryArtifactRepository(max_artifact_bytes=3)
         text = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
-        binary = await repo.put(
-            ArtifactWrite(_chunks(b"abc"), "application/octet-stream")
-        )
+        binary = await repo.put(ArtifactWrite(_chunks(b"abc"), "application/octet-stream"))
 
         assert text.artifact_id != binary.artifact_id
         assert text.sha256 == binary.sha256 == hashlib.sha256(b"abc").hexdigest()
@@ -135,9 +131,7 @@ def test_concurrent_distinct_descriptors_publish_independently(changed):
         second = await pending
 
         assert first.artifact_id != second.artifact_id
-        assert first == await repo.stat(
-            _address(b"abc", name="original", metadata={"version": 1})
-        )
+        assert first == await repo.stat(_address(b"abc", name="original", metadata={"version": 1}))
         assert second == await repo.stat(second.artifact_id)
         assert await _read(repo, first.artifact_id) == b"abc"
         assert await _read(repo, second.artifact_id) == b"abc"

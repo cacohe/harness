@@ -60,4 +60,3 @@ def test_router_denies_unknown_tool_without_fallback() -> None:
         assert result.execution_key == request.idempotency_key
 
     asyncio.run(scenario())
-

@@ -152,9 +152,7 @@ def test_same_bytes_with_different_media_types_publish_distinct_objects(tmp_path
     async def scenario():
         repo = FilesystemArtifactRepository(tmp_path, 3)
         text = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
-        binary = await repo.put(
-            ArtifactWrite(_chunks(b"abc"), "application/octet-stream")
-        )
+        binary = await repo.put(ArtifactWrite(_chunks(b"abc"), "application/octet-stream"))
 
         assert text.artifact_id != binary.artifact_id
         assert text.sha256 == binary.sha256 == hashlib.sha256(b"abc").hexdigest()

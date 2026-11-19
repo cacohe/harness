@@ -82,9 +82,7 @@ def _request(gateway: MCPToolGateway) -> ToolRequest:
         run_id=RunId("run-1"),
         session_id=SessionId("session-1"),
         step_id="step-1",
-        approval=(
-            ToolApproval.APPROVED if spec.requires_approval else ToolApproval.NOT_REQUIRED
-        ),
+        approval=(ToolApproval.APPROVED if spec.requires_approval else ToolApproval.NOT_REQUIRED),
     )
 
 

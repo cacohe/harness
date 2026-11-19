@@ -1967,9 +1967,10 @@ def test_commit_and_submission_lookup_do_not_replay_full_ledger(
         raise AssertionError("hot path replayed the complete ledger")
 
     monkeypatch.setattr(sqlite_module, "_preflight_existing_ledger", forbid_full_replay)
-    assert asyncio.run(
-        journal.find_submission(first.state.session_id, first.state.submission_id)
-    ) is not None
+    assert (
+        asyncio.run(journal.find_submission(first.state.session_id, first.state.submission_id))
+        is not None
+    )
     next_batch = _new_commit_after(
         receipt.state,
         version=receipt.version,

@@ -436,9 +436,7 @@ class _AsyncContextClient:
             await outcome
 
 
-async def _enter_async_context(
-    client: object, *, timeout: float, limiter: _SyncLimiter
-) -> object:
+async def _enter_async_context(client: object, *, timeout: float, limiter: _SyncLimiter) -> object:
     enter = getattr(client, "__aenter__", None)
     exit_context = getattr(client, "__aexit__", None)
     if enter is None and exit_context is None:
@@ -471,16 +469,10 @@ def _normalize_descriptors(descriptors: object) -> tuple[tuple[str, str, str], .
         remote_name = _value(descriptor, "name")
         description = _value(descriptor, "description", "")
         schema = _value(descriptor, "inputSchema", _value(descriptor, "input_schema", {}))
-        if (
-            type(remote_name) is not str
-            or type(description) is not str
-            or type(schema) is not dict
-        ):
+        if type(remote_name) is not str or type(description) is not str or type(schema) is not dict:
             raise ValueError("MCP tool descriptor is invalid")
         _public_tool_name("s", remote_name)
-        schema_json = json.dumps(
-            schema, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-        )
+        schema_json = json.dumps(schema, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         normalized.append((remote_name, description, schema_json))
     if len({item[0] for item in normalized}) != len(normalized):
         raise ValueError("MCP tool names are not unique")

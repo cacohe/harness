@@ -58,9 +58,8 @@ class ArtifactRetentionService:
         if not callable(load_references) or not callable(collect):
             raise RuntimeError("Artifact orphan collection is unavailable")
         references = await load_references(self._max_reference_ids + 1)
-        if (
-            type(references) is not tuple
-            or any(type(artifact_id) is not str or not artifact_id for artifact_id in references)
+        if type(references) is not tuple or any(
+            type(artifact_id) is not str or not artifact_id for artifact_id in references
         ):
             raise RuntimeError("Artifact reference inventory is invalid")
         if len(references) > self._max_reference_ids:

@@ -10,12 +10,8 @@ from src.core.artifacts import ArtifactWrite, artifact_id_from_descriptor
 ALL_TYPES = frozenset({"text/plain", "application/json", "application/octet-stream"})
 
 
-def _address(
-    content: bytes, media_type: str = "text/plain", name: str | None = None
-) -> str:
-    return artifact_id_from_descriptor(
-        hashlib.sha256(content).hexdigest(), media_type, name
-    )
+def _address(content: bytes, media_type: str = "text/plain", name: str | None = None) -> str:
+    return artifact_id_from_descriptor(hashlib.sha256(content).hexdigest(), media_type, name)
 
 
 def _externalizer(repo, *, inline=6, artifact=256, summary=48, allowed=ALL_TYPES):

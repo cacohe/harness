@@ -35,4 +35,3 @@ class ToolRouter:
         if gateway is None:
             return ToolResult(ToolResultStatus.DENIED, execution_key=request.idempotency_key)
         return await gateway.execute(request)
-

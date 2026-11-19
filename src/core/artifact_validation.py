@@ -42,4 +42,3 @@ def validate_artifact_name(name: str | None) -> None:
 
 def _bounded_text(value: str, max_bytes: int) -> bool:
     return 0 < len(value) <= max_bytes and len(value.encode("utf-8")) <= max_bytes
-

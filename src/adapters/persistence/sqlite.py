@@ -845,9 +845,7 @@ class SQLiteRunJournal:
     async def load_referenced_artifact_ids(self, limit: int) -> tuple[str, ...]:
         if type(limit) is not int or not 1 <= limit <= 1_000_001:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
-        return await self._run(
-            lambda _cancelled: self._load_referenced_artifact_ids_sync(limit)
-        )
+        return await self._run(lambda _cancelled: self._load_referenced_artifact_ids_sync(limit))
 
     async def reserve_artifact_retirement(
         self, artifact_id: str

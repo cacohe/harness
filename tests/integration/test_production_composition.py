@@ -66,9 +66,7 @@ def test_production_builder_wires_read_retention_gc_and_durable_tool_store(tmp_p
     async def scenario():
         journal = SQLiteRunJournal(tmp_path / "runs.sqlite3")
         repository = FilesystemArtifactRepository(tmp_path / "artifacts", 1_048_576)
-        source = await repository.put(
-            ArtifactWrite(_chunks(b"production-artifact"), "text/plain")
-        )
+        source = await repository.put(ArtifactWrite(_chunks(b"production-artifact"), "text/plain"))
         orphan = await repository.put(ArtifactWrite(_chunks(b"orphan"), "text/plain"))
 
         class Model:
@@ -208,4 +206,3 @@ def test_production_config_rejects_shared_sqlite_and_unsafe_read_limits(tmp_path
             )
 
     asyncio.run(scenario())
-
