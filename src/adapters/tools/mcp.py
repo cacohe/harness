@@ -477,12 +477,13 @@ class _AsyncContextClient:
             call = _AsyncContextCall(name, args, result)
             await self._queue.put(call)
             try:
-                return await result
+                return await asyncio.shield(result)
             except asyncio.CancelledError:
-                if not result.done():
+                pending = not result.done()
+                if pending:
                     result.cancel()
                 task = asyncio.current_task()
-                if call.started and task is not None and task.cancelling():
+                if pending and call.started and task is not None and task.cancelling():
                     call.cancel_requested = True
                     self._owner.cancel()
                 raise

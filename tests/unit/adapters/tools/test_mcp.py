@@ -1624,6 +1624,41 @@ def test_cancelling_a_queued_async_context_call_does_not_cancel_the_active_call(
     asyncio.run(scenario())
 
 
+def test_late_caller_cancellation_after_result_does_not_stop_owner() -> None:
+    caller = None
+
+    class RacingClient:
+        async def call_tool(self, value):
+            if value == "race":
+                assert caller is not None
+                asyncio.get_running_loop().call_soon(caller.cancel)
+            return value
+
+    class Manager:
+        async def __aenter__(self):
+            return RacingClient()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+    async def scenario():
+        nonlocal caller
+        proxy = await mcp_module._AsyncContextClient(
+            Manager(), 0.2, mcp_module._SyncLimiter()
+        ).start(0.2)
+        caller = asyncio.current_task()
+        assert caller is not None
+        with pytest.raises(asyncio.CancelledError):
+            await proxy.call_tool("race")
+        while caller.cancelling():
+            caller.uncancel()
+
+        assert await proxy.call_tool("next") == "next"
+        await proxy.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_async_context_method_cancellation_removes_the_dead_catalog() -> None:
     class Cancelled(Client):
         async def call_tool(self, name, arguments):
