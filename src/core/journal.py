@@ -332,6 +332,17 @@ class RunJournal(Protocol):
         """Return whether retirement is forbidden by any active durable attachment."""
         ...
 
+    def publish_artifact(
+        self, artifact: ArtifactRef
+    ) -> Awaitable[ArtifactRetirementReservation]:
+        """Declare that a complete readable object is available for attachment.
+
+        A retired descriptor starts a new lifecycle generation. An in-progress
+        retirement conflicts, so a publisher can never silently invalidate its
+        reservation. Callers must invoke this only after repository publication.
+        """
+        ...
+
     def reserve_artifact_retirement(
         self, artifact_id: str
     ) -> Awaitable[ArtifactRetirementReservation | None]:

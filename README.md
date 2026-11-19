@@ -105,7 +105,8 @@ CAS 原子提交。外层循环由 application runtime 驱动，受以下边界�
 
 1. `ArtifactExternalizer` 根据 policy 决定 inline 或外置；
 2. repository 完整写入并校验 hash/size；
-3. journal 仅提交 `ArtifactRef + bounded summary`；
+3. Core 在提交 attachment 前用完整 `ArtifactRef` 显式登记已可读 publication，journal 随后仅提交
+   `ArtifactRef + bounded summary`；
 4. 模型需要内容时，通过普通 `read_artifact` 工具按范围读取；
 5. journal 失败可能留下未引用对象，由 adapter 的宽限期回收处理。
 
@@ -120,8 +121,9 @@ Recovery 只把 journal 中仍然 active 的 attachment 当作待校验权威；
 `RunState`、tool result、final output 或 summary 引用不会因对象随后被回收而被误判为损坏。
 retire 先在 journal 中原子取得 `RETIRING` reservation：该步骤与“没有 active owner”的判断
 处于同一事务，并阻止新的 attachment；repository delete 成功后再标记 `RETIRED`，明确失败且
-对象仍存在时标记 `ABORTED`。进程可在任一阶段重启并通过重复 retire 收敛。content-addressed
-对象重新 `put()` 后，同 descriptor 的新 attachment 会开启下一 generation，不会永久封禁 digest。
+对象仍存在时标记 `ABORTED`。进程可在任一阶段重启并通过重复 retire 收敛。普通 attachment
+不能越过 `RETIRED` 墓碑；content-addressed 对象重新 `put()` 并显式登记 publication 后才会开启
+下一 generation，因此相同 digest 可以再次使用，同时不会把缺失对象静默恢复为可用。
 SQLite 不把 derived active index 或 retirement current row 当成单点权威：reserve 在同一
 `BEGIN IMMEDIATE` 中按 `artifact_id` 有界重放 append-only attachment facts 并与 index 双向
 核对；retirement transition 另有 append-only hash chain、固定深度 Merkle projection 与数据库

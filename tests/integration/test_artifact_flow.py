@@ -20,12 +20,14 @@ from src.adapters.tools import (
     ToolCatalogEntry,
 )
 from src.application.composition import ApplicationConfig, create_development_agent
+from src.application.artifact_retention import ArtifactRetentionService
 from src.core.commands import RunLimits
 from src.core.context import (
     ContextBudget,
     ContextRequest,
 )
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
+from src.core.journal import ArtifactAttachmentRole
 from src.core.model import ModelMessage, ModelResponse, ModelRole, ModelToolCall
 from src.core.state import RunStatus
 from src.core.tools import ToolSpec
@@ -85,13 +87,15 @@ class ArtifactModel:
 
     async def complete(self, request):
         self.requests.append(request)
-        payload = json.loads(request.messages[-1].content)
+        payload = json.loads(
+            next(message.content for message in reversed(request.messages) if message.role is ModelRole.USER)
+        )
         if payload["message"] == "after-final":
             return ModelResponse("follow-up")
         round_number = payload["round"]
         if round_number == 0:
             return ModelResponse(tool_calls=(ModelToolCall("produce-call", "produce", "{}"),))
-        history = "\n".join(message.content or "" for message in request.messages[:-1])
+        history = "\n".join(message.content or "" for message in request.messages)
         match = re.search(r"sha256:[0-9a-f]{64}", history)
         if round_number == 1:
             assert match is not None
@@ -224,3 +228,70 @@ def test_large_tool_result_is_referenced_read_in_bounded_slice_and_never_journal
     assert result.final_artifacts[0].artifact_id in journal_wire
     assert str(root) not in journal_wire
     assert all(ref.artifact_id != source_ref.artifact_id for ref in result.final_artifacts)
+
+
+def test_retired_content_can_be_published_by_a_later_run(tmp_path):
+    class FinalModel:
+        max_output_tokens = 256
+
+        async def complete(self, _request):
+            return ModelResponse("repeatable-" + "x" * 2_048)
+
+    class NoTools:
+        async def execute(self, _request):
+            raise AssertionError("No tool call is expected")
+
+    async def scenario():
+        repository = FilesystemArtifactRepository(tmp_path / "artifact-store", 1_048_576)
+        journal = InMemoryRunJournal()
+        externalizer = PolicyArtifactExternalizer(
+            repository,
+            ArtifactPolicy(64, 1_048_576, 64, frozenset({"text/plain"})),
+        )
+
+        def request_factory(state, message):
+            return ContextRequest(
+                state.session_id,
+                state.profile_id,
+                "artifact-republish-v1",
+                ModelMessage(ModelRole.SYSTEM, "artifact republish"),
+                ModelMessage(ModelRole.USER, message),
+            )
+
+        agent = await create_development_agent(
+            ApplicationConfig(
+                limits=RunLimits(8, 30.0, 64),
+                context_budget=ContextBudget(4_096, 256, 64),
+            ),
+            model=FinalModel(),
+            tools=NoTools(),
+            context=JournalContext(journal),
+            context_counter=ExactTokenCounter(),
+            context_request_factory=request_factory,
+            ids=Ids(),
+            clock=Clock(),
+            profile_id=ProfileId("profile"),
+            journal=journal,
+            artifacts=externalizer,
+            artifact_repository=repository,
+        )
+        session = await agent.open_session(SessionId("republish-session"))
+        first = await session.submit("first", SubmissionId("first"))
+        artifact_id = first.final_artifacts[0].artifact_id
+        await session.detach_artifacts(
+            first.run_id,
+            roles=(ArtifactAttachmentRole.FINAL_OUTPUT,),
+        )
+        await ArtifactRetentionService(journal=journal, artifacts=repository).retire(artifact_id)
+        assert await repository.stat(artifact_id) is None
+
+        second = await session.submit("second", SubmissionId("second"))
+        restored = await repository.stat(artifact_id)
+        await agent.close()
+        return first, second, restored
+
+    first, second, restored = asyncio.run(scenario())
+    assert first.status is RunStatus.COMPLETED
+    assert second.status is RunStatus.COMPLETED
+    assert second.final_artifacts == first.final_artifacts
+    assert restored == second.final_artifacts[0]

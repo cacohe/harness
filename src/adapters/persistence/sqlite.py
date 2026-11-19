@@ -45,6 +45,7 @@ from src.adapters.persistence.sqlite_integrity import (
     summary_record_hash,
     validate_hash,
 )
+from src.core.artifacts import ArtifactRef, snapshot_artifact_ref
 from src.core.context import (
     ConversationCoverage,
     ConversationCoverageSegment,
@@ -846,6 +847,17 @@ class SQLiteRunJournal:
         if type(limit) is not int or not 1 <= limit <= 1_000_001:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
         return await self._run(lambda _cancelled: self._load_referenced_artifact_ids_sync(limit))
+
+    async def publish_artifact(
+        self, artifact: ArtifactRef
+    ) -> ArtifactRetirementReservation:
+        try:
+            artifact = snapshot_artifact_ref(artifact)
+        except (AttributeError, TypeError, ValueError):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        return await self._run(
+            lambda _cancelled: self._publish_artifact_sync(artifact.artifact_id)
+        )
 
     async def reserve_artifact_retirement(
         self, artifact_id: str
@@ -2042,6 +2054,35 @@ class SQLiteRunJournal:
             )
             connection.commit()
             return reservation
+        except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
+            connection.rollback()
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        finally:
+            connection.close()
+
+    def _publish_artifact_sync(self, artifact_id: str) -> ArtifactRetirementReservation:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            current = _load_verified_retirement(connection, artifact_id)
+            if current is not None and current.state is ArtifactRetirementState.RETIRING:
+                raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
+            if current is not None and current.state is ArtifactRetirementState.AVAILABLE:
+                connection.rollback()
+                return current
+            generation = 1 if current is None else current.generation + 1
+            connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
+            published = _append_retirement_transition(
+                connection,
+                artifact_id,
+                generation,
+                ArtifactRetirementState.AVAILABLE,
+            )
+            connection.commit()
+            return published
+        except JournalError:
+            connection.rollback()
+            raise
         except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
             connection.rollback()
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None

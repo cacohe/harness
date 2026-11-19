@@ -557,6 +557,35 @@ class InMemoryRunJournal:
         with self._lock:
             return tuple(sorted(self._store.referenced_artifact_ids)[:limit])
 
+    async def publish_artifact(
+        self, artifact: ArtifactRef
+    ) -> ArtifactRetirementReservation:
+        try:
+            artifact = snapshot_artifact_ref(artifact)
+        except (AttributeError, TypeError, ValueError):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        with self._lock:
+            store = self._store
+            current = store.artifact_retirements.get(artifact.artifact_id)
+            if current is not None and current.state is ArtifactRetirementState.RETIRING:
+                raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
+            if current is not None and current.state is ArtifactRetirementState.AVAILABLE:
+                return current
+            generation = 1 if current is None else current.generation + 1
+            published = ArtifactRetirementReservation(
+                artifact.artifact_id,
+                generation,
+                ArtifactRetirementState.AVAILABLE,
+            )
+            self._store = replace(
+                store,
+                artifact_retirements={
+                    **store.artifact_retirements,
+                    artifact.artifact_id: published,
+                },
+            )
+            return published
+
     async def reserve_artifact_retirement(
         self, artifact_id: str
     ) -> ArtifactRetirementReservation | None:

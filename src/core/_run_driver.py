@@ -127,6 +127,14 @@ class _Driver:
             summary=self.checkpoint,
             artifact_facts=tuple(facts),
         )
+        published: set[str] = set()
+        for fact in facts:
+            if fact.action is not ArtifactAttachmentAction.ATTACHED:
+                continue
+            if fact.artifact.artifact_id in published:
+                continue
+            await self.owner._journal.publish_artifact(fact.artifact)
+            published.add(fact.artifact.artifact_id)
         receipt = await self.owner._journal.commit(batch, expected)
         receipt = validate_commit_receipt(
             receipt,
