@@ -38,9 +38,10 @@ def matches_trusted_context_shape(
     suffix_length = len(request.open_tool_messages) + 1
     if len(messages) < prefix_end + suffix_length:
         return False
-    if messages[-1] != request.current_input:
+    suffix = messages[-suffix_length:]
+    if suffix[0] != request.current_input:
         return False
-    if request.open_tool_messages and messages[-suffix_length:-1] != request.open_tool_messages:
+    if suffix[1:] != request.open_tool_messages:
         return False
     history = messages[prefix_end:-suffix_length]
     return all(message.role is not ModelRole.SYSTEM for message in history)

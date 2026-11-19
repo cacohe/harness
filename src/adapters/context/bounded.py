@@ -61,8 +61,8 @@ class BoundedContextProvider:
             raise ValueError("Context provider requires a request and budget")
         required = (
             request.system_message,
-            *request.open_tool_messages,
             request.current_input,
+            *request.open_tool_messages,
         )
         estimate = self._counter.count(required, request.tools)
         if estimate.tokens > budget.input_allowance_tokens:
@@ -421,6 +421,6 @@ class BoundedContextProvider:
             *skills,
             *summaries,
             *history,
-            *request.open_tool_messages,
             request.current_input,
+            *request.open_tool_messages,
         )

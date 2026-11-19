@@ -86,7 +86,7 @@ TOOLS = (
 
 class Context:
     async def build(self, request: ContextRequest, budget: ContextBudget) -> ContextWindow:
-        messages = (request.system_message, *request.open_tool_messages, request.current_input)
+        messages = (request.system_message, request.current_input, *request.open_tool_messages)
         return ContextWindow(
             messages,
             request.tools,
@@ -107,7 +107,9 @@ class Model:
 
     async def complete(self, request):
         self.requests.append(request)
-        payload = json.loads(request.messages[-1].content)
+        payload = json.loads(
+            next(message.content for message in reversed(request.messages) if message.role is ModelRole.USER)
+        )
         session = payload["session"]
         message = payload["message"]
         round_number = payload["round"]
@@ -247,9 +249,11 @@ def test_real_bounded_context_deduplicates_current_input_and_protects_latest_too
     assert state.status is RunStatus.COMPLETED
     assert len(context.context_requests) == 2
     assert context.context_requests[1].open_tool_messages
+    current = context.context_requests[1].current_input
+    open_tools = context.context_requests[1].open_tool_messages
+    assert model.requests[1].messages[-(len(open_tools) + 1) :] == (current, *open_tools)
     for request in model.requests:
-        current = request.messages[-1]
-        assert sum(message == current for message in request.messages) == 1
+        assert sum(message.role is ModelRole.USER for message in request.messages) == 1
     assert [message.role for message in context.context_requests[1].open_tool_messages] == [
         ModelRole.ASSISTANT,
         ModelRole.TOOL,

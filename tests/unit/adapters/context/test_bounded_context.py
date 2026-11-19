@@ -122,8 +122,8 @@ def test_open_tool_pair_is_mandatory_and_never_split() -> None:
     window = asyncio.run(provider.build(request, ContextBudget(45, 1, 0)))
     assert window.messages == (
         request.system_message,
-        *open_pair,
         request.current_input,
+        *open_pair,
     )
     with pytest.raises(ContextBudgetExceeded):
         asyncio.run(provider.build(request, ContextBudget(44, 1, 0)))
