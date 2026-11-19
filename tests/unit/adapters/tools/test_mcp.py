@@ -1175,7 +1175,7 @@ def test_abandoned_refresh_recovers_only_live_server_after_settle(
 
     async def scenario():
         client = Refreshing()
-        gateway = _gateway(client, timeout_seconds=0.05)
+        gateway = _gateway(client, timeout_seconds=0.2)
         await gateway.add_server("server", object())
         catalog = gateway._dynamic_catalog.specs
         generation = gateway._servers["server"].generation

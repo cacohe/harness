@@ -842,6 +842,13 @@ class SQLiteRunJournal:
             lambda _cancelled: self._artifact_has_active_attachments_sync(artifact_id)
         )
 
+    async def load_referenced_artifact_ids(self, limit: int) -> tuple[str, ...]:
+        if type(limit) is not int or not 1 <= limit <= 1_000_001:
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        return await self._run(
+            lambda _cancelled: self._load_referenced_artifact_ids_sync(limit)
+        )
+
     async def reserve_artifact_retirement(
         self, artifact_id: str
     ) -> ArtifactRetirementReservation | None:
@@ -1876,6 +1883,37 @@ class SQLiteRunJournal:
                     raise ValueError("Artifact lifecycle fact row disagrees")
                 records.append(ArtifactFactRecord(int(row["fact_index"]), fact))
             return tuple(records)
+        except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        finally:
+            connection.close()
+
+    def _load_referenced_artifact_ids_sync(self, limit: int) -> tuple[str, ...]:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            if (
+                connection.execute("SELECT 1 FROM integrity_violations LIMIT 1").fetchone()
+                is not None
+            ):
+                raise ValueError("SQLite journal has an integrity violation")
+            references: set[str] = set()
+            cursor = ""
+            while len(references) < limit:
+                row = connection.execute(
+                    "SELECT artifact_id, fact_json FROM artifact_attachment_facts "
+                    "WHERE artifact_id>? ORDER BY artifact_id LIMIT 1",
+                    (cursor,),
+                ).fetchone()
+                if row is None:
+                    break
+                fact = decode(row["fact_json"], ArtifactAttachmentFact)
+                artifact_id = fact.artifact.artifact_id
+                if row["artifact_id"] != artifact_id:
+                    raise ValueError("Artifact lifecycle fact row disagrees")
+                references.add(artifact_id)
+                cursor = artifact_id
+            return tuple(sorted(references))
         except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
         finally:

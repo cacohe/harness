@@ -26,7 +26,6 @@ from src.core.context import (
     ContextProvider,
     ContextRequest,
     TokenCounter,
-    summary_system_messages,
 )
 from src.core.errors import InvalidTransition, RunErrorCode, RunFailure
 from src.core.events import DomainEvent
@@ -39,11 +38,15 @@ from src.core.model import (
     ModelGateway,
     ModelMessage,
     ModelRequest,
-    ModelRole,
     snapshot_model_response,
 )
 from src.core.run_content import externalize_final_text, externalize_tool_result
-from src.core.run_projection import model_tool_requests, tool_failure, tool_transcript
+from src.core.run_projection import (
+    matches_trusted_context_shape,
+    model_tool_requests,
+    tool_failure,
+    tool_transcript,
+)
 from src.core.state import RunState, RunStatus, ToolCallState
 from src.core.tools import (
     ToolApproval,
@@ -64,42 +67,6 @@ class RunOutcome:
 
 class _ModelGatewayTimedOut(Exception):
     pass
-
-
-def _matches_trusted_context_shape(
-    messages: tuple[ModelMessage, ...], request: ContextRequest
-) -> bool:
-    if not messages or messages[0] != request.system_message:
-        return False
-    prefix_end = 1
-    while prefix_end < len(messages) and messages[prefix_end].role is ModelRole.SYSTEM:
-        prefix_end += 1
-    supplied_prefix = messages[1:prefix_end]
-    trusted_groups = (
-        *((message,) for message in request.memory_messages),
-        *((message,) for message in request.skill_messages),
-        *(summary_system_messages(checkpoint) for checkpoint in request.summary_checkpoints),
-    )
-    positions = {0}
-    for group in trusted_groups:
-        next_positions = set(positions)
-        for position in positions:
-            through = position + len(group)
-            if supplied_prefix[position:through] == group:
-                next_positions.add(through)
-        positions = next_positions
-    if len(supplied_prefix) not in positions:
-        return False
-
-    suffix_length = len(request.open_tool_messages) + 1
-    if len(messages) < prefix_end + suffix_length:
-        return False
-    if messages[-1] != request.current_input:
-        return False
-    if request.open_tool_messages and (messages[-suffix_length:-1] != request.open_tool_messages):
-        return False
-    history = messages[prefix_end:-suffix_length]
-    return all(message.role is not ModelRole.SYSTEM for message in history)
 
 
 class RunCoordinator:
@@ -188,7 +155,7 @@ class RunCoordinator:
             if (
                 window.policy_version != self._request.policy_version
                 or window.tools != self._request.tools
-                or not _matches_trusted_context_shape(window.messages, self._request)
+                or not matches_trusted_context_shape(window.messages, self._request)
             ):
                 raise ValueError("Context window does not match its request binding")
             if (

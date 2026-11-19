@@ -23,6 +23,7 @@ Harness 不隐式读取环境变量，也不在 Core 中选择模型、数据库
 ## 异步 API 与显式组合
 
 ```python
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.application import ApplicationConfig, create_production_agent
@@ -39,8 +40,12 @@ config = ApplicationConfig(
         safety_margin_tokens=1_024,
     ),
     sqlite_path=Path("C:/absolute/state/harness.db"),
+    tool_execution_path=Path("C:/absolute/state/tool-executions.db"),
     artifact_root=Path("C:/absolute/state/artifacts"),
+    max_artifact_read_bytes=65_536,
+    max_orphan_reference_ids=1_000_000,
 )
+orphan_cutoff_utc = datetime.now(timezone.utc) - timedelta(days=1)
 
 agent = await create_production_agent(
     config,
@@ -60,11 +65,24 @@ async with agent:
     if state.status.value == "waiting_approval":
         state = await session.decide_tool_call(state.run_id, "call-1", approved=True)
     detached = await session.detach_artifacts(state.run_id)
+    if detached:
+        await agent.artifacts.retire(detached[0].artifact.artifact_id)
+    collected = await agent.artifacts.collect_orphans(orphan_cutoff_utc)
 ```
 
-`create_development_agent()` 使用内存 journal 与内存 Artifact repository；生产组合在未显式注入
-实现时要求绝对 `sqlite_path` 和 `artifact_root`。两个 factory 都是 async-only，资源在调用方
-event loop 中创建和关闭。
+`create_development_agent()` 使用内存 journal 与内存 Artifact repository。生产组合要求可稳定
+识别的 Artifact root，并使用独立的 `tool_execution_path` 保存工具 exactly-once claim；未显式
+提供时会从显式 `sqlite_path` 派生同目录的 `*.tools` 文件，不会使用当前工作目录。两个 factory
+都是 async-only，资源在调用方 event loop 中创建和关闭。
+
+builder 会在启动时对该 tool execution store 执行 abandoned-claim recovery；同一个
+`tool_execution_path` 的生产启动必须串行且单进程独占。需要多进程或多节点执行时，应替换为带
+租约/协调能力的外部 ToolGateway，而不是让多个 builder 共享这个 reference SQLite store。
+
+生产组合始终保留 `read_artifact` 名称，并将它路由到有界 `ReadArtifactTool`。传入的
+`ToolGateway` 是其他工具的 fallback；`ContextRequestFactory` 不得重复声明 `read_artifact`，
+composition 会把可信的内置 spec 注入每次请求。传入 `tools=None` 可得到只允许 Artifact 回读的
+最小工具组合。
 
 ## 有界执行与上下文
 
@@ -112,6 +130,10 @@ authenticated root。普通 SQL 改写 current/fact/leaf/node/root/count 会在�
 
 `FilesystemArtifactRepository` 使用 content-addressed 路径、临时写入、原子 finalize、大小/hash
 校验和路径防护；它是单机 reference adapter，不宣称支持多节点共享。
+
+`agent.artifacts.collect_orphans(cutoff)` 只回收从未出现在 append-only Artifact facts 中且早于
+UTC cutoff 的对象，不会把 detach 当成 orphan。引用清单读取受
+`max_orphan_reference_ids` 限制；超过上限时安全失败，调用方必须提高显式配置或使用外部 GC。
 
 ## Adapter 边界
 

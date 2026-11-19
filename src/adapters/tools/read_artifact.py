@@ -4,12 +4,41 @@ import asyncio
 import base64
 from collections.abc import AsyncIterator
 
+from src.adapters.tools.catalog import ToolCatalogEntry
 from src.core.artifacts import (
     MAX_ARTIFACT_SIZE_BYTES,
     ArtifactRepository,
     snapshot_artifact_ref,
     validate_artifact_id,
 )
+from src.core.tools import ToolSpec
+
+
+READ_ARTIFACT_TOOL_NAME = "read_artifact"
+_READ_ARTIFACT_SCHEMA = (
+    '{"additionalProperties":false,"properties":{'
+    '"artifact_id":{"type":"string"},"limit":{"type":"integer"},'
+    '"offset":{"type":"integer"}},'
+    '"required":["artifact_id","offset","limit"],"type":"object"}'
+)
+
+
+def read_artifact_entry(
+    repository: ArtifactRepository,
+    *,
+    workspace_id: str,
+    max_read_bytes: int = 262_144,
+) -> ToolCatalogEntry:
+    handler = ReadArtifactTool(repository, max_read_bytes=max_read_bytes)
+    spec = ToolSpec(
+        READ_ARTIFACT_TOOL_NAME,
+        "Read one bounded byte range from an Artifact by ID.",
+        _READ_ARTIFACT_SCHEMA,
+        requires_approval=False,
+        approval_scope="read",
+        workspace_id=workspace_id,
+    )
+    return ToolCatalogEntry(spec, handler, False)
 
 
 class ReadArtifactTool:

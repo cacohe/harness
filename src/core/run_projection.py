@@ -2,11 +2,48 @@ import json
 
 from src.core.artifacts import ExternalizedContent
 from src.core.commands import ToolCallRequest
+from src.core.context import ContextRequest, summary_system_messages
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.journal import TranscriptEntry, TranscriptEntryType
-from src.core.model import ModelResponse
+from src.core.model import ModelMessage, ModelResponse, ModelRole
 from src.core.state import RunState, ToolCallState
 from src.core.tools import ToolResult, ToolResultStatus, ToolSpec
+
+
+def matches_trusted_context_shape(
+    messages: tuple[ModelMessage, ...], request: ContextRequest
+) -> bool:
+    if not messages or messages[0] != request.system_message:
+        return False
+    prefix_end = 1
+    while prefix_end < len(messages) and messages[prefix_end].role is ModelRole.SYSTEM:
+        prefix_end += 1
+    supplied_prefix = messages[1:prefix_end]
+    trusted_groups = (
+        *((message,) for message in request.memory_messages),
+        *((message,) for message in request.skill_messages),
+        *(summary_system_messages(checkpoint) for checkpoint in request.summary_checkpoints),
+    )
+    positions = {0}
+    for group in trusted_groups:
+        next_positions = set(positions)
+        for position in positions:
+            through = position + len(group)
+            if supplied_prefix[position:through] == group:
+                next_positions.add(through)
+        positions = next_positions
+    if len(supplied_prefix) not in positions:
+        return False
+
+    suffix_length = len(request.open_tool_messages) + 1
+    if len(messages) < prefix_end + suffix_length:
+        return False
+    if messages[-1] != request.current_input:
+        return False
+    if request.open_tool_messages and messages[-suffix_length:-1] != request.open_tool_messages:
+        return False
+    history = messages[prefix_end:-suffix_length]
+    return all(message.role is not ModelRole.SYSTEM for message in history)
 
 
 def model_tool_requests(

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from typing import cast
+
 from src.adapters.persistence.sqlite_codec import encode
-from src.core.context import ConversationPage
+from src.core.context import ConversationPage, ConversationReader
 from src.core.errors import RunErrorCode
 from src.core.ids import ProfileId, RunId, SessionId, SubmissionId
 from src.core.journal import (
@@ -82,7 +84,8 @@ class BoundedRunJournal:
     async def read_page(
         self, session_id: SessionId, before_sequence: int | None, limit: int
     ) -> ConversationPage:
-        return await self._delegate.read_page(session_id, before_sequence, limit)
+        reader = cast(ConversationReader, self._delegate)
+        return await reader.read_page(session_id, before_sequence, limit)
 
     async def find_run_state(
         self,

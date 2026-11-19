@@ -43,7 +43,6 @@ async def test_agent_exposes_only_async_first_session_and_submit_surface():
 
 def test_application_config_is_immutable_strict_and_requires_absolute_production_paths(tmp_path):
     from src.application.composition import ApplicationConfig
-    from src.core.commands import RunLimits
 
     config = ApplicationConfig(
         max_sessions=4,
@@ -67,12 +66,13 @@ def test_application_config_is_immutable_strict_and_requires_absolute_production
         ApplicationConfig(sqlite_path=PathSubclass(str(tmp_path / "subclass.sqlite3")))
     with pytest.raises(ValueError, match="configuration limits"):
         ApplicationConfig(
-            limits=RunLimits(8, 30.0, 32),
+            max_artifact_bytes=32,
             max_inline_artifact_bytes=33,
         )
 
 
 def test_production_composition_requires_explicit_durable_adapter_paths(tmp_path):
+    from src.adapters.artifacts.memory import InMemoryArtifactRepository
     from src.adapters.persistence.memory import InMemoryRunJournal
     from src.application.composition import ApplicationConfig, create_production_agent
 
@@ -86,6 +86,7 @@ def test_production_composition_requires_explicit_durable_adapter_paths(tmp_path
             create_production_agent(
                 ApplicationConfig(),
                 journal=InMemoryRunJournal(),
+                artifact_repository=InMemoryArtifactRepository(1_048_576),
                 **dependencies,
             )
         )
@@ -271,6 +272,19 @@ def test_third_resource_failure_closes_prior_resources_in_reverse_order(monkeypa
             def __init__(self, *_args):
                 pass
 
+            async def stat(self, _artifact_id):
+                return None
+
+            async def open(self, _artifact_id):
+                if False:
+                    yield b""
+
+            async def delete(self, _artifact_id):
+                return None
+
+            async def collect_orphans(self, _references, _cutoff):
+                return 0
+
             async def aclose(self):
                 closed.append(("repository", asyncio.get_running_loop()))
 
@@ -391,6 +405,19 @@ def test_successful_production_composition_owns_created_resources(monkeypatch, t
         class Repository:
             def __init__(self, *_args):
                 pass
+
+            async def stat(self, _artifact_id):
+                return None
+
+            async def open(self, _artifact_id):
+                if False:
+                    yield b""
+
+            async def delete(self, _artifact_id):
+                return None
+
+            async def collect_orphans(self, _references, _cutoff):
+                return 0
 
             async def aclose(self):
                 closed.append(("repository", asyncio.get_running_loop()))
@@ -546,6 +573,9 @@ class _JournalPort:
 
     async def load_artifact_facts(self, *_args):
         raise NotImplementedError
+
+    async def load_referenced_artifact_ids(self, *_args):
+        return ()
 
 
 class _ExternalizerPort:

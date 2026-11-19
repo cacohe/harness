@@ -96,6 +96,7 @@ class _Store:
     sessions: Mapping[str, _Session] = field(default_factory=dict)
     event_ids: frozenset[str] = frozenset()
     artifact_retirements: Mapping[str, ArtifactRetirementReservation] = field(default_factory=dict)
+    referenced_artifact_ids: frozenset[str] = frozenset()
 
 
 class InMemoryRunJournal:
@@ -273,6 +274,9 @@ class InMemoryRunJournal:
                 sessions={**store.sessions, session_key: next_session},
                 event_ids=store.event_ids.union(event_ids),
                 artifact_retirements=retirements,
+                referenced_artifact_ids=store.referenced_artifact_ids.union(
+                    fact.artifact.artifact_id for fact in batch.artifact_facts
+                ),
             )
             return result
 
@@ -546,6 +550,12 @@ class InMemoryRunJournal:
                 for session in self._store.sessions.values()
                 for fact in session.artifact_attachments.values()
             )
+
+    async def load_referenced_artifact_ids(self, limit: int) -> tuple[str, ...]:
+        if type(limit) is not int or not 1 <= limit <= 1_000_001:
+            raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+        with self._lock:
+            return tuple(sorted(self._store.referenced_artifact_ids)[:limit])
 
     async def reserve_artifact_retirement(
         self, artifact_id: str

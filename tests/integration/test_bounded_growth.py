@@ -19,7 +19,7 @@ from src.adapters.persistence.memory import InMemoryRunJournal
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.adapters.persistence.sqlite_codec import encode
 from src.application.composition import ApplicationConfig, create_development_agent
-from src.core.artifacts import ArtifactRef, InlineContent
+from src.core.artifacts import ArtifactRef, ArtifactWrite, InlineContent
 from src.core.commands import RunLimits
 from src.core.context import (
     ContextBudget,
@@ -335,9 +335,14 @@ def test_committed_candidate_is_reused_on_next_advance_or_authenticated_restart(
     async def scenario():
         path = (tmp_path / "summary-restart.sqlite3").resolve()
         first_journal = InMemoryRunJournal() if backend == "memory" else SQLiteRunJournal(path)
-        digests = ("c" * 64, "d" * 64)
-        artifacts = tuple(
-            ArtifactRef(f"sha256:{digest}", "text/plain", 1, digest) for digest in digests
+        repository = InMemoryArtifactRepository(1_048_576)
+
+        async def chunks(value: bytes):
+            yield value
+
+        artifacts = (
+            await repository.put(ArtifactWrite(chunks(b"c"), "text/plain")),
+            await repository.put(ArtifactWrite(chunks(b"d"), "text/plain")),
         )
         tool = ToolSpec(
             "guarded",
@@ -367,7 +372,6 @@ def test_committed_candidate_is_reused_on_next_advance_or_authenticated_restart(
             )
 
         async def make_agent(journal, model, namespace):
-            repository = InMemoryArtifactRepository(1_048_576)
             externalizer = PolicyArtifactExternalizer(
                 repository,
                 ArtifactPolicy(128, 1_048_576, 256, frozenset({"application/json"})),

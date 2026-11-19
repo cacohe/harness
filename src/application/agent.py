@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
+from src.application.artifact_retention import ArtifactRetentionService
 from src.application.runtime import RuntimeCoordinator
 from src.core.ids import IdGenerator, ProfileId, RunId, SessionId, SubmissionId
 from src.core.journal import ArtifactAttachmentFact, ArtifactAttachmentRole
@@ -81,6 +82,7 @@ class Agent:
         profile_id: ProfileId,
         *,
         default_session_id: SessionId | None = None,
+        artifacts: ArtifactRetentionService | None = None,
     ) -> None:
         self._runtime = runtime
         self._ids = ids
@@ -89,8 +91,15 @@ class Agent:
             _canonical_id(default_session_id, SessionId) if default_session_id is not None else None
         )
         self._default_session: AgentSession | None = None
+        self._artifact_services = artifacts
         self._default_lock = asyncio.Lock()
         self._closed = False
+
+    @property
+    def artifacts(self) -> ArtifactRetentionService:
+        if self._artifact_services is None:
+            raise RuntimeError("Artifact maintenance is not configured")
+        return self._artifact_services
 
     async def open_session(
         self,

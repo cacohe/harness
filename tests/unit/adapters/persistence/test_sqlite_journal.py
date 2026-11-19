@@ -74,6 +74,10 @@ def test_artifact_fact_and_active_index_tamper_is_rejected(tmp_path: Path, attac
     with pytest.raises(JournalError) as retirement:
         asyncio.run(journal.artifact_has_active_attachments(fact.artifact.artifact_id))
     assert retirement.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    if attack == "fact":
+        with pytest.raises(JournalError) as inventory:
+            asyncio.run(journal.load_referenced_artifact_ids(16))
+        assert inventory.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
 
 
 def test_retirement_reserve_replays_facts_when_active_index_and_sticky_row_are_deleted(
@@ -238,7 +242,7 @@ def test_retirement_reserve_and_attach_are_one_sqlite_serialization_order(
         assert attach_error is None
         assert asyncio.run(first.artifact_has_active_attachments(fact.artifact.artifact_id))
     else:
-        assert attach_error is RunErrorCode.INVARIANT_VIOLATION
+        assert attach_error is RunErrorCode.JOURNAL_CONFLICT
         assert not asyncio.run(first.artifact_has_active_attachments(fact.artifact.artifact_id))
 
 

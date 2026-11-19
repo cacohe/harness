@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import math
 from collections.abc import Callable
@@ -17,7 +18,13 @@ from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.persistence.bounded import BoundedRunJournal
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.adapters.persistence.sqlite import SQLiteRunJournal
+from src.adapters.tools.catalog import ToolCatalog
+from src.adapters.tools.execution_store import SQLiteToolExecutionStore
+from src.adapters.tools.local import LocalToolGateway
+from src.adapters.tools.read_artifact import READ_ARTIFACT_TOOL_NAME, read_artifact_entry
+from src.adapters.tools.router import ToolRouter
 from src.application.agent import Agent
+from src.application.artifact_retention import ArtifactRetentionService
 from src.application.observability import PostCommitObserver
 from src.application.recovery import RecoveryService
 from src.application.runtime import RuntimeCoordinator, _close_resource
@@ -27,10 +34,10 @@ from src.core.commands import RunLimits
 from src.core.context import ContextBudget, ContextProvider, ContextRequest, TokenCounter
 from src.core.ids import Clock, IdGenerator, ProfileId
 from src.core.journal import RunJournal
-from src.core.model import ModelGateway
+from src.core.model import ModelGateway, ModelMessage
 from src.core.run import RunCoordinator
 from src.core.state import RunState
-from src.core.tools import ToolGateway
+from src.core.tools import ToolGateway, ToolSpec
 
 ContextRequestFactory = Callable[[RunState, str], ContextRequest]
 _PATH_TYPE = type(Path())
@@ -48,9 +55,12 @@ class ApplicationConfig:
     max_artifact_bytes: int = 64 * 1_048_576
     max_inline_artifact_bytes: int = 65_536
     max_artifact_summary_bytes: int = 16_384
+    max_artifact_read_bytes: int = 65_536
+    max_orphan_reference_ids: int = 1_000_000
     max_serialized_run_state_bytes: int = 16 * 1_048_576
     max_user_message_bytes: int = 1_048_576
     sqlite_path: Path | None = None
+    tool_execution_path: Path | None = None
     artifact_root: Path | None = None
     observer_timeout_seconds: float = 0.1
 
@@ -62,6 +72,8 @@ class ApplicationConfig:
             object.__getattribute__(self, "max_artifact_bytes"),
             object.__getattribute__(self, "max_inline_artifact_bytes"),
             object.__getattribute__(self, "max_artifact_summary_bytes"),
+            object.__getattribute__(self, "max_artifact_read_bytes"),
+            object.__getattribute__(self, "max_orphan_reference_ids"),
             object.__getattribute__(self, "max_serialized_run_state_bytes"),
             object.__getattribute__(self, "max_user_message_bytes"),
         )
@@ -75,10 +87,11 @@ class ApplicationConfig:
             or not 1 <= integers[2] <= 1_000_000
             or not 1 <= integers[3] <= (1 << 63) - 1
             or not 0 <= integers[4] <= integers[3]
-            or integers[4] > limits.max_inline_result_bytes
             or not 1 <= integers[5] <= 1_048_576
-            or not 1_024 <= integers[6] <= 16 * 1_048_576
-            or not 1 <= integers[7] <= 64 * 1_048_576
+            or not 1 <= integers[6] <= integers[3]
+            or not 1 <= integers[7] <= 1_000_000
+            or not 1_024 <= integers[8] <= 16 * 1_048_576
+            or not 1 <= integers[9] <= 64 * 1_048_576
             or isinstance(observer_timeout, bool)
             or type(observer_timeout) not in (int, float)
             or not math.isfinite(observer_timeout)
@@ -88,7 +101,7 @@ class ApplicationConfig:
         object.__setattr__(self, "limits", limits)
         object.__setattr__(self, "context_budget", context_budget)
         object.__setattr__(self, "observer_timeout_seconds", float(observer_timeout))
-        for name in ("sqlite_path", "artifact_root"):
+        for name in ("sqlite_path", "tool_execution_path", "artifact_root"):
             value = object.__getattribute__(self, name)
             if value is None:
                 continue
@@ -98,6 +111,12 @@ class ApplicationConfig:
             if not rebuilt.is_absolute():
                 raise ValueError("Production paths must be explicit absolute paths")
             object.__setattr__(self, name, rebuilt)
+        if (
+            self.sqlite_path is not None
+            and self.tool_execution_path is not None
+            and self.sqlite_path == self.tool_execution_path
+        ):
+            raise ValueError("Application configuration limits are invalid")
 
 
 async def create_development_agent(
@@ -177,7 +196,7 @@ async def create_production_agent(
     config: ApplicationConfig,
     *,
     model: ModelGateway,
-    tools: ToolGateway,
+    tools: ToolGateway | None,
     context: ContextProvider,
     context_counter: TokenCounter,
     context_request_factory: ContextRequestFactory,
@@ -205,11 +224,18 @@ async def create_production_agent(
         artifact_repository=artifact_repository,
         owned_resources=owned_resources,
         observer=observer,
+        allow_missing_tools=True,
     )
     if journal is None and config.sqlite_path is None:
         raise ValueError("Production composition requires an absolute SQLite path")
-    if artifacts is None and artifact_repository is None and config.artifact_root is None:
+    if config.artifact_root is None:
         raise ValueError("Production composition requires an absolute Artifact root")
+    if (
+        config.max_inline_artifact_bytes > config.limits.max_inline_result_bytes
+        or config.max_artifact_summary_bytes > config.limits.max_inline_result_bytes
+        or config.max_artifact_read_bytes > config.limits.max_inline_result_bytes
+    ):
+        raise ValueError("Production Artifact limits exceed the Run inline result limit")
     created: list[object] = []
     try:
         selected_journal: RunJournal
@@ -239,10 +265,36 @@ async def create_production_agent(
                 selected_repository = _externalizer_repository(selected_artifacts)
         _require_methods(selected_journal, _JOURNAL_METHODS)
         _require_methods(selected_artifacts, ("externalize",))
+        if selected_repository is None:
+            raise ValueError("Production composition requires an Artifact repository")
+        _require_methods(selected_repository, ("stat", "open", "delete", "collect_orphans"))
+        _require_methods(selected_journal, ("load_referenced_artifact_ids",))
+        execution_store = SQLiteToolExecutionStore(_tool_execution_path(config))
+        await execution_store.recover_abandoned()
+        read_entry = read_artifact_entry(
+            selected_repository,
+            workspace_id=_artifact_workspace(config.artifact_root),
+            max_read_bytes=config.max_artifact_read_bytes,
+        )
+        read_gateway = LocalToolGateway(
+            ToolCatalog((read_entry,)),
+            execution_store,
+            selected_artifacts,
+            timeout_seconds=min(60.0, config.limits.max_elapsed_seconds),
+        )
+        selected_tools = ToolRouter(
+            {READ_ARTIFACT_TOOL_NAME: read_gateway},
+            fallback=tools,
+        )
+        maintenance = ArtifactRetentionService(
+            journal=selected_journal,
+            artifacts=selected_repository,
+            max_reference_ids=config.max_orphan_reference_ids,
+        )
         return _compose(
             config,
             model=model,
-            tools=tools,
+            tools=selected_tools,
             context=context,
             context_counter=context_counter,
             context_request_factory=context_request_factory,
@@ -254,6 +306,8 @@ async def create_production_agent(
             artifact_repository=selected_repository,
             owned_resources=(*owned_resources, *created),
             observer=observer,
+            reserved_tool=read_entry.spec,
+            artifact_services=maintenance,
         )
     except BaseException as error:
         await _cleanup_and_raise(error, created)
@@ -275,6 +329,8 @@ def _compose(
     artifact_repository: ArtifactRepository | None,
     owned_resources: tuple[object, ...],
     observer: PostCommitObserver | None,
+    reserved_tool: ToolSpec | None = None,
+    artifact_services: ArtifactRetentionService | None = None,
 ) -> Agent:
     bounded_journal = BoundedRunJournal(journal, config.max_serialized_run_state_bytes)
     submissions = SubmissionService(
@@ -287,6 +343,10 @@ def _compose(
             raise ValueError("Context request factory returned an invalid request")
         if request.session_id != state.session_id or request.profile_id != state.profile_id:
             raise ValueError("Context request factory returned mismatched identities")
+        if reserved_tool is not None:
+            if any(tool.name == reserved_tool.name for tool in request.tools):
+                raise ValueError("Context request collides with a reserved production tool")
+            request = replace(request, tools=(*request.tools, reserved_tool))
         summaries = await bounded_journal.load_context_summaries(
             state.session_id,
             state.profile_id,
@@ -302,7 +362,7 @@ def _compose(
         if input_entry is None:
             raise ValueError("Active Run does not have a durable input")
         latest = await bounded_journal.read_page(state.session_id, None, 1)
-        open_tool_messages = ()
+        open_tool_messages: tuple[ModelMessage, ...] = ()
         open_tool_sequence_range = None
         if latest.interactions:
             interaction = latest.interactions[0]
@@ -358,14 +418,14 @@ def _compose(
             else None
         ),
     )
-    return Agent(runtime, ids, profile_id)
+    return Agent(runtime, ids, profile_id, artifacts=artifact_services)
 
 
 def _validate_composition_inputs(
     config: ApplicationConfig,
     *,
     model: ModelGateway,
-    tools: ToolGateway,
+    tools: ToolGateway | None,
     context: ContextProvider,
     context_counter: TokenCounter,
     context_request_factory: ContextRequestFactory,
@@ -377,6 +437,7 @@ def _validate_composition_inputs(
     artifact_repository: ArtifactRepository | None,
     owned_resources: tuple[object, ...],
     observer: PostCommitObserver | None,
+    allow_missing_tools: bool = False,
 ) -> tuple[ApplicationConfig, ProfileId]:
     if (
         type(config) is not ApplicationConfig
@@ -387,7 +448,11 @@ def _validate_composition_inputs(
     config = _snapshot_application_config(config)
     profile = _snapshot_profile_id(profile_id)
     _require_methods(model, ("complete",))
-    _require_methods(tools, ("execute",))
+    if tools is None:
+        if not allow_missing_tools:
+            raise ValueError("Composition dependency ports are invalid")
+    else:
+        _require_methods(tools, ("execute",))
     _require_methods(context, ("build",))
     _require_methods(context_counter, ("count",))
     _require_callable(context_request_factory)
@@ -490,11 +555,14 @@ def _snapshot_application_config(value: object) -> ApplicationConfig:
             max_artifact_bytes=object.__getattribute__(value, "max_artifact_bytes"),
             max_inline_artifact_bytes=object.__getattribute__(value, "max_inline_artifact_bytes"),
             max_artifact_summary_bytes=object.__getattribute__(value, "max_artifact_summary_bytes"),
+            max_artifact_read_bytes=object.__getattribute__(value, "max_artifact_read_bytes"),
+            max_orphan_reference_ids=object.__getattribute__(value, "max_orphan_reference_ids"),
             max_serialized_run_state_bytes=object.__getattribute__(
                 value, "max_serialized_run_state_bytes"
             ),
             max_user_message_bytes=object.__getattribute__(value, "max_user_message_bytes"),
             sqlite_path=object.__getattribute__(value, "sqlite_path"),
+            tool_execution_path=object.__getattribute__(value, "tool_execution_path"),
             artifact_root=object.__getattribute__(value, "artifact_root"),
             observer_timeout_seconds=object.__getattribute__(value, "observer_timeout_seconds"),
         )
@@ -575,3 +643,16 @@ def _artifact_policy(config: ApplicationConfig) -> ArtifactPolicy:
         config.max_artifact_summary_bytes,
         frozenset({"application/json", "text/plain", "application/octet-stream"}),
     )
+
+
+def _tool_execution_path(config: ApplicationConfig) -> Path:
+    if config.tool_execution_path is not None:
+        return config.tool_execution_path
+    if config.sqlite_path is None:
+        raise ValueError("Production composition requires an absolute tool execution path")
+    return config.sqlite_path.with_name(f"{config.sqlite_path.name}.tools")
+
+
+def _artifact_workspace(root: Path) -> str:
+    digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()
+    return f"artifact-{digest}"
