@@ -50,8 +50,14 @@ class _Driver:
         return self.state.session_id
 
     def context(self) -> CommandContext:
-        elapsed = self.base_elapsed + max(0.0, self.owner._clock.monotonic() - self.started)
+        elapsed = self.elapsed_seconds()
         return CommandContext(self.owner._clock.now(), elapsed, (self.owner._ids.event(),))
+
+    def elapsed_seconds(self) -> float:
+        return self.base_elapsed + max(0.0, self.owner._clock.monotonic() - self.started)
+
+    def remaining_seconds(self) -> float:
+        return max(0.0, self.state.limits.max_elapsed_seconds - self.elapsed_seconds())
 
     def apply(self, command: CoreCommand) -> bool:
         transition: StateTransition = TaskStateMachine.apply(self.state, command)

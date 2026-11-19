@@ -38,6 +38,10 @@ class AgentSession:
         self._ensure_open()
         return await self._runtime.cancel_run(self.session_id, run_id)
 
+    async def current_run(self) -> RunState | None:
+        self._ensure_open()
+        return await self._runtime.current_run(self.session_id)
+
     async def detach_artifacts(
         self,
         run_id: RunId,

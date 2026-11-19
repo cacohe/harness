@@ -11,6 +11,7 @@ from typing import Protocol, TypeVar
 
 from src.application.artifact_lifecycle import ArtifactLifecycleService
 from src.application.observability import Observation, PostCommitObserver
+from src.application.recovery import RecoveryService
 from src.application.submissions import AcceptedRun, SubmissionService
 from src.core.commands import AdvanceRun, CancelRun, CommandContext, DecideToolCall, ResumeRun
 from src.core.ids import Clock, IdGenerator, ProfileId, RunId, SessionId, SubmissionId
@@ -135,6 +136,7 @@ class RuntimeCoordinator:
         owned_resources: tuple[object, ...] = (),
         observer: PostCommitObserver | None = None,
         observer_timeout_seconds: float = 0.1,
+        recovery: RecoveryService | None = None,
     ) -> None:
         if (
             type(max_sessions) is not int
@@ -165,6 +167,7 @@ class RuntimeCoordinator:
         self._owned_resources = owned_resources
         self._observer = observer
         self._observer_timeout = float(observer_timeout_seconds)
+        self._recovery = recovery
         self._sessions: dict[str, _SessionSlot] = {}
         self._registry_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
@@ -180,7 +183,23 @@ class RuntimeCoordinator:
 
     async def open_session(self, session_id: SessionId) -> None:
         session_id = _canonical_id(session_id, SessionId, "Session identity is invalid")
-        await self._slot(session_id)
+        slot = await self._slot(session_id)
+        if self._recovery is None:
+            return
+        async with slot.gate.enter():
+            async with self._operation(session_id, slot):
+                await self._recover(session_id)
+
+    async def current_run(self, session_id: SessionId) -> RunState | None:
+        session_id = _canonical_id(session_id, SessionId, "Session identity is invalid")
+        slot = await self._slot(session_id)
+        async with slot.gate.enter():
+            async with self._operation(session_id, slot):
+                head = await self._journal.load_head(session_id)
+                if type(head) is not JournalHead:
+                    raise SessionOwnershipError("Session head is invalid")
+                state = object.__getattribute__(head, "state")
+                return None if state is None else snapshot_run_state(state)
 
     async def close_session(self, session_id: SessionId) -> None:
         session_id = _canonical_id(session_id, SessionId, "Session identity is invalid")
@@ -213,6 +232,7 @@ class RuntimeCoordinator:
         slot = await self._slot(session_id)
         async with slot.gate.enter():
             async with self._operation(session_id, slot):
+                await self._recover(session_id)
                 accepted = await self._submissions.accept(
                     session_id, message, submission_id, profile_id
                 )
@@ -221,6 +241,14 @@ class RuntimeCoordinator:
                     await self._observe("submission.accepted", state)
                 async with self._active_run(slot, state.run_id):
                     return await self._drive(state, message)
+
+    async def _recover(self, session_id: SessionId) -> None:
+        recovery = self._recovery
+        if recovery is None:
+            return
+        outcome = await recovery.recover_session(session_id)
+        if outcome.changed and outcome.state is not None:
+            await self._observe("run.recovered", outcome.state)
 
     async def decide_tool_call(
         self,

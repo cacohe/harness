@@ -55,6 +55,14 @@ class PolicyArtifactExternalizer:
         self._repository = repository
         self._policy = policy
 
+    @property
+    def repository(self) -> ArtifactRepository:
+        return self._repository
+
+    @property
+    def policy(self) -> ArtifactPolicy:
+        return self._policy
+
     async def externalize(
         self,
         content: ArtifactContent,

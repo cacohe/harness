@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 from src.core._run_driver import _CommittedRun, _Driver
@@ -59,6 +60,10 @@ class RunOutcome:
     journal_version: int
     sequence: int
     events: tuple[DomainEvent, ...] = ()
+
+
+class _ModelGatewayTimedOut(Exception):
+    pass
 
 
 def _matches_trusted_context_shape(
@@ -196,9 +201,21 @@ class RunCoordinator:
         except Exception:
             return self._outcome(await driver.fail(RunErrorCode.INVARIANT_VIOLATION))
         try:
-            response = snapshot_model_response(
-                await self._model.complete(ModelRequest(window.messages, window.tools))
-            )
+            remaining = driver.remaining_seconds()
+            if remaining <= 0:
+                return self._outcome(await driver.fail(RunErrorCode.LIMIT_EXCEEDED))
+            async with asyncio.timeout(remaining):
+                try:
+                    raw_response = await self._model.complete(
+                        ModelRequest(window.messages, window.tools)
+                    )
+                except TimeoutError:
+                    raise _ModelGatewayTimedOut from None
+                response = snapshot_model_response(raw_response)
+        except _ModelGatewayTimedOut:
+            return self._outcome(await driver.fail(RunErrorCode.MODEL_FAILED))
+        except TimeoutError:
+            return self._outcome(await driver.fail(RunErrorCode.LIMIT_EXCEEDED))
         except Exception:
             return self._outcome(await driver.fail(RunErrorCode.MODEL_FAILED))
         try:

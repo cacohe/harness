@@ -23,7 +23,23 @@ Completion = Callable[..., Awaitable[object]]
 
 
 class ModelProviderError(RuntimeError):
+    retryable = False
+
+
+class ModelTimeoutError(ModelProviderError, TimeoutError):
+    retryable = True
+
+
+class ModelTruncatedError(ModelProviderError):
+    retryable = True
+
+
+class ModelProtocolError(ModelProviderError):
     pass
+
+
+class ModelTransportError(ModelProviderError):
+    retryable = True
 
 
 @dataclass(slots=True)
@@ -111,6 +127,10 @@ class LiteLLMModelGateway:
     def __repr__(self) -> str:
         return f"LiteLLMModelGateway(model={self._model!r}, stream={self._stream!r})"
 
+    @property
+    def max_output_tokens(self) -> int:
+        return self._max_output_tokens
+
     async def complete(self, request: ModelRequest) -> ModelResponse:
         arguments: dict[str, object] = {
             **self._options,
@@ -136,16 +156,23 @@ class LiteLLMModelGateway:
                 return self._parse(response)
         except asyncio.CancelledError:
             raise
+        except ModelProviderError:
+            raise
         except TimeoutError:
-            raise TimeoutError("Model request timed out") from None
+            raise ModelTimeoutError("Model request timed out") from None
+        except (AttributeError, KeyError, TypeError, ValueError):
+            raise ModelProtocolError("Model response was invalid") from None
         except Exception:
-            raise ModelProviderError("Model request failed") from None
+            raise ModelTransportError("Model request failed") from None
 
     def _parse(self, response: object) -> ModelResponse:
         choices = _field(response, "choices")
         if type(choices) is not list or len(choices) != 1:
             raise ValueError
-        message = _field(choices[0], "message")
+        choice = choices[0]
+        finish = _field(choice, "finish_reason", None)
+        _validate_finish_reason(finish)
+        message = _field(choice, "message")
         text = _optional_text(_field(message, "content", None))
         raw_calls = _field(message, "tool_calls", [])
         if type(raw_calls) is not list or len(raw_calls) > self._max_calls:
@@ -162,6 +189,7 @@ class LiteLLMModelGateway:
         usage: ModelUsage | None = None
         size = 0
         finished = False
+        finish_reason: str | None = None
         chunks = 0
         cancellation: asyncio.CancelledError | None = None
         try:
@@ -235,6 +263,7 @@ class LiteLLMModelGateway:
                             raise ValueError
                         current.arguments += arguments
                 if finish is not None:
+                    finish_reason = finish
                     finished = True
         except asyncio.CancelledError as error:
             cancellation = error
@@ -250,6 +279,7 @@ class LiteLLMModelGateway:
                     raise
         if not finished:
             raise ValueError
+        _validate_finish_reason(finish_reason)
         model_calls = tuple(
             ModelToolCall(item.call_id or "", item.name or "", item.arguments) for item in calls
         )
@@ -323,6 +353,17 @@ def _optional_text(value: object) -> str | None:
     if type(value) is not str:
         raise ValueError
     return value
+
+
+def _validate_finish_reason(value: object) -> None:
+    if value is None:
+        return
+    if type(value) is not str:
+        raise ValueError
+    if value in {"length", "content_filter"}:
+        raise ModelTruncatedError("Model response was truncated")
+    if value not in {"stop", "tool_calls", "function_call"}:
+        raise ModelProtocolError("Model finish reason was invalid")
 
 
 def _field(value: object, name: str, default: Any = ...) -> Any:

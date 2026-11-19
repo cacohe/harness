@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from src.core.context import ContextBudget
 from src.core.ids import ProfileId, SessionId, SubmissionId
 
 from .test_runtime_v3 import (
@@ -445,6 +446,20 @@ def test_development_factory_leaves_injected_resources_caller_owned():
         assert closed == []
 
     asyncio.run(scenario())
+
+
+def test_composition_rejects_model_output_limit_larger_than_reserved_context():
+    import src.application.composition as composition
+
+    dependencies = _valid_composition_dependencies()
+    dependencies["model"].max_output_tokens = 257
+    with pytest.raises(ValueError, match="reserved output"):
+        asyncio.run(
+            composition.create_development_agent(
+                composition.ApplicationConfig(context_budget=ContextBudget(1_024, 256, 16)),
+                **dependencies,
+            )
+        )
 
 
 def _valid_composition_dependencies():

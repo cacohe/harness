@@ -257,6 +257,50 @@ def test_real_bounded_context_deduplicates_current_input_and_protects_latest_too
     ]
 
 
+def test_cancelled_submit_is_recovered_before_the_next_submission():
+    class InterruptOnceModel(Model):
+        def __init__(self):
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.cancelled = asyncio.Event()
+            self._interrupt = True
+
+        async def complete(self, request):
+            if self._interrupt:
+                self._interrupt = False
+                self.entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    self.cancelled.set()
+            return await super().complete(request)
+
+    async def scenario():
+        model = InterruptOnceModel()
+        agent, journal, _, _ = await rig(model=model)
+        session = await agent.open_session(SessionId("recover-cancelled"))
+        interrupted = asyncio.create_task(
+            session.submit("interrupted", SubmissionId("interrupted"))
+        )
+        await model.entered.wait()
+        interrupted.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await interrupted
+        assert model.cancelled.is_set()
+        current = await session.current_run()
+        completed = await session.submit("next", SubmissionId("next"))
+        recovered = await journal.find_run_state(
+            SessionId("recover-cancelled"), current.run_id, current.submission_id
+        )
+        await agent.close()
+        return current, recovered, completed
+
+    current, recovered, completed = asyncio.run(scenario())
+    assert current.status is RunStatus.RUNNING
+    assert recovered is not None and recovered.status is RunStatus.FAILED
+    assert completed.status is RunStatus.COMPLETED
+
+
 def test_agent_runs_direct_answer_and_ordered_tool_batch_end_to_end():
     async def scenario():
         agent, journal, _, tools = await rig()

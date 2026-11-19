@@ -2,7 +2,14 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-from src.adapters.model.litellm import LiteLLMModelGateway, ModelProviderError
+from src.adapters.model.litellm import (
+    LiteLLMModelGateway,
+    ModelProtocolError,
+    ModelProviderError,
+    ModelTimeoutError,
+    ModelTransportError,
+    ModelTruncatedError,
+)
 from src.core.model import ModelMessage, ModelRequest, ModelRole, ModelToolCall
 from src.core.tools import ToolSpec
 
@@ -184,7 +191,7 @@ def test_timeout_and_caller_cancellation_are_distinct() -> None:
         await asyncio.sleep(10)
 
     request = ModelRequest((ModelMessage(ModelRole.USER, "x"),))
-    with pytest.raises(TimeoutError, match="Model request timed out"):
+    with pytest.raises(ModelTimeoutError, match="Model request timed out"):
         asyncio.run(
             LiteLLMModelGateway(
                 "p/m", max_output_tokens=128, timeout_seconds=0.01, completion=slow
@@ -201,6 +208,41 @@ def test_timeout_and_caller_cancellation_are_distinct() -> None:
             await task
 
     asyncio.run(cancel())
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_length_finish_reason_is_reported_as_truncated(stream: bool) -> None:
+    async def completion(**_kwargs):
+        choice = {"finish_reason": "length"}
+        if stream:
+            choice["delta"] = {"content": "partial"}
+            return _Stream([{"choices": [choice]}])
+        choice["message"] = {"content": "partial", "tool_calls": []}
+        return {"choices": [choice]}
+
+    gateway = LiteLLMModelGateway("p/m", max_output_tokens=8, stream=stream, completion=completion)
+    with pytest.raises(ModelTruncatedError):
+        asyncio.run(gateway.complete(ModelRequest((ModelMessage(ModelRole.USER, "x"),))))
+
+
+def test_transport_and_invalid_response_failures_keep_distinct_taxonomy() -> None:
+    async def transport(**_kwargs):
+        raise OSError("provider unavailable")
+
+    async def invalid(**_kwargs):
+        return {"choices": [{"finish_reason": "stop", "message": {"content": 1}}]}
+
+    request = ModelRequest((ModelMessage(ModelRole.USER, "x"),))
+    with pytest.raises(ModelTransportError) as transport_error:
+        asyncio.run(
+            LiteLLMModelGateway("p/m", max_output_tokens=8, completion=transport).complete(request)
+        )
+    assert transport_error.value.retryable is True
+    with pytest.raises(ModelProtocolError) as protocol_error:
+        asyncio.run(
+            LiteLLMModelGateway("p/m", max_output_tokens=8, completion=invalid).complete(request)
+        )
+    assert protocol_error.value.retryable is False
 
 
 def test_parallel_tool_fragments_continue_by_index_across_chunks() -> None:

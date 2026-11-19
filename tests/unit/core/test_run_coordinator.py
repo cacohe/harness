@@ -182,6 +182,7 @@ def coordinator(
     context=None,
     context_request=None,
     context_budget=BUDGET,
+    model=None,
 ):
     calls = []
     journal = journal or Journal(calls)
@@ -193,7 +194,7 @@ def coordinator(
     tools = Tools(calls, tool_results)
     result = RunCoordinator(
         context=context or Context(calls, context_failure, checkpoint),
-        model=Model(calls, responses),
+        model=model or Model(calls, responses),
         tools=tools,
         artifacts=externalizer,
         journal=journal,
@@ -522,6 +523,25 @@ def test_model_failure_hides_adapter_exception_text():
     outcome = run(coordinator_.advance(initial(), submit()))
     assert outcome.state.failure == RunFailure(RunErrorCode.MODEL_FAILED)
     assert "secret" not in outcome.state.failure.message
+
+
+def test_model_call_is_cancelled_at_the_remaining_run_deadline():
+    cancelled = asyncio.Event()
+
+    class BlockingModel:
+        async def complete(self, _request):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    coordinator_, _, _, _, _ = coordinator(responses=[], model=BlockingModel())
+    limited = RunState.create(submit(), RunLimits(8, 0.01, 64))
+
+    outcome = run(coordinator_.advance(limited, submit()))
+
+    assert outcome.state.failure == RunFailure(RunErrorCode.LIMIT_EXCEEDED)
+    assert cancelled.is_set()
 
 
 @pytest.mark.parametrize("bad_result", [object(), "not-a-response"])

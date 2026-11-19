@@ -19,9 +19,10 @@ from src.adapters.persistence.memory import InMemoryRunJournal
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.application.agent import Agent
 from src.application.observability import PostCommitObserver
+from src.application.recovery import RecoveryService
 from src.application.runtime import RuntimeCoordinator, _close_resource
 from src.application.submissions import SubmissionService
-from src.core.artifacts import ArtifactExternalizer
+from src.core.artifacts import ArtifactExternalizer, ArtifactRepository
 from src.core.commands import RunLimits
 from src.core.context import ContextBudget, ContextProvider, ContextRequest, TokenCounter
 from src.core.ids import Clock, IdGenerator, ProfileId
@@ -111,6 +112,7 @@ async def create_development_agent(
     profile_id: ProfileId,
     journal: RunJournal | None = None,
     artifacts: ArtifactExternalizer | None = None,
+    artifact_repository: ArtifactRepository | None = None,
     owned_resources: tuple[object, ...] = (),
     observer: PostCommitObserver | None = None,
 ) -> Agent:
@@ -126,6 +128,7 @@ async def create_development_agent(
         profile_id=profile_id,
         journal=journal,
         artifacts=artifacts,
+        artifact_repository=artifact_repository,
         owned_resources=owned_resources,
         observer=observer,
     )
@@ -136,11 +139,17 @@ async def create_development_agent(
             selected_journal = InMemoryRunJournal()
             created.append(selected_journal)
         selected_artifacts = artifacts
+        selected_repository = artifact_repository
         if selected_artifacts is None:
-            repository = InMemoryArtifactRepository(config.max_artifact_bytes)
-            created.append(repository)
-            selected_artifacts = PolicyArtifactExternalizer(repository, _artifact_policy(config))
+            if selected_repository is None:
+                selected_repository = InMemoryArtifactRepository(config.max_artifact_bytes)
+                created.append(selected_repository)
+            selected_artifacts = PolicyArtifactExternalizer(
+                selected_repository, _artifact_policy(config)
+            )
             created.append(selected_artifacts)
+        elif selected_repository is None:
+            selected_repository = _externalizer_repository(selected_artifacts)
         _require_methods(selected_journal, _JOURNAL_METHODS)
         _require_methods(selected_artifacts, ("externalize",))
         return _compose(
@@ -155,6 +164,7 @@ async def create_development_agent(
             profile_id=profile_id,
             journal=selected_journal,
             artifacts=selected_artifacts,
+            artifact_repository=selected_repository,
             owned_resources=(*owned_resources, *created),
             observer=observer,
         )
@@ -175,6 +185,7 @@ async def create_production_agent(
     profile_id: ProfileId,
     journal: RunJournal | None = None,
     artifacts: ArtifactExternalizer | None = None,
+    artifact_repository: ArtifactRepository | None = None,
     owned_resources: tuple[object, ...] = (),
     observer: PostCommitObserver | None = None,
 ) -> Agent:
@@ -190,12 +201,13 @@ async def create_production_agent(
         profile_id=profile_id,
         journal=journal,
         artifacts=artifacts,
+        artifact_repository=artifact_repository,
         owned_resources=owned_resources,
         observer=observer,
     )
     if journal is None and config.sqlite_path is None:
         raise ValueError("Production composition requires an absolute SQLite path")
-    if artifacts is None and config.artifact_root is None:
+    if artifacts is None and artifact_repository is None and config.artifact_root is None:
         raise ValueError("Production composition requires an absolute Artifact root")
     created: list[object] = []
     try:
@@ -207,17 +219,23 @@ async def create_production_agent(
         else:
             selected_journal = journal
         selected_artifacts: ArtifactExternalizer
+        selected_repository = artifact_repository
         if artifacts is None:
-            assert config.artifact_root is not None
-            repository = FilesystemArtifactRepository(
-                config.artifact_root,
-                config.max_artifact_bytes,
+            if selected_repository is None:
+                assert config.artifact_root is not None
+                selected_repository = FilesystemArtifactRepository(
+                    config.artifact_root,
+                    config.max_artifact_bytes,
+                )
+                created.append(selected_repository)
+            selected_artifacts = PolicyArtifactExternalizer(
+                selected_repository, _artifact_policy(config)
             )
-            created.append(repository)
-            selected_artifacts = PolicyArtifactExternalizer(repository, _artifact_policy(config))
             created.append(selected_artifacts)
         else:
             selected_artifacts = artifacts
+            if selected_repository is None:
+                selected_repository = _externalizer_repository(selected_artifacts)
         _require_methods(selected_journal, _JOURNAL_METHODS)
         _require_methods(selected_artifacts, ("externalize",))
         return _compose(
@@ -232,6 +250,7 @@ async def create_production_agent(
             profile_id=profile_id,
             journal=selected_journal,
             artifacts=selected_artifacts,
+            artifact_repository=selected_repository,
             owned_resources=(*owned_resources, *created),
             observer=observer,
         )
@@ -252,6 +271,7 @@ def _compose(
     profile_id: ProfileId,
     journal: RunJournal,
     artifacts: ArtifactExternalizer,
+    artifact_repository: ArtifactRepository | None,
     owned_resources: tuple[object, ...],
     observer: PostCommitObserver | None,
 ) -> Agent:
@@ -326,6 +346,16 @@ def _compose(
         owned_resources=owned_resources,
         observer=observer,
         observer_timeout_seconds=config.observer_timeout_seconds,
+        recovery=(
+            RecoveryService(
+                journal=bounded_journal,
+                artifacts=artifact_repository,
+                clock=clock,
+                ids=ids,
+            )
+            if artifact_repository is not None
+            else None
+        ),
     )
     return Agent(runtime, ids, profile_id)
 
@@ -343,6 +373,7 @@ def _validate_composition_inputs(
     profile_id: ProfileId,
     journal: RunJournal | None,
     artifacts: ArtifactExternalizer | None,
+    artifact_repository: ArtifactRepository | None,
     owned_resources: tuple[object, ...],
     observer: PostCommitObserver | None,
 ) -> tuple[ApplicationConfig, ProfileId]:
@@ -367,6 +398,18 @@ def _validate_composition_inputs(
         _require_methods(journal, _JOURNAL_METHODS)
     if artifacts is not None:
         _require_methods(artifacts, ("externalize",))
+    if artifact_repository is not None:
+        _require_methods(artifact_repository, ("stat",))
+    try:
+        max_output_tokens = object.__getattribute__(model, "max_output_tokens")
+    except AttributeError:
+        max_output_tokens = None
+    if max_output_tokens is not None and (
+        type(max_output_tokens) is not int
+        or max_output_tokens < 1
+        or max_output_tokens > config.context_budget.reserved_output_tokens
+    ):
+        raise ValueError("Model output limit exceeds the reserved output context")
     if observer is not None:
         _require_methods(observer, ("observe",))
     return config, profile
@@ -410,6 +453,15 @@ def _require_callable(value: object) -> None:
         raise ValueError("Composition dependency ports are invalid") from None
     if not callable(member):
         raise ValueError("Composition dependency ports are invalid")
+
+
+def _externalizer_repository(value: ArtifactExternalizer) -> ArtifactRepository | None:
+    try:
+        repository = object.__getattribute__(value, "repository")
+        inspect.getattr_static(repository, "stat")
+    except (AttributeError, TypeError):
+        return None
+    return repository
 
 
 def _snapshot_profile_id(value: object) -> ProfileId:
