@@ -34,7 +34,7 @@ from src.core.commands import RunLimits
 from src.core.context import ContextBudget, ContextProvider, ContextRequest, TokenCounter
 from src.core.ids import Clock, IdGenerator, ProfileId
 from src.core.journal import RunJournal
-from src.core.model import ModelGateway, ModelMessage
+from src.core.model import ModelGateway
 from src.core.run import RunCoordinator
 from src.core.state import RunState
 from src.core.tools import ToolGateway, ToolSpec

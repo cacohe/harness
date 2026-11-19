@@ -19,8 +19,8 @@ from src.adapters.tools import (
     ToolCatalog,
     ToolCatalogEntry,
 )
-from src.application.composition import ApplicationConfig, create_development_agent
 from src.application.artifact_retention import ArtifactRetentionService
+from src.application.composition import ApplicationConfig, create_development_agent
 from src.core.commands import RunLimits
 from src.core.context import (
     ContextBudget,
