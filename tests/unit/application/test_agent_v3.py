@@ -481,6 +481,74 @@ def test_development_factory_leaves_injected_resources_caller_owned():
     asyncio.run(scenario())
 
 
+def test_default_development_composition_exposes_artifacts_and_clamps_inline_policy():
+    from src.adapters.context.tokenizers import ExactTokenCounter
+    from src.application.composition import ApplicationConfig, create_development_agent
+    from src.core.commands import RunLimits
+    from src.core.context import ContextRequest, ContextWindow
+    from src.core.model import ModelMessage, ModelResponse, ModelRole
+    from src.core.state import RunStatus
+
+    class Model:
+        max_output_tokens = 16
+
+        async def complete(self, _request):
+            return ModelResponse("x" * 64)
+
+    class Tools:
+        async def execute(self, _request):
+            raise AssertionError("No tools are expected")
+
+    class Context:
+        async def build(self, request, budget):
+            messages = (request.system_message, request.current_input, *request.open_tool_messages)
+            estimate = ExactTokenCounter().count(messages, request.tools)
+            return ContextWindow(
+                messages,
+                request.tools,
+                estimate,
+                budget,
+                (),
+                request.policy_version,
+            )
+
+    def request_factory(state, message):
+        return ContextRequest(
+            state.session_id,
+            state.profile_id,
+            "development-artifacts-v1",
+            ModelMessage(ModelRole.SYSTEM, "system"),
+            ModelMessage(ModelRole.USER, message),
+        )
+
+    async def scenario():
+        agent = await create_development_agent(
+            ApplicationConfig(
+                limits=RunLimits(4, 30.0, 16),
+                context_budget=ContextBudget(1_024, 16, 16),
+            ),
+            model=Model(),
+            tools=Tools(),
+            context=Context(),
+            context_counter=ExactTokenCounter(),
+            context_request_factory=request_factory,
+            ids=Ids(),
+            clock=Clock(),
+            profile_id=ProfileId("profile"),
+        )
+        maintenance = agent.artifacts
+        session = await agent.open_session(SessionId("development-artifacts"))
+        result = await session.submit("hello", SubmissionId("development-artifacts"))
+        await agent.close()
+        return maintenance, result
+
+    maintenance, result = asyncio.run(scenario())
+    assert maintenance is not None
+    assert result.status is RunStatus.COMPLETED
+    assert result.final_artifacts
+    assert len(result.final_text.encode("utf-8")) <= 16
+
+
 def test_composition_rejects_model_output_limit_larger_than_reserved_context():
     import src.application.composition as composition
 
@@ -560,6 +628,9 @@ class _JournalPort:
         raise NotImplementedError
 
     async def artifact_has_active_attachments(self, *_args):
+        raise NotImplementedError
+
+    async def publish_artifact(self, *_args):
         raise NotImplementedError
 
     async def reserve_artifact_retirement(self, *_args):

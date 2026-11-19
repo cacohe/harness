@@ -165,13 +165,27 @@ async def create_development_agent(
                 selected_repository = InMemoryArtifactRepository(config.max_artifact_bytes)
                 created.append(selected_repository)
             selected_artifacts = PolicyArtifactExternalizer(
-                selected_repository, _artifact_policy(config)
+                selected_repository,
+                _artifact_policy(
+                    config,
+                    inline_result_limit=config.limits.max_inline_result_bytes,
+                ),
             )
             created.append(selected_artifacts)
         elif selected_repository is None:
             selected_repository = _externalizer_repository(selected_artifacts)
         _require_methods(selected_journal, _JOURNAL_METHODS)
         _require_methods(selected_artifacts, ("externalize",))
+        maintenance = (
+            ArtifactRetentionService(
+                journal=selected_journal,
+                artifacts=selected_repository,
+                max_reference_ids=config.max_orphan_reference_ids,
+            )
+            if selected_repository is not None
+            and _has_methods(selected_repository, ("stat", "delete"))
+            else None
+        )
         return _compose(
             config,
             model=model,
@@ -187,6 +201,7 @@ async def create_development_agent(
             artifact_repository=selected_repository,
             owned_resources=(*owned_resources, *created),
             observer=observer,
+            artifact_services=maintenance,
         )
     except BaseException as error:
         await _cleanup_and_raise(error, created)
@@ -513,6 +528,14 @@ def _require_methods(value: object, names: tuple[str, ...]) -> None:
             raise ValueError("Composition dependency ports are invalid")
 
 
+def _has_methods(value: object, names: tuple[str, ...]) -> bool:
+    try:
+        _require_methods(value, names)
+    except ValueError:
+        return False
+    return True
+
+
 def _require_callable(value: object) -> None:
     try:
         member = inspect.getattr_static(value, "__call__")
@@ -637,11 +660,18 @@ async def _cleanup_and_raise(original: BaseException, resources: list[object]) -
     raise original
 
 
-def _artifact_policy(config: ApplicationConfig) -> ArtifactPolicy:
+def _artifact_policy(
+    config: ApplicationConfig, *, inline_result_limit: int | None = None
+) -> ArtifactPolicy:
+    max_inline = config.max_inline_artifact_bytes
+    max_summary = config.max_artifact_summary_bytes
+    if inline_result_limit is not None:
+        max_inline = min(max_inline, inline_result_limit)
+        max_summary = min(max_summary, inline_result_limit)
     return ArtifactPolicy(
-        config.max_inline_artifact_bytes,
+        max_inline,
         config.max_artifact_bytes,
-        config.max_artifact_summary_bytes,
+        max_summary,
         frozenset({"application/json", "text/plain", "application/octet-stream"}),
     )
 
