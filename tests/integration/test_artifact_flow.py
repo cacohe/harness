@@ -286,12 +286,15 @@ def test_retired_content_can_be_published_by_a_later_run(tmp_path):
         assert await repository.stat(artifact_id) is None
 
         second = await session.submit("second", SubmissionId("second"))
-        restored = await repository.stat(artifact_id)
+        retired = await repository.stat(artifact_id)
+        republished = await repository.stat(second.final_artifacts[0].artifact_id)
         await agent.close()
-        return first, second, restored
+        return first, second, retired, republished
 
-    first, second, restored = asyncio.run(scenario())
+    first, second, retired, republished = asyncio.run(scenario())
     assert first.status is RunStatus.COMPLETED
     assert second.status is RunStatus.COMPLETED
-    assert second.final_artifacts == first.final_artifacts
-    assert restored == second.final_artifacts[0]
+    assert second.final_artifacts != first.final_artifacts
+    assert second.final_artifacts[0].sha256 == first.final_artifacts[0].sha256
+    assert retired is None
+    assert republished == second.final_artifacts[0]

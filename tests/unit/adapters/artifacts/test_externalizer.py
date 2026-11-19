@@ -5,13 +5,9 @@ import json
 import pytest
 from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactExternalizer
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
-from src.core.artifacts import ArtifactWrite, artifact_id_from_descriptor
+from src.core.artifacts import ArtifactWrite
 
 ALL_TYPES = frozenset({"text/plain", "application/json", "application/octet-stream"})
-
-
-def _address(content: bytes, media_type: str = "text/plain", name: str | None = None) -> str:
-    return artifact_id_from_descriptor(hashlib.sha256(content).hexdigest(), media_type, name)
 
 
 def _externalizer(repo, *, inline=6, artifact=256, summary=48, allowed=ALL_TYPES):
@@ -50,7 +46,7 @@ def test_inline_threshold_is_exact_encoded_byte_count(exact, over, media_type, e
         ref = external.artifacts[0]
         assert ref.media_type == media_type
         assert ref.size_bytes == 7
-        assert ref.artifact_id == _address(encoded, media_type)
+        assert ref.sha256 == hashlib.sha256(encoded).hexdigest()
         assert await repo.stat(ref.artifact_id) == ref
         assert await _read(repo, ref.artifact_id) == encoded
 
@@ -70,12 +66,13 @@ def test_json_content_is_deterministic_and_summary_retains_keys_and_count():
             "example.json",
         )
 
-        assert result == reordered
-        assert result.artifacts[0].artifact_id == _address(
-            expected, "application/json", "example.json"
-        )
+        assert result.artifacts[0].artifact_id != reordered.artifacts[0].artifact_id
+        assert result.artifacts[0].sha256 == reordered.artifacts[0].sha256
+        assert result.artifacts[0].size_bytes == reordered.artifacts[0].size_bytes
+        assert result.summary == reordered.summary
         assert result.artifacts[0].name == "example.json"
         assert await _read(repo, result.artifacts[0].artifact_id) == expected
+        assert await _read(repo, reordered.artifacts[0].artifact_id) == expected
         assert "2 keys" in result.summary
         assert '"alpha"' in result.summary and '"z"' in result.summary
         assert "保密内容" not in result.summary
@@ -226,7 +223,7 @@ def test_oversized_content_and_repository_rejection_propagate_without_a_ref():
             externalizer = _externalizer(repo, inline=2, artifact=artifact_max)
             with pytest.raises(ValueError):
                 await externalizer.externalize("123456789", "text/plain")
-            assert await repo.stat(_address(b"123456789")) is None
+            assert repo._objects == {}
 
     asyncio.run(scenario())
 
@@ -247,7 +244,7 @@ def test_externalizer_forwards_policy_budget_and_waits_for_publication():
         future = asyncio.create_task(externalizer.externalize("0123456789", "text/plain"))
         await started.wait()
         assert not future.done()
-        assert await repo.stat(_address(b"0123456789")) is None
+        assert repo._objects == {}
         release.set()
         result = await future
         assert await _read(repo, result.artifacts[0].artifact_id) == b"0123456789"

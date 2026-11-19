@@ -442,10 +442,14 @@ class FilesystemArtifactRepository:
                     raise ValueError("Artifact stream SHA-256 does not match the expected digest")
                 data = await _finish_io(lambda: self._seal_data(stage, fd))
                 await _finish_io(stage.close)
+                descriptor_id = artifact_id_from_descriptor(
+                    checksum, request.media_type, request.name, request.metadata
+                )
+                publication_id = artifact_id_from_sha256(
+                    sha256(f"{descriptor_id}:{uuid4().hex}".encode("ascii")).hexdigest()
+                )
                 ref = ArtifactRef(
-                    artifact_id_from_descriptor(
-                        checksum, request.media_type, request.name, request.metadata
-                    ),
+                    publication_id,
                     request.media_type,
                     size,
                     checksum,

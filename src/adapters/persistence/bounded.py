@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import cast
 
 from src.adapters.persistence.sqlite_codec import encode
-from src.core.artifacts import ArtifactRef
 from src.core.context import ConversationPage, ConversationReader
 from src.core.errors import RunErrorCode
 from src.core.ids import ProfileId, RunId, SessionId, SubmissionId
@@ -106,11 +105,6 @@ class BoundedRunJournal:
 
     async def artifact_has_active_attachments(self, artifact_id: str) -> bool:
         return await self._delegate.artifact_has_active_attachments(artifact_id)
-
-    async def publish_artifact(
-        self, artifact: ArtifactRef
-    ) -> ArtifactRetirementReservation:
-        return await self._delegate.publish_artifact(artifact)
 
     async def reserve_artifact_retirement(
         self, artifact_id: str

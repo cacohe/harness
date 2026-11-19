@@ -30,11 +30,8 @@ async def _read(repo: InMemoryArtifactRepository, artifact_id: str) -> bytes:
 def test_put_is_streaming_and_open_has_independent_readers():
     async def scenario():
         repo = InMemoryArtifactRepository(max_artifact_bytes=3)
-        artifact_id = _address(b"abc")
-
         async def stream():
             yield b"a"
-            assert await repo.stat(artifact_id) is None
             yield b"bc"
 
         ref = await repo.put(
@@ -46,23 +43,24 @@ def test_put_is_streaming_and_open_has_independent_readers():
             )
         )
 
-        assert ref.artifact_id == artifact_id
         assert ref.size_bytes == 3
-        assert ref == await repo.stat(artifact_id)
-        assert await asyncio.gather(_read(repo, artifact_id), _read(repo, artifact_id)) == [
+        assert ref == await repo.stat(ref.artifact_id)
+        assert await asyncio.gather(
+            _read(repo, ref.artifact_id), _read(repo, ref.artifact_id)
+        ) == [
             b"abc",
             b"abc",
         ]
-        await repo.delete(artifact_id)
-        await repo.delete(artifact_id)
-        assert await repo.stat(artifact_id) is None
+        await repo.delete(ref.artifact_id)
+        await repo.delete(ref.artifact_id)
+        assert await repo.stat(ref.artifact_id) is None
         with pytest.raises(KeyError):
-            await _read(repo, artifact_id)
+            await _read(repo, ref.artifact_id)
 
     asyncio.run(scenario())
 
 
-def test_empty_stream_and_equivalent_metadata_deduplicate():
+def test_equivalent_writes_create_distinct_publication_ids():
     async def scenario():
         repo = InMemoryArtifactRepository(max_artifact_bytes=3)
         first = await repo.put(
@@ -82,11 +80,14 @@ def test_empty_stream_and_equivalent_metadata_deduplicate():
             )
         )
 
-        artifact_id = _address(b"", name="same", metadata={"z": 1, "a": ["same"]})
-        assert first == duplicate == await repo.stat(artifact_id)
+        assert first.artifact_id != duplicate.artifact_id
+        assert first.sha256 == duplicate.sha256 == hashlib.sha256(b"").hexdigest()
+        assert first == await repo.stat(first.artifact_id)
+        assert duplicate == await repo.stat(duplicate.artifact_id)
         duplicate.metadata["z"] = 2
-        assert (await repo.stat(artifact_id)).metadata == {"z": 1, "a": ["same"]}
-        assert await _read(repo, artifact_id) == b""
+        assert (await repo.stat(first.artifact_id)).metadata == {"z": 1, "a": ["same"]}
+        assert await _read(repo, first.artifact_id) == b""
+        assert await _read(repo, duplicate.artifact_id) == b""
 
     asyncio.run(scenario())
 
@@ -131,7 +132,7 @@ def test_concurrent_distinct_descriptors_publish_independently(changed):
         second = await pending
 
         assert first.artifact_id != second.artifact_id
-        assert first == await repo.stat(_address(b"abc", name="original", metadata={"version": 1}))
+        assert first == await repo.stat(first.artifact_id)
         assert second == await repo.stat(second.artifact_id)
         assert await _read(repo, first.artifact_id) == b"abc"
         assert await _read(repo, second.artifact_id) == b"abc"

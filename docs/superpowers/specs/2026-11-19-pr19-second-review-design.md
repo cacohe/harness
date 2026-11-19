@@ -17,7 +17,7 @@
 ## 已选方案
 
 1. **上下文顺序：修正强制后缀契约。** `current_input` 位于 open tool batch 之前，core 的 shape validator 与 adapter 使用同一顺序。
-2. **Artifact：显式发布代次。** journal 增加“确认新发布”的端口；外置器在 repository `put()` 成功且可读后登记发布。`RETIRED -> AVAILABLE` 只允许由这一显式动作开启下一代，普通 attach 继续拒绝墓碑。发布和 attach 之间若被新一轮 retirement 抢占，attach 仍冲突而不会提交悬空引用。
+2. **Artifact：独立 publication identity。** 每次 repository `put()` 成功都生成新的不可变 `artifact_id`；`sha256` 单独保留内容摘要语义。journal 的墓碑永久绑定旧 publication ID，普通 attach 继续拒绝墓碑；重新写入相同内容不复活旧 ID，因此迟到或重复的旧 delete 不能误删新对象。
 3. **MCP 生命周期：owner task actor。** async context wrapper 创建一个常驻 task，由队列接收方法调用和 close；enter/call/exit 全部在该 task 内串行执行。同步客户端继续使用现有有界 worker。
 4. **工具名：稳定别名。** 保留安全字符，将其他连续字符替换为 `_`，必要时使用远端名 SHA-256 短后缀截断；公开长度根据 server 前缀动态计算。规范化后重复即拒绝。
 5. **development：能力对齐。** 仅对内部构造的 policy 做阈值收敛；调用方注入的 externalizer 不被改写。repository/journal 具备维护端口时暴露 `agent.artifacts`。
@@ -25,13 +25,13 @@
 ## 考虑过但未采用
 
 - **Artifact attach 时直接复活墓碑：** 改动最小，但无法证明对象仍存在，正是上一轮已修复的悬空引用缺陷。
-- **为每次 put 生成随机 Artifact ID：** 可以彻底隔离代次，但会破坏当前 content-addressed 去重契约并扩大文件系统迁移范围。
+- **journal 显式 republish 旧 Artifact ID：** 会在 repository `put()`、journal publication 和 retirement 之间制造跨存储竞态；旧删除操作仍可能在 republish 后误删新对象。
 - **MCP 只让 enter/exit 同 task、调用仍外置：** anyio 客户端的方法通常也依赖 enter task 的 cancel scope，因此生命周期必须整体归 owner task。
 
 ## 验收
 
 - 真实 bounded context 的多步工具请求消息顺序正确。
-- memory 与 SQLite journal 都能在 retire 后通过显式 republish 再次 attach；未 republish 的 attach 仍冲突。
+- retire 后相同内容可用新的 publication ID 再次 attach；旧 ID 仍保持 `RETIRED` 且无法再次 attach。
 - anyio task group 模拟客户端可 add/call/remove，且 enter/call/exit task identity 相同。
 - `server.tool`、`path/to/tool`、超长 Unicode 名可调用，且规范化碰撞被拒绝。
 - development 默认 `agent.artifacts` 可用，小 Run inline limit 会正常外置而不是 `ARTIFACT_FAILED`。

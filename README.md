@@ -105,7 +105,7 @@ CAS 原子提交。外层循环由 application runtime 驱动，受以下边界�
 
 1. `ArtifactExternalizer` 根据 policy 决定 inline 或外置；
 2. repository 完整写入并校验 hash/size；
-3. Core 在提交 attachment 前用完整 `ArtifactRef` 显式登记已可读 publication，journal 随后仅提交
+3. repository 为每次成功写入分配独立、不可变的 publication ID；journal 随后仅提交
    `ArtifactRef + bounded summary`；
 4. 模型需要内容时，通过普通 `read_artifact` 工具按范围读取；
 5. journal 失败可能留下未引用对象，由 adapter 的宽限期回收处理。
@@ -122,15 +122,15 @@ Recovery 只把 journal 中仍然 active 的 attachment 当作待校验权威；
 retire 先在 journal 中原子取得 `RETIRING` reservation：该步骤与“没有 active owner”的判断
 处于同一事务，并阻止新的 attachment；repository delete 成功后再标记 `RETIRED`，明确失败且
 对象仍存在时标记 `ABORTED`。进程可在任一阶段重启并通过重复 retire 收敛。普通 attachment
-不能越过 `RETIRED` 墓碑；content-addressed 对象重新 `put()` 并显式登记 publication 后才会开启
-下一 generation，因此相同 digest 可以再次使用，同时不会把缺失对象静默恢复为可用。
+不能越过 `RETIRED` 墓碑；相同内容重新 `put()` 会得到新的 publication ID，而 `sha256` 仍表示
+内容摘要。因此相同 digest 可以再次使用，旧 tombstone 或迟到的 delete 也不会影响新对象。
 SQLite 不把 derived active index 或 retirement current row 当成单点权威：reserve 在同一
 `BEGIN IMMEDIATE` 中按 `artifact_id` 有界重放 append-only attachment facts 并与 index 双向
 核对；retirement transition 另有 append-only hash chain、固定深度 Merkle projection 与数据库
 authenticated root。普通 SQL 改写 current/fact/leaf/node/root/count 会在下一次生命周期操作时
 稳定拒绝。
 
-`FilesystemArtifactRepository` 使用 content-addressed 路径、临时写入、原子 finalize、大小/hash
+`FilesystemArtifactRepository` 使用 publication-addressed 路径、临时写入、原子 finalize、大小/hash
 校验和路径防护；它是单机 reference adapter，不宣称支持多节点共享。
 
 `agent.artifacts.collect_orphans(cutoff)` 只回收从未出现在 append-only Artifact facts 中且早于

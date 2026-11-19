@@ -2,6 +2,7 @@ import asyncio
 import errno
 import hashlib
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -63,16 +64,8 @@ def test_large_stream_publishes_complete_read_only_object(tmp_path, monkeypatch)
         digest = hashlib.sha256()
         for _ in range(20):
             digest.update(payload)
-        artifact_id = artifact_id_from_descriptor(
-            digest.hexdigest(),
-            "application/octet-stream",
-            "CON",
-            {"results": [20]},
-        )
-
         async def source():
             for _ in range(20):
-                assert await repo.stat(artifact_id) is None
                 yield payload
 
         receipt = await repo.put(
@@ -85,7 +78,7 @@ def test_large_stream_publishes_complete_read_only_object(tmp_path, monkeypatch)
                 expected_sha256=digest.hexdigest(),
             )
         )
-        assert receipt.artifact_id == artifact_id
+        artifact_id = receipt.artifact_id
         assert receipt.name == "CON"
         assert _contents(root) == {_object(root, artifact_id)}
         assert len(list(_object(root, artifact_id).iterdir())) == 2
@@ -123,7 +116,7 @@ def test_large_stream_publishes_complete_read_only_object(tmp_path, monkeypatch)
         asyncio.run(scenario())
 
 
-def test_concurrent_writers_across_instances_deduplicate(tmp_path):
+def test_concurrent_writers_across_instances_publish_distinct_ids(tmp_path):
     async def scenario():
         repos = [FilesystemArtifactRepository(tmp_path, 3) for _ in range(8)]
         ready = asyncio.Event()
@@ -141,9 +134,11 @@ def test_concurrent_writers_across_instances_deduplicate(tmp_path):
         results = await asyncio.gather(
             *(repo.put(ArtifactWrite(source(), "text/plain")) for repo in repos)
         )
-        assert all(ref == results[0] for ref in results)
-        assert results[0] == await repos[0].stat(_address(b"abc"))
-        assert _contents(tmp_path) == {_object(tmp_path, _address(b"abc"))}
+        assert len({ref.artifact_id for ref in results}) == len(results)
+        assert all(ref.sha256 == hashlib.sha256(b"abc").hexdigest() for ref in results)
+        stored = await asyncio.gather(*(repos[0].stat(ref.artifact_id) for ref in results))
+        assert all(actual == expected for actual, expected in zip(stored, results))
+        assert _contents(tmp_path) == {_object(tmp_path, ref.artifact_id) for ref in results}
 
     asyncio.run(scenario())
 
@@ -174,29 +169,6 @@ def test_missing_stat_does_not_create_permanent_lock_files(tmp_path):
             artifact_id = "sha256:" + f"{index:064x}"
             assert await repo.stat(artifact_id) is None
         assert list(locks.iterdir()) == []
-
-    asyncio.run(scenario())
-
-
-def test_atomic_rename_loser_returns_the_other_publishers_receipt(tmp_path, monkeypatch):
-    async def scenario():
-        root = tmp_path / "repo"
-        other_root = tmp_path / "other"
-        repo = FilesystemArtifactRepository(root, 3)
-        other = FilesystemArtifactRepository(other_root, 3)
-        winner = await other.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
-        real_rename = os.rename
-
-        def rename_with_winner(source, target, *args, **kwargs):
-            real_rename(_object(other_root, winner.artifact_id), root / os.path.basename(target))
-            real_rename(source, target, *args, **kwargs)
-
-        with monkeypatch.context() as patch:
-            patch.setattr(os, "rename", rename_with_winner)
-            result = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
-        assert result == winner == await repo.stat(winner.artifact_id)
-        assert await _read(repo, winner.artifact_id) == b"abc"
-        assert _contents(root) == {_object(root, winner.artifact_id)}
 
     asyncio.run(scenario())
 
@@ -614,7 +586,7 @@ def test_orphan_collection_requires_an_exact_utc_cutoff(tmp_path, threshold):
     asyncio.run(scenario())
 
 
-def test_deduplicated_put_refreshes_the_orphan_grace_period(tmp_path):
+def test_new_publication_does_not_refresh_an_old_publications_orphan_grace(tmp_path):
     async def scenario():
         repo = FilesystemArtifactRepository(tmp_path, 3)
         ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
@@ -622,10 +594,12 @@ def test_deduplicated_put_refreshes_the_orphan_grace_period(tmp_path):
         old = int((cutoff - timedelta(days=1)).timestamp())
         os.utime(_object(tmp_path, ref.artifact_id), (old, old))
 
-        duplicate = await repo.put(ArtifactWrite(_chunks(b"a", b"bc"), "text/plain"))
-        assert duplicate == ref
-        assert await repo.collect_orphans([], cutoff) == 0
-        assert await _read(repo, ref.artifact_id) == b"abc"
+        replacement = await repo.put(ArtifactWrite(_chunks(b"a", b"bc"), "text/plain"))
+        assert replacement.artifact_id != ref.artifact_id
+        assert replacement.sha256 == ref.sha256
+        assert await repo.collect_orphans([], cutoff) == 1
+        assert await repo.stat(ref.artifact_id) is None
+        assert await _read(repo, replacement.artifact_id) == b"abc"
 
     asyncio.run(scenario())
 
@@ -681,9 +655,12 @@ def test_delete_rolls_back_a_replacement_captured_at_rename(tmp_path, monkeypatc
         root = tmp_path / "repo"
         replacement_root = tmp_path / "replacement"
         repo = FilesystemArtifactRepository(root, 3)
-        other = FilesystemArtifactRepository(replacement_root, 3)
         ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="old"))
-        replacement = await other.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="old"))
+        replacement_root.mkdir()
+        shutil.copytree(
+            _object(root, ref.artifact_id), _object(replacement_root, ref.artifact_id)
+        )
+        replacement = ref
         object_path = _object(root, ref.artifact_id)
         actual_rename = os.rename
 
@@ -732,9 +709,10 @@ def test_failed_rollback_does_not_allow_gc_to_remove_the_replacement(tmp_path, m
         root = tmp_path / "repo"
         other_root = tmp_path / "replacement"
         repo = FilesystemArtifactRepository(root, 3)
-        other = FilesystemArtifactRepository(other_root, 3)
         ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="old"))
-        replacement = await other.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="old"))
+        other_root.mkdir()
+        shutil.copytree(_object(root, ref.artifact_id), _object(other_root, ref.artifact_id))
+        replacement = ref
         actual_rename = os.rename
 
         def substitute(source, target, *args, **kwargs):
@@ -787,7 +765,8 @@ def test_cancel_during_publication_waits_for_rename_and_leaves_collectible_objec
                 release.set()
             with pytest.raises(asyncio.CancelledError):
                 await pending
-        assert await _read(repo, _address(b"abc")) == b"abc"
+        (published,) = _contents(tmp_path)
+        assert await _read(repo, f"sha256:{published.name}") == b"abc"
         assert await repo.collect_orphans([], datetime.now(timezone.utc) + timedelta(days=1)) == 1
 
     asyncio.run(scenario())
@@ -851,7 +830,7 @@ def test_publication_and_failure_cleanup_do_not_run_on_event_loop(tmp_path, monk
     asyncio.run(scenario())
 
 
-def test_independent_process_waits_for_an_in_progress_delete(tmp_path, monkeypatch):
+def test_independent_publication_proceeds_during_delete_of_an_old_id(tmp_path, monkeypatch):
     child = """
 import asyncio
 import sys
@@ -903,11 +882,13 @@ asyncio.run(main())
             with monkeypatch.context() as patch:
                 patch.setattr(os, "rename", pause_delete)
                 await repo.delete(ref.artifact_id)
-            assert observed == ["blocked"]
+            assert observed == [0]
             out, error = processes[0].communicate(timeout=10)
             assert processes[0].returncode == 0, error
             assert out.strip() == "published"
-            assert (await repo.stat(ref.artifact_id)).name == "initial"
+            assert await repo.stat(ref.artifact_id) is None
+            (remaining,) = _contents(tmp_path)
+            assert (await repo.stat(f"sha256:{remaining.name}")).name == "initial"
         finally:
             for process in processes:
                 if process.poll() is None:
@@ -1093,12 +1074,8 @@ def test_failed_rename_intent_is_cleared_only_for_the_same_live_object(
             final.rename(tmp_path / "original")
             expected = None
             if final_identity == "replacement":
-                other_root = tmp_path / "other"
-                other = FilesystemArtifactRepository(other_root, 3)
-                expected = await other.put(
-                    ArtifactWrite(_chunks(b"abc"), "text/plain", name="first")
-                )
-                _object(other_root, ref.artifact_id).rename(final)
+                    shutil.copytree(tmp_path / "original", final)
+                    expected = ref
 
         restarted = FilesystemArtifactRepository(root, 3)
         assert await restarted.collect_orphans({ref.artifact_id}, datetime.now(timezone.utc)) == 0

@@ -4,7 +4,7 @@
 
 **Goal:** 修复 PR #19 第二轮评审确认的阻塞问题，并完成紧邻边界的一致性修复。
 
-**Architecture:** Context 通过一个统一的强制消息后缀契约保证顺序；Artifact 通过 journal 显式发布代次区分墓碑与新对象；MCP async context 由单一 owner task actor 持有；composition 只在应用层收敛默认 adapter 策略。
+**Architecture:** Context 通过一个统一的强制消息后缀契约保证顺序；Artifact 通过每次写入独立的 publication ID 隔离永久墓碑与新对象；MCP async context 由单一 owner task actor 持有；composition 只在应用层收敛默认 adapter 策略。
 
 **Tech Stack:** Python 3.11, asyncio, anyio, SQLite, pytest
 
@@ -20,8 +20,8 @@
 ## Review Focus
 
 - 同一 Run 中 current user 与 open tool batch 的相对顺序由 integration test 固定。
-- Artifact 未显式 republish 时仍不能越过 `RETIRED` 墓碑。
-- republish 与新一轮 `RETIRING` 冲突时 attach 不得提交。
+- Artifact 的旧 publication ID 永远不能越过 `RETIRED` 墓碑。
+- 相同内容重新写入必须得到新 ID，旧 delete 与新对象互不影响。
 - MCP owner task 在超时、remove 和 gateway close 时都必须有界清理。
 - 名称规范化后的碰撞不得将调用路由到错误的远端工具。
 
@@ -44,27 +44,24 @@
 - [ ] Change adapter packing and core shape validation to the new suffix.
 - [ ] Run focused context/integration tests and commit.
 
-### Task 2: Explicit Artifact republication generation
+### Task 2: Independent Artifact publication identities
 
 **Files:**
-- Modify: `src/core/journal.py`
-- Modify: `src/adapters/persistence/memory.py`
-- Modify: `src/adapters/persistence/sqlite.py`
-- Modify: `src/adapters/persistence/bounded.py`
-- Modify: `src/adapters/artifacts/externalizer.py`
-- Modify: `src/application/composition.py`
+- Modify: `src/core/artifacts.py`
+- Modify: `src/adapters/artifacts/memory.py`
+- Modify: `src/adapters/artifacts/filesystem.py`
 - Test: `tests/unit/core/test_journal_contract.py`
 - Test: `tests/unit/application/test_artifact_retention.py`
 - Test: `tests/integration/test_artifact_flow.py`
 - Modify: `README.md`
 
 **Interfaces:**
-- Produces: `RunJournal.publish_artifact(ref) -> ArtifactRetirementReservation`
-- Consumes: repository `put()` success before publication; normal `commit()` attachment remains tombstone-safe
+- Produces: every successful `ArtifactRepository.put()` returns a unique immutable publication ID
+- Preserves: `ArtifactRef.sha256` as the content digest; journal attachment and tombstone rules remain unchanged
 
-- [ ] Add contract tests: retired attach fails, explicit publication opens generation+1, then attach succeeds; `RETIRING` publication fails.
-- [ ] Run memory and SQLite parameterized tests and confirm missing method/behavior failures.
-- [ ] Implement bounded validation, durable transition, externalizer publication hook, and composition wiring.
+- [ ] Add tests proving equivalent writes have distinct IDs and deleting the old ID cannot affect the new publication.
+- [ ] Run memory/filesystem tests and confirm deterministic-ID assumptions fail.
+- [ ] Separate publication identity validation from content digest validation in core, then update repository adapters.
 - [ ] Add end-to-end retire/reproduce test, update README, run focused suites, and commit.
 
 ### Task 3: MCP owner task and normalized names

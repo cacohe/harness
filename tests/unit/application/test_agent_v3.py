@@ -630,9 +630,6 @@ class _JournalPort:
     async def artifact_has_active_attachments(self, *_args):
         raise NotImplementedError
 
-    async def publish_artifact(self, *_args):
-        raise NotImplementedError
-
     async def reserve_artifact_retirement(self, *_args):
         raise NotImplementedError
 

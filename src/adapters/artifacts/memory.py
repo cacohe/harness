@@ -2,12 +2,14 @@ from asyncio import CancelledError, current_task, sleep
 from collections.abc import AsyncIterator
 from hashlib import sha256
 from threading import Lock
+from uuid import uuid4
 
 from src.core.artifacts import (
     MAX_ARTIFACT_SIZE_BYTES,
     ArtifactRef,
     ArtifactWrite,
     artifact_id_from_descriptor,
+    artifact_id_from_sha256,
     validate_artifact_id,
 )
 
@@ -68,8 +70,11 @@ class InMemoryArtifactRepository:
             raise ValueError("Artifact stream size does not match the expected size")
         if request.expected_sha256 is not None and request.expected_sha256 != checksum:
             raise ValueError("Artifact stream SHA-256 does not match the expected digest")
-        artifact_id = artifact_id_from_descriptor(
+        descriptor_id = artifact_id_from_descriptor(
             checksum, request.media_type, request.name, request.metadata
+        )
+        artifact_id = artifact_id_from_sha256(
+            sha256(f"{descriptor_id}:{uuid4().hex}".encode("ascii")).hexdigest()
         )
         ref = ArtifactRef(
             artifact_id,
@@ -85,11 +90,7 @@ class InMemoryArtifactRepository:
         await sleep(0)
         with self._lock:
             check_cancellation()
-            existing = self._objects.get(artifact_id)
-            if existing is not None and existing[0] != ref:
-                raise ValueError("Artifact descriptor conflict for content address")
-            if existing is None:
-                self._objects[artifact_id] = (ref, data)
+            self._objects[artifact_id] = (ref, data)
         return receipt
 
     async def stat(self, artifact_id: str) -> ArtifactRef | None:

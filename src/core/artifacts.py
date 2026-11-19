@@ -253,11 +253,7 @@ class ArtifactRef:
         validate_artifact_name(name)
         _validate_size(size_bytes)
         metadata_json = _encode_metadata(metadata)
-        if artifact_id not in {
-            artifact_id_from_sha256(sha256),
-            artifact_id_from_descriptor(sha256, media_type, name, metadata),
-        }:
-            raise ValueError("Artifact ID does not match its content and descriptor")
+        artifact_id_from_sha256(sha256)
         object.__setattr__(self, "artifact_id", artifact_id)
         object.__setattr__(self, "media_type", media_type)
         object.__setattr__(self, "size_bytes", size_bytes)
@@ -446,8 +442,8 @@ class ArtifactRepository(Protocol):
         """Consume exact bytes and publish only after validation completes.
 
         The adapter enforces its own upper limit and the request's write limit.
-        On return, the artifact is readable. A repeated address with identical
-        descriptors deduplicates; differences raise ValueError without mutation.
+        On return, the artifact is readable. Every successful call creates a new
+        immutable publication identity; ``sha256`` remains the content digest.
         """
         ...
 
