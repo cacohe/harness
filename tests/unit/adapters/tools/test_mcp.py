@@ -1447,9 +1447,43 @@ def test_provider_unsafe_remote_names_are_normalized_and_call_original(remote_na
         assert public_name.startswith("server__")
         assert len(public_name.encode("ascii")) <= 64
         assert mcp_module._PROVIDER_NAME.fullmatch(public_name) is not None
-        generation = gateway._servers["server"].generation
-        await gateway._call("server", generation, remote_name, {})
+        result = await gateway.execute(_request(gateway))
+        assert result.status is ToolResultStatus.SUCCESS
         assert client.called_name == remote_name
+        await gateway.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_safe_trailing_underscore_names_remain_distinct() -> None:
+    class Distinct(Client):
+        async def list_tools(self):
+            return [
+                {"name": "read", "inputSchema": {}},
+                {"name": "read_", "inputSchema": {}},
+            ]
+
+    async def scenario():
+        gateway = _gateway(Distinct())
+        await gateway.add_server("server", object())
+        assert [spec.name for spec in gateway._dynamic_catalog.specs] == [
+            "server__read",
+            "server__read_",
+        ]
+        await gateway.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_long_server_name_accepts_a_short_tool_name() -> None:
+    class Short(Client):
+        async def list_tools(self):
+            return [{"name": "x", "inputSchema": {}}]
+
+    async def scenario():
+        gateway = _gateway(Short())
+        await gateway.add_server("s" * 60, object())
+        assert gateway._dynamic_catalog.specs[0].name == f"{'s' * 60}__x"
         await gateway.aclose()
 
     asyncio.run(scenario())
@@ -1541,6 +1575,141 @@ def test_async_context_manager_owns_enter_calls_and_exit_in_one_task() -> None:
     asyncio.run(scenario())
     assert [kind for kind, _task in calls] == ["list", "call", "exit"]
     assert {task for _kind, task in calls} == {owner}
+
+
+def test_cancelling_a_queued_async_context_call_does_not_cancel_the_active_call() -> None:
+    class Blocking(Client):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def call_tool(self, name, arguments):
+            self.started.set()
+            await self.release.wait()
+            return {"name": name, "arguments": arguments}
+
+    async def scenario():
+        client = Blocking()
+
+        class Manager:
+            async def __aenter__(self):
+                return client
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return None
+
+        gateway = _gateway(client, factory=lambda _source: Manager())
+        await gateway.add_server("server", object())
+        generation = gateway._servers["server"].generation
+        active = asyncio.create_task(gateway._call("server", generation, "read", {"id": 1}))
+        await client.started.wait()
+        queued = asyncio.create_task(gateway._call("server", generation, "read", {"id": 2}))
+        await asyncio.sleep(0)
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+        assert not active.done()
+        client.release.set()
+        assert await active == {"name": "read", "arguments": {"id": 1}}
+        assert gateway._dynamic_catalog.specs
+        await gateway.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_async_context_method_cancellation_removes_the_dead_catalog() -> None:
+    class Cancelled(Client):
+        async def call_tool(self, name, arguments):
+            raise asyncio.CancelledError
+
+    class Manager:
+        async def __aenter__(self):
+            return client
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+    async def scenario():
+        gateway = _gateway(client, factory=lambda _source: Manager())
+        await gateway.add_server("server", object())
+        generation = gateway._servers["server"].generation
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(gateway._call("server", generation, "read", {}), 0.2)
+        for _ in range(20):
+            if not gateway._dynamic_catalog.specs:
+                break
+            await asyncio.sleep(0)
+        assert gateway._dynamic_catalog.specs == ()
+        await gateway.aclose()
+
+    client = Cancelled()
+    asyncio.run(scenario())
+
+
+def test_async_context_enter_timeout_is_bounded_when_cancellation_is_suppressed() -> None:
+    exited = asyncio.Event()
+
+    class Manager:
+        async def __aenter__(self):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return Client()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            exited.set()
+
+    async def scenario():
+        gateway = _gateway(Client(), timeout_seconds=0.03, factory=lambda _source: Manager())
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gateway.add_server("server", object()), 0.2)
+        await asyncio.wait_for(exited.wait(), 0.2)
+        await gateway.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_sync_client_from_async_context_does_not_block_the_event_loop() -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class SyncClient:
+        def list_tools(self):
+            started.set()
+            release.wait()
+            return [{"name": "read", "inputSchema": {}}]
+
+        def close(self):
+            return None
+
+    class Manager:
+        async def __aenter__(self):
+            return SyncClient()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+    async def scenario():
+        gateway = _gateway(Client(), factory=lambda _source: Manager())
+        before = time.monotonic()
+        adding = asyncio.create_task(gateway.add_server("server", object()))
+        assert await asyncio.to_thread(started.wait, 1)
+        assert time.monotonic() - before < 0.1
+        ticked = asyncio.Event()
+        asyncio.get_running_loop().call_soon(ticked.set)
+        await asyncio.wait_for(ticked.wait(), 0.05)
+        release.set()
+        await adding
+        await gateway.aclose()
+
+    watchdog = threading.Timer(0.2, release.set)
+    watchdog.start()
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        watchdog.cancel()
 
 
 def test_async_timeout_cancels_underlying_mcp_call() -> None:

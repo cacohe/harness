@@ -130,9 +130,12 @@ class MCPToolGateway(LocalToolGateway):
                 if self._closed or name in self._servers:
                     raise ValueError("MCP server cannot be added")
                 cleanup = _LiveClientCleanup(client, self._sync_timeout, self._cleanup_limiter)
-                replacement = {**self._servers, name: _Server(client, generation, entries, cleanup)}
+                state = _Server(client, generation, entries, cleanup)
+                replacement = {**self._servers, name: state}
                 self._publish(replacement)
                 self._servers = replacement
+                if isinstance(client, _AsyncContextClient):
+                    client.on_terminated(partial(self._async_client_terminated, name, state))
         except BaseException:
             if client is not None:
                 if discovery is not None and discovery.abandoned:
@@ -413,40 +416,72 @@ class MCPToolGateway(LocalToolGateway):
         if state.close_task is None:
             self._track_retired_close(asyncio.create_task(close_later()))
 
+    def _async_client_terminated(self, name: str, state: _Server) -> None:
+        async def retire() -> None:
+            async with self._lifecycle:
+                if self._servers.get(name) is not state:
+                    return
+                state.closing = True
+                replacement = dict(self._servers)
+                del replacement[name]
+                self._publish(replacement)
+                self._servers = replacement
+            self._defer_close_until_idle(state)
+
+        asyncio.create_task(retire())
+
     def _publish(self, servers: dict[str, _Server]) -> None:
         entries = tuple(entry for state in servers.values() for entry in state.entries)
         self._dynamic_catalog.replace(entries)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _AsyncContextCall:
     name: str
     args: tuple[object, ...]
     result: asyncio.Future[object]
+    started: bool = False
 
 
 class _AsyncContextClient:
-    def __init__(self, manager: object) -> None:
+    def __init__(self, manager: object, timeout: float, limiter: _SyncLimiter) -> None:
         self._manager = manager
         self._loop = asyncio.get_running_loop()
         self._ready: asyncio.Future[None] = self._loop.create_future()
         self._queue: asyncio.Queue[_AsyncContextCall | None] = asyncio.Queue()
         self._closed = False
         self._terminal_error: BaseException | None = None
+        self._timeout = timeout
+        self._limiter = limiter
+        self._termination_callbacks: list[Callable[[], object]] = []
         self._owner = asyncio.create_task(self._run())
+        self._owner.add_done_callback(self._owner_done)
+
+    def on_terminated(self, callback: Callable[[], object]) -> None:
+        if self._owner.done():
+            callback()
+        else:
+            self._termination_callbacks.append(callback)
+
+    def _owner_done(self, _task: asyncio.Task[None]) -> None:
+        callbacks, self._termination_callbacks = self._termination_callbacks, []
+        for callback in callbacks:
+            callback()
 
     def __getattr__(self, name: str) -> object:
         async def invoke(*args: object) -> object:
             if self._closed or self._owner.done():
                 raise RuntimeError("MCP async context client is closed")
             result: asyncio.Future[object] = self._loop.create_future()
-            await self._queue.put(_AsyncContextCall(name, args, result))
+            call = _AsyncContextCall(name, args, result)
+            await self._queue.put(call)
             try:
                 return await result
             except asyncio.CancelledError:
                 if not result.done():
                     result.cancel()
-                self._owner.cancel()
+                if call.started:
+                    self._owner.cancel()
                 raise
 
         return invoke
@@ -455,8 +490,12 @@ class _AsyncContextClient:
         try:
             await asyncio.wait_for(asyncio.shield(self._ready), timeout)
         except BaseException:
+            self._closed = True
+            self._queue.put_nowait(None)
             self._owner.cancel()
-            await asyncio.gather(self._owner, return_exceptions=True)
+            if not self._owner.done():
+                _late_cleanup_tasks.add(self._owner)
+                self._owner.add_done_callback(_late_cleanup_done)
             raise
         return self
 
@@ -493,11 +532,22 @@ class _AsyncContextClient:
                 if current.cancelled():
                     current = None
                     continue
+                call.started = True
                 try:
                     method = _client_method(client, call.name)
-                    value = method(*call.args)
-                    value = await value if inspect.isawaitable(value) else value
+                    if inspect.iscoroutinefunction(method):
+                        value = await method(*call.args)
+                    else:
+                        value = await _Invocation(
+                            method,
+                            call.args,
+                            self._limiter,
+                            None,
+                            self._timeout,
+                        ).wait(self._timeout)
                 except asyncio.CancelledError as error:
+                    if not current.done():
+                        current.cancel()
                     failure = error
                     raise
                 except BaseException as error:
@@ -547,7 +597,7 @@ async def _enter_async_context(client: object, *, timeout: float, limiter: _Sync
         return client
     if not callable(enter) or not callable(exit_context):
         raise ValueError("MCP async context manager contract is invalid")
-    return await _AsyncContextClient(client).start(timeout)
+    return await _AsyncContextClient(client, timeout, limiter).start(timeout)
 
 
 def _server_name(name: object) -> None:
@@ -594,16 +644,22 @@ def _normalize_descriptors(
 
 def _normalized_tool_segment(server_name: str, remote_name: str) -> str:
     available = 64 - len(server_name.encode("ascii")) - 2
-    if available < 10:
+    if available < 1:
         raise ValueError("MCP server name leaves no room for tool names")
-    segment = _UNSAFE_TOOL_NAME.sub("_", remote_name).strip("_")
+    if _PROVIDER_NAME.fullmatch(remote_name) is not None and len(remote_name) <= available:
+        return remote_name
+    segment = _UNSAFE_TOOL_NAME.sub("_", remote_name)
     if not segment:
         segment = "tool"
     if not segment[0].isalnum() or not segment[0].isascii():
         segment = f"tool_{segment}"
     if _PROVIDER_NAME.fullmatch(segment) is None or len(segment.encode("ascii")) > available:
         digest = hashlib.sha256(remote_name.encode("utf-8")).hexdigest()[:8]
-        base = _UNSAFE_TOOL_NAME.sub("_", segment).strip("_") or "tool"
+        if available <= 9:
+            segment = f"t{digest}"[:available]
+            _public_tool_name(server_name, segment)
+            return segment
+        base = _UNSAFE_TOOL_NAME.sub("_", segment) or "tool"
         if not base[0].isalnum() or not base[0].isascii():
             base = f"tool_{base}"
         segment = f"{base[: available - 9]}_{digest}"
