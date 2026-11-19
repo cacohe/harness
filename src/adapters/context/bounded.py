@@ -342,8 +342,8 @@ class BoundedContextProvider:
         sequence_range = request.open_tool_sequence_range
         if sequence_range is not None:
             if (
-                item.sequence_from == sequence_range[0]
-                and item.sequence_through == sequence_range[1]
+                item.sequence_from >= sequence_range[0]
+                and item.sequence_through <= sequence_range[1]
             ):
                 return True
             if not (

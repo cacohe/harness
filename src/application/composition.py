@@ -376,20 +376,38 @@ def _compose(
         )
         if input_entry is None:
             raise ValueError("Active Run does not have a durable input")
-        latest = await bounded_journal.read_page(state.session_id, None, 1)
-        open_tool_messages: tuple[ModelMessage, ...] = ()
-        open_tool_sequence_range = None
-        if latest.interactions:
-            interaction = latest.interactions[0]
-            if (
-                interaction.sequence_from > input_entry.sequence
-                and interaction.messages[0].tool_calls
-            ):
-                open_tool_messages = interaction.messages
-                open_tool_sequence_range = (
-                    interaction.sequence_from,
-                    interaction.sequence_through,
-                )
+        cursor = None
+        current_run_interactions = []
+        page_size = min(config.limits.max_steps + 1, 1_024)
+        while True:
+            page = await bounded_journal.read_page(state.session_id, cursor, page_size)
+            reached_input = False
+            for interaction in page.interactions:
+                if interaction.sequence_through <= input_entry.sequence:
+                    reached_input = True
+                    break
+                if interaction.sequence_from <= input_entry.sequence:
+                    raise ValueError("Run input splits a transcript interaction")
+                if not interaction.messages[0].tool_calls:
+                    raise ValueError("Current Run transcript contains a non-tool interaction")
+                current_run_interactions.append(interaction)
+            if reached_input or page.next_before_sequence is None:
+                break
+            cursor = page.next_before_sequence
+        ordered_current_run = tuple(
+            sorted(current_run_interactions, key=lambda item: item.sequence_from)
+        )
+        open_tool_messages = tuple(
+            message for interaction in ordered_current_run for message in interaction.messages
+        )
+        open_tool_sequence_range = (
+            (
+                ordered_current_run[0].sequence_from,
+                ordered_current_run[-1].sequence_through,
+            )
+            if ordered_current_run
+            else None
+        )
         request = replace(
             request,
             summary_checkpoints=summaries,

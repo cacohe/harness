@@ -264,10 +264,21 @@ class ContextRequest:
         if open_messages and (
             open_messages[0].role is not ModelRole.ASSISTANT
             or not open_messages[0].tool_calls
-            or any(message.role is not ModelRole.TOOL for message in open_messages[1:])
+            or any(
+                message.role not in {ModelRole.ASSISTANT, ModelRole.TOOL}
+                or message.role is ModelRole.ASSISTANT
+                and not message.tool_calls
+                for message in open_messages
+            )
         ):
-            raise ValueError("Open tool context requires one assistant call batch and its results")
-        ModelRequest((system, *open_messages, current), tuple(replace(tool) for tool in self.tools))
+            raise ValueError("Open tool context requires complete ordered tool batches")
+        try:
+            ModelRequest(
+                (system, current, *open_messages),
+                tuple(replace(tool) for tool in self.tools),
+            )
+        except ValueError:
+            raise ValueError("Open tool context requires complete ordered tool batches") from None
         object.__setattr__(self, "session_id", session_id)
         object.__setattr__(self, "profile_id", profile_id)
         object.__setattr__(self, "policy_version", policy_version)

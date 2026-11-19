@@ -130,6 +130,11 @@ class Model:
                     ModelToolCall("call-second", "second", "{}"),
                 )
             )
+        if message == "two-tool-batches" and round_number < 2:
+            name = "first" if round_number == 0 else "second"
+            return ModelResponse(
+                tool_calls=(ModelToolCall(f"call-{name}", name, "{}"),)
+            )
         if round_number == 0 and message in {"approval", "reject", "cancel", "restart"}:
             return ModelResponse(tool_calls=(ModelToolCall("call-guarded", "guarded", "{}"),))
         if round_number == 0 and message == "approval-batch":
@@ -257,6 +262,39 @@ def test_real_bounded_context_deduplicates_current_input_and_protects_latest_too
     assert [message.role for message in context.context_requests[1].open_tool_messages] == [
         ModelRole.ASSISTANT,
         ModelRole.TOOL,
+        ModelRole.TOOL,
+    ]
+
+
+def test_real_bounded_context_keeps_all_current_run_tool_batches_after_user_input():
+    class CapturingBoundedContext(BoundedContextProvider):
+        def __init__(self, journal):
+            super().__init__(journal, ExactTokenCounter(), page_size=8)
+
+    async def scenario():
+        journal = InMemoryRunJournal()
+        model = Model()
+        agent, _, _, _ = await rig(
+            journal=journal,
+            model=model,
+            context=CapturingBoundedContext(journal),
+        )
+        session = await agent.open_session(SessionId("multi-batch-context"))
+        state = await session.submit(
+            "two-tool-batches", SubmissionId("multi-batch-context")
+        )
+        await agent.close()
+        return state, model.requests
+
+    state, requests = asyncio.run(scenario())
+    assert state.status is RunStatus.COMPLETED
+    assert len(requests) == 3
+    assert [message.role for message in requests[2].messages] == [
+        ModelRole.SYSTEM,
+        ModelRole.USER,
+        ModelRole.ASSISTANT,
+        ModelRole.TOOL,
+        ModelRole.ASSISTANT,
         ModelRole.TOOL,
     ]
 
