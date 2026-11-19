@@ -47,7 +47,7 @@ def test_add_remove_is_atomic_and_closes_once() -> None:
             client_factory=lambda _source: client,
         )
         await gateway.add_server("server", object())
-        assert gateway._dynamic_catalog.specs[0].name == "server.read"
+        assert gateway._dynamic_catalog.specs[0].name == "server__read"
         await gateway.remove_server("server")
         assert gateway._dynamic_catalog.specs == ()
 
@@ -82,7 +82,9 @@ def _request(gateway: MCPToolGateway) -> ToolRequest:
         run_id=RunId("run-1"),
         session_id=SessionId("session-1"),
         step_id="step-1",
-        approval=ToolApproval.NOT_REQUIRED,
+        approval=(
+            ToolApproval.APPROVED if spec.requires_approval else ToolApproval.NOT_REQUIRED
+        ),
     )
 
 
@@ -113,6 +115,14 @@ def test_refresh_waits_for_active_lease_and_stale_generation_is_rejected() -> No
             super().__init__()
             self.started = asyncio.Event()
             self.release = asyncio.Event()
+            self.catalog_calls = 0
+
+        async def list_tools(self):
+            self.catalog_calls += 1
+            descriptors = await super().list_tools()
+            if self.catalog_calls > 1:
+                descriptors[0]["description"] = "changed"
+            return descriptors
 
         async def call_tool(self, name, arguments):
             self.started.set()
@@ -911,7 +921,7 @@ def test_synchronous_worker_count_is_bounded_and_late_clients_are_owned() -> Non
         watchdog.cancel()
 
 
-def test_blocked_async_factory_times_out_and_late_client_is_closed() -> None:
+def test_blocked_async_factory_timeout_cancels_before_client_is_created() -> None:
     async def scenario():
         release_factory = asyncio.Event()
         client = Client()
@@ -926,11 +936,8 @@ def test_blocked_async_factory_times_out_and_late_client_is_closed() -> None:
         assert await asyncio.wait_for(gateway.aclose(), 0.2) is None
         assert client.closed == 0
         release_factory.set()
-        for _ in range(100):
-            if client.closed:
-                break
-            await asyncio.sleep(0.01)
-        assert client.closed == 1
+        await asyncio.sleep(0)
+        assert client.closed == 0
 
     asyncio.run(scenario())
 
@@ -960,14 +967,13 @@ def test_blocked_async_discovery_never_closes_client_concurrently() -> None:
         gateway = _gateway(client, timeout_seconds=0.05)
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(gateway.add_server("server", object()), 0.2)
-        assert client.closed == 0
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(gateway.aclose(), 0.2)
-        client.release_list.set()
         for _ in range(100):
             if client.closed:
                 break
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.001)
+        assert client.closed == 1
+        assert await asyncio.wait_for(gateway.aclose(), 0.2) is None
+        client.release_list.set()
         assert client.closed == 1
         assert client.closed_while_listing is False
 
@@ -1004,14 +1010,9 @@ def test_blocked_async_call_times_out_without_concurrent_close() -> None:
         await client.call_started.wait()
         result = await asyncio.wait_for(executing, 0.2)
         assert result.status is ToolResultStatus.TIMED_OUT
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(gateway.aclose(), 0.2)
-        assert client.closed == 0
+        assert await asyncio.wait_for(gateway.aclose(), 0.2) is None
+        assert client.closed == 1
         client.release_call.set()
-        for _ in range(100):
-            if client.closed:
-                break
-            await asyncio.sleep(0.01)
         assert client.closed == 1
         assert client.closed_while_calling is False
 
@@ -1163,8 +1164,11 @@ def test_abandoned_refresh_recovers_only_live_server_after_settle(
             if self.list_count == 1:
                 self.listing = True
                 started.set()
-                while not release.is_set():
-                    await asyncio.sleep(0.001)
+                try:
+                    while not release.is_set():
+                        await asyncio.sleep(0.001)
+                finally:
+                    self.listing = False
             return sync_list(self)
 
         Refreshing.list_tools = list_tools
@@ -1181,10 +1185,20 @@ def test_abandoned_refresh_recovers_only_live_server_after_settle(
             refresh.cancel()
         with pytest.raises(asyncio.CancelledError if cancel else TimeoutError):
             await refresh
-        assert gateway._servers["server"].closing
+        if async_list:
+            for _ in range(100):
+                if not gateway._servers["server"].closing:
+                    break
+                await asyncio.sleep(0.001)
+            assert not gateway._servers["server"].closing
+        else:
+            assert gateway._servers["server"].closing
         if shutdown:
-            with pytest.raises(TimeoutError):
-                await gateway.aclose()
+            if async_list:
+                assert await gateway.aclose() is None
+            else:
+                with pytest.raises(TimeoutError):
+                    await gateway.aclose()
         release.set()
         for _ in range(100):
             if client.closed or (not shutdown and not gateway._servers["server"].closing):
@@ -1194,14 +1208,20 @@ def test_abandoned_refresh_recovers_only_live_server_after_settle(
             assert gateway._dynamic_catalog.specs == ()
             assert "server" not in gateway._servers
             assert client.closed == 1
-            with pytest.raises(TimeoutError):
-                await gateway.aclose()
+            if async_list:
+                assert await gateway.aclose() is None
+            else:
+                with pytest.raises(TimeoutError):
+                    await gateway.aclose()
         else:
             assert gateway._dynamic_catalog.specs == catalog
             assert await gateway._call("server", generation, "read", {}) == {
                 "name": "read",
                 "arguments": {},
             }
+            if async_list and fails:
+                with pytest.raises(RuntimeError, match="late discovery failure"):
+                    await gateway.refresh_server("server")
             await gateway.refresh_server("server")
             removing = asyncio.create_task(gateway.remove_server("server"))
             outcomes = await asyncio.gather(removing, gateway.aclose(), return_exceptions=True)
@@ -1384,3 +1404,105 @@ def test_closed_loop_cleanup_waits_for_all_underlying_calls() -> None:
             event.set()
     assert closed.wait(1)
     assert client.closed == 1
+
+
+def test_remote_annotations_cannot_remove_approval_and_identity_is_stable() -> None:
+    async def scenario():
+        first = _gateway(Client())
+        second = _gateway(Client())
+        await first.add_server("server", object())
+        await second.add_server("server", object())
+        first_spec = first._dynamic_catalog.specs[0]
+        second_spec = second._dynamic_catalog.specs[0]
+        assert first_spec.name == "server__read"
+        assert first_spec.requires_approval is True
+        assert first_spec.workspace_id == second_spec.workspace_id
+        before = first_spec.workspace_id
+        await first.refresh_server("server")
+        assert first._dynamic_catalog.specs[0].workspace_id == before
+        await first.aclose()
+        await second.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("remote_name", ["bad.name", "bad/name", "空白", "a" * 65])
+def test_provider_unsafe_remote_names_are_rejected(remote_name: str) -> None:
+    class Unsafe(Client):
+        async def list_tools(self):
+            return [{"name": remote_name, "inputSchema": {"type": "object"}}]
+
+    async def scenario():
+        gateway = _gateway(Unsafe())
+        with pytest.raises(ValueError, match="name"):
+            await gateway.add_server("server", object())
+        await gateway.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_async_context_manager_client_is_entered_and_exited_once() -> None:
+    client = Client()
+
+    class Manager:
+        def __init__(self):
+            self.entered = 0
+            self.exited = 0
+
+        async def __aenter__(self):
+            self.entered += 1
+            return client
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            self.exited += 1
+
+    manager = Manager()
+
+    async def scenario():
+        gateway = _gateway(client, factory=lambda _source: manager)
+        await gateway.add_server("server", object())
+        await gateway.aclose()
+
+    asyncio.run(scenario())
+    assert manager.entered == manager.exited == 1
+    assert client.closed == 0
+
+
+def test_async_timeout_cancels_underlying_mcp_call() -> None:
+    class Blocking(Client):
+        def __init__(self):
+            super().__init__()
+            self.cancelled = asyncio.Event()
+
+        async def call_tool(self, name, arguments):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+
+    async def scenario():
+        client = Blocking()
+        gateway = _gateway(client, timeout_seconds=0.05)
+        await gateway.add_server("server", object())
+        result = await gateway.execute(_request(gateway))
+        assert result.status is ToolResultStatus.TIMED_OUT
+        await asyncio.wait_for(client.cancelled.wait(), 0.2)
+        await gateway.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_mcp_error_result_maps_to_failed_tool_result() -> None:
+    class ErrorResult(Client):
+        async def call_tool(self, name, arguments):
+            return {"isError": True, "content": [{"type": "text", "text": "failed"}]}
+
+    async def scenario():
+        gateway = _gateway(ErrorResult())
+        await gateway.add_server("server", object())
+        result = await gateway.execute(_request(gateway))
+        assert result.status is ToolResultStatus.FAILED
+        await gateway.aclose()
+
+    asyncio.run(scenario())

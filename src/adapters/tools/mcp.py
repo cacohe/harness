@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
-import secrets
+import re
 import threading
 from dataclasses import dataclass, field
 from functools import partial
@@ -17,6 +18,7 @@ from src.core.tools import ToolSpec
 
 _MAX_SYNC_CALLS_PER_GATEWAY = 4
 _MAX_SYNC_CLOSES_PER_GATEWAY = 4
+_PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 _late_cleanup_tasks: set[asyncio.Task[None]] = set()
 
 
@@ -108,6 +110,9 @@ class MCPToolGateway(LocalToolGateway):
                     limiter=self._cleanup_limiter,
                 ),
             )
+            client = await _enter_async_context(
+                client, timeout=self._sync_timeout, limiter=self._sync_limiter
+            )
             discovery = _Invocation(
                 _client_method(client, "list_tools"),
                 (),
@@ -117,8 +122,9 @@ class MCPToolGateway(LocalToolGateway):
                 abandoned_client=client,
             )
             descriptors = await discovery.wait(self._sync_timeout)
-            generation = secrets.token_hex(16)
-            entries = self._entries(name, generation, client, descriptors)
+            normalized = _normalize_descriptors(descriptors)
+            generation = _catalog_generation(name, normalized)
+            entries = self._entries(name, generation, client, normalized)
             async with self._lifecycle:
                 if self._closed or name in self._servers:
                     raise ValueError("MCP server cannot be added")
@@ -166,8 +172,9 @@ class MCPToolGateway(LocalToolGateway):
             )
             lease_transferred = True
             descriptors = await invocation.wait(self._sync_timeout)
-            generation = secrets.token_hex(16)
-            entries = self._entries(name, generation, state.client, descriptors)
+            normalized = _normalize_descriptors(descriptors)
+            generation = _catalog_generation(name, normalized)
+            entries = self._entries(name, generation, state.client, normalized)
             async with self._lifecycle:
                 current = self._servers.get(name)
                 if current is not state or self._closed:
@@ -284,33 +291,22 @@ class MCPToolGateway(LocalToolGateway):
             raise failure
 
     def _entries(
-        self, name: str, generation: str, client: object, descriptors: object
+        self,
+        name: str,
+        generation: str,
+        client: object,
+        descriptors: tuple[tuple[str, str, str], ...],
     ) -> tuple[ToolCatalogEntry, ...]:
-        if type(descriptors) is not list or len(descriptors) > 128:
-            raise ValueError("MCP tool catalog is invalid")
         entries: list[ToolCatalogEntry] = []
-        for descriptor in descriptors:
-            remote_name = _value(descriptor, "name")
-            description = _value(descriptor, "description", "")
-            schema = _value(descriptor, "inputSchema", _value(descriptor, "input_schema", {}))
-            if (
-                type(remote_name) is not str
-                or type(description) is not str
-                or type(schema) is not dict
-            ):
-                raise ValueError("MCP tool descriptor is invalid")
-            validated_remote_name: str = remote_name
-            public_name = f"{name}.{validated_remote_name}"
-            annotations = _value(descriptor, "annotations", {})
+        for validated_remote_name, description, schema_json in descriptors:
+            public_name = _public_tool_name(name, validated_remote_name)
             mutating = True
-            if type(annotations) is dict and annotations.get("readOnlyHint") is True:
-                mutating = False
             workspace = f"{self._workspace}-{generation}"
             spec = ToolSpec(
                 public_name,
                 description,
-                json.dumps(schema, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
-                requires_approval=mutating,
+                schema_json,
+                requires_approval=True,
                 approval_scope="execute",
                 workspace_id=workspace,
             )
@@ -354,7 +350,10 @@ class MCPToolGateway(LocalToolGateway):
         invocation.settled.add_done_callback(
             lambda _future: asyncio.create_task(self._release_active(state))
         )
-        return await invocation.wait(self._sync_timeout)
+        result = await invocation.wait(self._sync_timeout)
+        if _value(result, "isError", _value(result, "is_error", False)) is True:
+            raise RuntimeError("MCP tool returned an error result")
+        return result
 
     @staticmethod
     async def _release_active(state: _Server) -> None:
@@ -418,9 +417,81 @@ class MCPToolGateway(LocalToolGateway):
         self._dynamic_catalog.replace(entries)
 
 
+class _AsyncContextClient:
+    def __init__(self, manager: object, client: object) -> None:
+        self._manager = manager
+        self._client = client
+        self._closed = False
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._client, name)
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        exit_context = getattr(self._manager, "__aexit__")
+        outcome = exit_context(None, None, None)
+        if inspect.isawaitable(outcome):
+            await outcome
+
+
+async def _enter_async_context(
+    client: object, *, timeout: float, limiter: _SyncLimiter
+) -> object:
+    enter = getattr(client, "__aenter__", None)
+    exit_context = getattr(client, "__aexit__", None)
+    if enter is None and exit_context is None:
+        return client
+    if not callable(enter) or not callable(exit_context):
+        raise ValueError("MCP async context manager contract is invalid")
+    entered = await _invoke(enter, timeout=timeout, limiter=limiter)
+    return _AsyncContextClient(client, entered)
+
+
 def _server_name(name: object) -> None:
-    if type(name) is not str or not name.strip() or any(item in name for item in "/\\\x00"):
+    if type(name) is not str or _PROVIDER_NAME.fullmatch(name) is None:
         raise ValueError("MCP server name is invalid")
+
+
+def _public_tool_name(server_name: str, remote_name: str) -> str:
+    if _PROVIDER_NAME.fullmatch(remote_name) is None:
+        raise ValueError("MCP tool name is invalid")
+    public_name = f"{server_name}__{remote_name}"
+    if len(public_name.encode("ascii")) > 64:
+        raise ValueError("MCP public tool name is invalid")
+    return public_name
+
+
+def _normalize_descriptors(descriptors: object) -> tuple[tuple[str, str, str], ...]:
+    if type(descriptors) is not list or len(descriptors) > 128:
+        raise ValueError("MCP tool catalog is invalid")
+    normalized: list[tuple[str, str, str]] = []
+    for descriptor in descriptors:
+        remote_name = _value(descriptor, "name")
+        description = _value(descriptor, "description", "")
+        schema = _value(descriptor, "inputSchema", _value(descriptor, "input_schema", {}))
+        if (
+            type(remote_name) is not str
+            or type(description) is not str
+            or type(schema) is not dict
+        ):
+            raise ValueError("MCP tool descriptor is invalid")
+        _public_tool_name("s", remote_name)
+        schema_json = json.dumps(
+            schema, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+        normalized.append((remote_name, description, schema_json))
+    if len({item[0] for item in normalized}) != len(normalized):
+        raise ValueError("MCP tool names are not unique")
+    return tuple(normalized)
+
+
+def _catalog_generation(name: str, descriptors: tuple[tuple[str, str, str], ...]) -> str:
+    payload = json.dumps(
+        [name, descriptors], ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _value(value: object, name: str, default: object = ...) -> object:
@@ -487,11 +558,13 @@ class _Invocation:
         self.cleanup_complete: asyncio.Future[BaseException | None] = self._loop.create_future()
         self._client_cleanup = client_cleanup
         self._usage_released = False
+        self._async_task: asyncio.Future[object] | None = None
         if client_cleanup is not None:
             client_cleanup.acquire()
         try:
             if inspect.iscoroutinefunction(method):
                 task = asyncio.create_task(method(*args))
+                self._async_task = task
                 task.add_done_callback(self._async_done)
             else:
                 self._start_sync()
@@ -573,7 +646,7 @@ class _Invocation:
         finally:
             self._limiter.release()
 
-    def _async_done(self, task: asyncio.Task[object]) -> None:
+    def _async_done(self, task: asyncio.Future[object]) -> None:
         try:
             result = task.result()
         except BaseException as error:
@@ -589,6 +662,7 @@ class _Invocation:
     ) -> None:
         if failure is None and result is not None and inspect.isawaitable(result):
             task = asyncio.ensure_future(result)
+            self._async_task = task
             task.add_done_callback(self._async_done)
             return
         if self._client_cleanup is not None and not self._usage_released:
@@ -619,6 +693,8 @@ class _Invocation:
             return
         self._abandoned = True
         self._abandoned_signal.set()
+        if self._async_task is not None and not self._async_task.done():
+            self._async_task.cancel()
         if not self._future.done():
             self._future.cancel()
             return
