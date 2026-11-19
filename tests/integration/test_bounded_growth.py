@@ -228,7 +228,11 @@ class RecordingJournal(InMemoryRunJournal):
 class BatchModel:
     async def complete(self, request):
         payload = json.loads(
-            next(message.content for message in reversed(request.messages) if message.role is ModelRole.USER)
+            next(
+                message.content
+                for message in reversed(request.messages)
+                if message.role is ModelRole.USER
+            )
         )
         if payload["round"] == 0:
             return ModelResponse(

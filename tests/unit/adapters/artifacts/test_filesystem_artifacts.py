@@ -64,6 +64,7 @@ def test_large_stream_publishes_complete_read_only_object(tmp_path, monkeypatch)
         digest = hashlib.sha256()
         for _ in range(20):
             digest.update(payload)
+
         async def source():
             for _ in range(20):
                 yield payload
@@ -657,9 +658,7 @@ def test_delete_rolls_back_a_replacement_captured_at_rename(tmp_path, monkeypatc
         repo = FilesystemArtifactRepository(root, 3)
         ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="old"))
         replacement_root.mkdir()
-        shutil.copytree(
-            _object(root, ref.artifact_id), _object(replacement_root, ref.artifact_id)
-        )
+        shutil.copytree(_object(root, ref.artifact_id), _object(replacement_root, ref.artifact_id))
         replacement = ref
         object_path = _object(root, ref.artifact_id)
         actual_rename = os.rename
@@ -1074,8 +1073,8 @@ def test_failed_rename_intent_is_cleared_only_for_the_same_live_object(
             final.rename(tmp_path / "original")
             expected = None
             if final_identity == "replacement":
-                    shutil.copytree(tmp_path / "original", final)
-                    expected = ref
+                shutil.copytree(tmp_path / "original", final)
+                expected = ref
 
         restarted = FilesystemArtifactRepository(root, 3)
         assert await restarted.collect_orphans({ref.artifact_id}, datetime.now(timezone.utc)) == 0

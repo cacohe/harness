@@ -30,6 +30,7 @@ async def _read(repo: InMemoryArtifactRepository, artifact_id: str) -> bytes:
 def test_put_is_streaming_and_open_has_independent_readers():
     async def scenario():
         repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+
         async def stream():
             yield b"a"
             yield b"bc"
@@ -45,9 +46,7 @@ def test_put_is_streaming_and_open_has_independent_readers():
 
         assert ref.size_bytes == 3
         assert ref == await repo.stat(ref.artifact_id)
-        assert await asyncio.gather(
-            _read(repo, ref.artifact_id), _read(repo, ref.artifact_id)
-        ) == [
+        assert await asyncio.gather(_read(repo, ref.artifact_id), _read(repo, ref.artifact_id)) == [
             b"abc",
             b"abc",
         ]

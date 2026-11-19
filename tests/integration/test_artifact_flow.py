@@ -88,7 +88,11 @@ class ArtifactModel:
     async def complete(self, request):
         self.requests.append(request)
         payload = json.loads(
-            next(message.content for message in reversed(request.messages) if message.role is ModelRole.USER)
+            next(
+                message.content
+                for message in reversed(request.messages)
+                if message.role is ModelRole.USER
+            )
         )
         if payload["message"] == "after-final":
             return ModelResponse("follow-up")

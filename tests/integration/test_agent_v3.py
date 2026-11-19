@@ -108,7 +108,11 @@ class Model:
     async def complete(self, request):
         self.requests.append(request)
         payload = json.loads(
-            next(message.content for message in reversed(request.messages) if message.role is ModelRole.USER)
+            next(
+                message.content
+                for message in reversed(request.messages)
+                if message.role is ModelRole.USER
+            )
         )
         session = payload["session"]
         message = payload["message"]
@@ -132,9 +136,7 @@ class Model:
             )
         if message == "two-tool-batches" and round_number < 2:
             name = "first" if round_number == 0 else "second"
-            return ModelResponse(
-                tool_calls=(ModelToolCall(f"call-{name}", name, "{}"),)
-            )
+            return ModelResponse(tool_calls=(ModelToolCall(f"call-{name}", name, "{}"),))
         if round_number == 0 and message in {"approval", "reject", "cancel", "restart"}:
             return ModelResponse(tool_calls=(ModelToolCall("call-guarded", "guarded", "{}"),))
         if round_number == 0 and message == "approval-batch":
@@ -280,9 +282,7 @@ def test_real_bounded_context_keeps_all_current_run_tool_batches_after_user_inpu
             context=CapturingBoundedContext(journal),
         )
         session = await agent.open_session(SessionId("multi-batch-context"))
-        state = await session.submit(
-            "two-tool-batches", SubmissionId("multi-batch-context")
-        )
+        state = await session.submit("two-tool-batches", SubmissionId("multi-batch-context"))
         await agent.close()
         return state, model.requests
 
