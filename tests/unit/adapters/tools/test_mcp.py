@@ -68,10 +68,16 @@ def _gateway(client, *, timeout_seconds=60.0, factory=None):
     )
 
 
-def _request(gateway: MCPToolGateway) -> ToolRequest:
-    spec = gateway._dynamic_catalog.specs[0]
+def _request(
+    gateway: MCPToolGateway,
+    *,
+    spec_index: int = 0,
+    call_id: str = "call-1",
+    step_id: str = "step-1",
+) -> ToolRequest:
+    spec = gateway._dynamic_catalog.specs[spec_index]
     call = ToolCallRequest(
-        "call-1",
+        call_id,
         spec.name,
         "{}",
         requires_approval=spec.requires_approval,
@@ -82,7 +88,7 @@ def _request(gateway: MCPToolGateway) -> ToolRequest:
         call,
         run_id=RunId("run-1"),
         session_id=SessionId("session-1"),
-        step_id="step-1",
+        step_id=step_id,
         approval=(ToolApproval.APPROVED if spec.requires_approval else ToolApproval.NOT_REQUIRED),
     )
 
@@ -1734,6 +1740,60 @@ def test_async_timeout_cancels_underlying_mcp_call() -> None:
         await asyncio.wait_for(client.cancelled.wait(), 0.2)
         await gateway.aclose()
 
+    asyncio.run(scenario())
+
+
+def test_async_context_timeout_cancels_only_the_current_call() -> None:
+    class StatefulClient(Client):
+        def __init__(self):
+            super().__init__()
+            self.cancelled = asyncio.Event()
+
+        async def list_tools(self):
+            return [
+                {"name": "slow", "inputSchema": {"type": "object"}},
+                {"name": "fast", "inputSchema": {"type": "object"}},
+            ]
+
+        async def call_tool(self, name, arguments):
+            if name == "fast":
+                return {"name": name, "arguments": arguments}
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+
+    class Manager:
+        async def __aenter__(self):
+            self.group = anyio.create_task_group()
+            await self.group.__aenter__()
+            return client
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            await self.group.__aexit__(exc_type, exc, traceback)
+
+    async def scenario():
+        gateway = _gateway(client, timeout_seconds=0.05, factory=lambda _source: Manager())
+        await gateway.add_server("server", object())
+
+        timed_out = await gateway.execute(_request(gateway))
+        assert timed_out.status is ToolResultStatus.TIMED_OUT
+        await asyncio.wait_for(client.cancelled.wait(), 0.2)
+        await asyncio.sleep(0)
+        assert [spec.name for spec in gateway._dynamic_catalog.specs] == [
+            "server__slow",
+            "server__fast",
+        ]
+
+        succeeded = await gateway.execute(
+            _request(gateway, spec_index=1, call_id="call-2", step_id="step-2")
+        )
+        assert succeeded.status is ToolResultStatus.SUCCESS
+        await gateway.remove_server("server")
+        await gateway.aclose()
+
+    client = StatefulClient()
     asyncio.run(scenario())
 
 

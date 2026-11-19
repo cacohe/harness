@@ -71,7 +71,7 @@ Artifact detach never accepts caller-supplied descriptors. It reads the Run's au
 attachments, appends exact `DETACHED` lifecycle facts with the current Session CAS, and retries a
 stale CAS from durable state. `roles` can select tool results, final outputs, or summaries; omitting
 it releases the whole Run. Repeated and concurrent calls are idempotent, and detaching one owner
-does not release another owner of the same content-addressed object. Lifecycle facts are available
+does not release another owner of the same publication. Lifecycle facts are available
 through the journal's bounded `load_artifact_facts(..., after_index, limit)` index.
 
 ## Tool side effects
@@ -108,7 +108,7 @@ request or truncate JSON into an invalid value.
 ## Artifact durability
 
 Large tool results and final answers are externalized before journal commit. Durable state, events
-and context contain only bounded summaries and content-addressed `ArtifactRef` values. A successful
+and context contain only bounded summaries and publication-scoped `ArtifactRef` values. A successful
 repository `put()` is readable before its ref can be committed.
 
 If journal commit fails after an Artifact write, the result is an unreferenced orphan, never a
@@ -126,8 +126,11 @@ Retirement is a journal-coordinated saga rather than a cross-store transaction. 
 atomically reserves `RETIRING` only when no active owner exists, and attachment commits reject that
 generation until delete completes. Successful delete records `RETIRED`; a confirmed failed delete
 with the object still present records `ABORTED`. Repeating retirement after a crash resumes safely.
-After a content-addressed object is put again, a new attachment atomically opens the next generation.
-SQLite persists these reservations; the memory journal uses the same state machine under one lock.
+Every successful `put()` creates a new immutable publication ID while `sha256` remains the content
+digest. A retired ID stays tombstoned permanently; putting the same bytes again creates a distinct
+readable publication, so a late delete of the old ID cannot affect it. This intentionally forgoes
+cross-publication content deduplication. SQLite persists retirement reservations; the memory journal
+uses the same state machine under one lock.
 Memory lifecycle paging keeps a per-Run ordered index and performs `bisect + limit` access, so its
 lookup cost is `O(log F_run + limit)` and does not scan other Runs or copy full fact history.
 

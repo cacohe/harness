@@ -279,6 +279,10 @@ Session transcript 作为独立、分页读取的记录保存。Run snapshot 只
 - `metadata`（有界、严格 JSON）
 
 `ArtifactRef` 不包含主机绝对路径、bucket 凭证或可长期访问 URL。
+`artifact_id` 是 repository 签发的不透明 publication identity，`sha256` 单独表示内容摘要；
+两者分别做格式校验，但不要求确定性相等。每次成功 `put()` 都创建新的 publication ID，因而
+相同内容允许重复存储。该取舍牺牲内容去重，以保证旧 retirement tombstone 和迟到 delete
+永远不能影响后来写入的相同内容。
 
 ### Core 端口
 
@@ -332,7 +336,7 @@ orphan 由 adapter garbage collector 按宽限期清理。内存和文件 adapte
 
 ### 文件系统 reference adapter
 
-`FilesystemArtifactRepository` 使用 content-addressed 路径、临时文件、原子 rename、hash
+`FilesystemArtifactRepository` 使用 publication-addressed 路径、临时文件、原子 rename、hash
 校验、最大流大小、路径穿越防护和有界读取。写入接口接受 stream，禁止先把全部内容读入
 内存。它是单机生产级 reference adapter，不宣称支持多节点共享。
 

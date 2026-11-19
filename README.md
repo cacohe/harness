@@ -114,7 +114,7 @@ terminal Run 的 ownership 不会随 Session handle 关闭而隐式消失。调�
 `await session.detach_artifacts(run_id)` 释放整 Run，或通过
 `roles=(ArtifactAttachmentRole.TOOL_RESULT,)` 只释放指定角色。该 API 不接受调用方构造的
 `ArtifactRef`，而是从 durable active index 读取完整 descriptor，并用 Session CAS 原子追加
-`DETACHED` facts；重复或并发调用幂等。共享 digest 只有在所有 owner 都 detach 后才允许
+`DETACHED` facts；重复或并发调用幂等。同一 publication ID 只有在所有 owner 都 detach 后才允许
 `ArtifactRetentionService.retire()`。
 
 Recovery 只把 journal 中仍然 active 的 attachment 当作待校验权威；已经显式 detach 的历史
@@ -124,6 +124,9 @@ retire 先在 journal 中原子取得 `RETIRING` reservation：该步骤与“�
 对象仍存在时标记 `ABORTED`。进程可在任一阶段重启并通过重复 retire 收敛。普通 attachment
 不能越过 `RETIRED` 墓碑；相同内容重新 `put()` 会得到新的 publication ID，而 `sha256` 仍表示
 内容摘要。因此相同 digest 可以再次使用，旧 tombstone 或迟到的 delete 也不会影响新对象。
+`artifact_id` 是 repository 签发的不透明 publication identity，不等于内容 hash；`ArtifactRef`
+分别校验 ID 与 `sha256` 的格式，而 repository 在签发 ref 前校验实际内容的 hash/size。该隔离会
+牺牲跨 publication 的内容去重，但避免退役、重发与迟到删除之间的跨存储竞态。
 SQLite 不把 derived active index 或 retirement current row 当成单点权威：reserve 在同一
 `BEGIN IMMEDIATE` 中按 `artifact_id` 有界重放 append-only attachment facts 并与 index 双向
 核对；retirement transition 另有 append-only hash chain、固定深度 Merkle projection 与数据库

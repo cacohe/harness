@@ -441,6 +441,7 @@ class _AsyncContextCall:
     args: tuple[object, ...]
     result: asyncio.Future[object]
     started: bool = False
+    cancel_requested: bool = False
 
 
 class _AsyncContextClient:
@@ -480,7 +481,9 @@ class _AsyncContextClient:
             except asyncio.CancelledError:
                 if not result.done():
                     result.cancel()
-                if call.started:
+                task = asyncio.current_task()
+                if call.started and task is not None and task.cancelling():
+                    call.cancel_requested = True
                     self._owner.cancel()
                 raise
 
@@ -533,6 +536,8 @@ class _AsyncContextClient:
                     current = None
                     continue
                 call.started = True
+                owner = asyncio.current_task()
+                baseline_cancelling = owner.cancelling() if owner is not None else 0
                 try:
                     method = _client_method(client, call.name)
                     if inspect.iscoroutinefunction(method):
@@ -548,12 +553,20 @@ class _AsyncContextClient:
                 except asyncio.CancelledError as error:
                     if not current.done():
                         current.cancel()
+                    if call.cancel_requested and not self._closed:
+                        if owner is not None:
+                            while owner.cancelling() > baseline_cancelling:
+                                owner.uncancel()
+                        continue
                     failure = error
                     raise
                 except BaseException as error:
                     if not current.done():
                         current.set_exception(error)
                 else:
+                    if call.cancel_requested and owner is not None:
+                        while owner.cancelling() > baseline_cancelling:
+                            owner.uncancel()
                     if not current.done():
                         current.set_result(value)
                 finally:
