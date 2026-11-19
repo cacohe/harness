@@ -184,9 +184,10 @@ def test_ref_requires_a_full_lowercase_sha256(digest):
         ArtifactRef("sha256:" + digest, "text/plain", 0, digest)
 
 
-def test_ref_requires_id_bound_to_the_sha256():
-    with pytest.raises(ValueError):
-        ArtifactRef("sha256:" + "b" * 64, "text/plain", 0, DIGEST)
+def test_ref_keeps_publication_identity_separate_from_content_sha256():
+    ref = ArtifactRef("sha256:" + "b" * 64, "text/plain", 0, DIGEST)
+    assert ref.artifact_id == "sha256:" + "b" * 64
+    assert ref.sha256 == DIGEST
 
 
 @pytest.mark.parametrize(
@@ -311,7 +312,7 @@ def test_externalized_content_isolates_inputs_and_readers_from_nested_mutations(
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("artifact_id", "sha256:" + "b" * 64),
+        ("artifact_id", "not-an-artifact-id"),
         ("size_bytes", -1),
         ("_metadata_json", '{"x":NaN}'),
     ],
