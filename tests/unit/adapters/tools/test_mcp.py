@@ -2,6 +2,7 @@ import asyncio
 import threading
 import time
 
+import anyio
 import pytest
 import src.adapters.tools.mcp as mcp_module
 from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactExternalizer
@@ -1424,15 +1425,47 @@ def test_remote_annotations_cannot_remove_approval_and_identity_is_stable() -> N
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("remote_name", ["bad.name", "bad/name", "空白", "a" * 65])
-def test_provider_unsafe_remote_names_are_rejected(remote_name: str) -> None:
+@pytest.mark.parametrize("remote_name", ["bad.name", "bad/name", "空白", "a" * 200])
+def test_provider_unsafe_remote_names_are_normalized_and_call_original(remote_name: str) -> None:
     class Unsafe(Client):
+        def __init__(self):
+            super().__init__()
+            self.called_name = None
+
         async def list_tools(self):
             return [{"name": remote_name, "inputSchema": {"type": "object"}}]
 
+        async def call_tool(self, name, arguments):
+            self.called_name = name
+            return {"name": name, "arguments": arguments}
+
     async def scenario():
-        gateway = _gateway(Unsafe())
-        with pytest.raises(ValueError, match="name"):
+        client = Unsafe()
+        gateway = _gateway(client)
+        await gateway.add_server("server", object())
+        public_name = gateway._dynamic_catalog.specs[0].name
+        assert public_name.startswith("server__")
+        assert len(public_name.encode("ascii")) <= 64
+        assert mcp_module._PROVIDER_NAME.fullmatch(public_name) is not None
+        generation = gateway._servers["server"].generation
+        await gateway._call("server", generation, remote_name, {})
+        assert client.called_name == remote_name
+        await gateway.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_remote_name_normalization_collision_is_rejected() -> None:
+    class Colliding(Client):
+        async def list_tools(self):
+            return [
+                {"name": "a.b", "inputSchema": {}},
+                {"name": "a/b", "inputSchema": {}},
+            ]
+
+    async def scenario():
+        gateway = _gateway(Colliding())
+        with pytest.raises(ValueError, match="unique"):
             await gateway.add_server("server", object())
         await gateway.aclose()
 
@@ -1464,6 +1497,50 @@ def test_async_context_manager_client_is_entered_and_exited_once() -> None:
     asyncio.run(scenario())
     assert manager.entered == manager.exited == 1
     assert client.closed == 0
+
+
+def test_async_context_manager_owns_enter_calls_and_exit_in_one_task() -> None:
+    owner = None
+    entered_group = None
+    calls = []
+
+    class ScopedClient(Client):
+        async def list_tools(self):
+            calls.append(("list", asyncio.current_task()))
+            assert asyncio.current_task() is owner
+            return await super().list_tools()
+
+        async def call_tool(self, name, arguments):
+            calls.append(("call", asyncio.current_task()))
+            assert asyncio.current_task() is owner
+            return await super().call_tool(name, arguments)
+
+    client = ScopedClient()
+
+    class Manager:
+        async def __aenter__(self):
+            nonlocal owner, entered_group
+            owner = asyncio.current_task()
+            entered_group = anyio.create_task_group()
+            await entered_group.__aenter__()
+            return client
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            calls.append(("exit", asyncio.current_task()))
+            assert asyncio.current_task() is owner
+            assert entered_group is not None
+            await entered_group.__aexit__(exc_type, exc, traceback)
+
+    async def scenario():
+        gateway = _gateway(client, factory=lambda _source: Manager())
+        await gateway.add_server("server", object())
+        generation = gateway._servers["server"].generation
+        await gateway._call("server", generation, "read", {})
+        await gateway.remove_server("server")
+
+    asyncio.run(scenario())
+    assert [kind for kind, _task in calls] == ["list", "call", "exit"]
+    assert {task for _kind, task in calls} == {owner}
 
 
 def test_async_timeout_cancels_underlying_mcp_call() -> None:

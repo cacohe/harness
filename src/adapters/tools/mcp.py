@@ -19,6 +19,7 @@ from src.core.tools import ToolSpec
 _MAX_SYNC_CALLS_PER_GATEWAY = 4
 _MAX_SYNC_CLOSES_PER_GATEWAY = 4
 _PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+_UNSAFE_TOOL_NAME = re.compile(r"[^A-Za-z0-9_-]+")
 _late_cleanup_tasks: set[asyncio.Task[None]] = set()
 
 
@@ -122,7 +123,7 @@ class MCPToolGateway(LocalToolGateway):
                 abandoned_client=client,
             )
             descriptors = await discovery.wait(self._sync_timeout)
-            normalized = _normalize_descriptors(descriptors)
+            normalized = _normalize_descriptors(name, descriptors)
             generation = _catalog_generation(name, normalized)
             entries = self._entries(name, generation, client, normalized)
             async with self._lifecycle:
@@ -172,7 +173,7 @@ class MCPToolGateway(LocalToolGateway):
             )
             lease_transferred = True
             descriptors = await invocation.wait(self._sync_timeout)
-            normalized = _normalize_descriptors(descriptors)
+            normalized = _normalize_descriptors(name, descriptors)
             generation = _catalog_generation(name, normalized)
             entries = self._entries(name, generation, state.client, normalized)
             async with self._lifecycle:
@@ -295,11 +296,11 @@ class MCPToolGateway(LocalToolGateway):
         name: str,
         generation: str,
         client: object,
-        descriptors: tuple[tuple[str, str, str], ...],
+        descriptors: tuple[tuple[str, str, str, str], ...],
     ) -> tuple[ToolCatalogEntry, ...]:
         entries: list[ToolCatalogEntry] = []
-        for validated_remote_name, description, schema_json in descriptors:
-            public_name = _public_tool_name(name, validated_remote_name)
+        for remote_name, public_segment, description, schema_json in descriptors:
+            public_name = _public_tool_name(name, public_segment)
             mutating = True
             workspace = f"{self._workspace}-{generation}"
             spec = ToolSpec(
@@ -316,7 +317,7 @@ class MCPToolGateway(LocalToolGateway):
                 *,
                 server_name: str = name,
                 expected_generation: str = generation,
-                tool_name: str = validated_remote_name,
+                tool_name: str = remote_name,
             ) -> object:
                 return await self._call(server_name, expected_generation, tool_name, arguments)
 
@@ -417,23 +418,126 @@ class MCPToolGateway(LocalToolGateway):
         self._dynamic_catalog.replace(entries)
 
 
+@dataclass(frozen=True, slots=True)
+class _AsyncContextCall:
+    name: str
+    args: tuple[object, ...]
+    result: asyncio.Future[object]
+
+
 class _AsyncContextClient:
-    def __init__(self, manager: object, client: object) -> None:
+    def __init__(self, manager: object) -> None:
         self._manager = manager
-        self._client = client
+        self._loop = asyncio.get_running_loop()
+        self._ready: asyncio.Future[None] = self._loop.create_future()
+        self._queue: asyncio.Queue[_AsyncContextCall | None] = asyncio.Queue()
         self._closed = False
+        self._terminal_error: BaseException | None = None
+        self._owner = asyncio.create_task(self._run())
 
     def __getattr__(self, name: str) -> object:
-        return getattr(self._client, name)
+        async def invoke(*args: object) -> object:
+            if self._closed or self._owner.done():
+                raise RuntimeError("MCP async context client is closed")
+            result: asyncio.Future[object] = self._loop.create_future()
+            await self._queue.put(_AsyncContextCall(name, args, result))
+            try:
+                return await result
+            except asyncio.CancelledError:
+                if not result.done():
+                    result.cancel()
+                self._owner.cancel()
+                raise
+
+        return invoke
+
+    async def start(self, timeout: float) -> _AsyncContextClient:
+        try:
+            await asyncio.wait_for(asyncio.shield(self._ready), timeout)
+        except BaseException:
+            self._owner.cancel()
+            await asyncio.gather(self._owner, return_exceptions=True)
+            raise
+        return self
 
     async def aclose(self) -> None:
         if self._closed:
-            return
-        self._closed = True
-        exit_context = getattr(self._manager, "__aexit__")
-        outcome = exit_context(None, None, None)
-        if inspect.isawaitable(outcome):
-            await outcome
+            await asyncio.shield(self._owner)
+        else:
+            self._closed = True
+            await self._queue.put(None)
+            try:
+                await asyncio.shield(self._owner)
+            except asyncio.CancelledError:
+                self._owner.cancel()
+                raise
+        if self._terminal_error is not None:
+            raise self._terminal_error
+
+    async def _run(self) -> None:
+        entered = False
+        client: object | None = None
+        current: asyncio.Future[object] | None = None
+        failure: BaseException | None = None
+        try:
+            enter = getattr(self._manager, "__aenter__")
+            outcome = enter()
+            client = await outcome if inspect.isawaitable(outcome) else outcome
+            entered = True
+            self._ready.set_result(None)
+            while True:
+                call = await self._queue.get()
+                if call is None:
+                    break
+                current = call.result
+                if current.cancelled():
+                    current = None
+                    continue
+                try:
+                    method = _client_method(client, call.name)
+                    value = method(*call.args)
+                    value = await value if inspect.isawaitable(value) else value
+                except asyncio.CancelledError as error:
+                    failure = error
+                    raise
+                except BaseException as error:
+                    if not current.done():
+                        current.set_exception(error)
+                else:
+                    if not current.done():
+                        current.set_result(value)
+                finally:
+                    current = None
+        except asyncio.CancelledError as error:
+            failure = error
+        except BaseException as error:
+            failure = error
+            self._terminal_error = error
+            if not self._ready.done():
+                self._ready.set_exception(error)
+        finally:
+            if current is not None and not current.done():
+                current.set_exception(RuntimeError("MCP async context client stopped"))
+            if entered:
+                try:
+                    exit_context = getattr(self._manager, "__aexit__")
+                    outcome = exit_context(
+                        type(failure) if failure is not None else None,
+                        failure,
+                        failure.__traceback__ if failure is not None else None,
+                    )
+                    if inspect.isawaitable(outcome):
+                        await outcome
+                except BaseException as error:
+                    self._terminal_error = error
+            if not self._ready.done():
+                self._ready.set_exception(
+                    self._terminal_error or RuntimeError("MCP async context client stopped")
+                )
+            while not self._queue.empty():
+                pending = self._queue.get_nowait()
+                if pending is not None and not pending.result.done():
+                    pending.result.set_exception(RuntimeError("MCP async context client stopped"))
 
 
 async def _enter_async_context(client: object, *, timeout: float, limiter: _SyncLimiter) -> object:
@@ -443,8 +547,7 @@ async def _enter_async_context(client: object, *, timeout: float, limiter: _Sync
         return client
     if not callable(enter) or not callable(exit_context):
         raise ValueError("MCP async context manager contract is invalid")
-    entered = await _invoke(enter, timeout=timeout, limiter=limiter)
-    return _AsyncContextClient(client, entered)
+    return await _AsyncContextClient(client).start(timeout)
 
 
 def _server_name(name: object) -> None:
@@ -452,34 +555,63 @@ def _server_name(name: object) -> None:
         raise ValueError("MCP server name is invalid")
 
 
-def _public_tool_name(server_name: str, remote_name: str) -> str:
-    if _PROVIDER_NAME.fullmatch(remote_name) is None:
+def _public_tool_name(server_name: str, public_segment: str) -> str:
+    if _PROVIDER_NAME.fullmatch(public_segment) is None:
         raise ValueError("MCP tool name is invalid")
-    public_name = f"{server_name}__{remote_name}"
+    public_name = f"{server_name}__{public_segment}"
     if len(public_name.encode("ascii")) > 64:
         raise ValueError("MCP public tool name is invalid")
     return public_name
 
 
-def _normalize_descriptors(descriptors: object) -> tuple[tuple[str, str, str], ...]:
+def _normalize_descriptors(
+    server_name: str, descriptors: object
+) -> tuple[tuple[str, str, str, str], ...]:
     if type(descriptors) is not list or len(descriptors) > 128:
         raise ValueError("MCP tool catalog is invalid")
-    normalized: list[tuple[str, str, str]] = []
+    normalized: list[tuple[str, str, str, str]] = []
     for descriptor in descriptors:
         remote_name = _value(descriptor, "name")
         description = _value(descriptor, "description", "")
         schema = _value(descriptor, "inputSchema", _value(descriptor, "input_schema", {}))
-        if type(remote_name) is not str or type(description) is not str or type(schema) is not dict:
+        if (
+            type(remote_name) is not str
+            or not remote_name
+            or len(remote_name.encode("utf-8")) > 1_024
+            or type(description) is not str
+            or type(schema) is not dict
+        ):
             raise ValueError("MCP tool descriptor is invalid")
-        _public_tool_name("s", remote_name)
+        public_segment = _normalized_tool_segment(server_name, remote_name)
         schema_json = json.dumps(schema, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-        normalized.append((remote_name, description, schema_json))
-    if len({item[0] for item in normalized}) != len(normalized):
+        normalized.append((remote_name, public_segment, description, schema_json))
+    if len({item[0] for item in normalized}) != len(normalized) or len(
+        {item[1] for item in normalized}
+    ) != len(normalized):
         raise ValueError("MCP tool names are not unique")
     return tuple(normalized)
 
 
-def _catalog_generation(name: str, descriptors: tuple[tuple[str, str, str], ...]) -> str:
+def _normalized_tool_segment(server_name: str, remote_name: str) -> str:
+    available = 64 - len(server_name.encode("ascii")) - 2
+    if available < 10:
+        raise ValueError("MCP server name leaves no room for tool names")
+    segment = _UNSAFE_TOOL_NAME.sub("_", remote_name).strip("_")
+    if not segment:
+        segment = "tool"
+    if not segment[0].isalnum() or not segment[0].isascii():
+        segment = f"tool_{segment}"
+    if _PROVIDER_NAME.fullmatch(segment) is None or len(segment.encode("ascii")) > available:
+        digest = hashlib.sha256(remote_name.encode("utf-8")).hexdigest()[:8]
+        base = _UNSAFE_TOOL_NAME.sub("_", segment).strip("_") or "tool"
+        if not base[0].isalnum() or not base[0].isascii():
+            base = f"tool_{base}"
+        segment = f"{base[: available - 9]}_{digest}"
+    _public_tool_name(server_name, segment)
+    return segment
+
+
+def _catalog_generation(name: str, descriptors: tuple[tuple[str, str, str, str], ...]) -> str:
     payload = json.dumps(
         [name, descriptors], ensure_ascii=False, separators=(",", ":"), sort_keys=True
     ).encode("utf-8")
