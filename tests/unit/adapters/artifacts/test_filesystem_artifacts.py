@@ -259,6 +259,34 @@ def test_iterator_error_removes_own_partial_write(tmp_path):
     asyncio.run(scenario())
 
 
+def test_threaded_io_stop_iteration_fails_without_hanging():
+    script = """
+import asyncio
+from src.adapters.artifacts.filesystem import _finish_io
+from src.adapters.artifacts.filesystem_platform import ArtifactRepositoryError
+
+def stop():
+    raise StopIteration
+
+async def main():
+    try:
+        await _finish_io(stop)
+    except ArtifactRepositoryError:
+        return
+    raise AssertionError("StopIteration escaped the filesystem I/O boundary")
+
+asyncio.run(main())
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 @pytest.mark.parametrize("suppress", [False, True])
 def test_cancelled_put_removes_own_partial_write(tmp_path, suppress):
     async def scenario():

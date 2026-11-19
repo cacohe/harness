@@ -32,9 +32,5 @@ jobs:
       - name: Check types
         run: uv run --locked mypy src
 
-      - name: Diagnose filesystem artifact tests
-        timeout-minutes: 10
-        run: uv run --locked python -m pytest -vv tests/unit/adapters/artifacts/test_filesystem_artifacts.py
-
       - name: Run tests
         run: uv run --locked python -m pytest

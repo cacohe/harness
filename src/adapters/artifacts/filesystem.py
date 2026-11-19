@@ -84,9 +84,17 @@ def _repository_io() -> Iterator[None]:
         raise ArtifactRepositoryError("Artifact filesystem operation failed") from None
 
 
+def _run_io(operation: Callable[[], _T]) -> _T:
+    try:
+        return operation()
+    except StopIteration:
+        # asyncio futures reject StopIteration and would otherwise remain pending forever.
+        raise ArtifactRepositoryError("Artifact filesystem operation failed") from None
+
+
 async def _finish_io(operation: Callable[[], _T], cancel: Event | None = None) -> _T:
     """Wait for an in-flight I/O operation before its caller closes or cleans up."""
-    pending = asyncio.create_task(asyncio.to_thread(operation))
+    pending = asyncio.create_task(asyncio.to_thread(_run_io, operation))
     try:
         return await asyncio.shield(pending)
     except asyncio.CancelledError:
