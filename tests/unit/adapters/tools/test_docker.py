@@ -1,5 +1,5 @@
 import asyncio
-import os
+import sys
 import threading
 from pathlib import Path
 
@@ -38,7 +38,7 @@ def _gateway(tmp_path: Path) -> DockerToolGateway:
         ToolCatalog(()),
         InMemoryToolExecutionStore(),
         externalizer,
-        docker_executable=Path(os.environ["COMSPEC"]),
+        docker_executable=Path(sys.executable),
         image="example.invalid/tool@sha256:" + "a" * 64,
         workspace_root=tmp_path.resolve(),
     )
@@ -57,7 +57,7 @@ def _configured_gateway(
             InMemoryArtifactRepository(1024),
             ArtifactPolicy(512, 1024, 128, frozenset({"application/json"})),
         ),
-        docker_executable=Path(os.environ["COMSPEC"]),
+        docker_executable=Path(sys.executable),
         image="example.invalid/tool@sha256:" + "a" * 64,
         workspace_root=tmp_path.resolve(),
         builder_timeout_seconds=builder_timeout_seconds,
@@ -161,7 +161,7 @@ def test_rejects_noncanonical_docker_hosts(tmp_path: Path, host: str) -> None:
                 InMemoryArtifactRepository(1024),
                 ArtifactPolicy(512, 1024, 128, frozenset({"application/json"})),
             ),
-            docker_executable=Path(os.environ["COMSPEC"]),
+            docker_executable=Path(sys.executable),
             image="example.invalid/tool@sha256:" + "a" * 64,
             workspace_root=tmp_path.resolve(),
             docker_host=host,
