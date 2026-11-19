@@ -5,10 +5,8 @@ from typing import Protocol
 
 from src.core.context_support import context_policy as _policy
 from src.core.context_support import optional_system_messages as _optional_messages
-from src.core.context_support import (
-    snapshot_summary_checkpoint,
-    summary_system_messages as summary_system_messages,
-)
+from src.core.context_support import snapshot_summary_checkpoint
+from src.core.context_support import summary_system_messages as summary_system_messages
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.ids import ProfileId, SessionId
 from src.core.journal import ConversationSummaryCheckpoint

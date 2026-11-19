@@ -6,13 +6,12 @@ from collections.abc import AsyncIterator
 
 from src.adapters.tools.catalog import ToolCatalogEntry
 from src.core.artifacts import (
-    ArtifactRepository,
     MAX_ARTIFACT_SIZE_BYTES,
+    ArtifactRepository,
     snapshot_artifact_ref,
     validate_artifact_id,
 )
 from src.core.tools import ToolSpec
-
 
 READ_ARTIFACT_TOOL_NAME = "read_artifact"
 _READ_ARTIFACT_SCHEMA = (
