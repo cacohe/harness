@@ -5,13 +5,17 @@ import json
 import pytest
 from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactExternalizer
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
-from src.core.artifacts import ArtifactWrite
+from src.core.artifacts import ArtifactWrite, artifact_id_from_descriptor
 
 ALL_TYPES = frozenset({"text/plain", "application/json", "application/octet-stream"})
 
 
-def _address(content: bytes) -> str:
-    return "sha256:" + hashlib.sha256(content).hexdigest()
+def _address(
+    content: bytes, media_type: str = "text/plain", name: str | None = None
+) -> str:
+    return artifact_id_from_descriptor(
+        hashlib.sha256(content).hexdigest(), media_type, name
+    )
 
 
 def _externalizer(repo, *, inline=6, artifact=256, summary=48, allowed=ALL_TYPES):
@@ -50,7 +54,7 @@ def test_inline_threshold_is_exact_encoded_byte_count(exact, over, media_type, e
         ref = external.artifacts[0]
         assert ref.media_type == media_type
         assert ref.size_bytes == 7
-        assert ref.artifact_id == _address(encoded)
+        assert ref.artifact_id == _address(encoded, media_type)
         assert await repo.stat(ref.artifact_id) == ref
         assert await _read(repo, ref.artifact_id) == encoded
 
@@ -71,7 +75,9 @@ def test_json_content_is_deterministic_and_summary_retains_keys_and_count():
         )
 
         assert result == reordered
-        assert result.artifacts[0].artifact_id == _address(expected)
+        assert result.artifacts[0].artifact_id == _address(
+            expected, "application/json", "example.json"
+        )
         assert result.artifacts[0].name == "example.json"
         assert await _read(repo, result.artifacts[0].artifact_id) == expected
         assert "2 keys" in result.summary

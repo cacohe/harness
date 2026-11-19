@@ -41,6 +41,7 @@ from src.core.artifacts import (
     MAX_ARTIFACT_SIZE_BYTES,
     ArtifactRef,
     ArtifactWrite,
+    artifact_id_from_descriptor,
     artifact_id_from_sha256,
     validate_artifact_id,
 )
@@ -355,7 +356,7 @@ class FilesystemArtifactRepository:
                 os.close(fd)
 
     def _publish(self, stage: _Stage, obj: _Object, cancel: Event) -> None:
-        digest = obj.ref.sha256
+        digest = obj.ref.artifact_id[7:]
         with self._pinned_root() as root, self._locked(root, digest):
             if cancel.is_set():
                 return
@@ -442,7 +443,9 @@ class FilesystemArtifactRepository:
                 data = await _finish_io(lambda: self._seal_data(stage, fd))
                 await _finish_io(stage.close)
                 ref = ArtifactRef(
-                    artifact_id_from_sha256(checksum),
+                    artifact_id_from_descriptor(
+                        checksum, request.media_type, request.name, request.metadata
+                    ),
                     request.media_type,
                     size,
                     checksum,
@@ -466,8 +469,13 @@ class FilesystemArtifactRepository:
             return ref
 
     def _find(self, digest: str, artifact_id: str) -> _Object | None:
-        with self._pinned_root() as root, self._locked(root, digest):
-            return _load(root, digest, artifact_id)
+        with self._pinned_root() as root:
+            try:
+                directory_info(root.stat(digest))
+            except FileNotFoundError:
+                return None
+            with self._locked(root, digest):
+                return _load(root, digest, artifact_id)
 
     async def stat(self, artifact_id: str) -> ArtifactRef | None:
         validate_artifact_id(artifact_id)
@@ -476,7 +484,7 @@ class FilesystemArtifactRepository:
         return found.ref if found is not None else None
 
     def _read_chunk(self, obj: _Object, offset: int) -> bytes:
-        digest = obj.ref.sha256
+        digest = obj.ref.artifact_id[7:]
         with self._pinned_root() as root, self._locked(root, digest):
             try:
                 directory_info(root.stat(digest))
@@ -516,7 +524,7 @@ class FilesystemArtifactRepository:
         cutoff_ns: int | None = None,
     ) -> bool:
         intent = RetirementIntent(
-            digest=obj.ref.sha256,
+            digest=obj.ref.artifact_id[7:],
             nonce=uuid4().hex,
             directory=directory_identity(obj.directory),
             data=file_identity(obj.data),

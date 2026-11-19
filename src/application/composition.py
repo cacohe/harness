@@ -75,6 +75,7 @@ class ApplicationConfig:
             or not 1 <= integers[2] <= 1_000_000
             or not 1 <= integers[3] <= (1 << 63) - 1
             or not 0 <= integers[4] <= integers[3]
+            or integers[4] > limits.max_inline_result_bytes
             or not 1 <= integers[5] <= 1_048_576
             or not 1_024 <= integers[6] <= 16 * 1_048_576
             or not 1 <= integers[7] <= 64 * 1_048_576

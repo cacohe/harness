@@ -4,11 +4,18 @@ import sys
 
 import pytest
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
-from src.core.artifacts import ArtifactWrite
+from src.core.artifacts import ArtifactWrite, artifact_id_from_descriptor
 
 
-def _address(content: bytes) -> str:
-    return "sha256:" + hashlib.sha256(content).hexdigest()
+def _address(
+    content: bytes,
+    media_type: str = "text/plain",
+    name: str | None = None,
+    metadata=None,
+) -> str:
+    return artifact_id_from_descriptor(
+        hashlib.sha256(content).hexdigest(), media_type, name, metadata
+    )
 
 
 async def _chunks(*items: bytes):
@@ -35,7 +42,7 @@ def test_put_is_streaming_and_open_has_independent_readers():
                 stream(),
                 "text/plain",
                 expected_size_bytes=3,
-                expected_sha256=artifact_id[7:],
+                expected_sha256=hashlib.sha256(b"abc").hexdigest(),
             )
         )
 
@@ -75,10 +82,29 @@ def test_empty_stream_and_equivalent_metadata_deduplicate():
             )
         )
 
-        assert first == duplicate == await repo.stat(_address(b""))
+        artifact_id = _address(
+            b"", name="same", metadata={"z": 1, "a": ["same"]}
+        )
+        assert first == duplicate == await repo.stat(artifact_id)
         duplicate.metadata["z"] = 2
-        assert (await repo.stat(_address(b""))).metadata == {"z": 1, "a": ["same"]}
-        assert await _read(repo, _address(b"")) == b""
+        assert (await repo.stat(artifact_id)).metadata == {"z": 1, "a": ["same"]}
+        assert await _read(repo, artifact_id) == b""
+
+    asyncio.run(scenario())
+
+
+def test_same_bytes_with_different_media_types_have_distinct_descriptor_ids():
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+        text = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
+        binary = await repo.put(
+            ArtifactWrite(_chunks(b"abc"), "application/octet-stream")
+        )
+
+        assert text.artifact_id != binary.artifact_id
+        assert text.sha256 == binary.sha256 == hashlib.sha256(b"abc").hexdigest()
+        assert await _read(repo, text.artifact_id) == b"abc"
+        assert await _read(repo, binary.artifact_id) == b"abc"
 
     asyncio.run(scenario())
 
@@ -91,7 +117,7 @@ def test_empty_stream_and_equivalent_metadata_deduplicate():
         {"metadata": {"version": True}},
     ],
 )
-def test_concurrent_descriptor_conflict_preserves_first_complete_publication(changed):
+def test_concurrent_distinct_descriptors_publish_independently(changed):
     async def scenario():
         repo = InMemoryArtifactRepository(max_artifact_bytes=3)
         blocked, resume = asyncio.Event(), asyncio.Event()
@@ -106,11 +132,15 @@ def test_concurrent_descriptor_conflict_preserves_first_complete_publication(cha
         await blocked.wait()
         first = await repo.put(ArtifactWrite(_chunks(b"abc"), **descriptor))
         resume.set()
-        with pytest.raises(ValueError, match="conflict"):
-            await pending
+        second = await pending
 
-        assert first == await repo.stat(_address(b"abc"))
+        assert first.artifact_id != second.artifact_id
+        assert first == await repo.stat(
+            _address(b"abc", name="original", metadata={"version": 1})
+        )
+        assert second == await repo.stat(second.artifact_id)
         assert await _read(repo, first.artifact_id) == b"abc"
+        assert await _read(repo, second.artifact_id) == b"abc"
 
     asyncio.run(scenario())
 

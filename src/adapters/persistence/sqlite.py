@@ -1120,17 +1120,12 @@ class SQLiteRunJournal:
                         retirement is not None
                         and retirement.state is ArtifactRetirementState.RETIRING
                     ):
-                        raise ValueError("Artifact retirement blocks attachment")
+                        raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
                     if (
                         retirement is not None
                         and retirement.state is ArtifactRetirementState.RETIRED
                     ):
-                        _append_retirement_transition(
-                            connection,
-                            fact.artifact.artifact_id,
-                            retirement.generation + 1,
-                            ArtifactRetirementState.AVAILABLE,
-                        )
+                        raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
                     existing_attachment = connection.execute(
                         "SELECT fact_json FROM artifact_attachments WHERE session_id=? AND run_id=? AND owner_id=? AND role=? AND artifact_id=?",
                         (

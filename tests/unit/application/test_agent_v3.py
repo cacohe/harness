@@ -43,6 +43,7 @@ async def test_agent_exposes_only_async_first_session_and_submit_surface():
 
 def test_application_config_is_immutable_strict_and_requires_absolute_production_paths(tmp_path):
     from src.application.composition import ApplicationConfig
+    from src.core.commands import RunLimits
 
     config = ApplicationConfig(
         max_sessions=4,
@@ -64,6 +65,11 @@ def test_application_config_is_immutable_strict_and_requires_absolute_production
 
     with pytest.raises(ValueError):
         ApplicationConfig(sqlite_path=PathSubclass(str(tmp_path / "subclass.sqlite3")))
+    with pytest.raises(ValueError, match="configuration limits"):
+        ApplicationConfig(
+            limits=RunLimits(8, 30.0, 32),
+            max_inline_artifact_bytes=33,
+        )
 
 
 def test_production_composition_requires_explicit_durable_adapter_paths(tmp_path):

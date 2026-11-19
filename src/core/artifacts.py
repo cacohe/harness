@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from hashlib import sha256 as _sha256
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from dataclasses import dataclass, field, fields
 from io import StringIO
@@ -241,6 +242,26 @@ def _encode_content(
     return encoded
 
 
+def artifact_id_from_descriptor(
+    content_sha256: str,
+    media_type: str,
+    name: str | None = None,
+    metadata: dict[str, JsonValue] | None = None,
+) -> str:
+    """Address immutable content together with its canonical descriptor."""
+
+    artifact_id_from_sha256(content_sha256)
+    validate_media_type(media_type)
+    validate_artifact_name(name)
+    metadata_json = _encode_metadata(metadata)
+    payload = json.dumps(
+        [content_sha256, media_type, name, metadata_json],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return artifact_id_from_sha256(_sha256(payload).hexdigest())
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class ArtifactRef:
     artifact_id: str
@@ -260,17 +281,21 @@ class ArtifactRef:
         metadata: dict[str, JsonValue] | None = None,
     ) -> None:
         validate_artifact_id(artifact_id)
-        if artifact_id != artifact_id_from_sha256(sha256):
-            raise ValueError("Artifact ID does not match the SHA-256 digest")
         validate_media_type(media_type)
         validate_artifact_name(name)
         _validate_size(size_bytes)
+        metadata_json = _encode_metadata(metadata)
+        if artifact_id not in {
+            artifact_id_from_sha256(sha256),
+            artifact_id_from_descriptor(sha256, media_type, name, metadata),
+        }:
+            raise ValueError("Artifact ID does not match its content and descriptor")
         object.__setattr__(self, "artifact_id", artifact_id)
         object.__setattr__(self, "media_type", media_type)
         object.__setattr__(self, "size_bytes", size_bytes)
         object.__setattr__(self, "sha256", sha256)
         object.__setattr__(self, "name", name)
-        object.__setattr__(self, "_metadata_json", _encode_metadata(metadata))
+        object.__setattr__(self, "_metadata_json", metadata_json)
 
     @property
     def metadata(self) -> dict[str, JsonValue]:

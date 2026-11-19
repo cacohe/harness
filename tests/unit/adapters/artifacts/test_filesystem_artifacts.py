@@ -11,11 +11,13 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from src.adapters.artifacts.filesystem import ArtifactRepositoryError, FilesystemArtifactRepository
 from src.adapters.artifacts.filesystem_platform import Directory
-from src.core.artifacts import ArtifactWrite
+from src.core.artifacts import ArtifactWrite, artifact_id_from_descriptor
 
 
-def _address(content):
-    return "sha256:" + hashlib.sha256(content).hexdigest()
+def _address(content, media_type="text/plain", name=None, metadata=None):
+    return artifact_id_from_descriptor(
+        hashlib.sha256(content).hexdigest(), media_type, name, metadata
+    )
 
 
 def _object(root, artifact_id):
@@ -61,7 +63,12 @@ def test_large_stream_publishes_complete_read_only_object(tmp_path, monkeypatch)
         digest = hashlib.sha256()
         for _ in range(20):
             digest.update(payload)
-        artifact_id = "sha256:" + digest.hexdigest()
+        artifact_id = artifact_id_from_descriptor(
+            digest.hexdigest(),
+            "application/octet-stream",
+            "CON",
+            {"results": [20]},
+        )
 
         async def source():
             for _ in range(20):
@@ -141,6 +148,38 @@ def test_concurrent_writers_across_instances_deduplicate(tmp_path):
     asyncio.run(scenario())
 
 
+def test_same_bytes_with_different_media_types_publish_distinct_objects(tmp_path):
+    async def scenario():
+        repo = FilesystemArtifactRepository(tmp_path, 3)
+        text = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
+        binary = await repo.put(
+            ArtifactWrite(_chunks(b"abc"), "application/octet-stream")
+        )
+
+        assert text.artifact_id != binary.artifact_id
+        assert text.sha256 == binary.sha256 == hashlib.sha256(b"abc").hexdigest()
+        assert await _read(repo, text.artifact_id) == b"abc"
+        assert await _read(repo, binary.artifact_id) == b"abc"
+        assert _contents(tmp_path) == {
+            _object(tmp_path, text.artifact_id),
+            _object(tmp_path, binary.artifact_id),
+        }
+
+    asyncio.run(scenario())
+
+
+def test_missing_stat_does_not_create_permanent_lock_files(tmp_path):
+    async def scenario():
+        repo = FilesystemArtifactRepository(tmp_path, 3)
+        locks = tmp_path / ".locks"
+        for index in range(100):
+            artifact_id = "sha256:" + f"{index:064x}"
+            assert await repo.stat(artifact_id) is None
+        assert list(locks.iterdir()) == []
+
+    asyncio.run(scenario())
+
+
 def test_atomic_rename_loser_returns_the_other_publishers_receipt(tmp_path, monkeypatch):
     async def scenario():
         root = tmp_path / "repo"
@@ -164,7 +203,7 @@ def test_atomic_rename_loser_returns_the_other_publishers_receipt(tmp_path, monk
     asyncio.run(scenario())
 
 
-def test_conflicting_descriptor_preserves_first_complete_publication(tmp_path):
+def test_distinct_descriptors_publish_independently(tmp_path):
     async def scenario():
         first_repo = FilesystemArtifactRepository(tmp_path, 3)
         second_repo = FilesystemArtifactRepository(tmp_path, 3)
@@ -185,11 +224,16 @@ def test_conflicting_descriptor_preserves_first_complete_publication(tmp_path):
             ArtifactWrite(_chunks(b"abc"), "text/plain", metadata={"value": 1})
         )
         proceed.set()
-        with pytest.raises(ValueError, match="conflict"):
-            await pending
+        second = await pending
+        assert second.artifact_id != first.artifact_id
         assert await second_repo.stat(first.artifact_id) == first
+        assert await second_repo.stat(second.artifact_id) == second
         assert await _read(second_repo, first.artifact_id) == b"abc"
-        assert _contents(tmp_path) == {_object(tmp_path, first.artifact_id)}
+        assert await _read(second_repo, second.artifact_id) == b"abc"
+        assert _contents(tmp_path) == {
+            _object(tmp_path, first.artifact_id),
+            _object(tmp_path, second.artifact_id),
+        }
 
     asyncio.run(scenario())
 
@@ -484,7 +528,7 @@ def test_open_stops_after_delete_without_reading_a_replacement(tmp_path):
         await repo.delete(ref.artifact_id)
         assert await repo.stat(ref.artifact_id) is None
         await repo.put(ArtifactWrite(_chunks(payload), "text/plain", name="replacement"))
-        with pytest.raises(ArtifactRepositoryError):
+        with pytest.raises(KeyError):
             await anext(reader)
 
     asyncio.run(scenario())
@@ -641,7 +685,7 @@ def test_delete_rolls_back_a_replacement_captured_at_rename(tmp_path, monkeypatc
         repo = FilesystemArtifactRepository(root, 3)
         other = FilesystemArtifactRepository(replacement_root, 3)
         ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="old"))
-        replacement = await other.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="new"))
+        replacement = await other.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="old"))
         object_path = _object(root, ref.artifact_id)
         actual_rename = os.rename
 
@@ -692,7 +736,7 @@ def test_failed_rollback_does_not_allow_gc_to_remove_the_replacement(tmp_path, m
         repo = FilesystemArtifactRepository(root, 3)
         other = FilesystemArtifactRepository(other_root, 3)
         ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="old"))
-        replacement = await other.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="new"))
+        replacement = await other.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="old"))
         actual_rename = os.rename
 
         def substitute(source, target, *args, **kwargs):
@@ -827,7 +871,7 @@ class SignalingRepository(FilesystemArtifactRepository):
 
 async def main():
     repo = SignalingRepository(Path(sys.argv[1]), 3)
-    await repo.put(ArtifactWrite(chunks(), "text/plain", name="replacement"))
+    await repo.put(ArtifactWrite(chunks(), "text/plain", name="initial"))
     print("published", flush=True)
 
 asyncio.run(main())
@@ -843,7 +887,7 @@ asyncio.run(main())
         def pause_delete(source, target, *args, **kwargs):
             if os.path.basename(source) == ref.artifact_id[7:]:
                 process = subprocess.Popen(
-                    [sys.executable, "-c", child, str(tmp_path)],
+                    [sys._base_executable, "-c", child, str(tmp_path)],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -865,7 +909,7 @@ asyncio.run(main())
             out, error = processes[0].communicate(timeout=10)
             assert processes[0].returncode == 0, error
             assert out.strip() == "published"
-            assert (await repo.stat(ref.artifact_id)).name == "replacement"
+            assert (await repo.stat(ref.artifact_id)).name == "initial"
         finally:
             for process in processes:
                 if process.poll() is None:
@@ -1054,7 +1098,7 @@ def test_failed_rename_intent_is_cleared_only_for_the_same_live_object(
                 other_root = tmp_path / "other"
                 other = FilesystemArtifactRepository(other_root, 3)
                 expected = await other.put(
-                    ArtifactWrite(_chunks(b"abc"), "text/plain", name="replacement")
+                    ArtifactWrite(_chunks(b"abc"), "text/plain", name="first")
                 )
                 _object(other_root, ref.artifact_id).rename(final)
 
@@ -1142,9 +1186,11 @@ def test_restart_finishes_retirement_after_tombstone_removal(
             await restarted.delete(original.artifact_id)
             assert await restarted.stat(original.artifact_id) is None
         else:
-            references = {original.artifact_id} if replacement is not None else set()
+            references = {replacement.artifact_id} if replacement is not None else set()
             assert await restarted.collect_orphans(references, datetime.now(timezone.utc)) == 0
-            assert await restarted.stat(original.artifact_id) == replacement
+            assert await restarted.stat(original.artifact_id) is None
+            if replacement is not None:
+                assert await restarted.stat(replacement.artifact_id) == replacement
         assert not old_record.exists()
 
         if replacement is None or recovery == "delete":
@@ -1163,7 +1209,9 @@ def test_restart_finishes_retirement_after_tombstone_removal(
     asyncio.run(scenario())
 
 
-def test_repeated_record_removal_failure_preserves_same_digest_replacement(tmp_path, monkeypatch):
+def test_repeated_record_removal_failure_keeps_descriptor_retirements_isolated(
+    tmp_path, monkeypatch
+):
     async def scenario():
         repo = FilesystemArtifactRepository(tmp_path, 3)
         original = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain", name="original"))
@@ -1190,10 +1238,10 @@ def test_repeated_record_removal_failure_preserves_same_digest_replacement(tmp_p
             assert await restarted.collect_orphans([], datetime.now(timezone.utc)) == 0
             assert old_record.exists()
             assert not list(tmp_path.glob(".delete-*"))
-            assert await restarted.stat(replacement.artifact_id) == replacement
-            assert await _read(restarted, replacement.artifact_id) == b"abc"
+            assert await restarted.stat(replacement.artifact_id) is None
 
         await restarted.delete(replacement.artifact_id)
+        await restarted.delete(original.artifact_id)
         assert await restarted.stat(replacement.artifact_id) is None
         assert not list(control.iterdir())
 

@@ -115,7 +115,7 @@ def test_concurrent_detach_and_retire_never_deletes_an_active_owner() -> None:
     asyncio.run(scenario())
 
 
-def test_retiring_blocks_attach_until_delete_completes_then_allows_reput() -> None:
+def test_retiring_and_retired_tombstones_block_attachment_resurrection() -> None:
     async def scenario() -> None:
         class BlockingRepository:
             def __init__(self, ref: ArtifactRef) -> None:
@@ -154,12 +154,14 @@ def test_retiring_blocks_attach_until_delete_completes_then_allows_reput() -> No
         )
         with pytest.raises(JournalError) as caught:
             await journal.commit(replace(batch, artifact_facts=(fact,)), 0)
-        assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+        assert caught.value.failure.code is RunErrorCode.JOURNAL_CONFLICT
         repository.release.set()
         await retirement
         repository.present = True  # content-addressed payload was put again
-        await journal.commit(replace(batch, artifact_facts=(fact,)), 0)
-        assert await journal.artifact_has_active_attachments(ref.artifact_id)
+        with pytest.raises(JournalError) as retired:
+            await journal.commit(replace(batch, artifact_facts=(fact,)), 0)
+        assert retired.value.failure.code is RunErrorCode.JOURNAL_CONFLICT
+        assert not await journal.artifact_has_active_attachments(ref.artifact_id)
 
     asyncio.run(scenario())
 

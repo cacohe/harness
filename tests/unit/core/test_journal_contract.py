@@ -143,7 +143,9 @@ def test_retirement_reservation_atomically_blocks_new_attachment(journal: RunJou
     assert asyncio.run(journal.reserve_artifact_retirement(ref.artifact_id)) is None
 
 
-def test_completed_retirement_allows_a_new_content_generation(journal: RunJournal) -> None:
+def test_completed_retirement_tombstone_blocks_same_descriptor_generation(
+    journal: RunJournal,
+) -> None:
     batch = acceptance("retirement-generation")
     ref = artifact_ref("f")
     first = asyncio.run(journal.reserve_artifact_retirement(ref.artifact_id))
@@ -159,9 +161,10 @@ def test_completed_retirement_allows_a_new_content_generation(journal: RunJourna
         ArtifactAttachmentAction.ATTACHED,
         ref,
     )
-    asyncio.run(journal.commit(replace(batch, artifact_facts=(fact,)), 0))
-    assert asyncio.run(journal.artifact_has_active_attachments(ref.artifact_id))
-    assert asyncio.run(journal.reserve_artifact_retirement(ref.artifact_id)) is None
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(journal.commit(replace(batch, artifact_facts=(fact,)), 0))
+    assert caught.value.failure.code is RunErrorCode.JOURNAL_CONFLICT
+    assert not asyncio.run(journal.artifact_has_active_attachments(ref.artifact_id))
 
 
 @pytest.mark.parametrize("mode", ("conflict", "detach-missing"))

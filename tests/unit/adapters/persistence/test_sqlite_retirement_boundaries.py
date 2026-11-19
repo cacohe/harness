@@ -316,7 +316,7 @@ def test_new_retirement_rejects_frontier_corruption(tmp_path: Path, attack: str)
     assert database_dump(journal.path) == before
 
 
-@pytest.mark.parametrize("operation", ("reserve", "complete", "abort", "reput"))
+@pytest.mark.parametrize("operation", ("reserve", "complete", "abort"))
 @pytest.mark.parametrize("room", (0, 1))
 def test_retirement_transition_limit_is_checked_before_any_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, room: int
@@ -328,9 +328,6 @@ def test_retirement_transition_limit_is_checked_before_any_write(
     count = 1
     if operation == "reserve":
         asyncio.run(journal.abort_artifact_retirement(reservation))
-        count = 2
-    elif operation == "reput":
-        asyncio.run(journal.complete_artifact_retirement(reservation))
         count = 2
     monkeypatch.setattr(sqlite_module, "_MAX_ARTIFACT_FACTS_PER_LOOKUP", count + room)
     batch = acceptance("bounded-reput")
@@ -361,11 +358,7 @@ def test_retirement_transition_limit_is_checked_before_any_write(
             )
         # Reopening at the exact limit must remain readable and support idempotent operations.
         reopened = SQLiteRunJournal(journal.path)
-        if operation == "reput":
-            assert asyncio.run(reopened.artifact_has_active_attachments(ref.artifact_id))
-            assert asyncio.run(reopened.load_head(batch.state.session_id)) is not None
-        else:
-            assert append(reopened) is not None
+        assert append(reopened) is not None
     else:
         before = database_dump(journal.path)
         for _ in range(2):

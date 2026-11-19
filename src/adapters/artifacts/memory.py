@@ -7,7 +7,7 @@ from src.core.artifacts import (
     MAX_ARTIFACT_SIZE_BYTES,
     ArtifactRef,
     ArtifactWrite,
-    artifact_id_from_sha256,
+    artifact_id_from_descriptor,
     validate_artifact_id,
 )
 
@@ -68,7 +68,9 @@ class InMemoryArtifactRepository:
             raise ValueError("Artifact stream size does not match the expected size")
         if request.expected_sha256 is not None and request.expected_sha256 != checksum:
             raise ValueError("Artifact stream SHA-256 does not match the expected digest")
-        artifact_id = artifact_id_from_sha256(checksum)
+        artifact_id = artifact_id_from_descriptor(
+            checksum, request.media_type, request.name, request.metadata
+        )
         ref = ArtifactRef(
             artifact_id,
             request.media_type,

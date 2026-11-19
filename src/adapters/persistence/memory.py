@@ -235,16 +235,12 @@ class InMemoryRunJournal:
                         retirement is not None
                         and retirement.state is ArtifactRetirementState.RETIRING
                     ):
-                        raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
+                        raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
                     if (
                         retirement is not None
                         and retirement.state is ArtifactRetirementState.RETIRED
                     ):
-                        retirements[fact.artifact.artifact_id] = ArtifactRetirementReservation(
-                            fact.artifact.artifact_id,
-                            retirement.generation + 1,
-                            ArtifactRetirementState.AVAILABLE,
-                        )
+                        raise JournalError(RunErrorCode.JOURNAL_CONFLICT)
                     if prior is not None and prior.artifact != fact.artifact:
                         raise JournalError(RunErrorCode.INVARIANT_VIOLATION)
                     attachments[key] = fact
