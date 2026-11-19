@@ -71,12 +71,15 @@ class SummaryCheckpointService:
         self,
         request: ContextRequest,
         interactions: tuple[ConversationInteraction, ...],
+        *,
+        prior_checkpoint: ConversationSummaryCheckpoint | None = None,
     ) -> CompactionOutcome:
         compaction = SummaryCompactionRequest(
             request.session_id,
             request.profile_id,
             request.policy_version,
             interactions,
+            prior_checkpoint,
         )
         retained = compaction.interactions
         if self._compactor is None:
@@ -90,9 +93,13 @@ class SummaryCheckpointService:
                 policy_version=request.policy_version,
             )
             assert checkpoint is not None
-            if (
-                checkpoint.covered_from_sequence != retained[0].sequence_from
-                or checkpoint.covered_through_sequence != retained[-1].sequence_through
+            expected_from = (
+                prior_checkpoint.covered_from_sequence
+                if prior_checkpoint is not None
+                else retained[0].sequence_from
+            )
+            if checkpoint.covered_from_sequence != expected_from or (
+                checkpoint.covered_through_sequence != retained[-1].sequence_through
             ):
                 raise ValueError
         except Exception:

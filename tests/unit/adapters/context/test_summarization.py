@@ -163,3 +163,38 @@ def test_invalid_compactor_binding_is_rejected_and_raw_records_remain() -> None:
     )
     assert outcome.checkpoint is None
     assert outcome.retained == records
+
+
+def test_compaction_accumulates_the_latest_durable_summary() -> None:
+    request = _request()
+    prior = ConversationSummaryCheckpoint(
+        request.session_id,
+        5,
+        request.policy_version,
+        request.profile_id,
+        "prior summary",
+        covered_from_sequence=1,
+    )
+    records = (
+        ConversationInteraction(6, 6, (ModelMessage(ModelRole.USER, "new"),)),
+        ConversationInteraction(7, 7, (ModelMessage(ModelRole.ASSISTANT, "answer"),)),
+    )
+    candidate = ConversationSummaryCheckpoint(
+        request.session_id,
+        7,
+        request.policy_version,
+        request.profile_id,
+        "cumulative summary",
+        covered_from_sequence=1,
+    )
+    compactor = Compactor(candidate)
+
+    outcome = asyncio.run(
+        SummaryCheckpointService(compactor).compact_or_retain(
+            request, records, prior_checkpoint=prior
+        )
+    )
+
+    assert outcome.checkpoint == candidate
+    assert len(compactor.calls) == 1
+    assert compactor.calls[0].prior_checkpoint == prior

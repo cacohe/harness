@@ -279,13 +279,18 @@ class DurableSummaryCompactor:
         self._artifacts = artifacts
 
     async def compact(self, request):
+        covered_from = (
+            request.prior_checkpoint.covered_from_sequence
+            if request.prior_checkpoint is not None
+            else request.interactions[0].sequence_from
+        )
         return ConversationSummaryCheckpoint(
             request.session_id,
             request.interactions[-1].sequence_through,
             request.policy_version,
             request.profile_id,
             "durable restart summary",
-            covered_from_sequence=request.interactions[0].sequence_from,
+            covered_from_sequence=covered_from,
             artifacts=self._artifacts,
         )
 
@@ -297,6 +302,8 @@ class DurableSummaryModel:
 
     async def complete(self, request):
         self.requests.append(request)
+        if request.messages[-1].content.startswith("seed-"):
+            return ModelResponse("seed-complete")
         if not any(message.content == "durable restart summary" for message in request.messages):
             return ModelResponse(
                 tool_calls=(ModelToolCall(self._missing_summary_call_id, "guarded", "{}"),)
@@ -385,6 +392,8 @@ def test_committed_candidate_is_reused_on_next_advance_or_authenticated_restart(
         first_model = DurableSummaryModel("guarded-call")
         first_agent = await make_agent(first_journal, first_model, f"{backend}-first")
         first_session = await first_agent.open_session(SessionId("summary-session"))
+        seeded = await first_session.submit("seed-" + "s" * 600, SubmissionId("summary-seed"))
+        assert seeded.final_text == "seed-complete"
         waiting = await first_session.submit(message, SubmissionId("summary-submission"))
         persisted = await first_journal.load_session(waiting.session_id, waiting.journal_sequence)
         assert len(persisted.summaries) == 1
@@ -405,7 +414,7 @@ def test_committed_candidate_is_reused_on_next_advance_or_authenticated_restart(
     message, artifacts, persisted, requests, settled = asyncio.run(scenario())
 
     assert len(persisted.summaries) == 1
-    assert len(requests) == (1 if restart else 2)
+    assert len(requests) == (1 if restart else 3)
     reused = requests[-1]
     contents = tuple(item.content for item in reused.messages)
     assert "durable restart summary" in contents, contents
@@ -605,7 +614,7 @@ def test_configured_serialized_run_envelope_bounds_large_batch_and_artifact_resu
 
         config = ApplicationConfig(
             limits=RunLimits(32, 30.0, 256),
-            context_budget=ContextBudget(4_096, 256, 128),
+            context_budget=ContextBudget(128_000, 4_096, 1_024),
             max_serialized_run_state_bytes=max_state_bytes,
         )
         agent = await create_development_agent(

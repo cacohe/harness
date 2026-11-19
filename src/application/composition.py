@@ -275,7 +275,32 @@ def _compose(
             state.journal_version,
             state.journal_sequence,
         )
-        request = replace(request, summary_checkpoints=summaries)
+        input_entry = await bounded_journal.find_run_input(
+            state.session_id, state.run_id, state.submission_id
+        )
+        if input_entry is None:
+            raise ValueError("Active Run does not have a durable input")
+        latest = await bounded_journal.read_page(state.session_id, None, 1)
+        open_tool_messages = ()
+        open_tool_sequence_range = None
+        if latest.interactions:
+            interaction = latest.interactions[0]
+            if (
+                interaction.sequence_from > input_entry.sequence
+                and interaction.messages[0].tool_calls
+            ):
+                open_tool_messages = interaction.messages
+                open_tool_sequence_range = (
+                    interaction.sequence_from,
+                    interaction.sequence_through,
+                )
+        request = replace(
+            request,
+            summary_checkpoints=summaries,
+            current_input_sequence=input_entry.sequence,
+            open_tool_messages=open_tool_messages,
+            open_tool_sequence_range=open_tool_sequence_range,
+        )
         return RunCoordinator(
             context=context,
             model=model,
@@ -354,6 +379,7 @@ _JOURNAL_METHODS = (
     "load_context_summaries",
     "find_submission",
     "find_run_input",
+    "read_page",
     "find_run_state",
     "find_run_state_by_id",
     "load_artifact_attachments",

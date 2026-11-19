@@ -129,6 +129,75 @@ def test_open_tool_pair_is_mandatory_and_never_split() -> None:
         asyncio.run(provider.build(request, ContextBudget(44, 1, 0)))
 
 
+def test_required_current_input_and_open_tool_batch_are_not_duplicated_from_history() -> None:
+    call = ModelToolCall("call", "read", "{}")
+    open_pair = (
+        ModelMessage(ModelRole.ASSISTANT, tool_calls=(call,)),
+        ModelMessage(ModelRole.TOOL, "ok", tool_call_id="call"),
+    )
+    request = _request(open_tool_messages=open_pair)
+    history = (
+        ConversationInteraction(3, 4, open_pair),
+        ConversationInteraction(2, 2, (request.current_input,)),
+        _interaction(1, "older"),
+    )
+
+    window = asyncio.run(
+        BoundedContextProvider(Reader(history), ExactTokenCounter(), page_size=3).build(
+            request, ContextBudget(256, 1, 0)
+        )
+    )
+
+    assert window.messages.count(request.current_input) == 1
+    assert window.messages.count(open_pair[0]) == 1
+    assert window.messages.count(open_pair[1]) == 1
+
+
+def test_summary_memory_and_skills_are_selected_before_optional_raw_history() -> None:
+    checkpoint = ConversationSummaryCheckpoint(
+        SessionId("session"), 1, "policy-v1", ProfileId("profile"), "SUMMARY"
+    )
+    memory = ModelMessage(ModelRole.SYSTEM, "MEMORY")
+    skill = ModelMessage(ModelRole.SYSTEM, "SKILL")
+    request = _request(
+        summary_checkpoints=(checkpoint,),
+        memory_messages=(memory,),
+        skill_messages=(skill,),
+    )
+    counter = ExactTokenCounter()
+    required_priority = (
+        request.system_message,
+        memory,
+        skill,
+        *BoundedContextProvider._checkpoint_messages(checkpoint),
+        request.current_input,
+    )
+    allowance = counter.count(required_priority, ()).tokens
+    provider = BoundedContextProvider(Reader((_interaction(2, "RAW" * 100),)), counter, page_size=1)
+
+    window = asyncio.run(provider.build(request, ContextBudget(allowance + 1, 1, 0)))
+
+    contents = [message.content for message in window.messages]
+    assert contents == [message.content for message in required_priority]
+    assert [item.source for item in window.omitted] == ["transcript"]
+
+
+def test_history_read_cost_is_bounded_even_when_every_page_would_fit() -> None:
+    reader = Reader(tuple(_interaction(index, "x") for index in range(1, 101)))
+    provider = BoundedContextProvider(
+        reader,
+        ExactTokenCounter(),
+        page_size=2,
+        max_compaction_interactions=3,
+    )
+
+    window = asyncio.run(provider.build(_request(), ContextBudget(10_000, 1, 0)))
+
+    assert len(reader.calls) == 2
+    assert len(reader.aggregate_calls) == 1
+    assert any(item.source == "transcript" and item.item_count == 96 for item in window.omitted)
+
+
 def test_selection_is_newest_first_but_output_is_chronological() -> None:
     reader = Reader(tuple(_interaction(index, str(index) * 3) for index in range(1, 6)))
     request = _request(
@@ -145,17 +214,12 @@ def test_selection_is_newest_first_but_output_is_chronological() -> None:
     window = asyncio.run(provider.build(request, ContextBudget(40, 1, 0)))
 
     contents = [message.content for message in window.messages]
-    assert contents == ["SS", "444", "555", "UUU"]
+    assert contents == ["SS", "MEM", "SKL", "UUU"]
     assert window.estimate.tokens <= window.budget.input_allowance_tokens
-    assert len(window.omitted) == 4
-    assert (window.omitted[0].first_sequence, window.omitted[0].last_sequence) == (2, 3)
-    assert window.omitted[0].item_count == 2
-    assert [item.source for item in window.omitted] == [
-        "transcript",
-        "summary",
-        "memory",
-        "skills",
-    ]
+    assert len(window.omitted) == 2
+    assert (window.omitted[0].first_sequence, window.omitted[0].last_sequence) == (2, 5)
+    assert window.omitted[0].item_count == 4
+    assert [item.source for item in window.omitted] == ["transcript", "summary"]
 
 
 def test_complete_tool_interaction_is_selected_atomically() -> None:
@@ -238,7 +302,7 @@ def test_ten_thousand_records_with_partial_checkpoint_remain_bounded_and_determi
     transcript = [item for item in first.omitted if item.source == "transcript"]
     assert [(item.first_sequence, item.last_sequence) for item in transcript] == [
         (1, 4_000),
-        (6_001, 9_996),
+        (6_001, 9_997),
     ]
     assert len(reader.calls) <= 4
     assert len(reader.aggregate_calls) == 2

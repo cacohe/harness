@@ -69,17 +69,57 @@ class BoundedContextProvider:
             raise ContextBudgetExceeded
 
         durable = self._summary_service.find_latest_reusable(request.summary_checkpoints, request)
-        durable_processed = durable is None
         selected: list[ConversationInteraction] = []
         included_checkpoints: list[ConversationSummaryCheckpoint] = []
         omitted_checkpoints: list[ConversationSummaryCheckpoint] = []
+        omitted: list[OmittedContextRef] = []
         omission_segments: list[_Omission] = []
         current_omission: _Omission | None = None
         compaction: list[ConversationInteraction] = []
         compaction_open = True
         suffix_open = True
+        memory: tuple[ModelMessage, ...] = ()
+        skills: tuple[ModelMessage, ...] = ()
+        memory, memory_omitted, estimate = self._include_messages(
+            request,
+            budget,
+            selected,
+            (),
+            memory,
+            skills,
+            request.memory_messages,
+            "memory",
+        )
+        omitted.extend(memory_omitted)
+        skills, skill_omitted, estimate = self._include_messages(
+            request,
+            budget,
+            selected,
+            (),
+            memory,
+            skills,
+            request.skill_messages,
+            "skills",
+        )
+        omitted.extend(skill_omitted)
+        if durable is not None:
+            suffix_open, estimate = self._consider_checkpoint(
+                request,
+                budget,
+                selected,
+                included_checkpoints,
+                omitted_checkpoints,
+                durable,
+                suffix_open,
+                estimate,
+                memory,
+                skills,
+            )
         cursor: int | None = None
         seen_cursors: set[int | None] = set()
+        scanned = 0
+        skipped_current = False
+        skipped_open_tools = False
 
         while True:
             if cursor in seen_cursors:
@@ -91,30 +131,28 @@ class BoundedContextProvider:
             ):
                 raise ValueError("Conversation reader returned an item outside its cursor")
             for item in page.interactions:
+                scanned += 1
+                if self._is_current_input(request, item, skipped_current):
+                    skipped_current = True
+                    continue
+                if self._is_open_tool_batch(request, item, skipped_open_tools):
+                    skipped_open_tools = True
+                    continue
                 relation = self._checkpoint_relation(item, durable)
                 if relation == "split":
                     raise ValueError("Summary checkpoint splits a transcript interaction")
-                if relation != "newer" and not durable_processed:
-                    suffix_open, estimate = self._consider_checkpoint(
-                        request,
-                        budget,
-                        selected,
-                        included_checkpoints,
-                        omitted_checkpoints,
-                        durable,
-                        suffix_open,
-                        estimate,
-                    )
-                    durable_processed = True
-                    current_omission = None
-                    if compaction:
-                        compaction_open = False
                 if relation == "covered":
                     continue
                 if suffix_open:
                     proposed = [*selected, item]
                     candidate_estimate = self._counter.count(
-                        self._assemble(request, proposed, tuple(included_checkpoints), (), ()),
+                        self._assemble(
+                            request,
+                            proposed,
+                            tuple(included_checkpoints),
+                            memory,
+                            skills,
+                        ),
                         request.tools,
                     )
                     if candidate_estimate.tokens <= budget.input_allowance_tokens:
@@ -130,63 +168,46 @@ class BoundedContextProvider:
                 if compaction_open and len(compaction) < self._max_compaction_interactions:
                     compaction.append(item)
             if (
-                not suffix_open
-                and len(compaction) >= self._max_compaction_interactions
+                scanned >= self._max_compaction_interactions
                 and page.next_before_sequence is not None
             ):
-                if not durable_processed:
-                    suffix_open, estimate = self._consider_checkpoint(
-                        request,
-                        budget,
-                        selected,
-                        included_checkpoints,
-                        omitted_checkpoints,
-                        durable,
-                        suffix_open,
-                        estimate,
-                    )
-                    durable_processed = True
-                    if compaction:
-                        compaction_open = False
                 aggregate = getattr(self._reader, "summarize_before", None)
-                if callable(aggregate):
-                    older = await aggregate(
-                        request.session_id,
-                        page.next_before_sequence,
-                        durable.covered_from_sequence if durable is not None else None,
-                        durable.covered_through_sequence if durable is not None else None,
-                    )
-                    self._append_coverage(
-                        omission_segments,
-                        current_omission,
-                        older,
-                        page.next_before_sequence,
-                        durable,
-                    )
-                    cursor = None
-                    break
+                if not callable(aggregate):
+                    raise ValueError("Bounded conversation reads require aggregate coverage")
+                older = await aggregate(
+                    request.session_id,
+                    page.next_before_sequence,
+                    durable.covered_from_sequence if durable is not None else None,
+                    durable.covered_through_sequence if durable is not None else None,
+                )
+                self._append_coverage(
+                    omission_segments,
+                    current_omission,
+                    older,
+                    page.next_before_sequence,
+                    durable,
+                )
+                cursor = None
+                break
             cursor = page.next_before_sequence
             if cursor is None:
                 break
 
-        if not durable_processed:
-            suffix_open, estimate = self._consider_checkpoint(
-                request,
-                budget,
-                selected,
-                included_checkpoints,
-                omitted_checkpoints,
-                durable,
-                suffix_open,
-                estimate,
-            )
-
         candidate_checkpoint: ConversationSummaryCheckpoint | None = None
         if compaction:
-            outcome = await self._summary_service.compact_or_retain(request, tuple(compaction))
+            prior = (
+                durable
+                if durable is not None
+                and min(item.sequence_from for item in compaction)
+                > durable.covered_through_sequence
+                else None
+            )
+            outcome = await self._summary_service.compact_or_retain(
+                request, tuple(compaction), prior_checkpoint=prior
+            )
             candidate_checkpoint = outcome.checkpoint
 
-        omitted = [
+        omitted[0:0] = [
             OmittedContextRef("transcript", item.first, item.last, item.count)
             for item in reversed(omission_segments)
         ]
@@ -200,31 +221,7 @@ class BoundedContextProvider:
             for checkpoint in omitted_checkpoints
         )
 
-        memory: tuple[ModelMessage, ...] = ()
-        skills: tuple[ModelMessage, ...] = ()
         checkpoints = tuple(included_checkpoints)
-        memory, memory_omitted, estimate = self._include_messages(
-            request,
-            budget,
-            selected,
-            checkpoints,
-            memory,
-            skills,
-            request.memory_messages,
-            "memory",
-        )
-        omitted.extend(memory_omitted)
-        skills, skill_omitted, estimate = self._include_messages(
-            request,
-            budget,
-            selected,
-            checkpoints,
-            memory,
-            skills,
-            request.skill_messages,
-            "skills",
-        )
-        omitted.extend(skill_omitted)
         messages = self._assemble(request, selected, checkpoints, memory, skills)
         estimate = self._counter.count(messages, request.tools)
         return ContextWindow(
@@ -311,17 +308,54 @@ class BoundedContextProvider:
         checkpoint: ConversationSummaryCheckpoint | None,
         suffix_open: bool,
         prior_estimate,
+        memory: tuple[ModelMessage, ...] = (),
+        skills: tuple[ModelMessage, ...] = (),
     ):
         assert checkpoint is not None
         proposed = (*included, checkpoint)
         estimate = self._counter.count(
-            self._assemble(request, selected, proposed, (), ()), request.tools
+            self._assemble(request, selected, proposed, memory, skills), request.tools
         )
         if suffix_open and estimate.tokens <= budget.input_allowance_tokens:
             included.append(checkpoint)
             return True, estimate
         omitted.append(checkpoint)
-        return False, prior_estimate
+        return suffix_open, prior_estimate
+
+    @staticmethod
+    def _is_current_input(
+        request: ContextRequest, item: ConversationInteraction, already_skipped: bool
+    ) -> bool:
+        sequence = request.current_input_sequence
+        if sequence is not None:
+            if item.sequence_from <= sequence <= item.sequence_through:
+                if item.sequence_from != sequence or item.sequence_through != sequence:
+                    raise ValueError("Current input sequence splits a transcript interaction")
+                return True
+            return False
+        return not already_skipped and item.messages == (request.current_input,)
+
+    @staticmethod
+    def _is_open_tool_batch(
+        request: ContextRequest, item: ConversationInteraction, already_skipped: bool
+    ) -> bool:
+        sequence_range = request.open_tool_sequence_range
+        if sequence_range is not None:
+            if (
+                item.sequence_from == sequence_range[0]
+                and item.sequence_through == sequence_range[1]
+            ):
+                return True
+            if not (
+                item.sequence_through < sequence_range[0] or item.sequence_from > sequence_range[1]
+            ):
+                raise ValueError("Open tool sequence range splits a transcript interaction")
+            return False
+        return (
+            bool(request.open_tool_messages)
+            and not already_skipped
+            and item.messages == request.open_tool_messages
+        )
 
     @staticmethod
     def _checkpoint_messages(
@@ -340,7 +374,7 @@ class BoundedContextProvider:
         candidates: tuple[ModelMessage, ...],
         source: str,
     ):
-        included = list(current)
+        included = list(current if source == "memory" else later)
         omitted_count = 0
         estimate = self._counter.count(
             self._assemble(request, selected, checkpoints, current, later), request.tools

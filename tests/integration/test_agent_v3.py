@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import pytest
 from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactExternalizer
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
+from src.adapters.context.bounded import BoundedContextProvider
 from src.adapters.context.tokenizers import ExactTokenCounter
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.adapters.persistence.sqlite import SQLiteRunJournal
@@ -102,8 +103,10 @@ class Model:
         self._expected_concurrent = concurrent_calls
         self._arrived = 0
         self._all_arrived = asyncio.Event()
+        self.requests = []
 
     async def complete(self, request):
+        self.requests.append(request)
         payload = json.loads(request.messages[-1].content)
         session = payload["session"]
         message = payload["message"]
@@ -184,7 +187,7 @@ def request_factory(state, message: str) -> ContextRequest:
     )
 
 
-async def rig(*, journal=None, model=None, tools=None, ids=None, observer=None):
+async def rig(*, journal=None, model=None, tools=None, ids=None, observer=None, context=None):
     selected_journal = journal or InMemoryRunJournal()
     selected_model = model or Model()
     selected_tools = tools or Tools()
@@ -203,11 +206,11 @@ async def rig(*, journal=None, model=None, tools=None, ids=None, observer=None):
             max_sessions=128,
             max_waiters_per_session=8,
             limits=RunLimits(16, 30.0, 64),
-            context_budget=ContextBudget(512, 32, 16),
+            context_budget=ContextBudget(2_048, 32, 16),
         ),
         model=selected_model,
         tools=selected_tools,
-        context=Context(),
+        context=context or Context(),
         context_counter=ExactTokenCounter(),
         context_request_factory=request_factory,
         ids=ids or Ids(),
@@ -218,6 +221,40 @@ async def rig(*, journal=None, model=None, tools=None, ids=None, observer=None):
         observer=observer,
     )
     return agent, selected_journal, selected_model, selected_tools
+
+
+def test_real_bounded_context_deduplicates_current_input_and_protects_latest_tool_batch():
+    class CapturingBoundedContext(BoundedContextProvider):
+        def __init__(self, journal):
+            super().__init__(journal, ExactTokenCounter(), page_size=8)
+            self.context_requests = []
+
+        async def build(self, request, budget):
+            self.context_requests.append(request)
+            return await super().build(request, budget)
+
+    async def scenario():
+        journal = InMemoryRunJournal()
+        context = CapturingBoundedContext(journal)
+        model = Model()
+        agent, _, _, _ = await rig(journal=journal, model=model, context=context)
+        session = await agent.open_session(SessionId("real-context"))
+        state = await session.submit("tools", SubmissionId("real-context"))
+        await agent.close()
+        return state, context, model
+
+    state, context, model = asyncio.run(scenario())
+    assert state.status is RunStatus.COMPLETED
+    assert len(context.context_requests) == 2
+    assert context.context_requests[1].open_tool_messages
+    for request in model.requests:
+        current = request.messages[-1]
+        assert sum(message == current for message in request.messages) == 1
+    assert [message.role for message in context.context_requests[1].open_tool_messages] == [
+        ModelRole.ASSISTANT,
+        ModelRole.TOOL,
+        ModelRole.TOOL,
+    ]
 
 
 def test_agent_runs_direct_answer_and_ordered_tool_batch_end_to_end():

@@ -335,6 +335,8 @@ class ContextRequest:
     summary_checkpoints: tuple[ConversationSummaryCheckpoint, ...] = ()
     memory_messages: tuple[ModelMessage, ...] = ()
     skill_messages: tuple[ModelMessage, ...] = ()
+    current_input_sequence: int | None = None
+    open_tool_sequence_range: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         if type(self.session_id) is not SessionId or type(self.profile_id) is not ProfileId:
@@ -392,6 +394,21 @@ class ContextRequest:
             self, "memory_messages", _optional_messages(self.memory_messages, "Memory")
         )
         object.__setattr__(self, "skill_messages", _optional_messages(self.skill_messages, "Skill"))
+        if self.current_input_sequence is not None and (
+            type(self.current_input_sequence) is not int or self.current_input_sequence < 1
+        ):
+            raise ValueError("Current input transcript sequence is invalid")
+        sequence_range = self.open_tool_sequence_range
+        if sequence_range is not None and (
+            type(sequence_range) is not tuple
+            or len(sequence_range) != 2
+            or any(type(value) is not int for value in sequence_range)
+            or not 1 <= sequence_range[0] <= sequence_range[1]
+            or not open_messages
+        ):
+            raise ValueError("Open tool transcript range is invalid")
+        if sequence_range is not None:
+            object.__setattr__(self, "open_tool_sequence_range", tuple(sequence_range))
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,6 +447,7 @@ class SummaryCompactionRequest:
     profile_id: ProfileId
     policy_version: str
     interactions: tuple[ConversationInteraction, ...]
+    prior_checkpoint: ConversationSummaryCheckpoint | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -460,6 +478,15 @@ class SummaryCompactionRequest:
         object.__setattr__(self, "profile_id", ProfileId(self.profile_id.value))
         object.__setattr__(self, "policy_version", _policy(self.policy_version))
         object.__setattr__(self, "interactions", ordered)
+        prior = snapshot_summary_checkpoint(
+            self.prior_checkpoint,
+            session_id=self.session_id,
+            profile_id=self.profile_id,
+            policy_version=self.policy_version,
+        )
+        if prior is not None and prior.covered_through_sequence >= ordered[0].sequence_from:
+            raise ValueError("Prior summary must precede new interactions")
+        object.__setattr__(self, "prior_checkpoint", prior)
 
 
 class ConversationReader(Protocol):
