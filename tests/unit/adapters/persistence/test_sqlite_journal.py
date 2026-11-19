@@ -1684,6 +1684,7 @@ def test_commit_preflights_existing_session_ledger_before_any_write(
         with_records=with_records,
     )
     with sqlite3.connect(journal.path) as connection:
+        connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
         if corruption == "delete-event-anchor":
             connection.execute(
                 "DELETE FROM journal_entries WHERE session_id=? AND sequence=1",
@@ -1913,3 +1914,63 @@ def test_codec_structural_attacks_map_to_stable_journal_failure(
     with pytest.raises(JournalError) as caught:
         asyncio.run(journal.load_head(batch.state.session_id))
     assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+
+
+def test_receipt_validation_failure_rolls_back_before_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = make_journal(tmp_path)
+    batch = acceptance("receipt-before-commit")
+    real_decode = sqlite_module.decode
+
+    def reject_receipt(payload, expected_type):
+        if expected_type is JournalSnapshot:
+            raise ValueError("injected receipt validation failure")
+        return real_decode(payload, expected_type)
+
+    monkeypatch.setattr(sqlite_module, "decode", reject_receipt)
+    with pytest.raises(JournalError) as caught:
+        asyncio.run(journal.commit(batch, 0))
+
+    assert caught.value.failure.code is RunErrorCode.INVARIANT_VIOLATION
+    with sqlite3.connect(journal.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM sessions").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM submissions").fetchone() == (0,)
+
+
+def test_busy_writer_maps_to_retryable_journal_conflict(tmp_path: Path) -> None:
+    path = (tmp_path / "busy.sqlite3").resolve()
+    journal = SQLiteRunJournal(path, timeout_seconds=0.01)
+    blocker = sqlite3.connect(path)
+    try:
+        blocker.execute("BEGIN IMMEDIATE")
+        with pytest.raises(JournalError) as caught:
+            asyncio.run(journal.commit(acceptance("busy"), 0))
+        assert caught.value.failure.code is RunErrorCode.JOURNAL_CONFLICT
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+
+def test_commit_and_submission_lookup_do_not_replay_full_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = make_journal(tmp_path)
+    first = acceptance("bounded-hot-path")
+    receipt = asyncio.run(journal.commit(first, 0))
+
+    def forbid_full_replay(*_args, **_kwargs):
+        raise AssertionError("hot path replayed the complete ledger")
+
+    monkeypatch.setattr(sqlite_module, "_preflight_existing_ledger", forbid_full_replay)
+    assert asyncio.run(
+        journal.find_submission(first.state.session_id, first.state.submission_id)
+    ) is not None
+    next_batch = _new_commit_after(
+        receipt.state,
+        version=receipt.version,
+        sequence=receipt.sequence,
+        with_records=True,
+    )
+    committed = asyncio.run(journal.commit(next_batch, receipt.version))
+    assert committed.version == receipt.version + 1

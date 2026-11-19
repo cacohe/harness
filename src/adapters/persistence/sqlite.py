@@ -207,6 +207,23 @@ WHEN harness_journal_append_allowed() != 1
 BEGIN
   SELECT RAISE(ABORT, 'transcript entries require the commit append channel');
 END;
+CREATE TRIGGER events_insert_guard BEFORE INSERT ON events
+WHEN harness_journal_append_allowed() != 1
+BEGIN
+  SELECT RAISE(ABORT, 'events require the commit append channel');
+END;
+CREATE TRIGGER events_update_violation AFTER UPDATE ON events
+BEGIN
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason)
+  VALUES (OLD.session_id, 'events updated');
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason)
+  VALUES (NEW.session_id, 'events updated');
+END;
+CREATE TRIGGER events_delete_violation AFTER DELETE ON events
+BEGIN
+  INSERT OR IGNORE INTO integrity_violations(session_id, reason)
+  VALUES (OLD.session_id, 'events deleted');
+END;
 CREATE TRIGGER journal_entries_update_violation AFTER UPDATE ON journal_entries
 BEGIN
   INSERT OR IGNORE INTO integrity_violations(session_id, reason)
@@ -886,6 +903,8 @@ class SQLiteRunJournal:
             except Exception:
                 pass
             raise
+        except sqlite3.OperationalError as error:
+            raise JournalError(_sqlite_operational_error_code(error)) from None
 
     def _initialize(self) -> None:
         connection = sqlite3.connect(self.path, timeout=self.timeout_seconds)
@@ -936,7 +955,7 @@ class SQLiteRunJournal:
             connection.execute("BEGIN IMMEDIATE")
             state = batch.state
             session_key = state.session_id.value
-            row, _current = _preflight_existing_ledger(connection, session_key)
+            row, _current = _read_verified_ledger_head(connection, session_key)
             # This capability exists only on this private commit connection. It is
             # neither persistent SQL state nor shared with concurrent readers/writers.
             connection.create_function("harness_journal_append_allowed", 0, lambda: 1)
@@ -1252,6 +1271,8 @@ class SQLiteRunJournal:
                 batch.submission,
                 batch.artifact_facts,
             )
+            encoded_receipt = encode(receipt)
+            result = decode(encoded_receipt, JournalSnapshot)
             if batch.summary is not None:
                 summary = batch.summary
                 summary_json = encode(summary)
@@ -1324,7 +1345,7 @@ class SQLiteRunJournal:
                         state.run_id.value,
                         batch.submission.digest,
                         intent_json,
-                        encode(receipt),
+                        encoded_receipt,
                         state_json,
                         persisted_version,
                     ),
@@ -1332,7 +1353,7 @@ class SQLiteRunJournal:
             if cancelled.is_set():
                 raise asyncio.CancelledError
             connection.commit()
-            return decode(encode(receipt), JournalSnapshot)
+            return result
         except asyncio.CancelledError:
             connection.rollback()
             raise
@@ -1342,6 +1363,9 @@ class SQLiteRunJournal:
         except sqlite3.IntegrityError:
             connection.rollback()
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
+        except sqlite3.OperationalError as error:
+            connection.rollback()
+            raise JournalError(_sqlite_operational_error_code(error)) from None
         except (
             sqlite3.Error,
             ValueError,
@@ -1668,7 +1692,7 @@ class SQLiteRunJournal:
         connection = self._connect()
         try:
             connection.execute("BEGIN")
-            _preflight_existing_ledger(connection, session_key)
+            _read_verified_ledger_head(connection, session_key)
             row = connection.execute(
                 "SELECT session_id, submission_id, run_id, digest, intent_json, receipt_json, "
                 "acceptance_state_json, acceptance_version FROM submissions "
@@ -1678,6 +1702,7 @@ class SQLiteRunJournal:
             if row is None:
                 return None
             receipt, state, version = _decode_submission_row(row, session_key, submission_key)
+            _verify_receipt_records(connection, session_key, receipt)
             assert receipt.submission is not None
             return SubmissionAcceptance(receipt.submission, state, version)
         except (sqlite3.Error, ValueError, TypeError, KeyError, MemoryError, RecursionError):
@@ -3119,6 +3144,90 @@ def _reject_integrity_violation(connection: sqlite3.Connection, session_key: str
         (session_key,),
     ).fetchone()[0]:
         raise ValueError("SQLite immutable journal history was modified")
+
+
+def _sqlite_operational_error_code(error: sqlite3.OperationalError) -> RunErrorCode:
+    code = getattr(error, "sqlite_errorcode", None)
+    primary = code & 0xFF if type(code) is int else None
+    if primary in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+        return RunErrorCode.JOURNAL_CONFLICT
+    return RunErrorCode.INVARIANT_VIOLATION
+
+
+def _read_verified_ledger_head(
+    connection: sqlite3.Connection, session_key: str
+) -> tuple[sqlite3.Row | None, RunState | None]:
+    """Authenticate the mutable head with indexed, history-independent reads."""
+
+    row = connection.execute(
+        "SELECT session_id, version, sequence, state_json, ledger_hash, coverage_hash, "
+        "transcript_count, summary_hash, summary_count, session_state_hash, "
+        "run_projection_hash, run_count, authenticated_root "
+        "FROM sessions WHERE session_id = ?",
+        (session_key,),
+    ).fetchone()
+    _reject_integrity_violation(connection, session_key)
+    if row is None:
+        dangling = any(
+            connection.execute(
+                f"SELECT EXISTS(SELECT 1 FROM {table} WHERE session_id=? LIMIT 1)",
+                (session_key,),
+            ).fetchone()[0]
+            for table in ("journal_entries", "events", "transcript", "submissions")
+        )
+        if dangling:
+            raise ValueError("SQLite ledger has records without a Session")
+        return None, None
+
+    state = decode(row["state_json"], RunState)
+    _verify_authenticated_root(row, session_key)
+    _, sequence = _validate_session_row(row, session_key, state)
+    current_run_row = connection.execute(
+        "SELECT session_id, run_id, submission_id, profile_id, status, state_version, "
+        "run_index, state_hash, state_json FROM runs "
+        "WHERE session_id = ? AND run_id = ?",
+        (session_key, state.run_id.value),
+    ).fetchone()
+    if current_run_row is None or decode(current_run_row["state_json"], RunState) != state:
+        raise ValueError("SQLite Session head disagrees with its Run projection")
+    _validate_run_row(current_run_row, state)
+    if validate_hash(row["session_state_hash"]) != validate_hash(current_run_row["state_hash"]):
+        raise ValueError("SQLite Session state hash disagrees with current Run")
+    _verify_run_projection_path(
+        connection,
+        session_key,
+        current_run_row["run_index"],
+        current_run_row["state_hash"],
+        row["run_projection_hash"],
+    )
+    _verify_ledger_tail(connection, session_key, sequence, row["ledger_hash"])
+    return row, state
+
+
+def _verify_receipt_records(
+    connection: sqlite3.Connection, session_key: str, receipt: JournalSnapshot
+) -> None:
+    """Authenticate only the bounded records named by one acceptance receipt."""
+
+    for expected_event in receipt.events:
+        physical = connection.execute(
+            "SELECT event_id, session_id, sequence, run_id, event_json FROM events "
+            "WHERE session_id = ? AND sequence = ?",
+            (session_key, expected_event.sequence),
+        ).fetchone()
+        if physical is None or _decode_event_row(physical, session_key) != expected_event:
+            raise ValueError("SQLite acceptance Event disagrees with physical history")
+        _verify_point_anchor(connection, session_key, expected_event.sequence)
+    for expected_entry in receipt.transcript:
+        physical = connection.execute(
+            "SELECT session_id, sequence, run_id, submission_id, role, content, "
+            "entry_type, format_version, entry_json FROM transcript "
+            "WHERE session_id = ? AND sequence = ?",
+            (session_key, expected_entry.sequence),
+        ).fetchone()
+        if physical is None or _decode_transcript_row(physical, session_key) != expected_entry:
+            raise ValueError("SQLite acceptance transcript disagrees with physical history")
+        _verify_point_anchor(connection, session_key, expected_entry.sequence)
 
 
 def _preflight_existing_ledger(
