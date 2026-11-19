@@ -6,8 +6,8 @@ from collections.abc import AsyncIterator
 
 from src.adapters.tools.catalog import ToolCatalogEntry
 from src.core.artifacts import (
-    MAX_ARTIFACT_SIZE_BYTES,
     ArtifactRepository,
+    MAX_ARTIFACT_SIZE_BYTES,
     snapshot_artifact_ref,
     validate_artifact_id,
 )

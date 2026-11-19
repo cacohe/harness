@@ -3,12 +3,11 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Protocol
 
-from src.core.artifacts import ArtifactRef
+from src.core.context_support import context_policy as _policy
+from src.core.context_support import optional_system_messages as _optional_messages
 from src.core.context_support import (
-    context_policy as _policy,
-    optional_system_messages as _optional_messages,
     snapshot_summary_checkpoint,
-    summary_system_messages,
+    summary_system_messages as summary_system_messages,
 )
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.ids import ProfileId, SessionId

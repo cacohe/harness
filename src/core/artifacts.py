@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 import re
-from hashlib import sha256 as _sha256
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from dataclasses import dataclass, field, fields
+from hashlib import sha256 as _sha256
 from io import StringIO
 from typing import NoReturn, Protocol, TypeAlias, TypeVar, cast
 

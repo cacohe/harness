@@ -36,7 +36,6 @@ from src.core.journal import (
 )
 from src.core.model import (
     ModelGateway,
-    ModelMessage,
     ModelRequest,
     snapshot_model_response,
 )
