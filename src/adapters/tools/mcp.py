@@ -299,7 +299,8 @@ class MCPToolGateway(LocalToolGateway):
                 or type(schema) is not dict
             ):
                 raise ValueError("MCP tool descriptor is invalid")
-            public_name = f"{name}.{remote_name}"
+            validated_remote_name: str = remote_name
+            public_name = f"{name}.{validated_remote_name}"
             annotations = _value(descriptor, "annotations", {})
             mutating = True
             if type(annotations) is dict and annotations.get("readOnlyHint") is True:
@@ -319,7 +320,7 @@ class MCPToolGateway(LocalToolGateway):
                 *,
                 server_name: str = name,
                 expected_generation: str = generation,
-                tool_name: str = remote_name,
+                tool_name: str = validated_remote_name,
             ) -> object:
                 return await self._call(server_name, expected_generation, tool_name, arguments)
 
