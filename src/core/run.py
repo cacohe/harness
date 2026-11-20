@@ -296,6 +296,9 @@ class RunCoordinator:
     async def _execute(
         self, driver: _Driver, call: ToolCallState
     ) -> ExternalizedContent | RunFailure:
+        if not call.request.available:
+            driver.checkpoint = None
+            return RunFailure(RunErrorCode.TOOL_FAILED)
         approval = ToolApproval.NOT_REQUIRED
         if call.approval is not None:
             if call.approval.approved is False:

@@ -57,7 +57,18 @@ def model_tool_requests(
     for call in response.tool_calls:
         spec = catalog.get(call.name)
         if spec is None:
-            raise ValueError
+            requests.append(
+                ToolCallRequest(
+                    call.tool_call_id,
+                    call.name,
+                    call.arguments_json,
+                    requires_approval=False,
+                    approval_scope="unavailable",
+                    workspace_id="unavailable",
+                    available=False,
+                )
+            )
+            continue
         requests.append(
             ToolCallRequest(
                 call.tool_call_id,

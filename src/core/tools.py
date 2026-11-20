@@ -102,6 +102,8 @@ class ToolRequest:
     ) -> "ToolRequest":
         """Carry the persisted call and its original approval binding into execution."""
         call = snapshot_tool_call(call)
+        if not call.available:
+            raise ValueError("Unavailable tool calls cannot be executed")
         return cls(
             tool_call_id=call.tool_call_id,
             name=call.name,

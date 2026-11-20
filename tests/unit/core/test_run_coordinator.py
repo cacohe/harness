@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections import deque
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -645,6 +646,50 @@ def test_ordered_tool_batch_pauses_and_resumes_without_replaying_side_effects():
         "workspace",
     )
     assert len(journal.batches) == 4
+
+
+def test_unknown_tool_fails_only_its_call_and_known_tool_still_runs():
+    response = ModelResponse(
+        tool_calls=(
+            ModelToolCall("unknown-call", "missing", "{}"),
+            ModelToolCall("known-call", "read", "{}"),
+        )
+    )
+    success = ToolResult(
+        ToolResultStatus.SUCCESS,
+        inline_content=InlineContent({"value": 1}, "application/json"),
+    )
+    coordinator_, calls, journal, tools, _ = coordinator(
+        responses=[response, ModelResponse("recovered")],
+        specs=(ToolSpec("read", "read", "{}"),),
+        tool_results=[success],
+    )
+
+    durable = run(coordinator_.advance(initial(), submit())).state
+    assert durable.status is RunStatus.RUNNING
+
+    after_tools = run(
+        coordinator_.advance(durable, AdvanceRun(RUN, SESSION, context=command_context("tools")))
+    ).state
+    assert after_tools.status is RunStatus.RUNNING
+    assert [request.name for request in tools.requests] == ["read"]
+    entries = {
+        json.loads(entry.content)["tool_call_id"]: json.loads(entry.content)
+        for entry in journal.batches[-1][0].transcript
+        if entry.role == "tool"
+    }
+    assert entries["unknown-call"]["error"] == "tool_failed"
+    assert entries["known-call"]["result"] == {"value": 1}
+
+    completed = run(
+        coordinator_.advance(
+            after_tools,
+            AdvanceRun(RUN, SESSION, context=command_context("recovery-model")),
+        )
+    ).state
+    assert completed.status is RunStatus.COMPLETED
+    assert completed.final_text == "recovered"
+    assert calls.count("model") == 2
 
 
 def test_model_tool_batch_is_committed_before_any_tool_gateway_call():
