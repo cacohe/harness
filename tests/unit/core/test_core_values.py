@@ -113,11 +113,21 @@ def test_failure_serializes_only_stable_public_details():
     assert json.loads(json.dumps(asdict(failure))) == {
         "code": "model_failed",
         "message": "Model request failed.",
+        "detail": None,
     }
     with pytest.raises(FrozenInstanceError):
         failure.message = "changed"
     with pytest.raises(ValueError):
         RunFailure(RuntimeError("adapter secret"))
+
+
+def test_failure_detail_is_optional_and_utf8_bounded():
+    detail = "界" * 100
+    assert RunFailure(RunErrorCode.TOOL_FAILED, detail).detail == detail
+    with pytest.raises(ValueError):
+        RunFailure(RunErrorCode.TOOL_FAILED, "x" * 65_537)
+    with pytest.raises(ValueError):
+        RunFailure(RunErrorCode.TOOL_FAILED, "\ud800")
 
 
 def _event(payload, *, timestamp=datetime(2026, 11, 17, tzinfo=timezone.utc)):

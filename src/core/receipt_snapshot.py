@@ -311,7 +311,10 @@ def _snapshot_artifact(value: object) -> ArtifactRef:
 def _snapshot_failure(value: object) -> RunFailure:
     _require_type(value, RunFailure)
     message = _exact_text(_raw(value, "message"))
-    result = RunFailure(_snapshot_error_code(_raw(value, "code")))
+    result = RunFailure(
+        _snapshot_error_code(_raw(value, "code")),
+        _optional_text(_raw(value, "detail")),
+    )
     if result.message != message:
         raise ValueError
     return result

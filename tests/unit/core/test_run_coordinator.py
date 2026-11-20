@@ -1188,3 +1188,23 @@ def test_tool_failures_use_stable_classification(status, code):
         coordinator_.advance(durable, AdvanceRun(RUN, SESSION, context=command_context("tools")))
     ).state
     assert state.current_step is None
+
+
+def test_reported_tool_failure_detail_is_written_to_transcript():
+    response = ModelResponse(tool_calls=(ModelToolCall("call", "read", "{}"),))
+    result = ToolResult(
+        ToolResultStatus.FAILED,
+        failure=RunFailure(RunErrorCode.TOOL_FAILED, '{"message":"remote failed"}'),
+    )
+    coordinator_, _, journal, _, _ = coordinator(
+        responses=[response], specs=(ToolSpec("read", "read", "{}"),), tool_results=[result]
+    )
+    durable = run(coordinator_.advance(initial(), submit())).state
+    run(coordinator_.advance(durable, AdvanceRun(RUN, SESSION, context=command_context("tools"))))
+
+    payload = json.loads(journal.batches[-1][0].transcript[-1].content)
+    assert payload == {
+        "tool_call_id": "call",
+        "error": "tool_failed",
+        "detail": '{"message":"remote failed"}',
+    }

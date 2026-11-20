@@ -13,6 +13,15 @@ from src.core.errors import RunErrorCode, RunFailure
 from src.core.tools import ToolApproval, ToolRequest, ToolResult, ToolResultStatus
 
 
+class ToolReportedError(RuntimeError):
+    """An adapter-owned failure detail explicitly safe to return to the model."""
+
+    def __init__(self, detail: str) -> None:
+        failure = RunFailure(RunErrorCode.TOOL_FAILED, detail)
+        self.detail = failure.detail
+        super().__init__(failure.message)
+
+
 class LocalToolGateway:
     """Validated local dispatch with durable claim-before-effect semantics."""
 
@@ -113,6 +122,12 @@ class LocalToolGateway:
             )
         except asyncio.CancelledError:
             raise
+        except ToolReportedError as error:
+            return ToolResult(
+                ToolResultStatus.FAILED,
+                failure=RunFailure(RunErrorCode.TOOL_FAILED, error.detail),
+                execution_key=request.idempotency_key,
+            )
         except Exception:
             return ToolResult(
                 ToolResultStatus.FAILED,

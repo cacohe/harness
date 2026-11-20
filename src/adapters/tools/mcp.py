@@ -13,8 +13,9 @@ from typing import Callable
 
 from src.adapters.tools.catalog import ToolCatalog, ToolCatalogEntry
 from src.adapters.tools.execution_store import ToolExecutionStore
-from src.adapters.tools.local import LocalToolGateway
+from src.adapters.tools.local import LocalToolGateway, ToolReportedError
 from src.core.artifacts import ArtifactExternalizer
+from src.core.errors import MAX_FAILURE_DETAIL_BYTES
 from src.core.tools import ToolSpec
 
 _MAX_SYNC_CALLS_PER_GATEWAY = 4
@@ -358,8 +359,7 @@ class MCPToolGateway(LocalToolGateway):
         result = await invocation.wait(self._sync_timeout)
         normalized = _normalize_tool_result(result)
         if _value(result, "isError", _value(result, "is_error", False)) is True:
-            detail = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
-            raise RuntimeError(f"MCP tool returned an error result: {detail}")
+            raise ToolReportedError(_bounded_error_detail(normalized))
         return normalized
 
     @staticmethod
@@ -725,6 +725,16 @@ def _normalize_tool_result(result: object) -> object:
         "structuredContent": _json_value(structured),
         "isError": is_error,
     }
+
+
+def _bounded_error_detail(value: object) -> str:
+    detail = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    encoded = detail.encode("utf-8")
+    if len(encoded) <= MAX_FAILURE_DETAIL_BYTES:
+        return detail
+    marker = "…"
+    limit = MAX_FAILURE_DETAIL_BYTES - len(marker.encode("utf-8"))
+    return encoded[:limit].decode("utf-8", errors="ignore") + marker
 
 
 def _json_value(value: object, depth: int = 0) -> object:

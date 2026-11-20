@@ -298,7 +298,7 @@ def _advance_running(
                     raise InvalidTransition from None
             elif type(command.result) is RunFailure:
                 try:
-                    result = RunFailure(command.result.code)
+                    result = RunFailure(command.result.code, command.result.detail)
                 except ValueError:
                     raise InvalidTransition from None
             else:

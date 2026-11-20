@@ -1880,6 +1880,27 @@ def test_mcp_error_result_maps_to_failed_tool_result() -> None:
         await gateway.add_server("server", object())
         result = await gateway.execute(_request(gateway))
         assert result.status is ToolResultStatus.FAILED
+        assert result.failure is not None
+        assert result.failure.detail is not None
+        assert "failed" in result.failure.detail
+        await gateway.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_mcp_error_result_detail_is_bounded() -> None:
+    class ErrorResult(Client):
+        async def call_tool(self, name, arguments):
+            return {"isError": True, "content": [{"type": "text", "text": "x" * 100_000}]}
+
+    async def scenario():
+        gateway = _gateway(ErrorResult())
+        await gateway.add_server("server", object())
+        result = await gateway.execute(_request(gateway))
+        assert result.failure is not None and result.failure.detail is not None
+        assert len(result.failure.detail.encode("utf-8")) <= 65_536
+        assert result.failure.detail.startswith('{"content"')
+        assert result.failure.detail.endswith("…")
         await gateway.aclose()
 
     asyncio.run(scenario())
