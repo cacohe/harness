@@ -1,0 +1,673 @@
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import pytest
+from src.core.commands import RunLimits
+from src.core.context import ContextBudget
+from src.core.ids import ProfileId, SessionId, SubmissionId
+
+from .test_runtime_v3 import (
+    Clock,
+    CompletingCoordinator,
+    Ids,
+    Journal,
+    Submissions,
+    async_test,
+)
+
+
+@async_test
+async def test_agent_exposes_only_async_first_session_and_submit_surface():
+    from src.application.agent import Agent
+    from src.application.runtime import RuntimeCoordinator
+
+    journal = Journal()
+    runtime = RuntimeCoordinator(
+        submissions=Submissions(journal),
+        journal=journal,
+        coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, []),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=3,
+        max_waiters_per_session=1,
+    )
+    agent = Agent(runtime, Ids(), ProfileId("profile"))
+    session = await agent.open_session(SessionId("session"))
+    result = await session.submit("hello", SubmissionId("submission"))
+    assert result.status.value == "completed"
+    assert not hasattr(agent, "chat")
+    assert not hasattr(agent, "achat")
+    await agent.close()
+
+
+def test_application_config_is_immutable_strict_and_requires_absolute_production_paths(tmp_path):
+    from src.application.composition import ApplicationConfig
+
+    config = ApplicationConfig(
+        max_sessions=4,
+        max_waiters_per_session=2,
+        max_advances_per_operation=65,
+        sqlite_path=tmp_path / "journal.sqlite3",
+        artifact_root=tmp_path / "artifacts",
+    )
+    assert config.sqlite_path.is_absolute()
+    with pytest.raises(Exception):
+        config.max_sessions = 8  # type: ignore[misc]
+    with pytest.raises(ValueError):
+        ApplicationConfig(max_sessions=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        ApplicationConfig(sqlite_path=Path("relative.sqlite3"))
+
+    class PathSubclass(type(tmp_path)):
+        pass
+
+    with pytest.raises(ValueError):
+        ApplicationConfig(sqlite_path=PathSubclass(str(tmp_path / "subclass.sqlite3")))
+    with pytest.raises(ValueError, match="configuration limits"):
+        ApplicationConfig(
+            max_artifact_bytes=32,
+            max_inline_artifact_bytes=33,
+        )
+    with pytest.raises(ValueError, match="configuration limits"):
+        ApplicationConfig(
+            limits=RunLimits(17, 30.0, 1_024),
+            max_advances_per_operation=34,
+        )
+    assert (
+        ApplicationConfig(
+            limits=RunLimits(17, 30.0, 1_024),
+            max_advances_per_operation=35,
+        ).max_advances_per_operation
+        == 35
+    )
+    with pytest.raises(ValueError, match="configuration limits"):
+        ApplicationConfig(max_inline_artifact_bytes=0)
+
+
+def test_production_composition_requires_explicit_durable_adapter_paths(tmp_path):
+    from src.adapters.artifacts.memory import InMemoryArtifactRepository
+    from src.adapters.persistence.memory import InMemoryRunJournal
+    from src.application.composition import ApplicationConfig, create_production_agent
+
+    dependencies = _valid_composition_dependencies()
+    with pytest.raises(ValueError, match="SQLite path"):
+        asyncio.run(
+            create_production_agent(ApplicationConfig(), **dependencies)  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="Artifact root"):
+        asyncio.run(
+            create_production_agent(
+                ApplicationConfig(),
+                journal=InMemoryRunJournal(),
+                artifact_repository=InMemoryArtifactRepository(1_048_576),
+                **dependencies,
+            )
+        )
+    sqlite_path = tmp_path / "must-not-exist.sqlite3"
+    artifact_root = tmp_path / "must-not-exist"
+    with pytest.raises(ValueError, match="Composition inputs"):
+        asyncio.run(
+            create_production_agent(
+                ApplicationConfig(sqlite_path=sqlite_path, artifact_root=artifact_root),
+                **{**dependencies, "profile_id": object()},  # type: ignore[arg-type]
+            )
+        )
+    assert not sqlite_path.exists()
+    assert not artifact_root.exists()
+
+
+def test_application_exports_do_not_reexport_legacy_harness_surface():
+    import src.application as application
+
+    assert application.Agent.__module__ == "src.application.agent"
+    assert not hasattr(application, "Harness")
+    assert not hasattr(application.Agent, "from_config")
+
+
+@pytest.mark.parametrize(
+    "invalid_name",
+    [
+        "model",
+        "tools",
+        "context",
+        "context_counter",
+        "context_request_factory",
+        "ids",
+        "clock",
+        "journal",
+        "artifacts",
+    ],
+)
+def test_composition_rejects_invalid_ports_before_filesystem_side_effects(tmp_path, invalid_name):
+    from src.application.composition import ApplicationConfig, create_production_agent
+
+    class Model:
+        async def complete(self, _request):
+            raise NotImplementedError
+
+    class Tools:
+        async def execute(self, _request):
+            raise NotImplementedError
+
+    class Context:
+        async def build(self, _request, _budget):
+            raise NotImplementedError
+
+    class Counter:
+        def count(self, _messages, _tools):
+            raise NotImplementedError
+
+    class RequestFactory:
+        def __call__(self, _state, _message):
+            raise NotImplementedError
+
+    class PortJournal:
+        async def commit(self, *_args):
+            raise NotImplementedError
+
+        async def load_head(self, *_args):
+            raise NotImplementedError
+
+        async def load_session(self, *_args):
+            raise NotImplementedError
+
+        async def find_submission(self, *_args):
+            raise NotImplementedError
+
+        async def find_run_input(self, *_args):
+            raise NotImplementedError
+
+    class Artifacts:
+        async def externalize(self, *_args):
+            raise NotImplementedError
+
+    sqlite_path = tmp_path / invalid_name / "journal.sqlite3"
+    artifact_root = tmp_path / invalid_name / "artifacts"
+    dependencies = {
+        "model": Model(),
+        "tools": Tools(),
+        "context": Context(),
+        "context_counter": Counter(),
+        "context_request_factory": RequestFactory(),
+        "ids": Ids(),
+        "clock": Clock(),
+        "profile_id": ProfileId("profile"),
+        "journal": PortJournal(),
+        "artifacts": Artifacts(),
+    }
+    dependencies[invalid_name] = object()
+
+    with pytest.raises(ValueError, match="Composition"):
+        asyncio.run(
+            create_production_agent(
+                ApplicationConfig(sqlite_path=sqlite_path, artifact_root=artifact_root),
+                **dependencies,  # type: ignore[arg-type]
+            )
+        )
+
+    assert not sqlite_path.exists()
+    assert not artifact_root.exists()
+
+
+def test_composition_validation_does_not_execute_malicious_descriptors(tmp_path):
+    from src.application.composition import ApplicationConfig, create_production_agent
+
+    class HostileModel:
+        @property
+        def complete(self):
+            raise AssertionError("descriptor executed")
+
+    with pytest.raises(ValueError, match="Composition"):
+        asyncio.run(
+            create_production_agent(
+                ApplicationConfig(
+                    sqlite_path=tmp_path / "journal.sqlite3",
+                    artifact_root=tmp_path / "artifacts",
+                ),
+                model=HostileModel(),  # type: ignore[arg-type]
+                tools=object(),  # type: ignore[arg-type]
+                context=object(),  # type: ignore[arg-type]
+                context_counter=object(),  # type: ignore[arg-type]
+                context_request_factory=object(),  # type: ignore[arg-type]
+                ids=Ids(),
+                clock=Clock(),
+                profile_id=ProfileId("profile"),
+            )
+        )
+
+
+def test_partial_production_construction_closes_created_resources(monkeypatch, tmp_path):
+    import src.application.composition as composition
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        closed: list[tuple[str, object]] = []
+
+        class JournalPort(_JournalPort):
+            def __init__(self, _path):
+                assert asyncio.get_running_loop() is loop
+
+            async def aclose(self):
+                closed.append(("journal", asyncio.get_running_loop()))
+
+        class FailingRepository:
+            def __init__(self, *_args):
+                assert asyncio.get_running_loop() is loop
+                raise RuntimeError("repository failed")
+
+        monkeypatch.setattr(composition, "SQLiteRunJournal", JournalPort)
+        monkeypatch.setattr(composition, "FilesystemArtifactRepository", FailingRepository)
+        with pytest.raises(RuntimeError, match="repository failed"):
+            await composition.create_production_agent(
+                _production_config(composition, tmp_path),
+                **_valid_composition_dependencies(),
+            )
+        assert closed == [("journal", loop)]
+
+    asyncio.run(scenario())
+
+
+def test_third_resource_failure_closes_prior_resources_in_reverse_order(monkeypatch, tmp_path):
+    import src.application.composition as composition
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        closed: list[tuple[str, object]] = []
+
+        class JournalPort(_JournalPort):
+            def __init__(self, _path):
+                pass
+
+            async def aclose(self):
+                closed.append(("journal", asyncio.get_running_loop()))
+
+        class Repository:
+            def __init__(self, *_args):
+                pass
+
+            async def stat(self, _artifact_id):
+                return None
+
+            async def open(self, _artifact_id):
+                if False:
+                    yield b""
+
+            async def delete(self, _artifact_id):
+                return None
+
+            async def collect_orphans(self, _references, _cutoff):
+                return 0
+
+            async def aclose(self):
+                closed.append(("repository", asyncio.get_running_loop()))
+
+        class FailingExternalizer:
+            def __init__(self, *_args):
+                raise RuntimeError("externalizer failed")
+
+        monkeypatch.setattr(composition, "SQLiteRunJournal", JournalPort)
+        monkeypatch.setattr(composition, "FilesystemArtifactRepository", Repository)
+        monkeypatch.setattr(composition, "PolicyArtifactExternalizer", FailingExternalizer)
+        with pytest.raises(RuntimeError, match="externalizer failed"):
+            await composition.create_production_agent(
+                _production_config(composition, tmp_path),
+                **_valid_composition_dependencies(),
+            )
+        assert closed == [("repository", loop), ("journal", loop)]
+
+    asyncio.run(scenario())
+
+
+def test_cleanup_failures_are_grouped_without_hiding_construction_error(monkeypatch, tmp_path):
+    import src.application.composition as composition
+
+    async def scenario():
+        class JournalPort(_JournalPort):
+            def __init__(self, _path):
+                pass
+
+            async def aclose(self):
+                raise LookupError("journal cleanup")
+
+        class Repository:
+            def __init__(self, *_args):
+                pass
+
+            async def aclose(self):
+                raise OSError("repository cleanup")
+
+        class FailingExternalizer:
+            def __init__(self, *_args):
+                raise RuntimeError("construction failed")
+
+        monkeypatch.setattr(composition, "SQLiteRunJournal", JournalPort)
+        monkeypatch.setattr(composition, "FilesystemArtifactRepository", Repository)
+        monkeypatch.setattr(composition, "PolicyArtifactExternalizer", FailingExternalizer)
+        with pytest.raises(RuntimeError, match="construction failed") as caught:
+            await composition.create_production_agent(
+                _production_config(composition, tmp_path),
+                **_valid_composition_dependencies(),
+            )
+        cause = caught.value.__cause__
+        assert isinstance(cause, BaseExceptionGroup)
+        assert [str(error) for error in cause.exceptions] == [
+            "repository cleanup",
+            "journal cleanup",
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_factory_cancellation_waits_for_same_loop_cleanup(monkeypatch, tmp_path):
+    import src.application.composition as composition
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        finished = asyncio.Event()
+
+        class JournalPort(_JournalPort):
+            def __init__(self, _path):
+                pass
+
+            async def aclose(self):
+                assert asyncio.get_running_loop() is loop
+                entered.set()
+                await release.wait()
+                finished.set()
+
+        class FailingRepository:
+            def __init__(self, *_args):
+                raise RuntimeError("repository failed")
+
+        monkeypatch.setattr(composition, "SQLiteRunJournal", JournalPort)
+        monkeypatch.setattr(composition, "FilesystemArtifactRepository", FailingRepository)
+        task = asyncio.create_task(
+            composition.create_production_agent(
+                _production_config(composition, tmp_path),
+                **_valid_composition_dependencies(),
+            )
+        )
+        await entered.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not finished.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert finished.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_successful_production_composition_owns_created_resources(monkeypatch, tmp_path):
+    import src.application.composition as composition
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        closed: list[tuple[str, object]] = []
+
+        class JournalPort(_JournalPort):
+            def __init__(self, _path):
+                pass
+
+            async def aclose(self):
+                closed.append(("journal", asyncio.get_running_loop()))
+
+        class Repository:
+            def __init__(self, *_args):
+                pass
+
+            async def stat(self, _artifact_id):
+                return None
+
+            async def open(self, _artifact_id):
+                if False:
+                    yield b""
+
+            async def delete(self, _artifact_id):
+                return None
+
+            async def collect_orphans(self, _references, _cutoff):
+                return 0
+
+            async def aclose(self):
+                closed.append(("repository", asyncio.get_running_loop()))
+
+        class Externalizer(_ExternalizerPort):
+            def __init__(self, _repository, _policy):
+                pass
+
+            async def aclose(self):
+                closed.append(("externalizer", asyncio.get_running_loop()))
+
+        dependencies = _valid_composition_dependencies()
+        caller_model = dependencies["model"]
+
+        async def caller_close():
+            closed.append(("caller-model", asyncio.get_running_loop()))
+
+        caller_model.aclose = caller_close  # type: ignore[attr-defined]
+        monkeypatch.setattr(composition, "SQLiteRunJournal", JournalPort)
+        monkeypatch.setattr(composition, "FilesystemArtifactRepository", Repository)
+        monkeypatch.setattr(composition, "PolicyArtifactExternalizer", Externalizer)
+        agent = await composition.create_production_agent(
+            _production_config(composition, tmp_path),
+            **dependencies,
+        )
+        await agent.close()
+        await agent.close()
+        assert closed == [
+            ("externalizer", loop),
+            ("repository", loop),
+            ("journal", loop),
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_development_factory_leaves_injected_resources_caller_owned():
+    import src.application.composition as composition
+
+    async def scenario():
+        closed: list[str] = []
+
+        class JournalPort(_JournalPort):
+            async def aclose(self):
+                closed.append("journal")
+
+        class Externalizer(_ExternalizerPort):
+            async def aclose(self):
+                closed.append("artifacts")
+
+        agent = await composition.create_development_agent(
+            composition.ApplicationConfig(),
+            journal=JournalPort(),
+            artifacts=Externalizer(),
+            **_valid_composition_dependencies(),
+        )
+        await agent.close()
+        await agent.close()
+        assert closed == []
+
+    asyncio.run(scenario())
+
+
+def test_default_development_composition_exposes_artifacts_and_clamps_inline_policy():
+    from src.adapters.context.tokenizers import ExactTokenCounter
+    from src.application.composition import ApplicationConfig, create_development_agent
+    from src.core.commands import RunLimits
+    from src.core.context import ContextRequest, ContextWindow
+    from src.core.model import ModelMessage, ModelResponse, ModelRole
+    from src.core.state import RunStatus
+
+    class Model:
+        max_output_tokens = 16
+
+        async def complete(self, _request):
+            return ModelResponse("x" * 64)
+
+    class Tools:
+        async def execute(self, _request):
+            raise AssertionError("No tools are expected")
+
+    class Context:
+        async def build(self, request, budget):
+            messages = (request.system_message, request.current_input, *request.open_tool_messages)
+            estimate = ExactTokenCounter().count(messages, request.tools)
+            return ContextWindow(
+                messages,
+                request.tools,
+                estimate,
+                budget,
+                (),
+                request.policy_version,
+            )
+
+    def request_factory(state, message):
+        return ContextRequest(
+            state.session_id,
+            state.profile_id,
+            "development-artifacts-v1",
+            ModelMessage(ModelRole.SYSTEM, "system"),
+            ModelMessage(ModelRole.USER, message),
+        )
+
+    async def scenario():
+        agent = await create_development_agent(
+            ApplicationConfig(
+                limits=RunLimits(4, 30.0, 16),
+                context_budget=ContextBudget(1_024, 16, 16),
+            ),
+            model=Model(),
+            tools=Tools(),
+            context=Context(),
+            context_counter=ExactTokenCounter(),
+            context_request_factory=request_factory,
+            ids=Ids(),
+            clock=Clock(),
+            profile_id=ProfileId("profile"),
+        )
+        maintenance = agent.artifacts
+        session = await agent.open_session(SessionId("development-artifacts"))
+        result = await session.submit("hello", SubmissionId("development-artifacts"))
+        await agent.close()
+        return maintenance, result
+
+    maintenance, result = asyncio.run(scenario())
+    assert maintenance is not None
+    assert result.status is RunStatus.COMPLETED
+    assert result.final_artifacts
+    assert len(result.final_text.encode("utf-8")) <= 16
+
+
+def test_composition_rejects_model_output_limit_larger_than_reserved_context():
+    import src.application.composition as composition
+
+    dependencies = _valid_composition_dependencies()
+    dependencies["model"].max_output_tokens = 257
+    with pytest.raises(ValueError, match="reserved output"):
+        asyncio.run(
+            composition.create_development_agent(
+                composition.ApplicationConfig(context_budget=ContextBudget(1_024, 256, 16)),
+                **dependencies,
+            )
+        )
+
+
+def _valid_composition_dependencies():
+    class Model:
+        async def complete(self, _request):
+            raise NotImplementedError
+
+    class Tools:
+        async def execute(self, _request):
+            raise NotImplementedError
+
+    class Context:
+        async def build(self, _request, _budget):
+            raise NotImplementedError
+
+    class Counter:
+        def count(self, _messages, _tools):
+            raise NotImplementedError
+
+    class RequestFactory:
+        def __call__(self, _state, _message):
+            raise NotImplementedError
+
+    return {
+        "model": Model(),
+        "tools": Tools(),
+        "context": Context(),
+        "context_counter": Counter(),
+        "context_request_factory": RequestFactory(),
+        "ids": Ids(),
+        "clock": Clock(),
+        "profile_id": ProfileId("profile"),
+    }
+
+
+class _JournalPort:
+    async def commit(self, *_args):
+        raise NotImplementedError
+
+    async def load_head(self, *_args):
+        raise NotImplementedError
+
+    async def load_session(self, *_args):
+        raise NotImplementedError
+
+    async def load_context_summaries(self, *_args):
+        raise NotImplementedError
+
+    async def find_submission(self, *_args):
+        raise NotImplementedError
+
+    async def find_run_input(self, *_args):
+        raise NotImplementedError
+
+    async def read_page(self, *_args):
+        raise NotImplementedError
+
+    async def find_run_state(self, *_args):
+        raise NotImplementedError
+
+    async def find_run_state_by_id(self, *_args):
+        raise NotImplementedError
+
+    async def load_artifact_attachments(self, *_args):
+        raise NotImplementedError
+
+    async def artifact_has_active_attachments(self, *_args):
+        raise NotImplementedError
+
+    async def reserve_artifact_retirement(self, *_args):
+        raise NotImplementedError
+
+    async def complete_artifact_retirement(self, *_args):
+        raise NotImplementedError
+
+    async def abort_artifact_retirement(self, *_args):
+        raise NotImplementedError
+
+    async def load_artifact_facts(self, *_args):
+        raise NotImplementedError
+
+    async def load_referenced_artifact_ids(self, *_args):
+        return ()
+
+
+class _ExternalizerPort:
+    async def externalize(self, *_args):
+        raise NotImplementedError
+
+
+def _production_config(composition, tmp_path):
+    return composition.ApplicationConfig(
+        sqlite_path=tmp_path / "journal.sqlite3",
+        artifact_root=tmp_path / "artifacts",
+    )

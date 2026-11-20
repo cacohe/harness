@@ -1,82 +1,93 @@
 import ast
 import importlib.util
+import inspect
 import tomllib
 from pathlib import Path
 
 import pytest
+from src.application.agent import AgentSession
+from src.application.composition import create_development_agent, create_production_agent
+from src.core.journal import RunJournal
 
 ROOT = Path(__file__).resolve().parents[2]
-LEGACY_TOP_LEVEL_MODULES = {
-    "config",
+LEGACY_SOURCE_PATHS = (
     "context",
-    "core",
     "demo",
     "llm",
-    "logger",
     "mcp",
     "memory",
+    "observability",
+    "persistence",
+    "sandbox",
+    "schema",
+    "skill",
     "tool",
+    "utils",
+)
+EXPECTED_CORE_MODULES = {
+    "__init__.py",
+    "_run_driver.py",
+    "approval.py",
+    "artifact_validation.py",
+    "artifacts.py",
+    "commands.py",
+    "context.py",
+    "context_support.py",
+    "errors.py",
+    "events.py",
+    "ids.py",
+    "journal.py",
+    "json_values.py",
+    "model.py",
+    "receipt_snapshot.py",
+    "run.py",
+    "run_content.py",
+    "run_projection.py",
+    "run_receipt.py",
+    "state.py",
+    "state_validation.py",
+    "tools.py",
 }
-
-
-def test_project_imports_are_qualified_by_src():
-    violations = []
-    for path in (ROOT / "src").rglob("*.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ImportFrom) or node.level != 0 or not node.module:
-                continue
-            if node.module.split(".", 1)[0] in LEGACY_TOP_LEVEL_MODULES:
-                violations.append(f"{path.relative_to(ROOT)}:{node.lineno}:{node.module}")
-    assert violations == []
-
-
-def _schema_core_violations(root: Path) -> list[str]:
-    violations = []
-    for path in (root / "src" / "schema").rglob("*.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            modules: list[str] = []
-            if isinstance(node, ast.Import):
-                modules.extend(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                if node.module == "src":
-                    modules.extend(f"src.{alias.name}" for alias in node.names)
-                else:
-                    modules.append(node.module)
-
-            for module in modules:
-                if module == "src.core" or module.startswith("src.core."):
-                    violations.append(f"{path.relative_to(root)}:{node.lineno}:{module}")
-    return violations
-
-
-FORBIDDEN_IMPORTS = {
-    "schema": (
-        "src.core",
-        "src.persistence",
-        "src.demo",
-        "src.llm",
-        "src.mcp",
-        "src.sandbox",
-        "fastmcp",
-        "litellm",
-        "docker",
-    ),
-    "core": (
-        "src.persistence",
-        "src.demo",
-        "src.llm.litellm",
-        "src.mcp",
-        "src.sandbox",
-        "fastmcp",
-        "litellm",
-        "docker",
-    ),
+FORBIDDEN_CORE_IMPORTS = (
+    "src.adapters",
+    "src.application",
+    "src" + ".config",
+    "src" + ".logger",
+    "src" + ".context",
+    "src" + ".demo",
+    "src" + ".llm",
+    "src" + ".mcp",
+    "src" + ".memory",
+    "src" + ".observability",
+    "src" + ".persistence",
+    "src" + ".sandbox",
+    "src" + ".schema",
+    "src" + ".skill",
+    "src" + ".tool",
+    "fastmcp",
+    "litellm",
+    "sqlite3",
+    "docker",
+    "pydantic",
+)
+LEGACY_SYMBOLS = (
+    "Snapshot" + "ExecutionStore",
+    "Task" + "Repository",
+    "src.core." + "loop",
+)
+LEGACY_DOCUMENT_TERMS = (
+    "Session" + "Event",
+    "AgentSession." + "chat",
+    "AgentSession." + "achat",
+    "Agent." + "aclose",
+    "Snapshot" + "ExecutionStore",
+    "Task" + "Repository",
+    "SQLite schema " + "v2",
+    "Migration from " + "v1",
+)
+ALLOWED_CORE_IMPORT_CYCLES = {
+    ("src.core.state", "src.core.state_validation"),
 }
-
-# Every exception must explain why dependency inversion cannot represent it.
-ARCHITECTURE_ALLOWLIST: dict[tuple[str, str], str] = {}
 
 
 def _resolved_imports(path: Path, root: Path) -> list[tuple[int, str]]:
@@ -96,13 +107,10 @@ def _resolved_imports(path: Path, root: Path) -> list[tuple[int, str]]:
                     module = name
             else:
                 module = node.module or ""
-            imports.append((node.lineno, module))
-            imports.extend(
-                (node.lineno, f"{module}.{alias.name}") for alias in node.names if alias.name != "*"
-            )
+            imports.extend((node.lineno, f"{module}.{alias.name}") for alias in node.names)
         elif (
             isinstance(node, ast.Call)
-            and len(node.args) >= 1
+            and node.args
             and isinstance(node.args[0], ast.Constant)
             and isinstance(node.args[0].value, str)
             and (
@@ -119,125 +127,162 @@ def _resolved_imports(path: Path, root: Path) -> list[tuple[int, str]]:
     return imports
 
 
-def _architecture_violations(root: Path) -> list[str]:
+def _core_violations(root: Path) -> list[str]:
     violations = []
-    for layer, prefixes in FORBIDDEN_IMPORTS.items():
-        for path in (root / "src" / layer).rglob("*.py"):
-            for line, module in _resolved_imports(path, root):
-                forbidden = next(
-                    (
-                        prefix
-                        for prefix in prefixes
-                        if module == prefix or module.startswith(f"{prefix}.")
-                    ),
-                    None,
-                )
-                if forbidden is None:
-                    continue
-                key = (str(path.relative_to(root)).replace("\\", "/"), module)
-                if key in ARCHITECTURE_ALLOWLIST:
-                    assert ARCHITECTURE_ALLOWLIST[key].strip()
-                    continue
-                violations.append(f"{key[0]}:{line}:{module}")
+    for path in (root / "src" / "core").rglob("*.py"):
+        for line, module in _resolved_imports(path, root):
+            if any(
+                module == prefix or module.startswith(f"{prefix}.")
+                for prefix in FORBIDDEN_CORE_IMPORTS
+            ):
+                violations.append(f"{path.relative_to(root)}:{line}:{module}")
     return violations
 
 
-@pytest.mark.architecture
-def test_schema_and_core_dependency_direction_is_enforced():
-    assert _architecture_violations(ROOT) == []
+def _present_legacy_paths(root: Path) -> list[str]:
+    return [name for name in LEGACY_SOURCE_PATHS if (root / "src" / name).exists()]
 
 
-@pytest.mark.parametrize(
-    "layer,statement",
-    [
-        ("schema", "import src.core.task"),
-        ("schema", "from ..core import task"),
-        ("schema", "importlib.import_module('src.persistence.sqlite')"),
-        ("core", "import src.persistence.sqlite"),
-        ("core", "from ..persistence import sqlite"),
-        ("core", "from src.llm import litellm"),
-        ("core", "import fastmcp"),
-        ("core", "import docker"),
-        ("core", "importlib.import_module('src.demo.agent')"),
-    ],
-)
-@pytest.mark.architecture
-def test_architecture_gate_rejects_concrete_dependency_bypasses(
-    tmp_path: Path, layer: str, statement: str
-):
-    target = tmp_path / "src" / layer
-    target.mkdir(parents=True)
-    source = "import importlib\n" if "importlib." in statement else ""
-    (target / "probe.py").write_text(f"{source}{statement}\n", encoding="utf-8")
-
-    assert _architecture_violations(tmp_path)
-
-
-@pytest.mark.parametrize(
-    "layer,statement",
-    [
-        ("schema", "from pydantic import BaseModel"),
-        ("core", "from src.schema.execution import SessionEvent"),
-        ("core", "from typing import Protocol"),
-        ("demo", "from src.persistence.sqlite import SqliteExecutionStore"),
-    ],
-)
-@pytest.mark.architecture
-def test_architecture_gate_allows_schema_values_and_core_ports(
-    tmp_path: Path, layer: str, statement: str
-):
-    target = tmp_path / "src" / layer
-    target.mkdir(parents=True)
-    (target / "probe.py").write_text(f"{statement}\n", encoding="utf-8")
-
-    assert _architecture_violations(tmp_path) == []
-
-
-def test_schema_layer_does_not_depend_on_core_runtime():
-    violations = _schema_core_violations(ROOT)
-    assert violations == []
-
-
-def test_internal_modules_use_canonical_neutral_imports():
-    compatibility_modules = {
-        ROOT / "src" / "core" / "async_utils.py",
-        ROOT / "src" / "core" / "workspace.py",
+def _core_line_counts(root: Path) -> dict[str, int]:
+    return {
+        path.name: len(path.read_text(encoding="utf-8").splitlines())
+        for path in (root / "src" / "core").glob("*.py")
     }
+
+
+def _core_runtime_dependencies(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    dependencies: set[str] = set()
+
+    class RuntimeImportVisitor(ast.NodeVisitor):
+        def visit_If(self, node: ast.If) -> None:
+            is_type_checking = isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING"
+            if is_type_checking:
+                for child in node.orelse:
+                    self.visit(child)
+                return
+            self.generic_visit(node)
+
+        def visit_Import(self, node: ast.Import) -> None:
+            dependencies.update(
+                alias.name for alias in node.names if alias.name.startswith("src.core.")
+            )
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            if node.level == 0 and node.module and node.module.startswith("src.core."):
+                dependencies.add(node.module)
+
+    RuntimeImportVisitor().visit(tree)
+    return dependencies
+
+
+def _core_import_cycles(root: Path) -> list[tuple[str, ...]]:
+    graph = {
+        f"src.core.{path.stem}": _core_runtime_dependencies(path)
+        for path in (root / "src" / "core").glob("*.py")
+    }
+    cycles: set[tuple[str, ...]] = set()
+
+    def visit(module: str, path: tuple[str, ...]) -> None:
+        if module in path:
+            start = path.index(module)
+            cycle = path[start:] + (module,)
+            rotations = [cycle[index:-1] + cycle[:index] for index in range(len(cycle) - 1)]
+            cycles.add(min(rotations))
+            return
+        for dependency in graph.get(module, set()):
+            if dependency in graph:
+                visit(dependency, path + (module,))
+
+    for module in graph:
+        visit(module, ())
+    return sorted(cycles)
+
+
+@pytest.mark.architecture
+def test_core_contains_only_harness_mechanism_and_extension_ports():
+    assert {path.name for path in (ROOT / "src" / "core").glob("*.py")} == EXPECTED_CORE_MODULES
+    assert _core_violations(ROOT) == []
+
+
+@pytest.mark.architecture
+def test_core_modules_stay_within_reviewable_size_limits():
+    line_counts = _core_line_counts(ROOT)
+    assert line_counts["run.py"] <= 350
+    assert {name: count for name, count in line_counts.items() if count > 500} == {}
+
+
+@pytest.mark.architecture
+def test_core_runtime_import_graph_is_acyclic():
+    cycles = set(_core_import_cycles(ROOT))
+    assert cycles - ALLOWED_CORE_IMPORT_CYCLES == set()
+
+
+@pytest.mark.architecture
+def test_legacy_architecture_paths_are_physically_absent():
+    assert _present_legacy_paths(ROOT) == []
+    searchable = [
+        ROOT / "src",
+        ROOT / "tests",
+        ROOT / "README.md",
+        ROOT / "docs" / "reliable-runtime.md",
+    ]
     violations = []
-    for path in (ROOT / "src").rglob("*.py"):
-        if path in compatibility_modules:
-            continue
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.name == "src.core.workspace":
-                        violations.append(f"{path.relative_to(ROOT)}:{node.lineno}:{alias.name}")
-            elif isinstance(node, ast.ImportFrom) and node.level == 0:
-                if node.module == "src.core.workspace":
-                    violations.append(f"{path.relative_to(ROOT)}:{node.lineno}:{node.module}")
-                if node.module == "src.core.async_utils" and any(
-                    alias.name == "iterate_maybe_async" for alias in node.names
-                ):
-                    violations.append(f"{path.relative_to(ROOT)}:{node.lineno}:iterate_maybe_async")
+    for target in searchable:
+        paths = target.rglob("*.py") if target.is_dir() else (target,)
+        for path in paths:
+            text = path.read_text(encoding="utf-8")
+            for symbol in LEGACY_SYMBOLS:
+                if symbol in text:
+                    violations.append(f"{path.relative_to(ROOT)}:{symbol}")
     assert violations == []
+
+
+def test_legacy_path_gate_rejects_placeholder_namespaces(tmp_path: Path):
+    sandbox = tmp_path / "src" / "sandbox"
+    sandbox.mkdir(parents=True)
+    (sandbox / ".gitkeep").write_text("", encoding="utf-8")
+
+    assert _present_legacy_paths(tmp_path) == ["sandbox"]
+
+
+def test_reliable_runtime_documents_only_the_async_single_track_api():
+    text = (ROOT / "docs" / "reliable-runtime.md").read_text(encoding="utf-8")
+    assert [term for term in LEGACY_DOCUMENT_TERMS if term in text] == []
+    assert inspect.iscoroutinefunction(create_development_agent)
+    assert inspect.iscoroutinefunction(create_production_agent)
+    for method in ("submit", "decide_tool_call", "cancel", "close"):
+        assert inspect.iscoroutinefunction(getattr(AgentSession, method))
+    for removed in ("chat", "achat", "aclose"):
+        assert not hasattr(AgentSession, removed)
+    assert list(inspect.signature(RunJournal.commit).parameters) == [
+        "self",
+        "batch",
+        "expected_version",
+    ]
+    assert "RunJournal.commit(batch, expected_version)" in text
 
 
 @pytest.mark.parametrize(
     "statement",
     [
-        "import src.core.workspace",
-        "import src.core.workspace as runtime",
-        "from src import core",
-        "from src import core as runtime",
+        "import src.adapters.tools",
+        "from src.application import runtime",
+        "from src import config",
+        "import src" + ".schema.execution",
+        "import src" + ".persistence.sqlite",
+        "import litellm",
+        "import sqlite3",
+        "importlib.import_module('src" + ".demo.agent')",
     ],
 )
-def test_schema_dependency_guard_rejects_every_absolute_core_import(tmp_path: Path, statement: str):
-    schema = tmp_path / "src" / "schema"
-    schema.mkdir(parents=True)
-    (schema / "probe.py").write_text(f"{statement}\n", encoding="utf-8")
-
-    assert _schema_core_violations(tmp_path) != []
+@pytest.mark.architecture
+def test_core_gate_rejects_concrete_and_legacy_dependencies(tmp_path: Path, statement: str):
+    core = tmp_path / "src" / "core"
+    core.mkdir(parents=True)
+    source = "import importlib\n" if "importlib." in statement else ""
+    (core / "probe.py").write_text(f"{source}{statement}\n", encoding="utf-8")
+    assert _core_violations(tmp_path)
 
 
 def test_uv_manages_a_non_packaged_project():
@@ -245,4 +290,3 @@ def test_uv_manages_a_non_packaged_project():
     assert config["tool"]["uv"]["package"] is False
     assert "build-system" not in config
     assert "dev" in config["dependency-groups"]
-    assert any(item.startswith("pydantic") for item in config["project"]["dependencies"])

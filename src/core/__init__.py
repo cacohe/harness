@@ -1,21 +1,5 @@
-from src.core.execution import (
-    ExecutionContext,
-    ExecutionLimits,
-    FactRecorder,
-    LifecycleError,
-    LifecycleTracker,
-    PayloadLimitError,
-)
-from src.core.identifiers import ExecutionIdFactory, UuidExecutionIds, validate_execution_id
+"""Harness execution semantics, bounded values, and extension ports.
 
-__all__ = [
-    "ExecutionContext",
-    "ExecutionIdFactory",
-    "ExecutionLimits",
-    "FactRecorder",
-    "LifecycleError",
-    "LifecycleTracker",
-    "PayloadLimitError",
-    "UuidExecutionIds",
-    "validate_execution_id",
-]
+Import concrete values from their defining modules so the Core package does not
+implicitly load infrastructure or application code.
+"""

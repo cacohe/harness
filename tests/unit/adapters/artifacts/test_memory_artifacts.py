@@ -1,0 +1,393 @@
+import asyncio
+import hashlib
+import sys
+
+import pytest
+from src.adapters.artifacts.memory import InMemoryArtifactRepository
+from src.core.artifacts import ArtifactWrite, artifact_id_from_descriptor
+
+
+def _address(
+    content: bytes,
+    media_type: str = "text/plain",
+    name: str | None = None,
+    metadata=None,
+) -> str:
+    return artifact_id_from_descriptor(
+        hashlib.sha256(content).hexdigest(), media_type, name, metadata
+    )
+
+
+async def _chunks(*items: bytes):
+    for item in items:
+        yield item
+
+
+async def _read(repo: InMemoryArtifactRepository, artifact_id: str) -> bytes:
+    return b"".join([chunk async for chunk in repo.open(artifact_id)])
+
+
+def test_put_is_streaming_and_open_has_independent_readers():
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+
+        async def stream():
+            yield b"a"
+            yield b"bc"
+
+        ref = await repo.put(
+            ArtifactWrite(
+                stream(),
+                "text/plain",
+                expected_size_bytes=3,
+                expected_sha256=hashlib.sha256(b"abc").hexdigest(),
+            )
+        )
+
+        assert ref.size_bytes == 3
+        assert ref == await repo.stat(ref.artifact_id)
+        assert await asyncio.gather(_read(repo, ref.artifact_id), _read(repo, ref.artifact_id)) == [
+            b"abc",
+            b"abc",
+        ]
+        await repo.delete(ref.artifact_id)
+        await repo.delete(ref.artifact_id)
+        assert await repo.stat(ref.artifact_id) is None
+        with pytest.raises(KeyError):
+            await _read(repo, ref.artifact_id)
+
+    asyncio.run(scenario())
+
+
+def test_equivalent_writes_create_distinct_publication_ids():
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+        first = await repo.put(
+            ArtifactWrite(
+                _chunks(),
+                "text/plain",
+                name="same",
+                metadata={"z": 1, "a": ["same"]},
+            )
+        )
+        duplicate = await repo.put(
+            ArtifactWrite(
+                _chunks(b""),
+                "text/plain",
+                name="same",
+                metadata={"a": ["same"], "z": 1},
+            )
+        )
+
+        assert first.artifact_id != duplicate.artifact_id
+        assert first.sha256 == duplicate.sha256 == hashlib.sha256(b"").hexdigest()
+        assert first == await repo.stat(first.artifact_id)
+        assert duplicate == await repo.stat(duplicate.artifact_id)
+        duplicate.metadata["z"] = 2
+        assert (await repo.stat(first.artifact_id)).metadata == {"z": 1, "a": ["same"]}
+        assert await _read(repo, first.artifact_id) == b""
+        assert await _read(repo, duplicate.artifact_id) == b""
+
+    asyncio.run(scenario())
+
+
+def test_same_bytes_with_different_media_types_have_distinct_descriptor_ids():
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+        text = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
+        binary = await repo.put(ArtifactWrite(_chunks(b"abc"), "application/octet-stream"))
+
+        assert text.artifact_id != binary.artifact_id
+        assert text.sha256 == binary.sha256 == hashlib.sha256(b"abc").hexdigest()
+        assert await _read(repo, text.artifact_id) == b"abc"
+        assert await _read(repo, binary.artifact_id) == b"abc"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"media_type": "application/octet-stream"},
+        {"name": "different"},
+        {"metadata": {"version": True}},
+    ],
+)
+def test_concurrent_distinct_descriptors_publish_independently(changed):
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+        blocked, resume = asyncio.Event(), asyncio.Event()
+        descriptor = {"media_type": "text/plain", "name": "original", "metadata": {"version": 1}}
+
+        async def slow():
+            blocked.set()
+            await resume.wait()
+            yield b"abc"
+
+        pending = asyncio.create_task(repo.put(ArtifactWrite(slow(), **(descriptor | changed))))
+        await blocked.wait()
+        first = await repo.put(ArtifactWrite(_chunks(b"abc"), **descriptor))
+        resume.set()
+        second = await pending
+
+        assert first.artifact_id != second.artifact_id
+        assert first == await repo.stat(first.artifact_id)
+        assert second == await repo.stat(second.artifact_id)
+        assert await _read(repo, first.artifact_id) == b"abc"
+        assert await _read(repo, second.artifact_id) == b"abc"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("request_limit,repo_limit", [(2, 10), (10, 2)])
+def test_limit_rejects_during_consumption_with_zero_publication(request_limit, repo_limit):
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=repo_limit)
+
+        async def oversized():
+            yield b"ab"
+            yield b"c"
+            pytest.fail("oversized stream was read past its first offending chunk")
+
+        with pytest.raises(ValueError):
+            await repo.put(ArtifactWrite(oversized(), "text/plain", max_bytes=request_limit))
+        assert await repo.stat(_address(b"abc")) is None
+        assert await repo.stat(_address(b"ab")) is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"expected_size_bytes": 2},
+        {"expected_size_bytes": 4},
+        {"expected_sha256": "0" * 64},
+    ],
+)
+def test_expectation_mismatch_publishes_nothing(kwargs):
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=5)
+        with pytest.raises(ValueError):
+            await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain", **kwargs))
+        assert await repo.stat(_address(b"abc")) is None
+
+    asyncio.run(scenario())
+
+
+class _BytesSubclass(bytes):
+    pass
+
+
+@pytest.mark.parametrize("chunk", [bytearray(b"abc"), memoryview(b"abc"), _BytesSubclass(b"abc")])
+def test_chunks_must_be_exact_immutable_bytes(chunk):
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+        with pytest.raises(ValueError):
+            await repo.put(ArtifactWrite(_chunks(chunk), "text/plain"))
+        assert await repo.stat(_address(b"abc")) is None
+
+    asyncio.run(scenario())
+
+
+def test_iterator_failure_publishes_nothing():
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+
+        async def failed():
+            yield b"abc"
+            raise RuntimeError("stream failure")
+
+        with pytest.raises(RuntimeError, match="stream failure"):
+            await repo.put(ArtifactWrite(failed(), "text/plain"))
+        assert await repo.stat(_address(b"abc")) is None
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_put_publishes_nothing():
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+        blocked = asyncio.Event()
+
+        async def suspended():
+            yield b"abc"
+            blocked.set()
+            await asyncio.Future()
+
+        put = asyncio.create_task(repo.put(ArtifactWrite(suspended(), "text/plain")))
+        await blocked.wait()
+        put.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await put
+        assert await repo.stat(_address(b"abc")) is None
+
+    asyncio.run(scenario())
+
+
+def test_cancellation_can_interrupt_an_iterator_that_does_not_suspend():
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+        entered = asyncio.Event()
+        consumed = 0
+
+        async def stream():
+            nonlocal consumed
+            entered.set()
+            for _ in range(1_000):
+                consumed += 1
+                yield b""
+
+        pending = asyncio.create_task(repo.put(ArtifactWrite(stream(), "text/plain")))
+        await entered.wait()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert consumed < 1_000
+        assert await repo.stat(_address(b"")) is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("yield_after_cancellation", [False, True])
+def test_put_honors_cancellation_even_when_the_stream_swallows_it(yield_after_cancellation):
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+        entered = asyncio.Event()
+
+        async def stream():
+            yield b"ab"
+            entered.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                if yield_after_cancellation:
+                    yield b"c"
+
+        pending = asyncio.create_task(repo.put(ArtifactWrite(stream(), "text/plain")))
+        await entered.wait()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert await repo.stat(_address(b"ab")) is None
+        assert await repo.stat(_address(b"abc")) is None
+
+    asyncio.run(scenario())
+
+
+def test_put_after_caught_cancellation_can_publish_with_historical_count():
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+        task = asyncio.current_task()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.sleep(0)
+        assert task.cancelling() == 1
+
+        ref = await repo.put(ArtifactWrite(_chunks(b"abc"), "text/plain"))
+
+        assert await _read(repo, ref.artifact_id) == b"abc"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(
+    sys.version_info >= (3, 13),
+    reason="Requires cancellation delivery pending after uncancel()",
+)
+def test_queued_cancellation_is_delivered_before_the_stream_can_swallow_it():
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+        entered = False
+
+        async def stream():
+            nonlocal entered
+            entered = True
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                pass
+            yield b"abc"
+
+        task = asyncio.current_task()
+        task.cancel()
+        assert task.uncancel() == 0
+        with pytest.raises(asyncio.CancelledError):
+            await repo.put(ArtifactWrite(stream(), "text/plain"))
+        assert not entered
+        assert await repo.stat(_address(b"abc")) is None
+
+    asyncio.run(scenario())
+
+
+def test_repository_isolates_request_and_receipt_records():
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+        blocked, resume = asyncio.Event(), asyncio.Event()
+
+        async def stream():
+            blocked.set()
+            await resume.wait()
+            yield b"abc"
+
+        request = ArtifactWrite(stream(), "text/plain", name="initial")
+        task = asyncio.create_task(repo.put(request))
+        await blocked.wait()
+        object.__setattr__(request, "name", "mutated")
+        resume.set()
+        ref = await task
+        assert ref.name == "initial"
+
+        object.__setattr__(ref, "name", "mutated")
+        saved = await repo.stat(ref.artifact_id)
+        assert saved.name == "initial"
+        object.__setattr__(saved, "name", "also mutated")
+        assert (await repo.stat(ref.artifact_id)).name == "initial"
+
+    asyncio.run(scenario())
+
+
+def test_forged_write_is_validated_before_stream_consumption():
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+
+        async def stream():
+            pytest.fail("invalid request consumed its stream")
+            yield b"abc"
+
+        request = ArtifactWrite(stream(), "text/plain")
+        object.__setattr__(request, "media_type", "text/plain\r\n")
+        with pytest.raises(ValueError):
+            await repo.put(request)
+
+    asyncio.run(scenario())
+
+
+def test_forged_metadata_text_rejects_duplicate_keys_before_reading_stream():
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+
+        async def stream():
+            pytest.fail("invalid request consumed its stream")
+            yield b"abc"
+
+        request = ArtifactWrite(stream(), "text/plain")
+        object.__setattr__(request, "_metadata_json", '{"outer":{"same":1,"same":2}}')
+        with pytest.raises(ValueError):
+            await repo.put(request)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("artifact_id", ["../abc", "C:\\abc", "sha256:" + "g" * 64])
+def test_repository_validates_id_for_all_lookup_operations(artifact_id):
+    async def scenario():
+        repo = InMemoryArtifactRepository(max_artifact_bytes=3)
+        with pytest.raises(ValueError):
+            await repo.stat(artifact_id)
+        with pytest.raises(ValueError):
+            await _read(repo, artifact_id)
+        with pytest.raises(ValueError):
+            await repo.delete(artifact_id)
+
+    asyncio.run(scenario())

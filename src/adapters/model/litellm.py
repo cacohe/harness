@@ -1,0 +1,418 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import math
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any
+
+import litellm
+
+from src.core.model import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    ModelRole,
+    ModelToolCall,
+    ModelUsage,
+)
+from src.core.tools import ToolSpec
+
+Completion = Callable[..., Awaitable[object]]
+
+
+class ModelProviderError(RuntimeError):
+    retryable = False
+
+
+class ModelTimeoutError(ModelProviderError, TimeoutError):
+    retryable = True
+
+
+class ModelTruncatedError(ModelProviderError):
+    retryable = True
+
+
+class ModelProtocolError(ModelProviderError):
+    pass
+
+
+class ModelTransportError(ModelProviderError):
+    retryable = True
+
+
+@dataclass(slots=True)
+class _CallParts:
+    call_id: str | None = None
+    name: str | None = None
+    arguments: str = ""
+
+
+class LiteLLMModelGateway:
+    """Wire-neutral LiteLLM adapter using only its native async API."""
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        max_output_tokens: int,
+        api_key: str | None = None,
+        api_base: str | None = None,
+        timeout_seconds: float = 60.0,
+        cleanup_timeout_seconds: float = 5.0,
+        stream: bool = False,
+        max_response_bytes: int = 1_048_576,
+        max_tool_calls: int = 64,
+        max_stream_chunks: int = 4096,
+        completion: Completion | None = None,
+        options: dict[str, object] | None = None,
+    ) -> None:
+        if type(model) is not str or not model.strip() or len(model.encode()) > 512:
+            raise ValueError("LiteLLM model is invalid")
+        if api_key is not None and (type(api_key) is not str or len(api_key.encode()) > 16_384):
+            raise ValueError("LiteLLM credential is invalid")
+        if api_base is not None and (type(api_base) is not str or len(api_base.encode()) > 4096):
+            raise ValueError("LiteLLM endpoint is invalid")
+        if isinstance(timeout_seconds, bool) or type(timeout_seconds) not in (int, float):
+            raise ValueError("LiteLLM timeout is invalid")
+        timeout = float(timeout_seconds)
+        if not math.isfinite(timeout) or not 0 < timeout <= 3600:
+            raise ValueError("LiteLLM timeout is invalid")
+        if isinstance(cleanup_timeout_seconds, bool) or type(cleanup_timeout_seconds) not in (
+            int,
+            float,
+        ):
+            raise ValueError("LiteLLM cleanup timeout is invalid")
+        cleanup_timeout = float(cleanup_timeout_seconds)
+        if not math.isfinite(cleanup_timeout) or not 0 < cleanup_timeout <= 3600:
+            raise ValueError("LiteLLM cleanup timeout is invalid")
+        if type(stream) is not bool:
+            raise ValueError("LiteLLM stream mode is invalid")
+        if type(max_response_bytes) is not int or not 1 <= max_response_bytes <= 8_388_608:
+            raise ValueError("LiteLLM response limit is invalid")
+        if type(max_tool_calls) is not int or not 1 <= max_tool_calls <= 64:
+            raise ValueError("LiteLLM tool-call limit is invalid")
+        if type(max_output_tokens) is not int or not 1 <= max_output_tokens <= 1_000_000:
+            raise ValueError("LiteLLM output-token limit is invalid")
+        if type(max_stream_chunks) is not int or not 1 <= max_stream_chunks <= 1_000_000:
+            raise ValueError("LiteLLM stream-chunk limit is invalid")
+        if options is not None and type(options) is not dict:
+            raise ValueError("LiteLLM options are invalid")
+        forbidden = {
+            "model",
+            "messages",
+            "tools",
+            "stream",
+            "api_key",
+            "api_base",
+            "timeout",
+            "max_tokens",
+            "_skip_mcp_handler",
+        }
+        if options is not None and forbidden.intersection(options):
+            raise ValueError("LiteLLM options override adapter-owned fields")
+        self._model = model
+        self._api_key = api_key
+        self._api_base = api_base
+        self._timeout = timeout
+        self._cleanup_timeout = cleanup_timeout
+        self._stream = stream
+        self._max_bytes = max_response_bytes
+        self._max_calls = max_tool_calls
+        self._max_output_tokens = max_output_tokens
+        self._max_chunks = max_stream_chunks
+        self._completion = completion or litellm.acompletion
+        self._options = dict(options or {})
+
+    def __repr__(self) -> str:
+        return f"LiteLLMModelGateway(model={self._model!r}, stream={self._stream!r})"
+
+    @property
+    def max_output_tokens(self) -> int:
+        return self._max_output_tokens
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        arguments: dict[str, object] = {
+            **self._options,
+            "model": self._model,
+            "messages": [_message(item) for item in request.messages],
+            "stream": self._stream,
+            "timeout": self._timeout,
+            "max_tokens": self._max_output_tokens,
+            "_skip_mcp_handler": True,
+        }
+        if request.tools:
+            arguments["tools"] = [_tool(item) for item in request.tools]
+        if self._api_key is not None:
+            arguments["api_key"] = self._api_key
+        if self._api_base is not None:
+            arguments["api_base"] = self._api_base
+        try:
+            async with asyncio.timeout(self._timeout):
+                response = await self._completion(**arguments)
+                if self._stream:
+                    if not hasattr(response, "__aiter__"):
+                        raise ValueError
+                    return await self._assemble(response)  # type: ignore[arg-type]
+                return self._parse(response)
+        except asyncio.CancelledError:
+            raise
+        except ModelProviderError:
+            raise
+        except TimeoutError:
+            raise ModelTimeoutError("Model request timed out") from None
+        except (AttributeError, KeyError, TypeError, ValueError):
+            raise ModelProtocolError("Model response was invalid") from None
+        except Exception:
+            raise ModelTransportError("Model request failed") from None
+
+    def _parse(self, response: object) -> ModelResponse:
+        choices = _field(response, "choices")
+        if type(choices) is not list or len(choices) != 1:
+            raise ValueError
+        choice = choices[0]
+        finish = _field(choice, "finish_reason", None)
+        _validate_finish_reason(finish)
+        message = _field(choice, "message")
+        text = _optional_text(_field(message, "content", None))
+        raw_calls = _field(message, "tool_calls", None)
+        if raw_calls is None:
+            raw_calls = []
+        if type(raw_calls) is not list or len(raw_calls) > self._max_calls:
+            raise ValueError
+        calls = tuple(_whole_call(item) for item in raw_calls)
+        self._check_size(text, calls)
+        usage = _usage(_field(response, "usage", None))
+        self._check_usage(usage)
+        return ModelResponse(text, calls, usage)
+
+    async def _assemble(self, response: AsyncIterator[object]) -> ModelResponse:
+        text_parts: list[str] = []
+        calls: list[_CallParts] = []
+        usage: ModelUsage | None = None
+        size = 0
+        finished = False
+        finish_reason: str | None = None
+        chunks = 0
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            async for chunk in response:
+                chunks += 1
+                if chunks > self._max_chunks:
+                    raise ValueError
+                chunk_usage = _usage(_field(chunk, "usage", None))
+                if chunk_usage is not None:
+                    usage = chunk_usage
+                choices = _field(chunk, "choices", [])
+                if type(choices) is not list or len(choices) > 1:
+                    raise ValueError
+                if not choices:
+                    continue
+                choice = choices[0]
+                finish = _field(choice, "finish_reason", None)
+                if finish is not None and (type(finish) is not str or finished):
+                    raise ValueError
+                delta = _field(choice, "delta", None)
+                if delta is None:
+                    if finish is not None:
+                        finished = True
+                    continue
+                content = _field(delta, "content", None)
+                fragments = _field(delta, "tool_calls", None)
+                if fragments is None:
+                    fragments = []
+                if finished and (content is not None or fragments):
+                    raise ValueError
+                if content is not None:
+                    if type(content) is not str:
+                        raise ValueError
+                    size += len(content.encode("utf-8"))
+                    if size > self._max_bytes:
+                        raise ValueError
+                    text_parts.append(content)
+                if type(fragments) is not list:
+                    raise ValueError
+                seen_indexes: set[int] = set()
+                for fragment in fragments:
+                    index = _field(fragment, "index", None)
+                    if (
+                        type(index) is not int
+                        or index < 0
+                        or index > len(calls)
+                        or index in seen_indexes
+                    ):
+                        raise ValueError
+                    seen_indexes.add(index)
+                    if index == len(calls):
+                        if len(calls) >= self._max_calls:
+                            raise ValueError
+                        calls.append(_CallParts())
+                    current = calls[index]
+                    call_id = _field(fragment, "id", None)
+                    function = _field(fragment, "function", {})
+                    name = _field(function, "name", None)
+                    arguments = _field(function, "arguments", None)
+                    if call_id is not None:
+                        if type(call_id) is not str or current.call_id is not None:
+                            raise ValueError
+                        current.call_id = call_id
+                    if name is not None:
+                        if type(name) is not str or current.name is not None:
+                            raise ValueError
+                        current.name = name
+                    if arguments is not None:
+                        if type(arguments) is not str:
+                            raise ValueError
+                        size += len(arguments.encode("utf-8"))
+                        if size > self._max_bytes:
+                            raise ValueError
+                        current.arguments += arguments
+                if finish is not None:
+                    finish_reason = finish
+                    finished = True
+        except asyncio.CancelledError as error:
+            cancellation = error
+            raise
+        finally:
+            closer = getattr(response, "aclose", None)
+            if callable(closer):
+                try:
+                    await _bounded_cleanup(closer(), self._cleanup_timeout)
+                except BaseException:
+                    if cancellation is not None:
+                        raise cancellation
+                    raise
+        if not finished:
+            raise ValueError
+        _validate_finish_reason(finish_reason)
+        model_calls = tuple(
+            ModelToolCall(item.call_id or "", item.name or "", item.arguments) for item in calls
+        )
+        text = "".join(text_parts) or None
+        self._check_size(text, model_calls)
+        self._check_usage(usage)
+        return ModelResponse(text, model_calls, usage)
+
+    def _check_size(self, text: str | None, calls: tuple[ModelToolCall, ...]) -> None:
+        size = len((text or "").encode("utf-8")) + sum(
+            len(item.arguments_json.encode("utf-8")) for item in calls
+        )
+        if size > self._max_bytes:
+            raise ValueError
+
+    def _check_usage(self, usage: ModelUsage | None) -> None:
+        if usage is not None and usage.output_tokens > self._max_output_tokens:
+            raise ValueError
+
+
+def _message(message: ModelMessage) -> dict[str, object]:
+    wire: dict[str, object] = {"role": message.role.value, "content": message.content}
+    if message.role is ModelRole.ASSISTANT and message.tool_calls:
+        wire["tool_calls"] = [
+            {
+                "id": call.tool_call_id,
+                "type": "function",
+                "function": {"name": call.name, "arguments": call.arguments_json},
+            }
+            for call in message.tool_calls
+        ]
+    if message.role is ModelRole.TOOL:
+        wire["tool_call_id"] = message.tool_call_id
+    return wire
+
+
+def _tool(spec: ToolSpec) -> dict[str, object]:
+    return {
+        "type": "function",
+        "function": {
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": json.loads(spec.input_schema_json),
+        },
+    }
+
+
+def _whole_call(value: object) -> ModelToolCall:
+    function = _field(value, "function")
+    call_id = _field(value, "id")
+    name = _field(function, "name")
+    arguments = _field(function, "arguments")
+    if any(type(item) is not str for item in (call_id, name, arguments)):
+        raise ValueError
+    return ModelToolCall(call_id, name, arguments)
+
+
+def _usage(value: object) -> ModelUsage | None:
+    if value is None:
+        return None
+    input_tokens = _field(value, "prompt_tokens", None)
+    output_tokens = _field(value, "completion_tokens", None)
+    if type(input_tokens) is not int or type(output_tokens) is not int:
+        raise ValueError
+    return ModelUsage(input_tokens, output_tokens)
+
+
+def _optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise ValueError
+    return value
+
+
+def _validate_finish_reason(value: object) -> None:
+    if value is None:
+        return
+    if type(value) is not str:
+        raise ValueError
+    if value in {"length", "content_filter"}:
+        raise ModelTruncatedError("Model response was truncated")
+    if value not in {"stop", "tool_calls", "function_call"}:
+        raise ModelProtocolError("Model finish reason was invalid")
+
+
+def _field(value: object, name: str, default: Any = ...) -> Any:
+    if type(value) is dict:
+        if default is ...:
+            return value[name]
+        return value.get(name, default)
+    if default is ...:
+        return getattr(value, name)
+    return getattr(value, name, default)
+
+
+class _StreamCleanupError(RuntimeError):
+    pass
+
+
+async def _bounded_cleanup(cleanup: Awaitable[object], timeout: float) -> None:
+    task: asyncio.Future[object] = asyncio.ensure_future(cleanup)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            task.cancel()
+            task.add_done_callback(_consume_task_result)
+            if cancellation is not None:
+                raise cancellation
+            raise _StreamCleanupError("Provider stream cleanup timed out")
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=remaining)
+            if not done:
+                continue
+        except asyncio.CancelledError as error:
+            cancellation = error
+    if cancellation is not None:
+        _consume_task_result(task)
+        raise cancellation
+    await task
+
+
+def _consume_task_result(task: asyncio.Future[object]) -> None:
+    try:
+        task.result()
+    except BaseException:
+        pass
