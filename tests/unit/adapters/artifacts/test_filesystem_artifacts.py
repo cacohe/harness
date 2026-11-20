@@ -474,6 +474,92 @@ def test_collect_orphans_skips_invalid_directory_with_extra_members(tmp_path):
     asyncio.run(scenario())
 
 
+def test_collect_orphans_reclaims_only_staging_older_than_cutoff(tmp_path):
+    async def scenario():
+        repo = FilesystemArtifactRepository(tmp_path, 3)
+        old_stage = tmp_path / (".put-" + "1" * 32)
+        new_stage = tmp_path / (".put-" + "2" * 32)
+        for stage in (old_stage, new_stage):
+            stage.mkdir()
+            (stage / "data").write_bytes(b"partial")
+        cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+        old = (cutoff - timedelta(days=1)).timestamp()
+        os.utime(old_stage / "data", (old, old))
+        os.utime(old_stage, (old, old))
+
+        assert await repo.collect_orphans([], cutoff) == 1
+        assert not old_stage.exists()
+        assert (new_stage / "data").read_bytes() == b"partial"
+
+    asyncio.run(scenario())
+
+
+def test_collect_orphans_waits_for_active_staging_lease(tmp_path):
+    async def scenario():
+        repo = FilesystemArtifactRepository(tmp_path, 2)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def source():
+            yield b"a"
+            started.set()
+            await release.wait()
+            yield b"b"
+
+        writer = asyncio.create_task(repo.put(ArtifactWrite(source(), "text/plain")))
+        await started.wait()
+        stage = next(path for path in tmp_path.iterdir() if path.name.startswith(".put-"))
+        old = (datetime.now(timezone.utc) - timedelta(days=2)).timestamp()
+        os.utime(stage / "data", (old, old))
+        os.utime(stage, (old, old))
+        collector = asyncio.create_task(
+            repo.collect_orphans([], datetime.now(timezone.utc) - timedelta(days=1))
+        )
+        await asyncio.sleep(0.05)
+        assert not collector.done()
+        release.set()
+        ref = await writer
+        assert await collector == 0
+        assert await _read(repo, ref.artifact_id) == b"ab"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("damage", ["reparse", "hard-link", "extra-member"])
+def test_collect_orphans_preserves_unsafe_staging(tmp_path, damage):
+    async def scenario():
+        repo = FilesystemArtifactRepository(tmp_path / "repo", 3)
+        root = tmp_path / "repo"
+        stage = root / (".put-" + "3" * 32)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        victim = outside / "victim"
+        victim.write_bytes(b"keep")
+        if damage == "reparse":
+            _junction(stage, outside)
+        else:
+            stage.mkdir()
+            if damage == "hard-link":
+                os.link(victim, stage / "data")
+            else:
+                (stage / "unexpected").write_bytes(b"preserve")
+        old = (datetime.now(timezone.utc) - timedelta(days=2)).timestamp()
+        if not stage.is_symlink() and not (
+            getattr(stage.lstat(), "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            for member in stage.iterdir():
+                os.utime(member, (old, old))
+            os.utime(stage, (old, old))
+
+        assert (
+            await repo.collect_orphans([], datetime.now(timezone.utc) - timedelta(days=1)) == 0
+        )
+        assert victim.read_bytes() == b"keep"
+        assert stage.exists()
+
+    asyncio.run(scenario())
+
+
 def test_repository_rejects_root_replacement(tmp_path):
     async def scenario():
         root = tmp_path / "repo"
