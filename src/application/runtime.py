@@ -6,19 +6,36 @@ import math
 from collections import deque
 from collections.abc import Awaitable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol, TypeVar
 
 from src.application.artifact_lifecycle import ArtifactLifecycleService
 from src.application.observability import Observation, PostCommitObserver
 from src.application.recovery import RecoveryService
 from src.application.submissions import AcceptedRun, SubmissionService
-from src.core.commands import AdvanceRun, CancelRun, CommandContext, DecideToolCall, ResumeRun
+from src.core.commands import (
+    AdvanceRun,
+    CancelRun,
+    CommandContext,
+    DecideToolCall,
+    FailRun,
+    ResumeRun,
+)
+from src.core.context import ContextBudgetExceeded
+from src.core.errors import InvalidTransition, RunErrorCode, RunFailure
 from src.core.ids import Clock, IdGenerator, ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import ArtifactAttachmentFact, ArtifactAttachmentRole, JournalHead, RunJournal
+from src.core.journal import (
+    ArtifactAttachmentFact,
+    ArtifactAttachmentRole,
+    JournalCommit,
+    JournalError,
+    JournalHead,
+    RunJournal,
+)
 from src.core.receipt_snapshot import snapshot_run_state, snapshot_transcript
+from src.core.run_receipt import validate_commit_receipt
 from src.core.run import RunCoordinator, RunOutcome
-from src.core.state import RunState, RunStatus
+from src.core.state import RunState, RunStatus, TaskStateMachine
 
 
 class ApplicationClosedError(RuntimeError):
@@ -347,16 +364,24 @@ class RuntimeCoordinator:
                 if state.status.terminal:
                     return state
                 message = await self._user_input(state)
-                coordinator = await self._coordinator(state, message)
-                outcome = await coordinator.advance(
-                    state,
-                    CancelRun(
-                        state.run_id,
-                        state.session_id,
-                        context=self._context(state),
-                    ),
-                )
-                cancelled = _outcome_state(outcome, state)
+                try:
+                    coordinator = await self._coordinator(state, message)
+                    outcome = await coordinator.advance(
+                        state,
+                        CancelRun(
+                            state.run_id,
+                            state.session_id,
+                            context=self._context(state),
+                        ),
+                    )
+                    cancelled = _outcome_state(outcome, state)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    try:
+                        cancelled = await self._commit_terminal(state, cancelled=True)
+                    except Exception:
+                        raise error
                 await self._observe("run.advanced", cancelled)
                 return cancelled
 
@@ -491,39 +516,81 @@ class RuntimeCoordinator:
         for _ in range(self._max_advances):
             if state.status.terminal:
                 return state
-            if state.status is RunStatus.WAITING_APPROVAL:
-                if not _has_durable_decision(state):
-                    return state
-                coordinator = await self._coordinator(state, message)
-                outcome = await coordinator.advance(
-                    state,
-                    ResumeRun(
-                        state.run_id,
-                        state.session_id,
-                        context=self._context(state),
-                    ),
-                )
+            try:
+                if state.status is RunStatus.WAITING_APPROVAL:
+                    if not _has_durable_decision(state):
+                        return state
+                    coordinator = await self._coordinator(state, message)
+                    outcome = await coordinator.advance(
+                        state,
+                        ResumeRun(
+                            state.run_id,
+                            state.session_id,
+                            context=self._context(state),
+                        ),
+                    )
+                else:
+                    coordinator = await self._coordinator(state, message)
+                    outcome = await coordinator.advance(
+                        state,
+                        AdvanceRun(
+                            state.run_id,
+                            state.session_id,
+                            context=self._context(state),
+                        ),
+                    )
                 next_state = _outcome_state(outcome, state)
                 await self._observe("run.advanced", next_state)
                 if next_state.version <= state.version:
                     raise RuntimeError("Run coordinator did not advance the state")
                 state = next_state
-                continue
-            coordinator = await self._coordinator(state, message)
-            outcome = await coordinator.advance(
-                state,
-                AdvanceRun(
-                    state.run_id,
-                    state.session_id,
-                    context=self._context(state),
-                ),
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                try:
+                    failed = await self._commit_terminal(state, code=_failure_code(error))
+                except Exception:
+                    raise error
+                await self._observe("run.advanced", failed)
+                return failed
+        failed = await self._commit_terminal(state, code=RunErrorCode.LIMIT_EXCEEDED)
+        await self._observe("run.advanced", failed)
+        return failed
+
+    async def _commit_terminal(
+        self,
+        state: RunState,
+        *,
+        code: RunErrorCode | None = None,
+        cancelled: bool = False,
+    ) -> RunState:
+        context = self._context(state)
+        command = (
+            CancelRun(state.run_id, state.session_id, context=context)
+            if cancelled
+            else FailRun(
+                state.run_id,
+                state.session_id,
+                RunFailure(code or RunErrorCode.INVARIANT_VIOLATION),
+                context=context,
             )
-            next_state = _outcome_state(outcome, state)
-            await self._observe("run.advanced", next_state)
-            if next_state.version <= state.version:
-                raise RuntimeError("Run coordinator did not advance the state")
-            state = next_state
-        raise RuntimeError("Application operation exceeded its advance limit")
+        )
+        transition = TaskStateMachine.apply(state, command)
+        expected = state.journal_version
+        persisted = replace(
+            transition.state,
+            journal_version=expected + 1,
+            journal_sequence=state.journal_sequence + len(transition.events),
+        )
+        batch = JournalCommit(persisted, events=transition.events)
+        receipt = await self._journal.commit(batch, expected)
+        validate_commit_receipt(
+            receipt,
+            batch,
+            expected_version=expected,
+            previous_sequence=state.journal_sequence,
+        )
+        return persisted
 
     async def _coordinator(self, state: RunState, message: str) -> RunCoordinator:
         value = self._coordinator_factory(state, message)
@@ -555,6 +622,14 @@ class RuntimeCoordinator:
 
 
 _IdT = TypeVar("_IdT", SessionId, RunId, SubmissionId, ProfileId)
+
+
+def _failure_code(error: Exception) -> RunErrorCode:
+    if isinstance(error, ContextBudgetExceeded):
+        return RunErrorCode.CONTEXT_BUDGET_EXCEEDED
+    if isinstance(error, (JournalError, InvalidTransition)):
+        return error.failure.code
+    return RunErrorCode.INVARIANT_VIOLATION
 
 
 def _canonical_id(value: object, expected: type[_IdT], message: str) -> _IdT:

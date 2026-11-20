@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from src.core.commands import RunLimits
 from src.core.context import ContextBudget
 from src.core.ids import ProfileId, SessionId, SubmissionId
 
@@ -47,7 +48,7 @@ def test_application_config_is_immutable_strict_and_requires_absolute_production
     config = ApplicationConfig(
         max_sessions=4,
         max_waiters_per_session=2,
-        max_advances_per_operation=32,
+        max_advances_per_operation=64,
         sqlite_path=tmp_path / "journal.sqlite3",
         artifact_root=tmp_path / "artifacts",
     )
@@ -68,6 +69,11 @@ def test_application_config_is_immutable_strict_and_requires_absolute_production
         ApplicationConfig(
             max_artifact_bytes=32,
             max_inline_artifact_bytes=33,
+        )
+    with pytest.raises(ValueError, match="configuration limits"):
+        ApplicationConfig(
+            limits=RunLimits(17, 30.0, 1_024),
+            max_advances_per_operation=32,
         )
 
 

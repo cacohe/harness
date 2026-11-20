@@ -21,9 +21,17 @@ from src.core.commands import (
     StartToolCall,
     ToolCallRequest,
 )
+from src.core.context import ContextBudgetExceeded
 from src.core.errors import RunErrorCode, RunFailure
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import JournalHead, JournalSnapshot, TranscriptEntry
+from src.core.journal import (
+    JournalCommit,
+    JournalError,
+    JournalEvent,
+    JournalHead,
+    JournalSnapshot,
+    TranscriptEntry,
+)
 from src.core.run import RunOutcome
 from src.core.state import RunState, RunStatus, TaskStateMachine
 
@@ -159,6 +167,26 @@ class Journal:
         if value is None or value.session_id != session_id or value.submission_id != submission_id:
             return None
         return value
+
+    async def commit(self, batch: JournalCommit, expected_version: int):
+        current = self.heads.get(batch.state.session_id.value)
+        assert current is not None and current.journal_version == expected_version
+        assert batch.submission is None and batch.transcript == () and batch.summary is None
+        assert batch.artifact_facts == ()
+        self.heads[batch.state.session_id.value] = batch.state
+        self.runs[batch.state.run_id.value] = batch.state
+        first_sequence = current.journal_sequence + 1
+        events = tuple(
+            JournalEvent(sequence, event)
+            for sequence, event in enumerate(batch.events, start=first_sequence)
+        )
+        return JournalSnapshot(
+            batch.state.session_id,
+            batch.state.journal_version,
+            batch.state.journal_sequence,
+            batch.state,
+            events=events,
+        )
 
 
 class CompletingCoordinator:
@@ -498,10 +526,132 @@ async def test_active_exception_releases_session_for_the_next_fifo_operation():
         max_sessions=1,
         max_waiters_per_session=1,
     )
-    with pytest.raises(RuntimeError, match="boom"):
-        await runtime.submit(SessionId("a"), ProfileId("profile"), "one", SubmissionId("one"))
+    failed = await runtime.submit(
+        SessionId("a"), ProfileId("profile"), "one", SubmissionId("one")
+    )
+    assert failed.status is RunStatus.FAILED
+    assert failed.failure == RunFailure(RunErrorCode.INVARIANT_VIOLATION)
     result = await runtime.submit(SessionId("a"), ProfileId("profile"), "two", SubmissionId("two"))
     assert result.status is RunStatus.COMPLETED
+
+
+@async_test
+async def test_factory_failure_does_not_prevent_cancelling_the_run():
+    from src.application.runtime import RuntimeCoordinator
+
+    journal = Journal()
+    current = state(SessionId("a"), SubmissionId("one"))
+    journal.heads["a"] = current
+    journal.runs[current.run_id.value] = current
+    journal.messages[current.run_id.value] = "hello"
+
+    def broken_factory(*_args):
+        raise ValueError("context is too large")
+
+    runtime = RuntimeCoordinator(
+        submissions=Submissions(journal),
+        journal=journal,
+        coordinator_factory=broken_factory,
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=1,
+    )
+
+    cancelled = await runtime.cancel_run(SessionId("a"), current.run_id)
+
+    assert cancelled.status is RunStatus.CANCELLED
+
+
+@async_test
+async def test_advance_limit_is_committed_as_a_terminal_failure():
+    from src.application.runtime import RuntimeCoordinator
+
+    journal = Journal()
+
+    class NeverTerminal:
+        async def advance(self, run, _command):
+            advanced = replace(
+                run,
+                version=run.version + 1,
+                journal_version=run.journal_version + 1,
+            )
+            journal.heads[run.session_id.value] = advanced
+            journal.runs[run.run_id.value] = advanced
+            return RunOutcome(advanced, advanced.journal_version, advanced.journal_sequence)
+
+    runtime = RuntimeCoordinator(
+        submissions=Submissions(journal),
+        journal=journal,
+        coordinator_factory=lambda *_args: NeverTerminal(),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=1,
+        max_advances_per_operation=1,
+    )
+
+    result = await runtime.submit(
+        SessionId("a"), ProfileId("profile"), "one", SubmissionId("one")
+    )
+
+    assert result.status is RunStatus.FAILED
+    assert result.failure == RunFailure(RunErrorCode.LIMIT_EXCEEDED)
+
+
+@async_test
+async def test_journal_limit_failure_preserves_its_error_code_and_terminalizes():
+    from src.application.runtime import RuntimeCoordinator
+
+    journal = Journal()
+
+    class StateTooLarge:
+        async def advance(self, _run, _command):
+            raise JournalError(RunErrorCode.LIMIT_EXCEEDED)
+
+    runtime = RuntimeCoordinator(
+        submissions=Submissions(journal),
+        journal=journal,
+        coordinator_factory=lambda *_args: StateTooLarge(),
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=1,
+    )
+
+    result = await runtime.submit(
+        SessionId("a"), ProfileId("profile"), "one", SubmissionId("one")
+    )
+
+    assert result.status is RunStatus.FAILED
+    assert result.failure == RunFailure(RunErrorCode.LIMIT_EXCEEDED)
+
+
+@async_test
+async def test_context_budget_failure_preserves_its_error_code_and_terminalizes():
+    from src.application.runtime import RuntimeCoordinator
+
+    journal = Journal()
+
+    def oversized_context(*_args):
+        raise ContextBudgetExceeded
+
+    runtime = RuntimeCoordinator(
+        submissions=Submissions(journal),
+        journal=journal,
+        coordinator_factory=oversized_context,
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=1,
+    )
+
+    result = await runtime.submit(
+        SessionId("a"), ProfileId("profile"), "one", SubmissionId("one")
+    )
+
+    assert result.status is RunStatus.FAILED
+    assert result.failure == RunFailure(RunErrorCode.CONTEXT_BUDGET_EXCEEDED)
 
 
 @async_test

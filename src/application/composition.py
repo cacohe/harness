@@ -31,7 +31,13 @@ from src.application.runtime import RuntimeCoordinator, _close_resource
 from src.application.submissions import SubmissionService
 from src.core.artifacts import ArtifactExternalizer, ArtifactRepository
 from src.core.commands import RunLimits
-from src.core.context import ContextBudget, ContextProvider, ContextRequest, TokenCounter
+from src.core.context import (
+    ContextBudget,
+    ContextBudgetExceeded,
+    ContextProvider,
+    ContextRequest,
+    TokenCounter,
+)
 from src.core.ids import Clock, IdGenerator, ProfileId
 from src.core.journal import RunJournal
 from src.core.model import ModelGateway
@@ -41,6 +47,7 @@ from src.core.tools import ToolGateway, ToolSpec
 
 ContextRequestFactory = Callable[[RunState, str], ContextRequest]
 _PATH_TYPE = type(Path())
+_MAX_OPEN_TOOL_MESSAGES = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +92,7 @@ class ApplicationConfig:
             or not 1 <= integers[0] <= 1_000_000
             or not 0 <= integers[1] <= 1_000_000
             or not 1 <= integers[2] <= 1_000_000
+            or integers[2] < 2 * limits.max_steps - 1
             or not 1 <= integers[3] <= (1 << 63) - 1
             or not 0 <= integers[4] <= integers[3]
             or not 1 <= integers[5] <= 1_048_576
@@ -290,6 +298,7 @@ async def create_production_agent(
             selected_repository,
             workspace_id=_artifact_workspace(config.artifact_root),
             max_read_bytes=config.max_artifact_read_bytes,
+            max_result_bytes=config.max_inline_artifact_bytes,
         )
         read_gateway = LocalToolGateway(
             ToolCatalog((read_entry,)),
@@ -400,6 +409,8 @@ def _compose(
         open_tool_messages = tuple(
             message for interaction in ordered_current_run for message in interaction.messages
         )
+        if len(open_tool_messages) > _MAX_OPEN_TOOL_MESSAGES:
+            raise ContextBudgetExceeded
         open_tool_sequence_range = (
             (
                 ordered_current_run[0].sequence_from,

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from collections.abc import AsyncIterator
 
 from src.adapters.tools.catalog import ToolCatalogEntry
 from src.core.artifacts import (
     MAX_ARTIFACT_SIZE_BYTES,
+    ArtifactRef,
     ArtifactRepository,
     snapshot_artifact_ref,
     validate_artifact_id,
@@ -27,8 +29,13 @@ def read_artifact_entry(
     *,
     workspace_id: str,
     max_read_bytes: int = 262_144,
+    max_result_bytes: int = 1_048_576,
 ) -> ToolCatalogEntry:
-    handler = ReadArtifactTool(repository, max_read_bytes=max_read_bytes)
+    handler = ReadArtifactTool(
+        repository,
+        max_read_bytes=max_read_bytes,
+        max_result_bytes=max_result_bytes,
+    )
     spec = ToolSpec(
         READ_ARTIFACT_TOOL_NAME,
         "Read one bounded byte range from an Artifact by ID.",
@@ -48,12 +55,16 @@ class ReadArtifactTool:
         repository: ArtifactRepository,
         *,
         max_read_bytes: int = 262_144,
+        max_result_bytes: int = 1_048_576,
         max_chunk_bytes: int = 1_048_576,
     ) -> None:
         if type(max_read_bytes) is not int or not 1 <= max_read_bytes <= 1_048_576:
             raise ValueError("Artifact read limit is invalid")
         self._repository = repository
         self._max = max_read_bytes
+        if type(max_result_bytes) is not int or not 1 <= max_result_bytes <= 1_048_576:
+            raise ValueError("Artifact read result limit is invalid")
+        self._max_result = max_result_bytes
         if type(max_chunk_bytes) is not int or not 1 <= max_chunk_bytes <= 8 * 1_048_576:
             raise ValueError("Artifact chunk limit is invalid")
         self._max_chunk = max_chunk_bytes
@@ -130,33 +141,59 @@ class ReadArtifactTool:
         if position < required:
             raise ValueError("Artifact stream ended before its declared size")
         payload = bytes(data[:limit])
-        truncated = offset + len(payload) < ref.size_bytes
-        if (
-            ref.media_type.startswith("text/")
-            or ref.media_type.endswith("+json")
-            or ref.media_type == "application/json"
-        ):
-            try:
-                content: str = payload.decode("utf-8", errors="strict")
-                encoding = "utf-8"
-            except UnicodeDecodeError:
-                content = base64.b64encode(payload).decode("ascii")
-                encoding = "base64"
-        else:
+        result = _read_result(ref, offset, payload)
+        if _encoded_size(result) <= self._max_result:
+            return result
+        low = 0
+        high = len(payload) - 1
+        best = _read_result(ref, offset, b"")
+        if _encoded_size(best) > self._max_result:
+            raise ValueError("Artifact read result limit is too small")
+        while low <= high:
+            middle = (low + high) // 2
+            candidate = _read_result(ref, offset, payload[:middle])
+            if _encoded_size(candidate) <= self._max_result:
+                best = candidate
+                low = middle + 1
+            else:
+                high = middle - 1
+        return best
+
+
+def _read_result(ref: ArtifactRef, offset: int, payload: bytes) -> dict[str, object]:
+    truncated = offset + len(payload) < ref.size_bytes
+    if (
+        ref.media_type.startswith("text/")
+        or ref.media_type.endswith("+json")
+        or ref.media_type == "application/json"
+    ):
+        try:
+            content: str = payload.decode("utf-8", errors="strict")
+            encoding = "utf-8"
+        except UnicodeDecodeError:
             content = base64.b64encode(payload).decode("ascii")
             encoding = "base64"
-        return {
-            "artifact": {
-                "artifact_id": ref.artifact_id,
-                "media_type": ref.media_type,
-                "size_bytes": ref.size_bytes,
-                "sha256": ref.sha256,
-                "name": ref.name,
-                "metadata": ref.metadata,
-            },
-            "offset": offset,
-            "returned_bytes": len(payload),
-            "truncated": truncated,
-            "encoding": encoding,
-            "content": content,
-        }
+    else:
+        content = base64.b64encode(payload).decode("ascii")
+        encoding = "base64"
+    return {
+        "artifact": {
+            "artifact_id": ref.artifact_id,
+            "media_type": ref.media_type,
+            "size_bytes": ref.size_bytes,
+            "sha256": ref.sha256,
+            "name": ref.name,
+            "metadata": ref.metadata,
+        },
+        "offset": offset,
+        "returned_bytes": len(payload),
+        "truncated": truncated,
+        "encoding": encoding,
+        "content": content,
+    }
+
+
+def _encoded_size(result: dict[str, object]) -> int:
+    return len(
+        json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )

@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 
 import pytest
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
@@ -165,3 +166,26 @@ def test_huge_chunk_is_rejected_and_iterator_is_closed() -> None:
             )
         )
     assert closed
+
+
+def test_full_binary_read_is_trimmed_to_the_encoded_result_budget() -> None:
+    async def scenario():
+        payload = bytes(range(256)) * 256
+        repo = InMemoryArtifactRepository(100_000)
+        ref = await repo.put(
+            ArtifactWrite(_stream(payload), "application/octet-stream", max_bytes=100_000)
+        )
+        result = await ReadArtifactTool(
+            repo,
+            max_read_bytes=65_536,
+            max_result_bytes=65_536,
+        )({"artifact_id": ref.artifact_id, "offset": 0, "limit": 65_536})
+
+        encoded = json.dumps(
+            result, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        assert len(encoded) <= 65_536
+        assert result["returned_bytes"] < 65_536
+        assert result["truncated"] is True
+
+    asyncio.run(scenario())

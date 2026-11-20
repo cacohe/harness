@@ -33,7 +33,6 @@ from src.core.context import (
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 from src.core.journal import (
     ConversationSummaryCheckpoint,
-    JournalError,
     TranscriptEntry,
 )
 from src.core.model import ModelMessage, ModelResponse, ModelRole, ModelToolCall
@@ -656,6 +655,8 @@ def test_configured_serialized_run_envelope_bounds_large_batch_and_artifact_resu
     assert state.final_text == "bounded batch complete"
     assert state.current_step is None
 
-    with pytest.raises(JournalError) as rejected:
-        asyncio.run(scenario(8 * 1_024))
-    assert rejected.value.failure.code.value == "limit_exceeded"
+    rejected_config, rejected_journal, rejected = asyncio.run(scenario(8 * 1_024))
+    assert max(rejected_journal.state_sizes) <= rejected_config.max_serialized_run_state_bytes
+    assert rejected.status.value == "failed"
+    assert rejected.failure is not None
+    assert rejected.failure.code.value == "limit_exceeded"
