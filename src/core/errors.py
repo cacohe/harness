@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+MAX_FAILURE_DETAIL_BYTES = 65_536
+
 
 class RunErrorCode(StrEnum):
     CONTEXT_BUDGET_EXCEEDED = "context_budget_exceeded"
@@ -30,11 +32,21 @@ _PUBLIC_MESSAGES = {
 @dataclass(frozen=True)
 class RunFailure:
     code: RunErrorCode
+    detail: str | None = None
     message: str = field(init=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.code, RunErrorCode):
             raise ValueError("Run failure requires a stable error code")
+        if self.detail is not None:
+            if type(self.detail) is not str:
+                raise ValueError("Run failure detail must be text")
+            try:
+                size = len(self.detail.encode("utf-8"))
+            except UnicodeEncodeError:
+                raise ValueError("Run failure detail must be valid UTF-8") from None
+            if size > MAX_FAILURE_DETAIL_BYTES:
+                raise ValueError("Run failure detail exceeds its limit")
         object.__setattr__(self, "message", _PUBLIC_MESSAGES[self.code])
 
 

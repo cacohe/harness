@@ -9,7 +9,7 @@ import pytest
 import src.adapters.persistence.sqlite as sqlite_module
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.adapters.persistence.sqlite_codec import decode, encode
-from src.core.errors import RunErrorCode
+from src.core.errors import RunErrorCode, RunFailure
 from src.core.ids import EventId, ProfileId, RunId, SessionId
 from src.core.journal import (
     ArtifactAttachmentAction,
@@ -629,6 +629,11 @@ def test_sqlite_v6_round_trips_and_reopens(tmp_path: Path) -> None:
     found = asyncio.run(reopened.find_submission(batch.state.session_id, batch.state.submission_id))
     assert found is not None and (found.state, found.version) == (batch.state, 1)
     assert asyncio.run(reopened.commit(acceptance("first"), 0)) == receipt
+
+
+def test_failure_detail_round_trips_through_sqlite_codec() -> None:
+    failure = RunFailure(RunErrorCode.TOOL_FAILED, '{"message":"remote failed"}')
+    assert decode(encode(failure), RunFailure) == failure
 
 
 def test_context_summary_lookup_filters_bounds_and_survives_restart(tmp_path: Path) -> None:

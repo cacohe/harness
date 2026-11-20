@@ -4,6 +4,7 @@ import threading
 from pathlib import Path
 
 import pytest
+import src.adapters.tools.local as local_tools
 from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactExternalizer
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.tools import (
@@ -149,6 +150,7 @@ def test_timeout_exception_and_cancellation_are_stable(tmp_path: Path) -> None:
         failed = await broken_gateway.execute(_request())
         assert failed.status.value == "failed"
         assert failed.failure is not None and "secret" not in failed.failure.message
+        assert failed.failure.detail is None
 
         started = asyncio.Event()
 
@@ -175,6 +177,27 @@ def test_timeout_exception_and_cancellation_are_stable(tmp_path: Path) -> None:
             raise AssertionError("caller cancellation was swallowed")
         retry = await cancel_gateway.execute(_request())
         assert retry.status.value == "cancelled"
+
+    asyncio.run(scenario())
+
+
+def test_explicitly_reported_tool_error_preserves_model_safe_detail(tmp_path: Path) -> None:
+    async def reported(_arguments):
+        raise local_tools.ToolReportedError('{"message":"remote failed"}')
+
+    async def scenario():
+        gateway = LocalToolGateway(
+            ToolCatalog((ToolCatalogEntry(ToolSpec("increment", "x", "true"), reported, True),)),
+            SQLiteToolExecutionStore((tmp_path / "reported.db").resolve()),
+            _externalizer(),
+        )
+        result = await gateway.execute(_request())
+        assert result.status.value == "failed"
+        assert result.failure is not None
+        assert result.failure.detail == '{"message":"remote failed"}'
+        recovered = await gateway.execute(_request())
+        assert recovered.failure is not None
+        assert recovered.failure.detail == result.failure.detail
 
     asyncio.run(scenario())
 

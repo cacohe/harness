@@ -371,6 +371,7 @@ def _interrupted(binding: str) -> ToolResult:
 
 def _encode_result(result: ToolResult) -> str:
     inline = result.inline_content
+    failure = result.failure
     payload = {
         "artifacts": [
             {
@@ -384,7 +385,8 @@ def _encode_result(result: ToolResult) -> str:
             for ref in result.artifacts
         ],
         "execution_key": result.execution_key,
-        "failure": result.failure.code.value if result.failure is not None else None,
+        "failure": failure.code.value if failure is not None else None,
+        "failure_detail": failure.detail if failure is not None else None,
         "inline": None
         if inline is None
         else {"media_type": inline.media_type, "value": inline.value},
@@ -434,11 +436,26 @@ def _decode_result(encoded: str, binding: str) -> ToolResult:
             raise ValueError
         value = json.loads(encoded, object_pairs_hook=_pairs, parse_constant=_constant)
         _check_depth(value)
-        required = {"artifacts", "execution_key", "failure", "inline", "status", "summary"}
+        required = {
+            "artifacts",
+            "execution_key",
+            "failure",
+            "failure_detail",
+            "inline",
+            "status",
+            "summary",
+        }
         if type(value) is not dict or set(value) != required or value["execution_key"] != binding:
             raise ValueError
         failure_raw = value["failure"]
-        failure = None if failure_raw is None else RunFailure(RunErrorCode(cast(str, failure_raw)))
+        failure_detail = cast(str | None, value["failure_detail"])
+        failure = (
+            None
+            if failure_raw is None
+            else RunFailure(RunErrorCode(cast(str, failure_raw)), failure_detail)
+        )
+        if failure is None and failure_detail is not None:
+            raise ValueError
         inline_raw = value["inline"]
         inline = None
         if inline_raw is not None:

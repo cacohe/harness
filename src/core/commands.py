@@ -124,11 +124,14 @@ class ToolCallRequest:
     requires_approval: bool = field(kw_only=True)
     approval_scope: str = field(kw_only=True)
     workspace_id: str = field(kw_only=True)
+    available: bool = field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
         _check_child_id(self.tool_call_id)
         _check_child_id(self.name)
         if type(self.requires_approval) is not bool:
+            raise InvalidTransition
+        if type(self.available) is not bool or (not self.available and self.requires_approval):
             raise InvalidTransition
         try:
             validate_approval_binding(self.approval_scope, self.workspace_id)
@@ -149,6 +152,7 @@ def snapshot_tool_call(request: object) -> ToolCallRequest:
             requires_approval=object.__getattribute__(request, "requires_approval"),
             approval_scope=object.__getattribute__(request, "approval_scope"),
             workspace_id=object.__getattribute__(request, "workspace_id"),
+            available=object.__getattribute__(request, "available"),
         )
     except AttributeError:
         raise InvalidTransition from None

@@ -151,7 +151,12 @@ def _pack(value: object) -> object:
             "summary": value.summary,
         }
     if type(value) is RunFailure:
-        return {"$": "RunFailure", "code": _pack(value.code), "message": value.message}
+        return {
+            "$": "RunFailure",
+            "code": _pack(value.code),
+            "detail": value.detail,
+            "message": value.message,
+        }
     if name in _RECORDS and type(value) is _RECORDS[name] and is_dataclass(type(value)):
         return {
             "$": name,
@@ -256,8 +261,10 @@ def _unpack(value: object) -> object:
             _optional_text(value["summary"]),
         )
     if tag == "RunFailure":
-        _keys(value, {"$", "code", "message"})
-        failure = RunFailure(cast(RunErrorCode, _unpack(value["code"])))
+        _keys(value, {"$", "code", "detail", "message"})
+        failure = RunFailure(
+            cast(RunErrorCode, _unpack(value["code"])), _optional_text(value["detail"])
+        )
         if failure.message != _text(value["message"]):
             raise ValueError("SQLite failure message is invalid")
         return failure

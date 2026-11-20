@@ -102,6 +102,8 @@ class ToolRequest:
     ) -> "ToolRequest":
         """Carry the persisted call and its original approval binding into execution."""
         call = snapshot_tool_call(call)
+        if not call.available:
+            raise ValueError("Unavailable tool calls cannot be executed")
         return cls(
             tool_call_id=call.tool_call_id,
             name=call.name,
@@ -168,6 +170,7 @@ class ToolResult:
     status: ToolResultStatus
     _content: ExternalizedContent | None = field(repr=False)
     _failure_code: RunErrorCode | None
+    _failure_detail: str | None = field(repr=False)
     execution_key: str | None
 
     def __init__(
@@ -191,6 +194,7 @@ class ToolResult:
 
         content = None
         failure_code = None
+        failure_detail = None
         if status is ToolResultStatus.SUCCESS:
             if failure is not None:
                 raise ValueError("Successful tool results cannot carry a failure")
@@ -211,11 +215,20 @@ class ToolResult:
             ):
                 raise ValueError("Tool result requires a failure matching its status")
             else:
-                failure_code = failure.code
+                try:
+                    canonical = RunFailure(
+                        object.__getattribute__(failure, "code"),
+                        object.__getattribute__(failure, "detail"),
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    raise ValueError("Tool result requires a valid failure") from None
+                failure_code = canonical.code
+                failure_detail = canonical.detail
 
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "_content", content)
         object.__setattr__(self, "_failure_code", failure_code)
+        object.__setattr__(self, "_failure_detail", failure_detail)
         object.__setattr__(self, "execution_key", execution_key)
 
     @property
@@ -232,7 +245,11 @@ class ToolResult:
 
     @property
     def failure(self) -> RunFailure | None:
-        return RunFailure(self._failure_code) if self._failure_code is not None else None
+        return (
+            RunFailure(self._failure_code, self._failure_detail)
+            if self._failure_code is not None
+            else None
+        )
 
 
 class ToolGateway(Protocol):
@@ -258,6 +275,7 @@ def snapshot_tool_result(value: object) -> ToolResult:
         status = object.__getattribute__(value, "status")
         content = object.__getattribute__(value, "_content")
         failure_code = object.__getattribute__(value, "_failure_code")
+        failure_detail = object.__getattribute__(value, "_failure_detail")
         execution_key = object.__getattribute__(value, "execution_key")
         if (
             type(status) is not ToolResultStatus
@@ -265,6 +283,8 @@ def snapshot_tool_result(value: object) -> ToolResult:
             and type(content) is not ExternalizedContent
             or failure_code is not None
             and type(failure_code) is not RunErrorCode
+            or failure_detail is not None
+            and type(failure_detail) is not str
             or execution_key is not None
             and type(execution_key) is not str
         ):
@@ -272,7 +292,7 @@ def snapshot_tool_result(value: object) -> ToolResult:
         inline = content.inline_content if content is not None else None
         artifacts = content.artifacts if content is not None else ()
         summary = content.summary if content is not None else None
-        failure = RunFailure(failure_code) if failure_code is not None else None
+        failure = RunFailure(failure_code, failure_detail) if failure_code is not None else None
         return ToolResult(
             status,
             inline_content=inline,

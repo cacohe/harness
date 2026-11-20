@@ -264,6 +264,14 @@ def _lock_fd(fd: int) -> None:
 
 @contextmanager
 def object_lock(directory: Directory, digest: str) -> Iterator[None]:
+    fd = acquire_object_lock(directory, digest)
+    try:
+        yield
+    finally:
+        release_object_lock(fd)
+
+
+def acquire_object_lock(directory: Directory, digest: str) -> int:
     # Never unlink a lock file. An already waiting process may hold its inode.
     try:
         expected = regular_file(directory.stat(digest))
@@ -277,7 +285,15 @@ def object_lock(directory: Directory, digest: str) -> Iterator[None]:
         same_entry(regular_file(directory.stat(digest)), actual)
         _lock_fd(fd)
         same_entry(regular_file(directory.stat(digest)), actual)
-        yield
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def release_object_lock(fd: int) -> None:
+    try:
+        regular_file(os.fstat(fd))
     finally:
         # Closing the only descriptor releases both flock and Windows byte locks.
         os.close(fd)

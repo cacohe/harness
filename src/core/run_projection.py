@@ -57,7 +57,18 @@ def model_tool_requests(
     for call in response.tool_calls:
         spec = catalog.get(call.name)
         if spec is None:
-            raise ValueError
+            requests.append(
+                ToolCallRequest(
+                    call.tool_call_id,
+                    call.name,
+                    call.arguments_json,
+                    requires_approval=False,
+                    approval_scope="unavailable",
+                    workspace_id="unavailable",
+                    available=False,
+                )
+            )
+            continue
         requests.append(
             ToolCallRequest(
                 call.tool_call_id,
@@ -145,10 +156,10 @@ def _tool_text(call: ToolCallState) -> str:
     if call.approval is not None and call.approval.approved is False:
         return json.dumps({"tool_call_id": call.tool_call_id, "status": "denied"})
     if type(call.result) is RunFailure:
-        return json.dumps(
-            {"tool_call_id": call.tool_call_id, "error": call.result.code.value},
-            separators=(",", ":"),
-        )
+        payload = {"tool_call_id": call.tool_call_id, "error": call.result.code.value}
+        if call.result.detail is not None:
+            payload["detail"] = call.result.detail
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     assert type(call.result) is ExternalizedContent
     inline = call.result.inline_content
     if inline is not None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import stat
 from collections.abc import AsyncGenerator, Callable, Collection, Iterator
 from contextlib import contextmanager
@@ -19,10 +20,12 @@ from src.adapters.artifacts.filesystem_platform import (
 )
 from src.adapters.artifacts.filesystem_platform import (
     Directory,
+    acquire_object_lock,
     directory_info,
     object_lock,
     pin_root,
     regular_file,
+    release_object_lock,
     same_entry,
     same_file,
     write_bytes,
@@ -53,6 +56,7 @@ _DESCRIPTOR = "descriptor.json"
 _MEMBERS = {_DATA, _DESCRIPTOR}
 _LOCKS = ".locks"
 _INTENTS = ".retire-intents"
+_STAGE_NAME = re.compile(r"\.put-[0-9a-f]{32}")
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _T = TypeVar("_T")
 
@@ -70,11 +74,23 @@ class _Stage:
     name: str
     directory: os.stat_result | None = None
     fd: int | None = None
+    lock_fd: int | None = None
 
-    def close(self) -> None:
+    def close_data(self) -> None:
         fd, self.fd = self.fd, None
         if fd is not None:
             os.close(fd)
+
+    def close_lock(self) -> None:
+        fd, self.lock_fd = self.lock_fd, None
+        if fd is not None:
+            release_object_lock(fd)
+
+
+def _stage_lock_name(name: str) -> str:
+    if _STAGE_NAME.fullmatch(name) is None:
+        raise ValueError("Invalid artifact staging name")
+    return "stage-" + name[5:7]
 
 
 @contextmanager
@@ -333,6 +349,10 @@ class FilesystemArtifactRepository:
                 stage.fd = directory.open(_DATA, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
                 return stage.fd
 
+    def _acquire_stage(self, stage: _Stage) -> None:
+        with self._pinned_root() as root, root.child(_LOCKS, self._locks_info) as locks:
+            stage.lock_fd = acquire_object_lock(locks, _stage_lock_name(stage.name))
+
     def _seal_data(self, stage: _Stage, fd: int) -> os.stat_result:
         assert stage.directory is not None
         with self._pinned_root() as root, root.child(stage.name, stage.directory) as directory:
@@ -387,15 +407,18 @@ class FilesystemArtifactRepository:
                 directory.refresh()
 
     def _discard(self, stage: _Stage) -> None:
-        stage.close()
-        if stage.directory is None:
-            return
-        with self._pinned_root() as root:
-            try:
-                root.stat(stage.name)
-            except FileNotFoundError:
+        stage.close_data()
+        try:
+            if stage.directory is None:
                 return
-            _remove_directory(root, stage.name, stage.directory)
+            with self._pinned_root() as root:
+                try:
+                    root.stat(stage.name)
+                except FileNotFoundError:
+                    return
+                _remove_directory(root, stage.name, stage.directory)
+        finally:
+            stage.close_lock()
 
     async def put(self, request: ArtifactWrite) -> ArtifactRef:
         await asyncio.sleep(0)
@@ -417,6 +440,7 @@ class FilesystemArtifactRepository:
         stage = _Stage(".put-" + uuid4().hex)
         with _repository_io():
             try:
+                await _finish_io(lambda: self._acquire_stage(stage))
                 fd = await _finish_io(lambda: self._start(stage))
                 size = 0
                 digest = sha256()
@@ -441,7 +465,7 @@ class FilesystemArtifactRepository:
                 if request.expected_sha256 is not None and request.expected_sha256 != checksum:
                     raise ValueError("Artifact stream SHA-256 does not match the expected digest")
                 data = await _finish_io(lambda: self._seal_data(stage, fd))
-                await _finish_io(stage.close)
+                await _finish_io(stage.close_data)
                 descriptor_id = artifact_id_from_descriptor(
                     checksum, request.media_type, request.name, request.metadata
                 )
@@ -645,6 +669,17 @@ class FilesystemArtifactRepository:
     def _collect(self, references: set[str], cutoff_ns: int) -> int:
         removed = 0
         with self._pinned_root() as root, self._intents(root) as control:
+            with root.entries() as entries:
+                stages = [entry.name for entry in entries if _STAGE_NAME.fullmatch(entry.name)]
+            for name in stages:
+                try:
+                    with (
+                        root.child(_LOCKS, self._locks_info) as locks,
+                        object_lock(locks, _stage_lock_name(name)),
+                    ):
+                        removed += self._remove_abandoned_stage(root, name, cutoff_ns)
+                except (OSError, ArtifactRepositoryError):
+                    continue
             unresolved = set()
             with control.entries() as entries:
                 for entry in entries:
@@ -682,3 +717,23 @@ class FilesystemArtifactRepository:
                         # Corrupt, replaced, or busy entries are left for inspection or retry.
                         continue
         return removed
+
+    @staticmethod
+    def _remove_abandoned_stage(root: Directory, name: str, cutoff_ns: int) -> bool:
+        try:
+            info = directory_info(root.stat(name))
+        except FileNotFoundError:
+            return False
+        if info.st_mtime_ns >= cutoff_ns:
+            return False
+        with root.child(name, info) as directory:
+            members = _members(directory)
+            entries = {member: regular_file(directory.stat(member)) for member in members}
+            if any(entry.st_mtime_ns >= cutoff_ns for entry in entries.values()):
+                return False
+        current = directory_info(root.stat(name))
+        same_entry(current, info)
+        if current.st_mtime_ns >= cutoff_ns:
+            return False
+        _remove_directory(root, name, info)
+        return True
