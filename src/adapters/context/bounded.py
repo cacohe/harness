@@ -78,6 +78,7 @@ class BoundedContextProvider:
         current_omission: _Omission | None = None
         compaction: list[ConversationInteraction] = []
         compaction_open = True
+        compaction_follows_durable = False
         suffix_open = True
         memory: tuple[ModelMessage, ...] = ()
         skills: tuple[ModelMessage, ...] = ()
@@ -135,14 +136,21 @@ class BoundedContextProvider:
                 scanned += 1
                 if self._is_current_input(request, item, skipped_current):
                     skipped_current = True
+                    if compaction:
+                        compaction_open = False
                     continue
                 if self._is_open_tool_batch(request, item, skipped_open_tools):
                     skipped_open_tools = True
+                    if compaction:
+                        compaction_open = False
                     continue
                 relation = self._checkpoint_relation(item, durable)
                 if relation == "split":
                     raise ValueError("Summary checkpoint splits a transcript interaction")
                 if relation == "covered":
+                    if compaction and compaction_open:
+                        compaction_follows_durable = True
+                    compaction_open = False
                     continue
                 if suffix_open:
                     proposed = [*selected, item]
@@ -167,8 +175,8 @@ class BoundedContextProvider:
                     omission_segments.append(current_omission)
                 else:
                     current_omission.include(item)
-                if compaction_open and len(compaction) < self._max_compaction_interactions:
-                    if not compaction or item.sequence_through + 1 == compaction[-1].sequence_from:
+                if compaction_open:
+                    if len(compaction) < self._max_compaction_interactions:
                         compaction.append(item)
                     else:
                         compaction_open = False
@@ -202,9 +210,7 @@ class BoundedContextProvider:
         if compaction:
             prior = (
                 durable
-                if durable is not None
-                and min(item.sequence_from for item in compaction)
-                == durable.covered_through_sequence + 1
+                if durable is not None and compaction_follows_durable
                 else None
             )
             outcome = await self._summary_service.compact_or_retain(

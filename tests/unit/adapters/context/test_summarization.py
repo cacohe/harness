@@ -108,16 +108,17 @@ def test_build_invokes_compactor_but_defers_candidate_until_a_trusted_request() 
     request = _request()
     records = tuple(
         ConversationInteraction(index, index, (ModelMessage(ModelRole.ASSISTANT, "X" * 120),))
-        for index in range(3, 0, -1)
+        for index in (9, 6, 3)
     )
     digest = "b" * 64
     ref = ArtifactRef(f"sha256:{digest}", "application/json", 20, digest)
     candidate = ConversationSummaryCheckpoint(
         request.session_id,
-        3,
+        9,
         request.policy_version,
         request.profile_id,
         "compacted",
+        covered_from_sequence=3,
         artifacts=(ref,),
     )
     compactor = Compactor(candidate)
@@ -200,7 +201,51 @@ def test_compaction_accumulates_the_latest_durable_summary() -> None:
     assert compactor.calls[0].prior_checkpoint == prior
 
 
-def test_compaction_rejects_a_gap_after_the_prior_checkpoint() -> None:
+def test_bounded_provider_extends_prior_across_journal_event_sequence_gaps() -> None:
+    request = _request()
+    prior = ConversationSummaryCheckpoint(
+        request.session_id,
+        3,
+        request.policy_version,
+        request.profile_id,
+        "prior summary",
+        covered_from_sequence=1,
+    )
+    candidate = ConversationSummaryCheckpoint(
+        request.session_id,
+        9,
+        request.policy_version,
+        request.profile_id,
+        "extended summary",
+        covered_from_sequence=1,
+    )
+    records = (
+        ConversationInteraction(9, 9, (ModelMessage(ModelRole.ASSISTANT, "X" * 120),)),
+        ConversationInteraction(6, 6, (ModelMessage(ModelRole.USER, "Y" * 120),)),
+        ConversationInteraction(3, 3, (ModelMessage(ModelRole.ASSISTANT, "covered"),)),
+    )
+    compactor = Compactor(candidate)
+    provider = BoundedContextProvider(
+        Reader(records),
+        ExactTokenCounter(),
+        page_size=3,
+        summary_service=SummaryCheckpointService(compactor),
+    )
+
+    window = asyncio.run(
+        provider.build(
+            replace(request, summary_checkpoints=(prior,)),
+            ContextBudget(127, 1, 0),
+        )
+    )
+
+    assert window.new_checkpoint == candidate
+    assert len(compactor.calls) == 1
+    assert compactor.calls[0].prior_checkpoint == prior
+    assert [item.sequence_from for item in compactor.calls[0].interactions] == [6, 9]
+
+
+def test_compaction_accepts_journal_event_sequence_gaps_after_prior_checkpoint() -> None:
     prior = ConversationSummaryCheckpoint(
         SessionId("session"),
         27,
@@ -232,5 +277,6 @@ def test_compaction_rejects_a_gap_after_the_prior_checkpoint() -> None:
         service.compact_or_retain(_request(), records, prior_checkpoint=prior)
     )
 
-    assert outcome.checkpoint is None
-    assert compactor.calls == []
+    assert outcome.checkpoint == candidate
+    assert len(compactor.calls) == 1
+    assert compactor.calls[0].prior_checkpoint == prior

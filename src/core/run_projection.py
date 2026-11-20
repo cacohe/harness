@@ -1,4 +1,6 @@
+import hashlib
 import json
+from dataclasses import replace
 
 from src.core.artifacts import ExternalizedContent
 from src.core.commands import ToolCallRequest
@@ -67,6 +69,34 @@ def model_tool_requests(
             )
         )
     return tuple(requests)
+
+
+def scope_reused_tool_call_ids(
+    requests: tuple[ToolCallRequest, ...],
+    used: frozenset[str],
+    run_id: str,
+    step_id: str,
+) -> tuple[ToolCallRequest, ...]:
+    if not any(request.tool_call_id in used for request in requests):
+        return requests
+    occupied = set(used)
+    scoped = []
+    for request in requests:
+        identifier = request.tool_call_id
+        if identifier in occupied:
+            nonce = 0
+            while True:
+                digest = hashlib.sha256(
+                    f"{run_id}\0{step_id}\0{identifier}\0{nonce}".encode("utf-8")
+                ).hexdigest()
+                candidate = f"call-{digest}"
+                if candidate not in occupied:
+                    identifier = candidate
+                    break
+                nonce += 1
+        occupied.add(identifier)
+        scoped.append(replace(request, tool_call_id=identifier))
+    return tuple(scoped)
 
 
 def tool_failure(result: ToolResult) -> RunFailure:

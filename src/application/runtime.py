@@ -287,18 +287,28 @@ class RuntimeCoordinator:
                     raise SessionOwnershipError("Tool call is not owned by this Session and Run")
                 message = await self._user_input(state)
                 async with self._active_run(slot, state.run_id):
-                    coordinator = await self._coordinator(state, message)
-                    outcome = await coordinator.advance(
-                        state,
-                        DecideToolCall(
-                            state.run_id,
-                            state.session_id,
-                            tool_call_id,
-                            approved,
-                            context=self._context(state),
-                        ),
-                    )
-                    decided = _outcome_state(outcome, state)
+                    try:
+                        coordinator = await self._coordinator(state, message)
+                        outcome = await coordinator.advance(
+                            state,
+                            DecideToolCall(
+                                state.run_id,
+                                state.session_id,
+                                tool_call_id,
+                                approved,
+                                context=self._context(state),
+                            ),
+                        )
+                        decided = _outcome_state(outcome, state)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        try:
+                            decided = await self._commit_terminal(
+                                state, code=_failure_code(error)
+                            )
+                        except Exception:
+                            raise error
                     await self._observe("run.advanced", decided)
                     return await self._drive(decided, message)
 

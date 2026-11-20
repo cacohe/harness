@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from src.core._run_driver import _CommittedRun, _Driver
 from src.core.artifacts import ArtifactExternalizer, ArtifactRef, ExternalizedContent
@@ -44,6 +43,7 @@ from src.core.run_content import externalize_final_text, externalize_tool_result
 from src.core.run_projection import (
     matches_trusted_context_shape,
     model_tool_requests,
+    scope_reused_tool_call_ids,
     tool_failure,
     tool_transcript,
 )
@@ -186,7 +186,7 @@ class RunCoordinator:
         except Exception:
             return self._outcome(await driver.fail(RunErrorCode.MODEL_FAILED))
         try:
-            requests = _scope_reused_tool_call_ids(
+            requests = scope_reused_tool_call_ids(
                 model_tool_requests(response, window.tools),
                 driver.state.used_tool_call_ids,
                 driver.run_id.value,
@@ -334,26 +334,3 @@ class RunCoordinator:
         except Exception:
             driver.checkpoint = None
             return RunFailure(RunErrorCode.ARTIFACT_FAILED)
-
-
-def _scope_reused_tool_call_ids(requests, used: frozenset[str], run_id: str, step_id: str):
-    if not any(request.tool_call_id in used for request in requests):
-        return requests
-    occupied = set(used)
-    scoped = []
-    for request in requests:
-        identifier = request.tool_call_id
-        if identifier in occupied:
-            nonce = 0
-            while True:
-                digest = hashlib.sha256(
-                    f"{run_id}\0{step_id}\0{identifier}\0{nonce}".encode("utf-8")
-                ).hexdigest()
-                candidate = f"call-{digest}"
-                if candidate not in occupied:
-                    identifier = candidate
-                    break
-                nonce += 1
-        occupied.add(identifier)
-        scoped.append(replace(request, tool_call_id=identifier))
-    return tuple(scoped)

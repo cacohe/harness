@@ -688,6 +688,37 @@ async def test_approval_rejects_cross_session_run_and_tool_ownership_before_io()
 
 
 @async_test
+async def test_approval_factory_failure_is_committed_as_a_terminal_failure():
+    from src.application.runtime import RuntimeCoordinator
+
+    journal = Journal()
+    current = waiting_state(SessionId("a"), SubmissionId("submission"))
+    journal.heads["a"] = current
+    journal.runs[current.run_id.value] = current
+    journal.messages[current.run_id.value] = "hello"
+
+    def broken_factory(*_args):
+        raise RuntimeError("boom")
+
+    runtime = RuntimeCoordinator(
+        submissions=Submissions(journal),
+        journal=journal,
+        coordinator_factory=broken_factory,
+        ids=Ids(),
+        clock=Clock(),
+        max_sessions=1,
+        max_waiters_per_session=1,
+    )
+
+    result = await runtime.decide_tool_call(
+        SessionId("a"), current.run_id, "tool-call", True
+    )
+
+    assert result.status is RunStatus.FAILED
+    assert result.failure == RunFailure(RunErrorCode.INVARIANT_VIOLATION)
+
+
+@async_test
 async def test_approval_decides_resumes_and_drives_one_step_at_a_time():
     from src.application.runtime import RuntimeCoordinator
 

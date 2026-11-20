@@ -48,7 +48,7 @@ def test_application_config_is_immutable_strict_and_requires_absolute_production
     config = ApplicationConfig(
         max_sessions=4,
         max_waiters_per_session=2,
-        max_advances_per_operation=64,
+        max_advances_per_operation=65,
         sqlite_path=tmp_path / "journal.sqlite3",
         artifact_root=tmp_path / "artifacts",
     )
@@ -73,8 +73,14 @@ def test_application_config_is_immutable_strict_and_requires_absolute_production
     with pytest.raises(ValueError, match="configuration limits"):
         ApplicationConfig(
             limits=RunLimits(17, 30.0, 1_024),
-            max_advances_per_operation=32,
+            max_advances_per_operation=34,
         )
+    assert ApplicationConfig(
+        limits=RunLimits(17, 30.0, 1_024),
+        max_advances_per_operation=35,
+    ).max_advances_per_operation == 35
+    with pytest.raises(ValueError, match="configuration limits"):
+        ApplicationConfig(max_inline_artifact_bytes=0)
 
 
 def test_production_composition_requires_explicit_durable_adapter_paths(tmp_path):

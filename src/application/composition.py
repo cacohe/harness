@@ -92,9 +92,9 @@ class ApplicationConfig:
             or not 1 <= integers[0] <= 1_000_000
             or not 0 <= integers[1] <= 1_000_000
             or not 1 <= integers[2] <= 1_000_000
-            or integers[2] < 2 * limits.max_steps - 1
+            or integers[2] < 2 * limits.max_steps + 1
             or not 1 <= integers[3] <= (1 << 63) - 1
-            or not 0 <= integers[4] <= integers[3]
+            or not 1 <= integers[4] <= integers[3]
             or not 1 <= integers[5] <= 1_048_576
             or not 1 <= integers[6] <= integers[3]
             or not 1 <= integers[7] <= 1_000_000
