@@ -6,7 +6,8 @@ import inspect
 import json
 import re
 import threading
-from dataclasses import dataclass, field
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass, field, is_dataclass
 from functools import partial
 from typing import Callable
 
@@ -135,7 +136,7 @@ class MCPToolGateway(LocalToolGateway):
                 self._publish(replacement)
                 self._servers = replacement
                 if isinstance(client, _AsyncContextClient):
-                    client.on_terminated(partial(self._async_client_terminated, name, state))
+                    client.on_terminated(partial(self._async_client_terminated, name, client))
         except BaseException:
             if client is not None:
                 if discovery is not None and discovery.abandoned:
@@ -355,9 +356,11 @@ class MCPToolGateway(LocalToolGateway):
             lambda _future: asyncio.create_task(self._release_active(state))
         )
         result = await invocation.wait(self._sync_timeout)
+        normalized = _normalize_tool_result(result)
         if _value(result, "isError", _value(result, "is_error", False)) is True:
-            raise RuntimeError("MCP tool returned an error result")
-        return result
+            detail = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+            raise RuntimeError(f"MCP tool returned an error result: {detail}")
+        return normalized
 
     @staticmethod
     async def _release_active(state: _Server) -> None:
@@ -416,10 +419,11 @@ class MCPToolGateway(LocalToolGateway):
         if state.close_task is None:
             self._track_retired_close(asyncio.create_task(close_later()))
 
-    def _async_client_terminated(self, name: str, state: _Server) -> None:
+    def _async_client_terminated(self, name: str, client: object) -> None:
         async def retire() -> None:
             async with self._lifecycle:
-                if self._servers.get(name) is not state:
+                state = self._servers.get(name)
+                if state is None or state.client is not client:
                     return
                 state.closing = True
                 replacement = dict(self._servers)
@@ -637,6 +641,8 @@ def _normalize_descriptors(
     for descriptor in descriptors:
         remote_name = _value(descriptor, "name")
         description = _value(descriptor, "description", "")
+        if description is None:
+            description = ""
         schema = _value(descriptor, "inputSchema", _value(descriptor, "input_schema", {}))
         if (
             type(remote_name) is not str
@@ -696,6 +702,52 @@ def _value(value: object, name: str, default: object = ...) -> object:
     if default is ...:
         return getattr(value, name)
     return getattr(value, name, default)
+
+
+def _normalize_tool_result(result: object) -> object:
+    has_protocol_fields = any(
+        (type(result) is dict and name in result) or hasattr(result, name)
+        for name in ("content", "structuredContent", "structured_content", "isError", "is_error")
+    )
+    if not has_protocol_fields:
+        return _json_value(result)
+    content = _value(result, "content", [])
+    structured = _value(
+        result,
+        "structuredContent",
+        _value(result, "structured_content", None),
+    )
+    is_error = _value(result, "isError", _value(result, "is_error", False))
+    if type(is_error) is not bool:
+        raise ValueError("MCP tool result is invalid")
+    return {
+        "content": _json_value(content),
+        "structuredContent": _json_value(structured),
+        "isError": is_error,
+    }
+
+
+def _json_value(value: object, depth: int = 0) -> object:
+    if depth > 64:
+        raise ValueError("MCP tool result is too deeply nested")
+    if value is None or type(value) in (bool, int, float, str):
+        return value
+    dumper = getattr(value, "model_dump", None)
+    if callable(dumper):
+        try:
+            value = dumper(mode="json", by_alias=True)
+        except TypeError:
+            value = dumper()
+        return _json_value(value, depth + 1)
+    if is_dataclass(value) and not isinstance(value, type):
+        return _json_value(asdict(value), depth + 1)
+    if isinstance(value, Mapping):
+        if any(type(key) is not str for key in value):
+            raise ValueError("MCP tool result object keys must be strings")
+        return {key: _json_value(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_json_value(item, depth + 1) for item in value]
+    raise ValueError("MCP tool result is not JSON serializable")
 
 
 def _client_method(target: object, name: str) -> Callable[..., object]:

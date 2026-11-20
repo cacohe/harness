@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 import threading
 import time
 
@@ -182,6 +183,29 @@ def test_refresh_failure_keeps_previous_catalog() -> None:
             pass
         assert gateway._dynamic_catalog.specs == before
         assert gateway._servers["server"].closing is False
+        await gateway.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_refresh_keeps_transport_termination_bound_to_current_generation() -> None:
+    class Manager:
+        async def __aenter__(self):
+            return Client()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+    async def scenario():
+        gateway = _gateway(Client(), factory=lambda _source: Manager())
+        await gateway.add_server("server", object())
+        await gateway.refresh_server("server")
+        proxy = gateway._servers["server"].client
+        proxy._owner.cancel()
+        await proxy._owner
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert gateway._dynamic_catalog.specs == ()
         await gateway.aclose()
 
     asyncio.run(scenario())
@@ -1461,6 +1485,20 @@ def test_provider_unsafe_remote_names_are_normalized_and_call_original(remote_na
     asyncio.run(scenario())
 
 
+def test_optional_none_description_is_normalized_to_empty_text() -> None:
+    class OptionalDescription(Client):
+        async def list_tools(self):
+            return [{"name": "read", "description": None, "inputSchema": {}}]
+
+    async def scenario():
+        gateway = _gateway(OptionalDescription())
+        await gateway.add_server("server", object())
+        assert gateway._dynamic_catalog.specs[0].description == ""
+        await gateway.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_safe_trailing_underscore_names_remain_distinct() -> None:
     class Distinct(Client):
         async def list_tools(self):
@@ -1842,6 +1880,39 @@ def test_mcp_error_result_maps_to_failed_tool_result() -> None:
         await gateway.add_server("server", object())
         result = await gateway.execute(_request(gateway))
         assert result.status is ToolResultStatus.FAILED
+        await gateway.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_mcp_model_result_is_normalized_to_json_envelope() -> None:
+    @dataclass
+    class TextContent:
+        type: str
+        text: str
+
+    class CallToolResult:
+        isError = False
+        structuredContent = {"answer": 42}
+
+        def __init__(self):
+            self.content = [TextContent("text", "hello")]
+
+    class ModelResult(Client):
+        async def call_tool(self, name, arguments):
+            return CallToolResult()
+
+    async def scenario():
+        gateway = _gateway(ModelResult())
+        await gateway.add_server("server", object())
+        result = await gateway.execute(_request(gateway))
+        assert result.status is ToolResultStatus.SUCCESS
+        assert result.inline_content is not None
+        assert result.inline_content.value == {
+            "content": [{"type": "text", "text": "hello"}],
+            "structuredContent": {"answer": 42},
+            "isError": False,
+        }
         await gateway.aclose()
 
     asyncio.run(scenario())
