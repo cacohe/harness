@@ -33,6 +33,52 @@ def test_complete_preserves_wire_and_returns_core_types() -> None:
     assert captured["max_tokens"] == 128
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_real_litellm_response_accepts_none_tool_calls(stream: bool) -> None:
+    gateway = LiteLLMModelGateway(
+        "openai/gpt-4o-mini",
+        api_key="sk-test",
+        max_output_tokens=64,
+        stream=stream,
+        options={"mock_response": "hi there"},
+    )
+
+    response = asyncio.run(
+        gateway.complete(ModelRequest((ModelMessage(ModelRole.USER, "hello"),)))
+    )
+
+    assert response.text == "hi there"
+    assert response.tool_calls == ()
+
+
+def test_plain_provider_tools_skip_litellm_mcp_handler() -> None:
+    captured = {}
+
+    async def completion(**kwargs):
+        captured.update(kwargs)
+        return {"choices": [{"message": {"content": "ok", "tool_calls": None}}]}
+
+    request = ModelRequest(
+        (ModelMessage(ModelRole.USER, "hello"),),
+        (ToolSpec("lookup", "lookup", '{"type":"object"}'),),
+    )
+    response = asyncio.run(
+        LiteLLMModelGateway("p/m", max_output_tokens=64, completion=completion).complete(request)
+    )
+
+    assert response.text == "ok"
+    assert captured["_skip_mcp_handler"] is True
+
+
+def test_litellm_options_cannot_override_mcp_handler_ownership() -> None:
+    with pytest.raises(ValueError, match="adapter-owned"):
+        LiteLLMModelGateway(
+            "p/m",
+            max_output_tokens=64,
+            options={"_skip_mcp_handler": False},
+        )
+
+
 def test_provider_error_is_sanitized_and_secret_not_in_repr() -> None:
     async def completion(**_kwargs):
         raise RuntimeError("secret provider detail")

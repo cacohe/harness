@@ -108,6 +108,7 @@ class LiteLLMModelGateway:
             "api_base",
             "timeout",
             "max_tokens",
+            "_skip_mcp_handler",
         }
         if options is not None and forbidden.intersection(options):
             raise ValueError("LiteLLM options override adapter-owned fields")
@@ -139,6 +140,7 @@ class LiteLLMModelGateway:
             "stream": self._stream,
             "timeout": self._timeout,
             "max_tokens": self._max_output_tokens,
+            "_skip_mcp_handler": True,
         }
         if request.tools:
             arguments["tools"] = [_tool(item) for item in request.tools]
@@ -174,7 +176,9 @@ class LiteLLMModelGateway:
         _validate_finish_reason(finish)
         message = _field(choice, "message")
         text = _optional_text(_field(message, "content", None))
-        raw_calls = _field(message, "tool_calls", [])
+        raw_calls = _field(message, "tool_calls", None)
+        if raw_calls is None:
+            raw_calls = []
         if type(raw_calls) is not list or len(raw_calls) > self._max_calls:
             raise ValueError
         calls = tuple(_whole_call(item) for item in raw_calls)
@@ -215,7 +219,9 @@ class LiteLLMModelGateway:
                         finished = True
                     continue
                 content = _field(delta, "content", None)
-                fragments = _field(delta, "tool_calls", [])
+                fragments = _field(delta, "tool_calls", None)
+                if fragments is None:
+                    fragments = []
                 if finished and (content is not None or fragments):
                     raise ValueError
                 if content is not None:
