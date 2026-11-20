@@ -187,9 +187,7 @@ def test_explicitly_reported_tool_error_preserves_model_safe_detail(tmp_path: Pa
 
     async def scenario():
         gateway = LocalToolGateway(
-            ToolCatalog(
-                (ToolCatalogEntry(ToolSpec("increment", "x", "true"), reported, True),)
-            ),
+            ToolCatalog((ToolCatalogEntry(ToolSpec("increment", "x", "true"), reported, True),)),
             SQLiteToolExecutionStore((tmp_path / "reported.db").resolve()),
             _externalizer(),
         )

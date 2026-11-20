@@ -292,9 +292,7 @@ def snapshot_tool_result(value: object) -> ToolResult:
         inline = content.inline_content if content is not None else None
         artifacts = content.artifacts if content is not None else ()
         summary = content.summary if content is not None else None
-        failure = (
-            RunFailure(failure_code, failure_detail) if failure_code is not None else None
-        )
+        failure = RunFailure(failure_code, failure_detail) if failure_code is not None else None
         return ToolResult(
             status,
             inline_content=inline,

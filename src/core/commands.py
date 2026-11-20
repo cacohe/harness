@@ -131,9 +131,7 @@ class ToolCallRequest:
         _check_child_id(self.name)
         if type(self.requires_approval) is not bool:
             raise InvalidTransition
-        if type(self.available) is not bool or (
-            not self.available and self.requires_approval
-        ):
+        if type(self.available) is not bool or (not self.available and self.requires_approval):
             raise InvalidTransition
         try:
             validate_approval_binding(self.approval_scope, self.workspace_id)

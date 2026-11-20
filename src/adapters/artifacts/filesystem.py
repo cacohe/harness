@@ -673,8 +673,9 @@ class FilesystemArtifactRepository:
                 stages = [entry.name for entry in entries if _STAGE_NAME.fullmatch(entry.name)]
             for name in stages:
                 try:
-                    with root.child(_LOCKS, self._locks_info) as locks, object_lock(
-                        locks, _stage_lock_name(name)
+                    with (
+                        root.child(_LOCKS, self._locks_info) as locks,
+                        object_lock(locks, _stage_lock_name(name)),
                     ):
                         removed += self._remove_abandoned_stage(root, name, cutoff_ns)
                 except (OSError, ArtifactRepositoryError):

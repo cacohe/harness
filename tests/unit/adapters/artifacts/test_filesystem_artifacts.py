@@ -551,9 +551,7 @@ def test_collect_orphans_preserves_unsafe_staging(tmp_path, damage):
                 os.utime(member, (old, old))
             os.utime(stage, (old, old))
 
-        assert (
-            await repo.collect_orphans([], datetime.now(timezone.utc) - timedelta(days=1)) == 0
-        )
+        assert await repo.collect_orphans([], datetime.now(timezone.utc) - timedelta(days=1)) == 0
         assert victim.read_bytes() == b"keep"
         assert stage.exists()
 
