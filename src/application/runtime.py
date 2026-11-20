@@ -33,8 +33,8 @@ from src.core.journal import (
     RunJournal,
 )
 from src.core.receipt_snapshot import snapshot_run_state, snapshot_transcript
-from src.core.run_receipt import validate_commit_receipt
 from src.core.run import RunCoordinator, RunOutcome
+from src.core.run_receipt import validate_commit_receipt
 from src.core.state import RunState, RunStatus, TaskStateMachine
 
 

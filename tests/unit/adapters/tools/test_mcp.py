@@ -1,7 +1,7 @@
 import asyncio
-from dataclasses import dataclass
 import threading
 import time
+from dataclasses import dataclass
 
 import anyio
 import pytest
