@@ -74,6 +74,18 @@ class SummaryCheckpointService:
         *,
         prior_checkpoint: ConversationSummaryCheckpoint | None = None,
     ) -> CompactionOutcome:
+        ordered = tuple(sorted(interactions, key=lambda item: item.sequence_from))
+        contiguous = all(
+            earlier.sequence_through + 1 == later.sequence_from
+            for earlier, later in zip(ordered, ordered[1:])
+        )
+        follows_prior = (
+            prior_checkpoint is None
+            or bool(ordered)
+            and prior_checkpoint.covered_through_sequence + 1 == ordered[0].sequence_from
+        )
+        if not contiguous or not follows_prior:
+            return CompactionOutcome(None, ordered)
         compaction = SummaryCompactionRequest(
             request.session_id,
             request.profile_id,

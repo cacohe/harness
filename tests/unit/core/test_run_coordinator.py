@@ -671,6 +671,37 @@ def test_model_tool_batch_is_committed_before_any_tool_gateway_call():
     assert journal.batches[0][0].state == model_outcome.state
 
 
+def test_repeated_provider_tool_id_is_scoped_to_the_later_step() -> None:
+    response = ModelResponse(tool_calls=(ModelToolCall("call_0", "read", "{}"),))
+    success = ToolResult(
+        ToolResultStatus.SUCCESS,
+        inline_content=InlineContent({"ok": True}, "application/json"),
+    )
+    coordinator_, _, _, _, _ = coordinator(
+        responses=[response, response],
+        specs=(ToolSpec("read", "read", "{}"),),
+        tool_results=[success],
+    )
+    first_model = run(coordinator_.advance(initial(), submit())).state
+    after_tool = run(
+        coordinator_.advance(
+            first_model, AdvanceRun(RUN, SESSION, context=command_context("first-tool"))
+        )
+    ).state
+
+    second_model = run(
+        coordinator_.advance(
+            after_tool, AdvanceRun(RUN, SESSION, context=command_context("second-model"))
+        )
+    ).state
+
+    assert second_model.status is RunStatus.RUNNING
+    assert second_model.current_step is not None
+    second_id = second_model.current_step.model_call.tool_requests[0].tool_call_id
+    assert second_id != "call_0"
+    assert second_id not in after_tool.used_tool_call_ids
+
+
 def test_model_batch_commit_failure_never_calls_tool_and_retry_does_not_recall_model():
     class FailOnceJournal(Journal):
         failed = False

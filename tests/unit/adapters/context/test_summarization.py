@@ -198,3 +198,39 @@ def test_compaction_accumulates_the_latest_durable_summary() -> None:
     assert outcome.checkpoint == candidate
     assert len(compactor.calls) == 1
     assert compactor.calls[0].prior_checkpoint == prior
+
+
+def test_compaction_rejects_a_gap_after_the_prior_checkpoint() -> None:
+    prior = ConversationSummaryCheckpoint(
+        SessionId("session"),
+        27,
+        "policy-v1",
+        ProfileId("profile"),
+        "summary-24-27",
+        covered_from_sequence=24,
+    )
+    candidate = ConversationSummaryCheckpoint(
+        SessionId("session"),
+        38,
+        "policy-v1",
+        ProfileId("profile"),
+        "invalid-gap",
+        covered_from_sequence=24,
+    )
+    compactor = Compactor(candidate)
+    service = SummaryCheckpointService(compactor)
+    records = tuple(
+        ConversationInteraction(
+            index,
+            index,
+            (ModelMessage(ModelRole.ASSISTANT, f"history-{index}"),),
+        )
+        for index in range(35, 39)
+    )
+
+    outcome = asyncio.run(
+        service.compact_or_retain(_request(), records, prior_checkpoint=prior)
+    )
+
+    assert outcome.checkpoint is None
+    assert compactor.calls == []

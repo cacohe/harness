@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+from dataclasses import dataclass, replace
 
 from src.adapters.context.summarization import SummaryCheckpointService
 from src.core.context import (
@@ -16,7 +17,7 @@ from src.core.context import (
     summary_system_messages,
 )
 from src.core.journal import ConversationSummaryCheckpoint
-from src.core.model import ModelMessage
+from src.core.model import ModelMessage, ModelRequest, ModelRole, ModelToolCall
 
 
 @dataclass
@@ -64,8 +65,8 @@ class BoundedContextProvider:
             request.current_input,
             *request.open_tool_messages,
         )
-        estimate = self._counter.count(required, request.tools)
-        if estimate.tokens > budget.input_allowance_tokens:
+        estimate = self._candidate_estimate(request, budget, required)
+        if estimate is None:
             raise ContextBudgetExceeded
 
         durable = self._summary_service.find_latest_reusable(request.summary_checkpoints, request)
@@ -145,7 +146,9 @@ class BoundedContextProvider:
                     continue
                 if suffix_open:
                     proposed = [*selected, item]
-                    candidate_estimate = self._counter.count(
+                    candidate_estimate = self._candidate_estimate(
+                        request,
+                        budget,
                         self._assemble(
                             request,
                             proposed,
@@ -153,9 +156,8 @@ class BoundedContextProvider:
                             memory,
                             skills,
                         ),
-                        request.tools,
                     )
-                    if candidate_estimate.tokens <= budget.input_allowance_tokens:
+                    if candidate_estimate is not None:
                         selected.append(item)
                         estimate = candidate_estimate
                         continue
@@ -166,7 +168,10 @@ class BoundedContextProvider:
                 else:
                     current_omission.include(item)
                 if compaction_open and len(compaction) < self._max_compaction_interactions:
-                    compaction.append(item)
+                    if not compaction or item.sequence_through + 1 == compaction[-1].sequence_from:
+                        compaction.append(item)
+                    else:
+                        compaction_open = False
             if (
                 scanned >= self._max_compaction_interactions
                 and page.next_before_sequence is not None
@@ -199,7 +204,7 @@ class BoundedContextProvider:
                 durable
                 if durable is not None
                 and min(item.sequence_from for item in compaction)
-                > durable.covered_through_sequence
+                == durable.covered_through_sequence + 1
                 else None
             )
             outcome = await self._summary_service.compact_or_retain(
@@ -313,10 +318,12 @@ class BoundedContextProvider:
     ):
         assert checkpoint is not None
         proposed = (*included, checkpoint)
-        estimate = self._counter.count(
-            self._assemble(request, selected, proposed, memory, skills), request.tools
+        estimate = self._candidate_estimate(
+            request,
+            budget,
+            self._assemble(request, selected, proposed, memory, skills),
         )
-        if suffix_open and estimate.tokens <= budget.input_allowance_tokens:
+        if suffix_open and estimate is not None:
             included.append(checkpoint)
             return True, estimate
         omitted.append(checkpoint)
@@ -385,8 +392,8 @@ class BoundedContextProvider:
                 assembled = self._assemble(request, selected, checkpoints, proposed, later)
             else:
                 assembled = self._assemble(request, selected, checkpoints, current, proposed)
-            candidate_estimate = self._counter.count(assembled, request.tools)
-            if candidate_estimate.tokens <= budget.input_allowance_tokens:
+            candidate_estimate = self._candidate_estimate(request, budget, assembled)
+            if candidate_estimate is not None:
                 included.append(message)
                 estimate = candidate_estimate
             else:
@@ -409,7 +416,11 @@ class BoundedContextProvider:
         ordered = sorted(segments, key=lambda item: item[0])
         if any(earlier[1] >= later[0] for earlier, later in zip(ordered, ordered[1:])):
             raise ValueError("Context history segments overlap")
-        history = tuple(message for _, _, messages in ordered for message in messages)
+        history = tuple(
+            message
+            for sequence_from, _, messages in ordered
+            for message in _namespace_history_messages(sequence_from, messages)
+        )
         summaries = tuple(
             message
             for checkpoint in checkpoints
@@ -424,3 +435,53 @@ class BoundedContextProvider:
             request.current_input,
             *request.open_tool_messages,
         )
+
+    def _candidate_estimate(
+        self,
+        request: ContextRequest,
+        budget: ContextBudget,
+        messages: tuple[ModelMessage, ...],
+    ):
+        try:
+            ModelRequest(messages, request.tools)
+        except ValueError:
+            return None
+        estimate = self._counter.count(messages, request.tools)
+        return estimate if estimate.tokens <= budget.input_allowance_tokens else None
+
+
+def _namespace_history_messages(
+    sequence_from: int, messages: tuple[ModelMessage, ...]
+) -> tuple[ModelMessage, ...]:
+    identifiers = {
+        call.tool_call_id for message in messages for call in message.tool_calls
+    }
+    if not identifiers:
+        return messages
+    mapping = {
+        identifier: _history_tool_call_id(sequence_from, identifier)
+        for identifier in identifiers
+    }
+    rewritten: list[ModelMessage] = []
+    for message in messages:
+        if message.role is ModelRole.ASSISTANT:
+            calls = tuple(
+                ModelToolCall(mapping[call.tool_call_id], call.name, call.arguments_json)
+                for call in message.tool_calls
+            )
+            rewritten.append(replace(message, tool_calls=calls))
+        elif message.role is ModelRole.TOOL:
+            assert message.tool_call_id is not None
+            rewritten.append(replace(message, tool_call_id=mapping[message.tool_call_id]))
+        else:
+            rewritten.append(message)
+    return tuple(rewritten)
+
+
+def _history_tool_call_id(sequence_from: int, identifier: str) -> str:
+    candidate = f"h{sequence_from}_{identifier}"
+    if len(candidate.encode("utf-8")) <= 256:
+        return candidate
+    return "history-" + hashlib.sha256(
+        f"{sequence_from}\0{identifier}".encode("utf-8")
+    ).hexdigest()

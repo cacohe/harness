@@ -14,6 +14,7 @@ from src.core.context import (
     ConversationPage,
     EstimateQuality,
     OmittedContextRef,
+    TokenEstimate,
 )
 from src.core.ids import ProfileId, SessionId
 from src.core.journal import ConversationSummaryCheckpoint
@@ -236,7 +237,7 @@ def test_complete_tool_interaction_is_selected_atomically() -> None:
     request = _request()
 
     excluded = asyncio.run(provider.build(request, ContextBudget(44, 1, 0)))
-    included = asyncio.run(provider.build(request, ContextBudget(45, 1, 0)))
+    included = asyncio.run(provider.build(request, ContextBudget(64, 1, 0)))
     assert all(message.tool_call_id != "c1" for message in excluded.messages)
     assert [message.role for message in included.messages[1:3]] == [
         ModelRole.ASSISTANT,
@@ -506,6 +507,70 @@ def test_history_selection_is_a_contiguous_newest_suffix() -> None:
     assert "X" * 80 not in contents
     assert "old" not in contents
     assert window.omitted[0].item_count == 2
+
+
+def test_history_is_trimmed_by_model_message_limit_even_when_tokens_fit() -> None:
+    records = tuple(_interaction(index, "x") for index in range(1, 1_025))
+    window = asyncio.run(
+        BoundedContextProvider(
+            Reader(records), ExactTokenCounter(), page_size=1_024
+        ).build(_request(), ContextBudget(1_000_000, 1, 0))
+    )
+
+    assert len(window.messages) <= 1_024
+    assert any(item.source == "transcript" for item in window.omitted)
+
+
+def test_history_is_trimmed_by_model_byte_limit_even_when_tokens_fit() -> None:
+    class FlatCounter:
+        def count(self, messages, tools):
+            return TokenEstimate(1, EstimateQuality.EXACT)
+
+    records = tuple(_interaction(index, "x" * 1_000_000) for index in range(1, 10))
+    window = asyncio.run(
+        BoundedContextProvider(Reader(records), FlatCounter(), page_size=16).build(
+            _request(), ContextBudget(100, 1, 0)
+        )
+    )
+
+    assert len(window.messages) < 11
+    assert any(item.source == "transcript" for item in window.omitted)
+
+
+def test_repeated_provider_tool_ids_are_namespaced_in_history() -> None:
+    call = ModelToolCall("call_0", "read", "{}")
+    records = (
+        ConversationInteraction(
+            1,
+            2,
+            (
+                ModelMessage(ModelRole.ASSISTANT, tool_calls=(call,)),
+                ModelMessage(ModelRole.TOOL, "first", tool_call_id="call_0"),
+            ),
+        ),
+        ConversationInteraction(
+            3,
+            4,
+            (
+                ModelMessage(ModelRole.ASSISTANT, tool_calls=(call,)),
+                ModelMessage(ModelRole.TOOL, "second", tool_call_id="call_0"),
+            ),
+        ),
+    )
+
+    window = asyncio.run(
+        BoundedContextProvider(Reader(records), ExactTokenCounter(), page_size=4).build(
+            _request(), ContextBudget(1_000, 1, 0)
+        )
+    )
+
+    ids = [
+        call.tool_call_id
+        for message in window.messages
+        for call in message.tool_calls
+    ]
+    assert len(ids) == 2
+    assert len(set(ids)) == 2
 
 
 def test_conservative_fallback_applies_safety_factor() -> None:
