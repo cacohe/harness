@@ -194,6 +194,4 @@ def _read_result(ref: ArtifactRef, offset: int, payload: bytes) -> dict[str, obj
 
 
 def _encoded_size(result: dict[str, object]) -> int:
-    return len(
-        json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    )
+    return len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))

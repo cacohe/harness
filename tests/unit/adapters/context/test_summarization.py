@@ -273,9 +273,7 @@ def test_compaction_accepts_journal_event_sequence_gaps_after_prior_checkpoint()
         for index in range(35, 39)
     )
 
-    outcome = asyncio.run(
-        service.compact_or_retain(_request(), records, prior_checkpoint=prior)
-    )
+    outcome = asyncio.run(service.compact_or_retain(_request(), records, prior_checkpoint=prior))
 
     assert outcome.checkpoint == candidate
     assert len(compactor.calls) == 1

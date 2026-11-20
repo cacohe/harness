@@ -512,9 +512,9 @@ def test_history_selection_is_a_contiguous_newest_suffix() -> None:
 def test_history_is_trimmed_by_model_message_limit_even_when_tokens_fit() -> None:
     records = tuple(_interaction(index, "x") for index in range(1, 1_025))
     window = asyncio.run(
-        BoundedContextProvider(
-            Reader(records), ExactTokenCounter(), page_size=1_024
-        ).build(_request(), ContextBudget(1_000_000, 1, 0))
+        BoundedContextProvider(Reader(records), ExactTokenCounter(), page_size=1_024).build(
+            _request(), ContextBudget(1_000_000, 1, 0)
+        )
     )
 
     assert len(window.messages) <= 1_024
@@ -564,11 +564,7 @@ def test_repeated_provider_tool_ids_are_namespaced_in_history() -> None:
         )
     )
 
-    ids = [
-        call.tool_call_id
-        for message in window.messages
-        for call in message.tool_calls
-    ]
+    ids = [call.tool_call_id for message in window.messages for call in message.tool_calls]
     assert len(ids) == 2
     assert len(set(ids)) == 2
 

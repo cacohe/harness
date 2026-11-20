@@ -208,11 +208,7 @@ class BoundedContextProvider:
 
         candidate_checkpoint: ConversationSummaryCheckpoint | None = None
         if compaction:
-            prior = (
-                durable
-                if durable is not None and compaction_follows_durable
-                else None
-            )
+            prior = durable if durable is not None and compaction_follows_durable else None
             outcome = await self._summary_service.compact_or_retain(
                 request, tuple(compaction), prior_checkpoint=prior
             )
@@ -459,14 +455,11 @@ class BoundedContextProvider:
 def _namespace_history_messages(
     sequence_from: int, messages: tuple[ModelMessage, ...]
 ) -> tuple[ModelMessage, ...]:
-    identifiers = {
-        call.tool_call_id for message in messages for call in message.tool_calls
-    }
+    identifiers = {call.tool_call_id for message in messages for call in message.tool_calls}
     if not identifiers:
         return messages
     mapping = {
-        identifier: _history_tool_call_id(sequence_from, identifier)
-        for identifier in identifiers
+        identifier: _history_tool_call_id(sequence_from, identifier) for identifier in identifiers
     }
     rewritten: list[ModelMessage] = []
     for message in messages:
@@ -488,6 +481,4 @@ def _history_tool_call_id(sequence_from: int, identifier: str) -> str:
     candidate = f"h{sequence_from}_{identifier}"
     if len(candidate.encode("utf-8")) <= 256:
         return candidate
-    return "history-" + hashlib.sha256(
-        f"{sequence_from}\0{identifier}".encode("utf-8")
-    ).hexdigest()
+    return "history-" + hashlib.sha256(f"{sequence_from}\0{identifier}".encode("utf-8")).hexdigest()

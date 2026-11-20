@@ -304,9 +304,7 @@ class RuntimeCoordinator:
                         raise
                     except Exception as error:
                         try:
-                            decided = await self._commit_terminal(
-                                state, code=_failure_code(error)
-                            )
+                            decided = await self._commit_terminal(state, code=_failure_code(error))
                         except Exception:
                             raise error
                     await self._observe("run.advanced", decided)

@@ -43,9 +43,7 @@ def test_real_litellm_response_accepts_none_tool_calls(stream: bool) -> None:
         options={"mock_response": "hi there"},
     )
 
-    response = asyncio.run(
-        gateway.complete(ModelRequest((ModelMessage(ModelRole.USER, "hello"),)))
-    )
+    response = asyncio.run(gateway.complete(ModelRequest((ModelMessage(ModelRole.USER, "hello"),))))
 
     assert response.text == "hi there"
     assert response.tool_calls == ()

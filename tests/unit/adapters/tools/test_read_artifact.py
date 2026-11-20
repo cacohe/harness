@@ -181,9 +181,7 @@ def test_full_binary_read_is_trimmed_to_the_encoded_result_budget() -> None:
             max_result_bytes=65_536,
         )({"artifact_id": ref.artifact_id, "offset": 0, "limit": 65_536})
 
-        encoded = json.dumps(
-            result, ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")
+        encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         assert len(encoded) <= 65_536
         assert result["returned_bytes"] < 65_536
         assert result["truncated"] is True

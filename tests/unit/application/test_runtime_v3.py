@@ -526,9 +526,7 @@ async def test_active_exception_releases_session_for_the_next_fifo_operation():
         max_sessions=1,
         max_waiters_per_session=1,
     )
-    failed = await runtime.submit(
-        SessionId("a"), ProfileId("profile"), "one", SubmissionId("one")
-    )
+    failed = await runtime.submit(SessionId("a"), ProfileId("profile"), "one", SubmissionId("one"))
     assert failed.status is RunStatus.FAILED
     assert failed.failure == RunFailure(RunErrorCode.INVARIANT_VIOLATION)
     result = await runtime.submit(SessionId("a"), ProfileId("profile"), "two", SubmissionId("two"))
@@ -591,9 +589,7 @@ async def test_advance_limit_is_committed_as_a_terminal_failure():
         max_advances_per_operation=1,
     )
 
-    result = await runtime.submit(
-        SessionId("a"), ProfileId("profile"), "one", SubmissionId("one")
-    )
+    result = await runtime.submit(SessionId("a"), ProfileId("profile"), "one", SubmissionId("one"))
 
     assert result.status is RunStatus.FAILED
     assert result.failure == RunFailure(RunErrorCode.LIMIT_EXCEEDED)
@@ -619,9 +615,7 @@ async def test_journal_limit_failure_preserves_its_error_code_and_terminalizes()
         max_waiters_per_session=1,
     )
 
-    result = await runtime.submit(
-        SessionId("a"), ProfileId("profile"), "one", SubmissionId("one")
-    )
+    result = await runtime.submit(SessionId("a"), ProfileId("profile"), "one", SubmissionId("one"))
 
     assert result.status is RunStatus.FAILED
     assert result.failure == RunFailure(RunErrorCode.LIMIT_EXCEEDED)
@@ -646,9 +640,7 @@ async def test_context_budget_failure_preserves_its_error_code_and_terminalizes(
         max_waiters_per_session=1,
     )
 
-    result = await runtime.submit(
-        SessionId("a"), ProfileId("profile"), "one", SubmissionId("one")
-    )
+    result = await runtime.submit(SessionId("a"), ProfileId("profile"), "one", SubmissionId("one"))
 
     assert result.status is RunStatus.FAILED
     assert result.failure == RunFailure(RunErrorCode.CONTEXT_BUDGET_EXCEEDED)
@@ -710,9 +702,7 @@ async def test_approval_factory_failure_is_committed_as_a_terminal_failure():
         max_waiters_per_session=1,
     )
 
-    result = await runtime.decide_tool_call(
-        SessionId("a"), current.run_id, "tool-call", True
-    )
+    result = await runtime.decide_tool_call(SessionId("a"), current.run_id, "tool-call", True)
 
     assert result.status is RunStatus.FAILED
     assert result.failure == RunFailure(RunErrorCode.INVARIANT_VIOLATION)
