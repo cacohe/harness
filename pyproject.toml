@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Lean async Harness core with bounded context, durable runs, and artifact-aware adapters."
 requires-python = ">=3.11"
 readme = "README.md"
+license = "MIT"
 dependencies = ["litellm"]
 
 [dependency-groups]
