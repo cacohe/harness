@@ -166,3 +166,7 @@ uv run --locked ruff format --check src tests
 
 架构测试确保 `src/core` 不导入 application、adapter、SQLite、LiteLLM、Docker、MCP 或观测实现，
 并确保旧 schema、旧 Harness 和兼容路径不会重新出现。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。
