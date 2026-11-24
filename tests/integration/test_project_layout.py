@@ -148,9 +148,17 @@ def _present_legacy_paths(root: Path) -> list[str]:
     return [name for name in LEGACY_SOURCE_PATHS if (root / "src" / name).exists()]
 
 
-def _core_runtime_dependencies(path: Path) -> set[str]:
+def _core_module_name(path: Path, root: Path) -> str:
+    relative = path.relative_to(root / "src").with_suffix("")
+    parts = relative.parts[:-1] if relative.name == "__init__" else relative.parts
+    return ".".join(("src", *parts))
+
+
+def _core_runtime_dependencies(path: Path, root: Path, modules: set[str]) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     dependencies: set[str] = set()
+    module = _core_module_name(path, root)
+    package = module if path.name == "__init__.py" else module.rpartition(".")[0]
 
     class RuntimeImportVisitor(ast.NodeVisitor):
         def visit_If(self, node: ast.If) -> None:
@@ -167,8 +175,24 @@ def _core_runtime_dependencies(path: Path) -> set[str]:
             )
 
         def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-            if node.level == 0 and node.module and node.module.startswith("src.core."):
-                dependencies.add(node.module)
+            imported = node.module or ""
+            if node.level:
+                try:
+                    imported = importlib.util.resolve_name(
+                        "." * node.level + imported,
+                        package,
+                    )
+                except (ImportError, ValueError):
+                    return
+            if not imported.startswith("src.core"):
+                return
+            if imported in modules:
+                dependencies.add(imported)
+            dependencies.update(
+                candidate
+                for alias in node.names
+                if (candidate := f"{imported}.{alias.name}") in modules
+            )
 
     RuntimeImportVisitor().visit(tree)
     return dependencies
@@ -176,13 +200,12 @@ def _core_runtime_dependencies(path: Path) -> set[str]:
 
 def _core_import_cycles(root: Path) -> list[tuple[str, ...]]:
     core = root / "src" / "core"
-
-    def module_name(path: Path) -> str:
-        relative = path.relative_to(root / "src").with_suffix("")
-        parts = relative.parts[:-1] if relative.name == "__init__" else relative.parts
-        return ".".join(("src", *parts))
-
-    graph = {module_name(path): _core_runtime_dependencies(path) for path in core.rglob("*.py")}
+    paths = tuple(core.rglob("*.py"))
+    modules = {_core_module_name(path, root) for path in paths}
+    graph = {
+        _core_module_name(path, root): _core_runtime_dependencies(path, root, modules)
+        for path in paths
+    }
     cycles: set[tuple[str, ...]] = set()
 
     def visit(module: str, path: tuple[str, ...]) -> None:
@@ -214,6 +237,31 @@ def test_core_contains_only_harness_mechanism_and_extension_ports():
 def test_core_runtime_import_graph_is_acyclic():
     cycles = set(_core_import_cycles(ROOT))
     assert cycles - ALLOWED_CORE_IMPORT_CYCLES == set()
+
+
+@pytest.mark.parametrize(
+    ("left_import", "right_import"),
+    [
+        ("from .right import value", "from .left import value"),
+        (
+            "from src.core.execution import right",
+            "from src.core.execution import left",
+        ),
+    ],
+)
+def test_core_cycle_gate_resolves_nested_import_forms(
+    tmp_path: Path, left_import: str, right_import: str
+):
+    package = tmp_path / "src" / "core" / "execution"
+    package.mkdir(parents=True)
+    for parent in (package.parent.parent, package.parent, package):
+        (parent / "__init__.py").write_text("", encoding="utf-8")
+    (package / "left.py").write_text(f"{left_import}\nvalue = 1\n", encoding="utf-8")
+    (package / "right.py").write_text(f"{right_import}\nvalue = 2\n", encoding="utf-8")
+
+    assert set(_core_import_cycles(tmp_path)) == {
+        ("src.core.execution.left", "src.core.execution.right")
+    }
 
 
 @pytest.mark.architecture
