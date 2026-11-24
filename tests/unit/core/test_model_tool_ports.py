@@ -2,11 +2,8 @@ from dataclasses import FrozenInstanceError
 from decimal import Inexact, InvalidOperation, localcontext
 
 import pytest
-from src.core.artifacts import MAX_SUMMARY_BYTES, ArtifactRef, InlineContent
-from src.core.commands import ToolCallRequest
-from src.core.errors import RunErrorCode, RunFailure
-from src.core.ids import RunId, SessionId
-from src.core.model import (
+from src.core.artifacts.contracts import MAX_SUMMARY_BYTES, ArtifactRef, InlineContent
+from src.core.context.model import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -14,7 +11,16 @@ from src.core.model import (
     ModelToolCall,
     ModelUsage,
 )
-from src.core.tools import ToolApproval, ToolRequest, ToolResult, ToolResultStatus, ToolSpec
+from src.core.execution.commands import ToolCallRequest
+from src.core.execution.errors import RunErrorCode, RunFailure
+from src.core.ids import RunId, SessionId
+from src.core.tools.contracts import (
+    ToolApproval,
+    ToolRequest,
+    ToolResult,
+    ToolResultStatus,
+    ToolSpec,
+)
 
 
 class StringSubclass(str):

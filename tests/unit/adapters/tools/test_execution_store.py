@@ -11,10 +11,10 @@ from src.adapters.tools.execution_store import (
     ToolExecutionStoreError,
     ToolExecutionWaitExpired,
 )
-from src.core.commands import ToolCallRequest
-from src.core.errors import RunErrorCode, RunFailure
+from src.core.execution.commands import ToolCallRequest
+from src.core.execution.errors import RunErrorCode, RunFailure
 from src.core.ids import RunId, SessionId
-from src.core.tools import ToolApproval, ToolRequest, ToolResult, ToolResultStatus
+from src.core.tools.contracts import ToolApproval, ToolRequest, ToolResult, ToolResultStatus
 
 
 def _request(arguments: str = "{}", *, call_id: str = "call") -> ToolRequest:

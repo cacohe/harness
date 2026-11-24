@@ -10,8 +10,8 @@ from src.adapters.model.litellm import (
     ModelTransportError,
     ModelTruncatedError,
 )
-from src.core.model import ModelMessage, ModelRequest, ModelRole, ModelToolCall
-from src.core.tools import ToolSpec
+from src.core.context.model import ModelMessage, ModelRequest, ModelRole, ModelToolCall
+from src.core.tools.contracts import ToolSpec
 
 
 def test_complete_preserves_wire_and_returns_core_types() -> None:

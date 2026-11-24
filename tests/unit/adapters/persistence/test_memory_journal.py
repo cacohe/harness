@@ -6,10 +6,10 @@ from typing import cast
 
 import pytest
 from src.adapters.persistence.memory import InMemoryRunJournal, _Store
-from src.core.errors import RunErrorCode
-from src.core.events import DomainEvent, JsonValue
+from src.core.execution.errors import RunErrorCode
+from src.core.execution.events import DomainEvent, JsonValue
 from src.core.ids import EventId, RunId, SessionId
-from src.core.journal import (
+from src.core.persistence.journal import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,

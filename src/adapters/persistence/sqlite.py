@@ -45,14 +45,15 @@ from src.adapters.persistence.sqlite_integrity import (
     summary_record_hash,
     validate_hash,
 )
-from src.core.context import (
+from src.core.context.contracts import (
     ConversationCoverage,
     ConversationCoverageSegment,
     ConversationPage,
 )
-from src.core.errors import RunErrorCode
+from src.core.execution.errors import RunErrorCode
+from src.core.execution.state import RunState
 from src.core.ids import ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import (
+from src.core.persistence.journal import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
     ArtifactFactRecord,
@@ -68,8 +69,7 @@ from src.core.journal import (
     TranscriptEntry,
     TranscriptEntryType,
 )
-from src.core.run_receipt import validate_commit_receipt
-from src.core.state import RunState
+from src.core.persistence.receipt import validate_commit_receipt
 
 _SCHEMA_VERSION = 6
 _COVERAGE_BLOCK_SIZE = 128

@@ -29,21 +29,21 @@ from src.application.observability import PostCommitObserver
 from src.application.recovery import RecoveryService
 from src.application.runtime import RuntimeCoordinator, _close_resource
 from src.application.submissions import SubmissionService
-from src.core.artifacts import ArtifactExternalizer, ArtifactRepository
-from src.core.commands import RunLimits
-from src.core.context import (
+from src.core.artifacts.contracts import ArtifactExternalizer, ArtifactRepository
+from src.core.context.contracts import (
     ContextBudget,
     ContextBudgetExceeded,
     ContextProvider,
     ContextRequest,
     TokenCounter,
 )
+from src.core.context.model import ModelGateway
+from src.core.execution.commands import RunLimits
+from src.core.execution.coordinator import RunCoordinator
+from src.core.execution.state import RunState
 from src.core.ids import Clock, IdGenerator, ProfileId
-from src.core.journal import RunJournal
-from src.core.model import ModelGateway
-from src.core.run import RunCoordinator
-from src.core.state import RunState
-from src.core.tools import ToolGateway, ToolSpec
+from src.core.persistence.journal import RunJournal
+from src.core.tools.contracts import ToolGateway, ToolSpec
 
 ContextRequestFactory = Callable[[RunState, str], ContextRequest]
 _PATH_TYPE = type(Path())

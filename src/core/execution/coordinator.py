@@ -3,9 +3,21 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
-from src.core._run_driver import _CommittedRun, _Driver
-from src.core.artifacts import ArtifactExternalizer, ArtifactRef, ExternalizedContent
-from src.core.commands import (
+from src.core.artifacts.contracts import ArtifactExternalizer, ArtifactRef, ExternalizedContent
+from src.core.context.contracts import (
+    ContextBudget,
+    ContextBudgetExceeded,
+    ContextProvider,
+    ContextRequest,
+    TokenCounter,
+)
+from src.core.context.model import (
+    ModelGateway,
+    ModelRequest,
+    snapshot_model_response,
+)
+from src.core.execution._driver import _CommittedRun, _Driver
+from src.core.execution.commands import (
     AdvanceRun,
     CancelRun,
     CompleteRun,
@@ -20,35 +32,23 @@ from src.core.commands import (
     StartToolCall,
     SubmitRun,
 )
-from src.core.context import (
-    ContextBudget,
-    ContextBudgetExceeded,
-    ContextProvider,
-    ContextRequest,
-    TokenCounter,
-)
-from src.core.errors import InvalidTransition, RunErrorCode, RunFailure
-from src.core.events import DomainEvent
-from src.core.ids import Clock, IdGenerator
-from src.core.journal import (
-    ArtifactAttachmentRole,
-    RunJournal,
-)
-from src.core.model import (
-    ModelGateway,
-    ModelRequest,
-    snapshot_model_response,
-)
-from src.core.run_content import externalize_final_text, externalize_tool_result
-from src.core.run_projection import (
+from src.core.execution.content import externalize_final_text, externalize_tool_result
+from src.core.execution.errors import InvalidTransition, RunErrorCode, RunFailure
+from src.core.execution.events import DomainEvent
+from src.core.execution.projection import (
     matches_trusted_context_shape,
     model_tool_requests,
     scope_reused_tool_call_ids,
     tool_failure,
     tool_transcript,
 )
-from src.core.state import RunState, RunStatus, ToolCallState
-from src.core.tools import (
+from src.core.execution.state import RunState, RunStatus, ToolCallState
+from src.core.ids import Clock, IdGenerator
+from src.core.persistence.journal import (
+    ArtifactAttachmentRole,
+    RunJournal,
+)
+from src.core.tools.contracts import (
     ToolApproval,
     ToolGateway,
     ToolRequest,

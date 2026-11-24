@@ -2,8 +2,8 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import TypeAlias, assert_never
 
-from src.core.artifacts import ArtifactRef, ExternalizedContent, snapshot_artifact_ref
-from src.core.commands import (
+from src.core.artifacts.contracts import ArtifactRef, ExternalizedContent, snapshot_artifact_ref
+from src.core.execution.commands import (
     AdvanceRun,
     CancelRun,
     CompleteRun,
@@ -24,8 +24,8 @@ from src.core.commands import (
     _check_child_id,
     snapshot_tool_call,
 )
-from src.core.errors import InvalidTransition, RunErrorCode, RunFailure
-from src.core.events import DomainEvent, DomainEventType, JsonValue
+from src.core.execution.errors import InvalidTransition, RunErrorCode, RunFailure
+from src.core.execution.events import DomainEvent, DomainEventType, JsonValue
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 
 
@@ -116,7 +116,7 @@ class RunState:
     journal_sequence: int = 0
 
     def __post_init__(self) -> None:
-        from src.core.state_validation import validate_state
+        from src.core.execution.state_validation import validate_state
 
         validate_state(self)
 

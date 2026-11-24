@@ -2,9 +2,9 @@ import json
 
 import pytest
 from src.adapters.context import journal_history
+from src.core.context.model import ModelRole
 from src.core.ids import RunId, SessionId, SubmissionId
-from src.core.journal import TranscriptEntry, TranscriptEntryType
-from src.core.model import ModelRole
+from src.core.persistence.journal import TranscriptEntry, TranscriptEntryType
 
 SESSION = SessionId("session")
 RUN = RunId("run")

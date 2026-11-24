@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
-from src.core.artifacts import ArtifactRepository
-from src.core.journal import ArtifactRetirementState, RunJournal
+from src.core.artifacts.contracts import ArtifactRepository
+from src.core.persistence.journal import ArtifactRetirementState, RunJournal
 
 
 class ArtifactRetentionBlocked(RuntimeError):

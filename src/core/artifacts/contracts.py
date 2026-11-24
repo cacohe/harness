@@ -8,13 +8,13 @@ from hashlib import sha256 as _sha256
 from io import StringIO
 from typing import NoReturn, Protocol, TypeAlias, TypeVar, cast
 
-from src.core.artifact_validation import (
+from src.core.artifacts.validation import (
     artifact_id_from_sha256,
     validate_artifact_id,
     validate_artifact_name,
     validate_media_type,
 )
-from src.core.events import JsonValue
+from src.core.execution.events import JsonValue
 
 MAX_ARTIFACT_SIZE_BYTES = (1 << 63) - 1
 MAX_INLINE_CONTENT_BYTES = 1_048_576

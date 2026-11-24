@@ -13,7 +13,8 @@ from src.application.artifact_lifecycle import ArtifactLifecycleService
 from src.application.observability import Observation, PostCommitObserver
 from src.application.recovery import RecoveryService
 from src.application.submissions import AcceptedRun, SubmissionService
-from src.core.commands import (
+from src.core.context.contracts import ContextBudgetExceeded
+from src.core.execution.commands import (
     AdvanceRun,
     CancelRun,
     CommandContext,
@@ -21,10 +22,11 @@ from src.core.commands import (
     FailRun,
     ResumeRun,
 )
-from src.core.context import ContextBudgetExceeded
-from src.core.errors import InvalidTransition, RunErrorCode, RunFailure
+from src.core.execution.coordinator import RunCoordinator, RunOutcome
+from src.core.execution.errors import InvalidTransition, RunErrorCode, RunFailure
+from src.core.execution.state import RunState, RunStatus, TaskStateMachine
 from src.core.ids import Clock, IdGenerator, ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import (
+from src.core.persistence.journal import (
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,
     JournalCommit,
@@ -32,10 +34,8 @@ from src.core.journal import (
     JournalHead,
     RunJournal,
 )
-from src.core.receipt_snapshot import snapshot_run_state, snapshot_transcript
-from src.core.run import RunCoordinator, RunOutcome
-from src.core.run_receipt import validate_commit_receipt
-from src.core.state import RunState, RunStatus, TaskStateMachine
+from src.core.persistence.receipt import validate_commit_receipt
+from src.core.persistence.snapshots import snapshot_run_state, snapshot_transcript
 
 
 class ApplicationClosedError(RuntimeError):

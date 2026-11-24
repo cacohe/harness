@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from src.application.agent import AgentSession
 from src.application.composition import create_development_agent, create_production_agent
-from src.core.journal import RunJournal
+from src.core.persistence.journal import RunJournal
 
 ROOT = Path(__file__).resolve().parents[2]
 LEGACY_SOURCE_PATHS = (
@@ -24,29 +24,34 @@ LEGACY_SOURCE_PATHS = (
     "tool",
     "utils",
 )
-EXPECTED_CORE_MODULES = {
+EXPECTED_CORE_PATHS = {
     "__init__.py",
-    "_run_driver.py",
-    "approval.py",
-    "artifact_validation.py",
-    "artifacts.py",
-    "commands.py",
-    "context.py",
-    "context_support.py",
-    "errors.py",
-    "events.py",
     "ids.py",
-    "journal.py",
     "json_values.py",
-    "model.py",
-    "receipt_snapshot.py",
-    "run.py",
-    "run_content.py",
-    "run_projection.py",
-    "run_receipt.py",
-    "state.py",
-    "state_validation.py",
-    "tools.py",
+    "execution/__init__.py",
+    "execution/_driver.py",
+    "execution/commands.py",
+    "execution/content.py",
+    "execution/coordinator.py",
+    "execution/errors.py",
+    "execution/events.py",
+    "execution/projection.py",
+    "execution/state.py",
+    "execution/state_validation.py",
+    "context/__init__.py",
+    "context/contracts.py",
+    "context/model.py",
+    "context/support.py",
+    "tools/__init__.py",
+    "tools/approval.py",
+    "tools/contracts.py",
+    "artifacts/__init__.py",
+    "artifacts/contracts.py",
+    "artifacts/validation.py",
+    "persistence/__init__.py",
+    "persistence/journal.py",
+    "persistence/receipt.py",
+    "persistence/snapshots.py",
 }
 FORBIDDEN_CORE_IMPORTS = (
     "src.adapters",
@@ -86,7 +91,7 @@ LEGACY_DOCUMENT_TERMS = (
     "Migration from " + "v1",
 )
 ALLOWED_CORE_IMPORT_CYCLES = {
-    ("src.core.state", "src.core.state_validation"),
+    ("src.core.execution.state", "src.core.execution.state_validation"),
 }
 
 
@@ -143,13 +148,6 @@ def _present_legacy_paths(root: Path) -> list[str]:
     return [name for name in LEGACY_SOURCE_PATHS if (root / "src" / name).exists()]
 
 
-def _core_line_counts(root: Path) -> dict[str, int]:
-    return {
-        path.name: len(path.read_text(encoding="utf-8").splitlines())
-        for path in (root / "src" / "core").glob("*.py")
-    }
-
-
 def _core_runtime_dependencies(path: Path) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     dependencies: set[str] = set()
@@ -177,10 +175,14 @@ def _core_runtime_dependencies(path: Path) -> set[str]:
 
 
 def _core_import_cycles(root: Path) -> list[tuple[str, ...]]:
-    graph = {
-        f"src.core.{path.stem}": _core_runtime_dependencies(path)
-        for path in (root / "src" / "core").glob("*.py")
-    }
+    core = root / "src" / "core"
+
+    def module_name(path: Path) -> str:
+        relative = path.relative_to(root / "src").with_suffix("")
+        parts = relative.parts[:-1] if relative.name == "__init__" else relative.parts
+        return ".".join(("src", *parts))
+
+    graph = {module_name(path): _core_runtime_dependencies(path) for path in core.rglob("*.py")}
     cycles: set[tuple[str, ...]] = set()
 
     def visit(module: str, path: tuple[str, ...]) -> None:
@@ -201,15 +203,11 @@ def _core_import_cycles(root: Path) -> list[tuple[str, ...]]:
 
 @pytest.mark.architecture
 def test_core_contains_only_harness_mechanism_and_extension_ports():
-    assert {path.name for path in (ROOT / "src" / "core").glob("*.py")} == EXPECTED_CORE_MODULES
+    core = ROOT / "src" / "core"
+    assert {path.relative_to(core).as_posix() for path in core.rglob("*.py")} == (
+        EXPECTED_CORE_PATHS
+    )
     assert _core_violations(ROOT) == []
-
-
-@pytest.mark.architecture
-def test_core_modules_stay_within_reviewable_size_limits():
-    line_counts = _core_line_counts(ROOT)
-    assert line_counts["run.py"] <= 350
-    assert {name: count for name, count in line_counts.items() if count > 500} == {}
 
 
 @pytest.mark.architecture

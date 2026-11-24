@@ -1,9 +1,9 @@
 import asyncio
 
 from src.adapters.tools.router import ToolRouter
-from src.core.commands import ToolCallRequest
+from src.core.execution.commands import ToolCallRequest
 from src.core.ids import RunId, SessionId
-from src.core.tools import ToolApproval, ToolRequest, ToolResult, ToolResultStatus
+from src.core.tools.contracts import ToolApproval, ToolRequest, ToolResult, ToolResultStatus
 
 
 class _Gateway:

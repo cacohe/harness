@@ -4,7 +4,7 @@ from bisect import bisect_left, bisect_right
 import pytest
 from src.adapters.context.bounded import BoundedContextProvider
 from src.adapters.context.tokenizers import ConservativeTokenCounter, ExactTokenCounter
-from src.core.context import (
+from src.core.context.contracts import (
     ContextBudget,
     ContextBudgetExceeded,
     ContextRequest,
@@ -16,10 +16,10 @@ from src.core.context import (
     OmittedContextRef,
     TokenEstimate,
 )
+from src.core.context.model import ModelMessage, ModelRole, ModelToolCall
 from src.core.ids import ProfileId, SessionId
-from src.core.journal import ConversationSummaryCheckpoint
-from src.core.model import ModelMessage, ModelRole, ModelToolCall
-from src.core.tools import ToolSpec
+from src.core.persistence.journal import ConversationSummaryCheckpoint
+from src.core.tools.contracts import ToolSpec
 
 
 class Reader:

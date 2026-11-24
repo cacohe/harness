@@ -4,7 +4,7 @@ import hashlib
 from dataclasses import dataclass, replace
 
 from src.adapters.context.summarization import SummaryCheckpointService
-from src.core.context import (
+from src.core.context.contracts import (
     ContextBudget,
     ContextBudgetExceeded,
     ContextRequest,
@@ -16,8 +16,8 @@ from src.core.context import (
     TokenCounter,
     summary_system_messages,
 )
-from src.core.journal import ConversationSummaryCheckpoint
-from src.core.model import ModelMessage, ModelRequest, ModelRole, ModelToolCall
+from src.core.context.model import ModelMessage, ModelRequest, ModelRole, ModelToolCall
+from src.core.persistence.journal import ConversationSummaryCheckpoint
 
 
 @dataclass

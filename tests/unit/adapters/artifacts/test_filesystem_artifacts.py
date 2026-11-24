@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from src.adapters.artifacts.filesystem import ArtifactRepositoryError, FilesystemArtifactRepository
 from src.adapters.artifacts.filesystem_platform import Directory
-from src.core.artifacts import ArtifactWrite, artifact_id_from_descriptor
+from src.core.artifacts.contracts import ArtifactWrite, artifact_id_from_descriptor
 
 
 def _address(content, media_type="text/plain", name=None, metadata=None):
@@ -919,7 +919,7 @@ import asyncio
 import sys
 from pathlib import Path
 from src.adapters.artifacts.filesystem import FilesystemArtifactRepository
-from src.core.artifacts import ArtifactWrite
+from src.core.artifacts.contracts import ArtifactWrite
 
 async def chunks():
     yield b"abc"

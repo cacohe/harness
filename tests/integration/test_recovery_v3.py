@@ -9,19 +9,19 @@ from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.application.artifact_lifecycle import ArtifactLifecycleService
 from src.application.recovery import RecoveryCorruption, RecoveryService
-from src.core.artifacts import ArtifactRef, ArtifactRepository, ExternalizedContent
-from src.core.commands import RunLimits
-from src.core.errors import RunErrorCode
-from src.core.events import DomainEvent, DomainEventType
+from src.core.artifacts.contracts import ArtifactRef, ArtifactRepository, ExternalizedContent
+from src.core.execution.commands import RunLimits
+from src.core.execution.errors import RunErrorCode
+from src.core.execution.events import DomainEvent, DomainEventType
+from src.core.execution.state import RunState, RunStatus
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import (
+from src.core.persistence.journal import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,
     ConversationSummaryCheckpoint,
     JournalCommit,
 )
-from src.core.state import RunState, RunStatus
 from tests.unit.core.test_journal_contract import acceptance
 from tests.unit.core.test_run_state import (
     advance,

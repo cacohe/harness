@@ -10,9 +10,9 @@ from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactEx
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.tools import InMemoryToolExecutionStore
 from src.adapters.tools.mcp import MCPToolGateway
-from src.core.commands import ToolCallRequest
+from src.core.execution.commands import ToolCallRequest
 from src.core.ids import RunId, SessionId
-from src.core.tools import ToolApproval, ToolRequest, ToolResultStatus
+from src.core.tools.contracts import ToolApproval, ToolRequest, ToolResultStatus
 
 
 class Client:

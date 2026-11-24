@@ -4,9 +4,9 @@ import asyncio
 
 from src.application.artifact_retention import ArtifactRetentionService
 from src.application.runtime import RuntimeCoordinator
+from src.core.execution.state import RunState
 from src.core.ids import IdGenerator, ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import ArtifactAttachmentFact, ArtifactAttachmentRole
-from src.core.state import RunState
+from src.core.persistence.journal import ArtifactAttachmentFact, ArtifactAttachmentRole
 
 
 class AgentSession:

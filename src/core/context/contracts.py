@@ -3,15 +3,15 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Protocol
 
-from src.core.context_support import context_policy as _policy
-from src.core.context_support import optional_system_messages as _optional_messages
-from src.core.context_support import snapshot_summary_checkpoint
-from src.core.context_support import summary_system_messages as summary_system_messages
-from src.core.errors import RunErrorCode, RunFailure
+from src.core.context.model import ModelMessage, ModelRequest, ModelRole
+from src.core.context.support import context_policy as _policy
+from src.core.context.support import optional_system_messages as _optional_messages
+from src.core.context.support import snapshot_summary_checkpoint
+from src.core.context.support import summary_system_messages as summary_system_messages
+from src.core.execution.errors import RunErrorCode, RunFailure
 from src.core.ids import ProfileId, SessionId
-from src.core.journal import ConversationSummaryCheckpoint
-from src.core.model import ModelMessage, ModelRequest, ModelRole
-from src.core.tools import ToolSpec
+from src.core.persistence.journal import ConversationSummaryCheckpoint
+from src.core.tools.contracts import ToolSpec
 
 _MAX_TOKEN_COUNT = (1 << 63) - 1
 _MAX_INTERACTION_MESSAGES = 128

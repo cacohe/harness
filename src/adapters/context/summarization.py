@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.core.context import (
+from src.core.context.contracts import (
     ContextRequest,
     ConversationCompactor,
     ConversationInteraction,
     SummaryCompactionRequest,
     snapshot_summary_checkpoint,
 )
-from src.core.journal import ConversationSummaryCheckpoint
+from src.core.persistence.journal import ConversationSummaryCheckpoint
 
 
 @dataclass(frozen=True, slots=True)

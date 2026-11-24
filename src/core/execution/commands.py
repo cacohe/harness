@@ -4,12 +4,12 @@ from datetime import datetime
 from typing import TypeAlias
 from unicodedata import category
 
-from src.core.approval import validate_approval_binding
-from src.core.artifacts import ArtifactRef, ExternalizedContent, snapshot_artifact_ref
-from src.core.errors import InvalidTransition, RunFailure
-from src.core.events import _contains_host_path
+from src.core.artifacts.contracts import ArtifactRef, ExternalizedContent, snapshot_artifact_ref
+from src.core.execution.errors import InvalidTransition, RunFailure
+from src.core.execution.events import _contains_host_path
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 from src.core.json_values import MAX_TOOL_ARGUMENT_BYTES, validate_json_text
+from src.core.tools.approval import validate_approval_binding
 
 _MAX_CHILD_ID_BYTES = 256
 

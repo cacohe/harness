@@ -40,7 +40,7 @@ from src.adapters.artifacts.filesystem_retirement import (
     remove_record,
     write_record,
 )
-from src.core.artifacts import (
+from src.core.artifacts.contracts import (
     MAX_ARTIFACT_SIZE_BYTES,
     ArtifactRef,
     ArtifactWrite,

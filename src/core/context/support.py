@@ -1,9 +1,9 @@
 from dataclasses import replace
 
-from src.core.artifacts import ArtifactRef
+from src.core.artifacts.contracts import ArtifactRef
+from src.core.context.model import ModelMessage, ModelRole
 from src.core.ids import ProfileId, SessionId
-from src.core.journal import ConversationSummaryCheckpoint
-from src.core.model import ModelMessage, ModelRole
+from src.core.persistence.journal import ConversationSummaryCheckpoint
 
 _MAX_TOKEN_COUNT = (1 << 63) - 1
 _MAX_OPTIONAL_MESSAGES = 128

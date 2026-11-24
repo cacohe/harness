@@ -8,15 +8,15 @@ from src.adapters.persistence.memory import InMemoryRunJournal
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.application.artifact_lifecycle import ArtifactLifecycleService
 from src.application.artifact_retention import ArtifactRetentionBlocked, ArtifactRetentionService
-from src.core.artifacts import ArtifactRef, ArtifactRepository, ArtifactWrite
-from src.core.errors import RunErrorCode
-from src.core.journal import (
+from src.core.artifacts.contracts import ArtifactRef, ArtifactRepository, ArtifactWrite
+from src.core.execution.errors import RunErrorCode
+from src.core.execution.state import RunStatus
+from src.core.persistence.journal import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,
     JournalError,
 )
-from src.core.state import RunStatus
 from tests.unit.core.test_journal_contract import acceptance
 
 

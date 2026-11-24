@@ -9,7 +9,7 @@ from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.tools import InMemoryToolExecutionStore, ToolCatalog
 from src.adapters.tools.catalog import ToolCatalogEntry
 from src.adapters.tools.docker import DockerInvocation, DockerToolGateway, _drain
-from src.core.tools import ToolSpec
+from src.core.tools.contracts import ToolSpec
 
 
 def test_invocation_rejects_nul() -> None:

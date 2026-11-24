@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 A production-grade, async-first Harness core. The project clearly separates execution semantics, application use cases, and concrete infrastructure:
 
-- `src/core`: bounded state machines, a single-step coordinator, domain values, and extension ports;
+- `src/core`: five capability packages for execution, context, tools, Artifacts, and persistence, plus shared bounded values;
 - `src/application`: Session ownership, idempotent submission, runtime lifecycle, and the composition root;
 - `src/adapters`: SQLite, filesystem Artifacts, LiteLLM, Docker, MCP, context policies, and observability implementations.
 
@@ -28,10 +28,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.application import ApplicationConfig, create_production_agent
-from src.core.commands import RunLimits
-from src.core.context import ContextBudget
+from src.core.context.contracts import ContextBudget
+from src.core.execution.commands import RunLimits
 from src.core.ids import ProfileId
-from src.core.journal import ArtifactAttachmentRole
+from src.core.persistence.journal import ArtifactAttachmentRole
 
 config = ApplicationConfig(
     limits=RunLimits(max_steps=32, max_elapsed_seconds=300.0, max_inline_result_bytes=65_536),

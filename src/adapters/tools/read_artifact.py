@@ -6,14 +6,14 @@ import json
 from collections.abc import AsyncIterator
 
 from src.adapters.tools.catalog import ToolCatalogEntry
-from src.core.artifacts import (
+from src.core.artifacts.contracts import (
     MAX_ARTIFACT_SIZE_BYTES,
     ArtifactRef,
     ArtifactRepository,
     snapshot_artifact_ref,
     validate_artifact_id,
 )
-from src.core.tools import ToolSpec
+from src.core.tools.contracts import ToolSpec
 
 READ_ARTIFACT_TOOL_NAME = "read_artifact"
 _READ_ARTIFACT_SCHEMA = (

@@ -8,7 +8,7 @@ from typing import cast
 import pytest
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.application.submissions import AcceptedRun, SubmissionService
-from src.core.commands import (
+from src.core.execution.commands import (
     CommandContext,
     CompleteRun,
     FinishModelCall,
@@ -18,10 +18,11 @@ from src.core.commands import (
     StartToolCall,
     ToolCallRequest,
 )
-from src.core.errors import InvalidTransition, RunErrorCode
-from src.core.events import DomainEvent, DomainEventType
+from src.core.execution.errors import InvalidTransition, RunErrorCode
+from src.core.execution.events import DomainEvent, DomainEventType
+from src.core.execution.state import RunStatus, TaskStateMachine
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import (
+from src.core.persistence.journal import (
     JournalCommit,
     JournalError,
     JournalHead,
@@ -29,7 +30,6 @@ from src.core.journal import (
     RunJournal,
     SubmissionAcceptance,
 )
-from src.core.state import RunStatus, TaskStateMachine
 
 SESSION = SessionId("session")
 FIRST = SubmissionId("first")

@@ -3,12 +3,20 @@ from datetime import datetime, timezone
 
 import pytest
 from src.adapters.persistence.memory import InMemoryRunJournal
-from src.core.artifacts import ArtifactRef, ExternalizedContent, InlineContent
-from src.core.commands import RunLimits, ToolCallRequest
-from src.core.errors import RunErrorCode, RunFailure
-from src.core.events import DomainEvent, DomainEventType
+from src.core.artifacts.contracts import ArtifactRef, ExternalizedContent, InlineContent
+from src.core.execution.commands import RunLimits, ToolCallRequest
+from src.core.execution.errors import RunErrorCode, RunFailure
+from src.core.execution.events import DomainEvent, DomainEventType
+from src.core.execution.state import (
+    ApprovalState,
+    ModelCallState,
+    RunState,
+    RunStatus,
+    StepState,
+    ToolCallState,
+)
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import (
+from src.core.persistence.journal import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,
@@ -18,15 +26,7 @@ from src.core.journal import (
     SubmissionRecord,
     TranscriptEntry,
 )
-from src.core.run_receipt import validate_commit_receipt
-from src.core.state import (
-    ApprovalState,
-    ModelCallState,
-    RunState,
-    RunStatus,
-    StepState,
-    ToolCallState,
-)
+from src.core.persistence.receipt import validate_commit_receipt
 
 NOW = datetime(2026, 11, 18, tzinfo=timezone.utc)
 RUN = RunId("run")

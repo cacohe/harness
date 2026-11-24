@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from src.core.tools import ToolGateway, ToolRequest, ToolResult, ToolResultStatus
+from src.core.tools.contracts import ToolGateway, ToolRequest, ToolResult, ToolResultStatus
 
 
 class ToolRouter:

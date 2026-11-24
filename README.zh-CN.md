@@ -4,7 +4,7 @@
 
 生产级、异步优先的 Harness 内核。项目将执行语义、应用用例和具体基础设施明确分层：
 
-- `src/core`：有界状态机、单步协调器、领域值与扩展端口；
+- `src/core`：按执行、上下文、工具、Artifact、持久化划分的五个能力包，以及共享的有界值；
 - `src/application`：Session 所有权、幂等提交、运行时生命周期和 composition root；
 - `src/adapters`：SQLite、文件 Artifact、LiteLLM、Docker、MCP、上下文策略与观测实现。
 
@@ -29,10 +29,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.application import ApplicationConfig, create_production_agent
-from src.core.commands import RunLimits
-from src.core.context import ContextBudget
+from src.core.context.contracts import ContextBudget
+from src.core.execution.commands import RunLimits
 from src.core.ids import ProfileId
-from src.core.journal import ArtifactAttachmentRole
+from src.core.persistence.journal import ArtifactAttachmentRole
 
 config = ApplicationConfig(
     limits=RunLimits(max_steps=32, max_elapsed_seconds=300.0, max_inline_result_bytes=65_536),

@@ -5,7 +5,7 @@ import json
 import pytest
 from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactExternalizer
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
-from src.core.artifacts import ArtifactWrite
+from src.core.artifacts.contracts import ArtifactWrite
 
 ALL_TYPES = frozenset({"text/plain", "application/json", "application/octet-stream"})
 

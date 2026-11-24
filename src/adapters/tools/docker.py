@@ -13,10 +13,10 @@ from typing import cast
 from src.adapters.tools.catalog import ToolCatalog
 from src.adapters.tools.execution_store import ToolExecutionStore
 from src.adapters.tools.local import LocalToolGateway
-from src.core.artifacts import ArtifactExternalizer
-from src.core.errors import RunErrorCode, RunFailure
-from src.core.events import JsonValue
-from src.core.tools import ToolRequest, ToolResult, ToolResultStatus
+from src.core.artifacts.contracts import ArtifactExternalizer
+from src.core.execution.errors import RunErrorCode, RunFailure
+from src.core.execution.events import JsonValue
+from src.core.tools.contracts import ToolRequest, ToolResult, ToolResultStatus
 
 _IMAGE = re.compile(r"[^\s\x00-\x1f]+@sha256:[0-9a-f]{64}")
 _USER = re.compile(r"[1-9][0-9]*:[1-9][0-9]*")

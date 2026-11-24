@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from src.core.artifacts import ArtifactRef
-from src.core.commands import CommandContext, CoreCommand, FailRun
-from src.core.errors import RunErrorCode, RunFailure
-from src.core.events import DomainEvent
-from src.core.journal import (
+from src.core.artifacts.contracts import ArtifactRef
+from src.core.execution.commands import CommandContext, CoreCommand, FailRun
+from src.core.execution.errors import RunErrorCode, RunFailure
+from src.core.execution.events import DomainEvent
+from src.core.execution.state import RunState, StateTransition, TaskStateMachine
+from src.core.persistence.journal import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,
@@ -15,11 +16,10 @@ from src.core.journal import (
     JournalCommit,
     TranscriptEntry,
 )
-from src.core.run_receipt import validate_commit_receipt
-from src.core.state import RunState, StateTransition, TaskStateMachine
+from src.core.persistence.receipt import validate_commit_receipt
 
 if TYPE_CHECKING:
-    from src.core.run import RunCoordinator
+    from src.core.execution.coordinator import RunCoordinator
 
 
 @dataclass(frozen=True, slots=True)
