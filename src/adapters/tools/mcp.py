@@ -14,9 +14,9 @@ from typing import Callable
 from src.adapters.tools.catalog import ToolCatalog, ToolCatalogEntry
 from src.adapters.tools.execution_store import ToolExecutionStore
 from src.adapters.tools.local import LocalToolGateway, ToolReportedError
-from src.core.artifacts import ArtifactExternalizer
-from src.core.errors import MAX_FAILURE_DETAIL_BYTES
-from src.core.tools import ToolSpec
+from src.core.artifacts.contracts import ArtifactExternalizer
+from src.core.execution.errors import MAX_FAILURE_DETAIL_BYTES
+from src.core.tools.contracts import ToolSpec
 
 _MAX_SYNC_CALLS_PER_GATEWAY = 4
 _MAX_SYNC_CLOSES_PER_GATEWAY = 4

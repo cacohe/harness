@@ -4,8 +4,8 @@ import asyncio
 from pathlib import Path
 
 import pytest
-from src.core.commands import RunLimits
-from src.core.context import ContextBudget
+from src.core.context.contracts import ContextBudget
+from src.core.execution.commands import RunLimits
 from src.core.ids import ProfileId, SessionId, SubmissionId
 
 from .test_runtime_v3 import (
@@ -499,10 +499,10 @@ def test_development_factory_leaves_injected_resources_caller_owned():
 def test_default_development_composition_exposes_artifacts_and_clamps_inline_policy():
     from src.adapters.context.tokenizers import ExactTokenCounter
     from src.application.composition import ApplicationConfig, create_development_agent
-    from src.core.commands import RunLimits
-    from src.core.context import ContextRequest, ContextWindow
-    from src.core.model import ModelMessage, ModelResponse, ModelRole
-    from src.core.state import RunStatus
+    from src.core.context.contracts import ContextRequest, ContextWindow
+    from src.core.context.model import ModelMessage, ModelResponse, ModelRole
+    from src.core.execution.commands import RunLimits
+    from src.core.execution.state import RunStatus
 
     class Model:
         max_output_tokens = 16

@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from src.core.artifacts import ArtifactRef, ArtifactRepository, snapshot_artifact_ref
-from src.core.commands import CommandContext, FailRun
-from src.core.errors import RunErrorCode, RunFailure
+from src.core.artifacts.contracts import ArtifactRef, ArtifactRepository, snapshot_artifact_ref
+from src.core.execution.commands import CommandContext, FailRun
+from src.core.execution.errors import RunErrorCode, RunFailure
+from src.core.execution.state import RunState, RunStatus, TaskStateMachine
 from src.core.ids import Clock, IdGenerator, SessionId
-from src.core.journal import JournalCommit, RunJournal
-from src.core.run_receipt import validate_commit_receipt
-from src.core.state import RunState, RunStatus, TaskStateMachine
+from src.core.persistence.journal import JournalCommit, RunJournal
+from src.core.persistence.receipt import validate_commit_receipt
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,7 +4,7 @@ from hashlib import sha256
 from threading import Lock
 from uuid import uuid4
 
-from src.core.artifacts import (
+from src.core.artifacts.contracts import (
     MAX_ARTIFACT_SIZE_BYTES,
     ArtifactRef,
     ArtifactWrite,

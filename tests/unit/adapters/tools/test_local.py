@@ -14,9 +14,9 @@ from src.adapters.tools import (
     ToolCatalogEntry,
 )
 from src.adapters.tools.local import LocalToolGateway
-from src.core.commands import ToolCallRequest
+from src.core.execution.commands import ToolCallRequest
 from src.core.ids import RunId, SessionId
-from src.core.tools import ToolApproval, ToolRequest, ToolSpec
+from src.core.tools.contracts import ToolApproval, ToolRequest, ToolSpec
 
 
 def _request(arguments: str = '{"value":1}') -> ToolRequest:

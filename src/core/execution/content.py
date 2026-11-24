@@ -1,5 +1,5 @@
-from src.core.artifacts import ArtifactExternalizer, ArtifactRef, ExternalizedContent
-from src.core.tools import ToolResult
+from src.core.artifacts.contracts import ArtifactExternalizer, ArtifactRef, ExternalizedContent
+from src.core.tools.contracts import ToolResult
 
 
 async def externalize_final_text(

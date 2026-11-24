@@ -9,8 +9,17 @@ from src.adapters.artifacts.externalizer import ArtifactPolicy, PolicyArtifactEx
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.context.tokenizers import ExactTokenCounter
 from src.adapters.persistence.memory import InMemoryRunJournal
-from src.core.artifacts import ArtifactRef, InlineContent
-from src.core.commands import (
+from src.core.artifacts.contracts import ArtifactRef, InlineContent
+from src.core.context.contracts import (
+    ContextBudget,
+    ContextBudgetExceeded,
+    ContextRequest,
+    ContextWindow,
+    EstimateQuality,
+    TokenEstimate,
+)
+from src.core.context.model import ModelMessage, ModelResponse, ModelRole, ModelToolCall
+from src.core.execution.commands import (
     AdvanceRun,
     CancelRun,
     CommandContext,
@@ -19,21 +28,16 @@ from src.core.commands import (
     RunLimits,
     SubmitRun,
 )
-from src.core.context import (
-    ContextBudget,
-    ContextBudgetExceeded,
-    ContextRequest,
-    ContextWindow,
-    EstimateQuality,
-    TokenEstimate,
-)
-from src.core.errors import RunErrorCode, RunFailure
+from src.core.execution.coordinator import RunCoordinator
+from src.core.execution.errors import RunErrorCode, RunFailure
+from src.core.execution.state import RunState, RunStatus
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import ArtifactAttachmentRole, ConversationSummaryCheckpoint, JournalError
-from src.core.model import ModelMessage, ModelResponse, ModelRole, ModelToolCall
-from src.core.run import RunCoordinator
-from src.core.state import RunState, RunStatus
-from src.core.tools import ToolApproval, ToolResult, ToolResultStatus, ToolSpec
+from src.core.persistence.journal import (
+    ArtifactAttachmentRole,
+    ConversationSummaryCheckpoint,
+    JournalError,
+)
+from src.core.tools.contracts import ToolApproval, ToolResult, ToolResultStatus, ToolSpec
 
 NOW = datetime(2026, 11, 18, tzinfo=timezone.utc)
 RUN = RunId("run")

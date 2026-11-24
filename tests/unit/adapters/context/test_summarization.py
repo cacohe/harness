@@ -4,16 +4,16 @@ from dataclasses import replace
 from src.adapters.context.bounded import BoundedContextProvider
 from src.adapters.context.summarization import SummaryCheckpointService
 from src.adapters.context.tokenizers import ExactTokenCounter
-from src.core.artifacts import ArtifactRef
-from src.core.context import (
+from src.core.artifacts.contracts import ArtifactRef
+from src.core.context.contracts import (
     ContextBudget,
     ContextRequest,
     ConversationInteraction,
     ConversationPage,
 )
+from src.core.context.model import ModelMessage, ModelRole
 from src.core.ids import ProfileId, SessionId
-from src.core.journal import ConversationSummaryCheckpoint
-from src.core.model import ModelMessage, ModelRole
+from src.core.persistence.journal import ConversationSummaryCheckpoint
 
 
 def _request(**changes) -> ContextRequest:

@@ -1,7 +1,12 @@
 from dataclasses import FrozenInstanceError
 
 import pytest
-from src.core.artifacts import ArtifactRef, ArtifactWrite, ExternalizedContent, InlineContent
+from src.core.artifacts.contracts import (
+    ArtifactRef,
+    ArtifactWrite,
+    ExternalizedContent,
+    InlineContent,
+)
 
 DIGEST = "a" * 64
 ARTIFACT_ID = "sha256:" + DIGEST

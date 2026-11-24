@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 
-from src.core.context import ConversationInteraction
-from src.core.journal import TranscriptEntry, TranscriptEntryType
-from src.core.model import ModelMessage, ModelRole, ModelToolCall
+from src.core.context.contracts import ConversationInteraction
+from src.core.context.model import ModelMessage, ModelRole, ModelToolCall
+from src.core.persistence.journal import TranscriptEntry, TranscriptEntryType
 
 MAX_TRANSCRIPT_ROWS_PER_INTERACTION = 65
 

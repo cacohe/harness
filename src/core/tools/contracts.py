@@ -6,12 +6,12 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
 
-from src.core.approval import validate_approval_binding
-from src.core.artifacts import ArtifactRef, ExternalizedContent, InlineContent
-from src.core.commands import ToolCallRequest, _check_child_id, snapshot_tool_call
-from src.core.errors import RunErrorCode, RunFailure
+from src.core.artifacts.contracts import ArtifactRef, ExternalizedContent, InlineContent
+from src.core.execution.commands import ToolCallRequest, _check_child_id, snapshot_tool_call
+from src.core.execution.errors import RunErrorCode, RunFailure
 from src.core.ids import RunId, SessionId
 from src.core.json_values import validate_bounded_text, validate_json_text
+from src.core.tools.approval import validate_approval_binding
 
 _MAX_SCHEMA_BYTES = 65_536
 _MAX_DESCRIPTION_BYTES = 16_384

@@ -5,8 +5,8 @@ from itertools import product
 
 import pytest
 from src.adapters.persistence.memory import InMemoryRunJournal
-from src.core.artifacts import ExternalizedContent, InlineContent
-from src.core.commands import (
+from src.core.artifacts.contracts import ExternalizedContent, InlineContent
+from src.core.execution.commands import (
     CancelRun,
     CommandContext,
     CompleteRun,
@@ -24,12 +24,18 @@ from src.core.commands import (
     SubmitRun,
     ToolCallRequest,
 )
-from src.core.errors import RunErrorCode, RunFailure
-from src.core.events import DomainEventType
+from src.core.execution.errors import RunErrorCode, RunFailure
+from src.core.execution.events import DomainEventType
+from src.core.execution.state import (
+    ApprovalState,
+    InvalidTransition,
+    RunState,
+    RunStatus,
+    TaskStateMachine,
+)
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import JournalCommit
-from src.core.state import ApprovalState, InvalidTransition, RunState, RunStatus, TaskStateMachine
-from src.core.tools import ToolApproval, ToolRequest
+from src.core.persistence.journal import JournalCommit
+from src.core.tools.contracts import ToolApproval, ToolRequest
 
 RUN = RunId("run")
 SESSION = SessionId("session")

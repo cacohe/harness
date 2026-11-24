@@ -6,12 +6,20 @@ from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
 from typing import Any, TypeVar, cast
 
-from src.core.artifacts import ArtifactRef, ExternalizedContent, InlineContent
-from src.core.commands import RunLimits, ToolCallRequest
-from src.core.errors import RunErrorCode, RunFailure
-from src.core.events import DomainEvent, DomainEventType
+from src.core.artifacts.contracts import ArtifactRef, ExternalizedContent, InlineContent
+from src.core.execution.commands import RunLimits, ToolCallRequest
+from src.core.execution.errors import RunErrorCode, RunFailure
+from src.core.execution.events import DomainEvent, DomainEventType
+from src.core.execution.state import (
+    ApprovalState,
+    ModelCallState,
+    RunState,
+    RunStatus,
+    StepState,
+    ToolCallState,
+)
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import (
+from src.core.persistence.journal import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,
@@ -24,14 +32,6 @@ from src.core.journal import (
     SubmissionRecord,
     TranscriptEntry,
     TranscriptEntryType,
-)
-from src.core.state import (
-    ApprovalState,
-    ModelCallState,
-    RunState,
-    RunStatus,
-    StepState,
-    ToolCallState,
 )
 
 _MAX_DOCUMENT_BYTES = 16 * 1_048_576

@@ -5,7 +5,7 @@ import json
 import pytest
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.tools.read_artifact import ReadArtifactTool
-from src.core.artifacts import ArtifactWrite
+from src.core.artifacts.contracts import ArtifactWrite
 
 
 async def _stream(payload: bytes):
@@ -106,7 +106,7 @@ def test_untrusted_stat_and_stream_are_rejected() -> None:
 
 @pytest.mark.parametrize("payload", [b"ab", b"abcdef"])
 def test_declared_size_mismatch_is_rejected(payload: bytes) -> None:
-    from src.core.artifacts import ArtifactRef
+    from src.core.artifacts.contracts import ArtifactRef
 
     declared = b"abcd"
     digest = hashlib.sha256(declared).hexdigest()
@@ -131,7 +131,7 @@ def test_declared_size_mismatch_is_rejected(payload: bytes) -> None:
 
 
 def test_huge_chunk_is_rejected_and_iterator_is_closed() -> None:
-    from src.core.artifacts import ArtifactRef
+    from src.core.artifacts.contracts import ArtifactRef
 
     payload = b"abcd"
     digest = hashlib.sha256(payload).hexdigest()

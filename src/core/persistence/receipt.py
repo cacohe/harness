@@ -1,11 +1,11 @@
-from src.core.errors import RunErrorCode
-from src.core.journal import (
+from src.core.execution.errors import RunErrorCode
+from src.core.persistence.journal import (
     JournalCommit,
     JournalError,
     JournalEvent,
     JournalSnapshot,
 )
-from src.core.receipt_snapshot import (
+from src.core.persistence.snapshots import (
     snapshot_artifact_attachment,
     snapshot_domain_event,
     snapshot_journal_snapshot,

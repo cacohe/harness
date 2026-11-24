@@ -9,9 +9,10 @@ import pytest
 import src.adapters.persistence.sqlite as sqlite_module
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.adapters.persistence.sqlite_codec import decode, encode
-from src.core.errors import RunErrorCode, RunFailure
+from src.core.execution.errors import RunErrorCode, RunFailure
+from src.core.execution.state import RunState, RunStatus
 from src.core.ids import EventId, ProfileId, RunId, SessionId
-from src.core.journal import (
+from src.core.persistence.journal import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,
@@ -23,7 +24,6 @@ from src.core.journal import (
     TranscriptEntry,
     TranscriptEntryType,
 )
-from src.core.state import RunState, RunStatus
 from tests.unit.core.test_journal_contract import acceptance, artifact_ref
 from tests.unit.core.test_run_state import (
     advance,

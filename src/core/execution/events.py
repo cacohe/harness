@@ -9,7 +9,7 @@ from enum import StrEnum
 from io import StringIO
 from typing import TypeAlias, cast
 
-from src.core.errors import InvalidTransition
+from src.core.execution.errors import InvalidTransition
 from src.core.ids import EventId, RunId, SessionId
 
 _MAX_PAYLOAD_BYTES = 1_048_576

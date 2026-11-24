@@ -10,8 +10,8 @@ import pytest
 import src.adapters.persistence.sqlite as sqlite_module
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.adapters.persistence.sqlite_integrity import retirement_empty_hash
-from src.core.errors import RunErrorCode
-from src.core.journal import (
+from src.core.execution.errors import RunErrorCode
+from src.core.persistence.journal import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,

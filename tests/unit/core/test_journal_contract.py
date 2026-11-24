@@ -5,12 +5,13 @@ from datetime import datetime, timedelta, timezone, tzinfo
 import pytest
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.adapters.persistence.sqlite import SQLiteRunJournal
-from src.core.artifacts import ArtifactRef
-from src.core.commands import RunLimits
-from src.core.errors import RunErrorCode, RunFailure
-from src.core.events import DomainEvent, DomainEventType
+from src.core.artifacts.contracts import ArtifactRef
+from src.core.execution.commands import RunLimits
+from src.core.execution.errors import RunErrorCode, RunFailure
+from src.core.execution.events import DomainEvent, DomainEventType
+from src.core.execution.state import RunState, RunStatus
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import (
+from src.core.persistence.journal import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,
@@ -22,7 +23,6 @@ from src.core.journal import (
     SubmissionRecord,
     TranscriptEntry,
 )
-from src.core.state import RunState, RunStatus
 
 NOW = datetime(2026, 11, 17, tzinfo=timezone.utc)
 LIMITS = RunLimits(5, 30, 1024)

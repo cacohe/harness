@@ -19,9 +19,8 @@ from src.adapters.persistence.memory import InMemoryRunJournal
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.adapters.persistence.sqlite_codec import encode
 from src.application.composition import ApplicationConfig, create_development_agent
-from src.core.artifacts import ArtifactRef, ArtifactWrite, InlineContent
-from src.core.commands import RunLimits
-from src.core.context import (
+from src.core.artifacts.contracts import ArtifactRef, ArtifactWrite, InlineContent
+from src.core.context.contracts import (
     ContextBudget,
     ContextRequest,
     ConversationCoverage,
@@ -30,13 +29,14 @@ from src.core.context import (
     ConversationPage,
     OmittedContextRef,
 )
+from src.core.context.model import ModelMessage, ModelResponse, ModelRole, ModelToolCall
+from src.core.execution.commands import RunLimits
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
-from src.core.journal import (
+from src.core.persistence.journal import (
     ConversationSummaryCheckpoint,
     TranscriptEntry,
 )
-from src.core.model import ModelMessage, ModelResponse, ModelRole, ModelToolCall
-from src.core.tools import ToolResult, ToolResultStatus, ToolSpec
+from src.core.tools.contracts import ToolResult, ToolResultStatus, ToolSpec
 from tests.unit.core.test_journal_contract import acceptance
 
 

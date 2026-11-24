@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
-from src.core.tools import ToolSpec
+from src.core.tools.contracts import ToolSpec
 
 ToolHandler = Callable[[dict[str, object]], object | Awaitable[object]]
 

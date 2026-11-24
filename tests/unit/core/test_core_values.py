@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import PureWindowsPath
 
 import pytest
-from src.core.commands import (
+from src.core.execution.commands import (
     CancelRun,
     CommandContext,
     DecideToolCall,
@@ -12,8 +12,8 @@ from src.core.commands import (
     RunLimits,
     SubmitRun,
 )
-from src.core.errors import InvalidTransition, RunErrorCode, RunFailure
-from src.core.events import DomainEvent, DomainEventType, _text_outside_web_urls
+from src.core.execution.errors import InvalidTransition, RunErrorCode, RunFailure
+from src.core.execution.events import DomainEvent, DomainEventType, _text_outside_web_urls
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 
 ID_TYPES = (RunId, SessionId, SubmissionId, ProfileId, EventId)

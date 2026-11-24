@@ -8,9 +8,9 @@ from collections.abc import Awaitable, Callable
 
 from src.adapters.tools.catalog import ToolCatalog, ToolCatalogEntry
 from src.adapters.tools.execution_store import ClaimState, ToolExecutionStore
-from src.core.artifacts import ArtifactExternalizer
-from src.core.errors import RunErrorCode, RunFailure
-from src.core.tools import ToolApproval, ToolRequest, ToolResult, ToolResultStatus
+from src.core.artifacts.contracts import ArtifactExternalizer
+from src.core.execution.errors import RunErrorCode, RunFailure
+from src.core.tools.contracts import ToolApproval, ToolRequest, ToolResult, ToolResultStatus
 
 
 class ToolReportedError(RuntimeError):

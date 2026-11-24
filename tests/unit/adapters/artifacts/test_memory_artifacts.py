@@ -4,7 +4,7 @@ import sys
 
 import pytest
 from src.adapters.artifacts.memory import InMemoryArtifactRepository
-from src.core.artifacts import ArtifactWrite, artifact_id_from_descriptor
+from src.core.artifacts.contracts import ArtifactWrite, artifact_id_from_descriptor
 
 
 def _address(

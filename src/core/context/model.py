@@ -3,9 +3,9 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Protocol
 
-from src.core.commands import _check_child_id
+from src.core.execution.commands import _check_child_id
 from src.core.json_values import MAX_TOOL_ARGUMENT_BYTES, validate_bounded_text, validate_json_text
-from src.core.tools import ToolSpec
+from src.core.tools.contracts import ToolSpec
 
 _MAX_TEXT_BYTES = 1_048_576
 _MAX_REQUEST_BYTES = 8 * 1_048_576

@@ -3,9 +3,9 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Iterator
 
-from src.core.context import EstimateQuality, TokenEstimate
-from src.core.model import ModelMessage
-from src.core.tools import ToolSpec
+from src.core.context.contracts import EstimateQuality, TokenEstimate
+from src.core.context.model import ModelMessage
+from src.core.tools.contracts import ToolSpec
 
 _MAX_TOKEN_COUNT = (1 << 63) - 1
 _MAX_SAFETY_FACTOR = 1024.0

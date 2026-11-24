@@ -9,7 +9,7 @@ from typing import Any
 
 import litellm
 
-from src.core.model import (
+from src.core.context.model import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -17,7 +17,7 @@ from src.core.model import (
     ModelToolCall,
     ModelUsage,
 )
-from src.core.tools import ToolSpec
+from src.core.tools.contracts import ToolSpec
 
 Completion = Callable[..., Awaitable[object]]
 

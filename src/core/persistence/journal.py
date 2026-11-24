@@ -3,11 +3,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
-from src.core.artifacts import ArtifactRef, snapshot_artifact_ref
-from src.core.errors import RunErrorCode, RunFailure
-from src.core.events import DomainEvent
+from src.core.artifacts.contracts import ArtifactRef, snapshot_artifact_ref
+from src.core.execution.errors import RunErrorCode, RunFailure
+from src.core.execution.events import DomainEvent
+from src.core.execution.state import RunState
 from src.core.ids import ProfileId, RunId, SessionId, SubmissionId
-from src.core.state import RunState
 
 
 class JournalError(ValueError):

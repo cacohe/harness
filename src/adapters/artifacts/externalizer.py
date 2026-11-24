@@ -4,7 +4,7 @@ import json
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 
-from src.core.artifacts import (
+from src.core.artifacts.contracts import (
     MAX_ARTIFACT_SIZE_BYTES,
     MAX_INLINE_CONTENT_BYTES,
     MAX_SUMMARY_BYTES,

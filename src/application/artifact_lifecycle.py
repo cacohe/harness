@@ -1,8 +1,8 @@
 from dataclasses import replace
 
-from src.core.errors import RunErrorCode
+from src.core.execution.errors import RunErrorCode
 from src.core.ids import RunId, SessionId
-from src.core.journal import (
+from src.core.persistence.journal import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,
@@ -10,7 +10,7 @@ from src.core.journal import (
     JournalError,
     RunJournal,
 )
-from src.core.run_receipt import validate_commit_receipt
+from src.core.persistence.receipt import validate_commit_receipt
 
 
 class ArtifactLifecycleService:

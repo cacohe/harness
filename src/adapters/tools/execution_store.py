@@ -11,9 +11,9 @@ from enum import StrEnum
 from pathlib import Path
 from typing import NoReturn, Protocol, cast
 
-from src.core.artifacts import ArtifactRef, InlineContent
-from src.core.errors import RunErrorCode, RunFailure
-from src.core.tools import ToolRequest, ToolResult, ToolResultStatus, snapshot_tool_result
+from src.core.artifacts.contracts import ArtifactRef, InlineContent
+from src.core.execution.errors import RunErrorCode, RunFailure
+from src.core.tools.contracts import ToolRequest, ToolResult, ToolResultStatus, snapshot_tool_result
 
 _VERSION = 1
 _MAX_RESULT_BYTES = 2 * 1_048_576
