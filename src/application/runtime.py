@@ -143,6 +143,7 @@ class RuntimeCoordinator:
         *,
         submissions: SubmissionService,
         journal: RunJournal,
+        artifact_lifecycle: ArtifactLifecycleService,
         coordinator_factory: CoordinatorFactory,
         ids: IdGenerator,
         clock: Clock,
@@ -171,9 +172,9 @@ class RuntimeCoordinator:
             raise ValueError("Runtime limits and resources are invalid")
         self._submissions = submissions
         self._journal = journal
-        self._artifact_lifecycle = ArtifactLifecycleService(
-            journal=journal, max_conflict_retries=max_advances_per_operation
-        )
+        if type(artifact_lifecycle) is not ArtifactLifecycleService:
+            raise ValueError("Artifact lifecycle service is invalid")
+        self._artifact_lifecycle = artifact_lifecycle
         self._coordinator_factory = coordinator_factory
         self._ids = ids
         self._clock = clock

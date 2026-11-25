@@ -209,7 +209,9 @@ def test_detached_terminal_final_ref_is_not_recovery_corruption(tmp_path: Path) 
     )
     asyncio.run(journal.commit(replace(batch, state=terminal, artifact_facts=(fact,)), 0))
     asyncio.run(
-        ArtifactLifecycleService(journal=journal).detach(terminal.session_id, terminal.run_id)
+        ArtifactLifecycleService(journal=journal, ownership=journal).detach(
+            terminal.session_id, terminal.run_id
+        )
     )
     reopened = SQLiteRunJournal(path)
     recovery = RecoveryService(

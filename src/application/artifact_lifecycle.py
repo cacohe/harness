@@ -1,5 +1,5 @@
+import inspect
 from dataclasses import replace
-from typing import cast
 
 from src.core.artifacts.lifecycle import (
     ArtifactAttachmentAction,
@@ -20,11 +20,26 @@ from src.core.persistence.receipt import validate_commit_receipt
 class ArtifactLifecycleService:
     """CAS-safe ownership release built only from authoritative journal descriptors."""
 
-    def __init__(self, *, journal: RunJournal, max_conflict_retries: int = 16) -> None:
+    def __init__(
+        self,
+        *,
+        journal: RunJournal,
+        ownership: ArtifactOwnershipStore,
+        max_conflict_retries: int = 16,
+    ) -> None:
         if type(max_conflict_retries) is not int or not 1 <= max_conflict_retries <= 1_024:
             raise ValueError("Artifact lifecycle retry limit is invalid")
+        _require_capability(
+            ownership,
+            (
+                "load_artifact_attachments",
+                "artifact_has_active_attachments",
+                "load_artifact_facts",
+            ),
+            "Artifact ownership capability is invalid",
+        )
         self._journal = journal
-        self._ownership = cast(ArtifactOwnershipStore, journal)
+        self._ownership = ownership
         self._max_retries = max_conflict_retries
 
     async def detach(
@@ -84,3 +99,15 @@ def _selected_roles(
     ):
         raise ValueError("Artifact attachment roles are invalid")
     return frozenset(roles)
+
+
+def _require_capability(value: object, names: tuple[str, ...], message: str) -> None:
+    for name in names:
+        try:
+            member = inspect.getattr_static(value, name)
+        except (AttributeError, TypeError):
+            raise ValueError(message) from None
+        if isinstance(member, (classmethod, staticmethod)):
+            member = member.__func__
+        if not callable(member):
+            raise ValueError(message)

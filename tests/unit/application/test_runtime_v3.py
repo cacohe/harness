@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from functools import wraps
 
 import pytest
+from src.application.artifact_lifecycle import ArtifactLifecycleService
 from src.application.submissions import AcceptedRun
 from src.core.context.contracts import ContextBudgetExceeded
 from src.core.execution.commands import (
@@ -37,6 +38,21 @@ from src.core.persistence.journal import (
 
 NOW = datetime(2026, 11, 18, tzinfo=timezone.utc)
 LIMITS = RunLimits(8, 60.0, 1024)
+
+
+class _NoArtifactOwnership:
+    async def load_artifact_attachments(self, *_args):
+        return ()
+
+    async def artifact_has_active_attachments(self, *_args):
+        return False
+
+    async def load_artifact_facts(self, *_args):
+        return ()
+
+
+def _artifact_lifecycle(journal) -> ArtifactLifecycleService:
+    return ArtifactLifecycleService(journal=journal, ownership=_NoArtifactOwnership())
 
 
 def async_test(function):
@@ -231,6 +247,7 @@ async def test_post_commit_observer_runs_after_acceptance_and_advance_and_is_iso
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, []),
         ids=Ids(),
         clock=Clock(),
@@ -268,6 +285,7 @@ async def test_replayed_acceptance_emits_no_acceptance_observation_and_hung_obse
     runtime = RuntimeCoordinator(
         submissions=ReplaySubmissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, []),
         ids=Ids(),
         clock=Clock(),
@@ -340,6 +358,7 @@ async def test_same_session_is_fifo_but_different_sessions_run_concurrently():
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=factory,
         ids=ids,
         clock=Clock(),
@@ -374,6 +393,7 @@ async def test_waiter_cancellation_releases_fifo_slot_and_capacity_is_bounded():
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, [], blocker),
         ids=Ids(),
         clock=Clock(),
@@ -405,6 +425,7 @@ async def test_close_cancels_active_rejects_waiters_and_is_idempotent():
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, [], blocker),
         ids=Ids(),
         clock=Clock(),
@@ -444,6 +465,7 @@ async def test_owned_resources_close_reverse_once_but_injected_are_untouched():
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, []),
         ids=Ids(),
         clock=Clock(),
@@ -476,6 +498,7 @@ async def test_cancelling_close_caller_does_not_cancel_exactly_once_cleanup():
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, []),
         ids=Ids(),
         clock=Clock(),
@@ -520,6 +543,7 @@ async def test_active_exception_releases_session_for_the_next_fifo_operation():
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda _run, _message: RaisesOnce(),
         ids=Ids(),
         clock=Clock(),
@@ -549,6 +573,7 @@ async def test_factory_failure_does_not_prevent_cancelling_the_run():
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=broken_factory,
         ids=Ids(),
         clock=Clock(),
@@ -581,6 +606,7 @@ async def test_advance_limit_is_committed_as_a_terminal_failure():
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda *_args: NeverTerminal(),
         ids=Ids(),
         clock=Clock(),
@@ -608,6 +634,7 @@ async def test_journal_limit_failure_preserves_its_error_code_and_terminalizes()
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda *_args: StateTooLarge(),
         ids=Ids(),
         clock=Clock(),
@@ -633,6 +660,7 @@ async def test_context_budget_failure_preserves_its_error_code_and_terminalizes(
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=oversized_context,
         ids=Ids(),
         clock=Clock(),
@@ -664,6 +692,7 @@ async def test_approval_rejects_cross_session_run_and_tool_ownership_before_io()
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=factory,
         ids=Ids(),
         clock=Clock(),
@@ -695,6 +724,7 @@ async def test_approval_factory_failure_is_committed_as_a_terminal_failure():
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=broken_factory,
         ids=Ids(),
         clock=Clock(),
@@ -753,6 +783,7 @@ async def test_approval_decides_resumes_and_drives_one_step_at_a_time():
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda _run, _message: ApprovalCoordinator(),
         ids=Ids(),
         clock=Clock(),
@@ -812,6 +843,7 @@ async def test_durable_approval_decision_resumes_after_observer_cancellation_and
     first = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda *_args: ApprovalCoordinator(),
         ids=Ids(),
         clock=Clock(),
@@ -830,6 +862,7 @@ async def test_durable_approval_decision_resumes_after_observer_cancellation_and
     restarted = RuntimeCoordinator(
         submissions=Replay(),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda *_args: ApprovalCoordinator(),
         ids=Ids(),
         clock=Clock(),
@@ -861,6 +894,7 @@ async def test_duplicate_terminal_submission_does_not_drive_or_append_again():
     runtime = RuntimeCoordinator(
         submissions=DuplicateSubmissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda run, _message: CompletingCoordinator(
             journal, run, coordinator_calls
         ),
@@ -914,6 +948,7 @@ async def test_cancel_interrupts_blocked_drive_and_commits_once():
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda _run, _message: InterruptibleCoordinator(),
         ids=Ids(),
         clock=Clock(),
@@ -961,6 +996,7 @@ async def test_cancel_completion_race_returns_the_existing_terminal_outcome():
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda *_args: pytest.fail("terminal cancellation must not drive"),
         ids=Ids(),
         clock=Clock(),
@@ -1008,6 +1044,7 @@ async def test_cancel_retry_rebuilds_after_post_commit_observer_cancellation():
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda *_args: CancelCoordinator(),
         ids=Ids(),
         clock=Clock(),
@@ -1058,6 +1095,7 @@ async def test_cancel_retry_recovers_when_adapter_raises_after_durable_commit():
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda *_args: CommitThenRaise(),
         ids=Ids(),
         clock=Clock(),
@@ -1114,6 +1152,7 @@ async def test_cancel_retry_after_isolated_observer_exception_does_not_repeat_co
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda *_args: CancelCoordinator(),
         ids=Ids(),
         clock=Clock(),
@@ -1168,6 +1207,7 @@ async def test_close_session_during_post_commit_observation_allows_terminal_canc
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda *_args: CancelCoordinator(),
         ids=Ids(),
         clock=Clock(),
@@ -1218,6 +1258,7 @@ async def test_historical_submission_replay_returns_its_terminal_run_without_dri
     runtime = RuntimeCoordinator(
         submissions=Replay(),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda *_args: pytest.fail("historical replay must not drive"),
         ids=Ids(),
         clock=Clock(),
@@ -1272,6 +1313,7 @@ def test_historical_run_lookup_rejects_each_forged_identity(forged_field):
         runtime = RuntimeCoordinator(
             submissions=Replay(),
             journal=journal,
+            artifact_lifecycle=_artifact_lifecycle(journal),
             coordinator_factory=lambda *_args: pytest.fail("forged replay must not drive"),
             ids=Ids(),
             clock=Clock(),
@@ -1317,6 +1359,7 @@ async def test_historical_run_lookup_returns_a_canonical_copy_not_port_alias():
     runtime = RuntimeCoordinator(
         submissions=Replay(),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda *_args: pytest.fail("historical replay must not drive"),
         ids=Ids(),
         clock=Clock(),
@@ -1364,6 +1407,7 @@ async def test_historical_run_lookup_rejects_forged_nested_terminal_state():
     runtime = RuntimeCoordinator(
         submissions=Replay(),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda *_args: pytest.fail("forged replay must not drive"),
         ids=Ids(),
         clock=Clock(),
@@ -1415,6 +1459,7 @@ async def test_historical_run_lookup_rejects_hostile_identity_without_running_ho
     runtime = RuntimeCoordinator(
         submissions=Replay(),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda *_args: pytest.fail("forged replay must not drive"),
         ids=Ids(),
         clock=Clock(),
@@ -1433,6 +1478,7 @@ async def test_session_registry_is_bounded_and_explicit_close_reclaims_capacity(
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, []),
         ids=Ids(),
         clock=Clock(),
@@ -1474,6 +1520,7 @@ async def test_public_id_boundaries_reject_subclasses_and_corrupt_exact_ids_with
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, []),
         ids=Ids(),
         clock=Clock(),
@@ -1505,6 +1552,7 @@ async def test_close_and_reopen_invalidates_owner_before_operation_registration(
     runtime = RuntimeCoordinator(
         submissions=submissions,
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, []),
         ids=Ids(),
         clock=Clock(),
@@ -1543,6 +1591,7 @@ async def test_cancelled_pre_registration_owner_releases_gate_without_deadlock()
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, []),
         ids=Ids(),
         clock=Clock(),
@@ -1586,6 +1635,7 @@ async def test_close_session_cancels_active_rejects_queue_and_allows_clean_reope
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, [], blocker),
         ids=Ids(),
         clock=Clock(),
@@ -1653,6 +1703,7 @@ async def test_approval_uses_bounded_run_input_lookup_not_full_session_history()
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda _run, _message: StopsAfterDecision(),
         ids=Ids(),
         clock=Clock(),

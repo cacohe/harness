@@ -4,10 +4,11 @@ import asyncio
 import hashlib
 import inspect
 import math
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, cast
 
 from src.adapters.artifacts.externalizer import (
     ArtifactPolicy,
@@ -24,12 +25,22 @@ from src.adapters.tools.local import LocalToolGateway
 from src.adapters.tools.read_artifact import READ_ARTIFACT_TOOL_NAME, read_artifact_entry
 from src.adapters.tools.router import ToolRouter
 from src.application.agent import Agent
+from src.application.artifact_lifecycle import ArtifactLifecycleService
 from src.application.artifact_retention import ArtifactRetentionService
 from src.application.observability import PostCommitObserver
 from src.application.recovery import RecoveryService
 from src.application.runtime import RuntimeCoordinator, _close_resource
 from src.application.submissions import SubmissionService
-from src.core.artifacts.contracts import ArtifactExternalizer, ArtifactRepository
+from src.core.artifacts.contracts import (
+    ArtifactExternalizer,
+    ArtifactGarbageCollector,
+    ArtifactRepository,
+)
+from src.core.artifacts.lifecycle import (
+    ArtifactOwnershipStore,
+    ArtifactReferenceIndex,
+    ArtifactRetirementStore,
+)
 from src.core.context.contracts import (
     ContextBudget,
     ContextBudgetExceeded,
@@ -48,6 +59,7 @@ from src.core.tools.contracts import ToolGateway, ToolSpec
 ContextRequestFactory = Callable[[RunState, str], ContextRequest]
 _PATH_TYPE = type(Path())
 _MAX_OPEN_TOOL_MESSAGES = 128
+_OPAQUE_WORKSPACE_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,255}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +81,7 @@ class ApplicationConfig:
     sqlite_path: Path | None = None
     tool_execution_path: Path | None = None
     artifact_root: Path | None = None
+    artifact_workspace_id: str | None = None
     observer_timeout_seconds: float = 0.1
 
     def __post_init__(self) -> None:
@@ -109,6 +122,11 @@ class ApplicationConfig:
         object.__setattr__(self, "limits", limits)
         object.__setattr__(self, "context_budget", context_budget)
         object.__setattr__(self, "observer_timeout_seconds", float(observer_timeout))
+        workspace_id = object.__getattribute__(self, "artifact_workspace_id")
+        if workspace_id is not None and (
+            type(workspace_id) is not str or not _OPAQUE_WORKSPACE_ID.fullmatch(workspace_id)
+        ):
+            raise ValueError("Artifact workspace must be an opaque ID")
         for name in ("sqlite_path", "tool_execution_path", "artifact_root"):
             value = object.__getattribute__(self, name)
             if value is None:
@@ -182,18 +200,8 @@ async def create_development_agent(
             created.append(selected_artifacts)
         elif selected_repository is None:
             selected_repository = _externalizer_repository(selected_artifacts)
-        _require_methods(selected_journal, _JOURNAL_METHODS)
+        _require_methods(selected_journal, _ATOMIC_ARTIFACT_AUTHORITY_METHODS)
         _require_methods(selected_artifacts, ("externalize",))
-        maintenance = (
-            ArtifactRetentionService(
-                journal=selected_journal,
-                artifacts=selected_repository,
-                max_reference_ids=config.max_orphan_reference_ids,
-            )
-            if selected_repository is not None
-            and _has_methods(selected_repository, ("stat", "delete"))
-            else None
-        )
         return _compose(
             config,
             model=model,
@@ -209,7 +217,12 @@ async def create_development_agent(
             artifact_repository=selected_repository,
             owned_resources=(*owned_resources, *created),
             observer=observer,
-            artifact_services=maintenance,
+            artifact_collector=(
+                cast(ArtifactGarbageCollector, selected_repository)
+                if selected_repository is not None
+                and _has_methods(selected_repository, ("collect_orphans",))
+                else None
+            ),
         )
     except BaseException as error:
         await _cleanup_and_raise(error, created)
@@ -229,6 +242,10 @@ async def create_production_agent(
     journal: RunJournal | None = None,
     artifacts: ArtifactExternalizer | None = None,
     artifact_repository: ArtifactRepository | None = None,
+    artifact_ownership: ArtifactOwnershipStore | None = None,
+    artifact_retirement: ArtifactRetirementStore | None = None,
+    artifact_references: ArtifactReferenceIndex | None = None,
+    artifact_collector: ArtifactGarbageCollector | None = None,
     owned_resources: tuple[object, ...] = (),
     observer: PostCommitObserver | None = None,
 ) -> Agent:
@@ -251,8 +268,6 @@ async def create_production_agent(
     )
     if journal is None and config.sqlite_path is None:
         raise ValueError("Production composition requires an absolute SQLite path")
-    if config.artifact_root is None:
-        raise ValueError("Production composition requires an absolute Artifact root")
     if (
         config.max_inline_artifact_bytes > config.limits.max_inline_result_bytes
         or config.max_artifact_summary_bytes > config.limits.max_inline_result_bytes
@@ -268,16 +283,37 @@ async def create_production_agent(
             created.append(selected_journal)
         else:
             selected_journal = journal
+        selected_ownership = selected_journal if artifact_ownership is None else artifact_ownership
+        selected_retirement = (
+            selected_journal if artifact_retirement is None else artifact_retirement
+        )
+        selected_references = (
+            selected_journal if artifact_references is None else artifact_references
+        )
+        _require_methods(selected_journal, _RUN_JOURNAL_METHODS)
+        _require_methods(selected_ownership, _ARTIFACT_OWNERSHIP_METHODS)
+        _require_methods(selected_retirement, _ARTIFACT_RETIREMENT_METHODS)
+        _require_methods(selected_references, _ARTIFACT_REFERENCE_METHODS)
+        if not (
+            selected_ownership is selected_journal
+            and selected_retirement is selected_journal
+            and selected_references is selected_journal
+        ):
+            raise ValueError("Artifact capabilities must use the same atomic persistence authority")
         selected_artifacts: ArtifactExternalizer
         selected_repository = artifact_repository
+        created_repository = False
         if artifacts is None:
             if selected_repository is None:
+                if config.artifact_root is None:
+                    raise ValueError("Production composition requires an absolute Artifact root")
                 assert config.artifact_root is not None
                 selected_repository = FilesystemArtifactRepository(
                     config.artifact_root,
                     config.max_artifact_bytes,
                 )
                 created.append(selected_repository)
+                created_repository = True
             selected_artifacts = PolicyArtifactExternalizer(
                 selected_repository, _artifact_policy(config)
             )
@@ -286,17 +322,28 @@ async def create_production_agent(
             selected_artifacts = artifacts
             if selected_repository is None:
                 selected_repository = _externalizer_repository(selected_artifacts)
-        _require_methods(selected_journal, _JOURNAL_METHODS)
         _require_methods(selected_artifacts, ("externalize",))
         if selected_repository is None:
             raise ValueError("Production composition requires an Artifact repository")
-        _require_methods(selected_repository, ("stat", "open", "delete", "collect_orphans"))
-        _require_methods(selected_journal, ("load_referenced_artifact_ids",))
+        _require_methods(selected_repository, ("put", "stat", "open", "delete"))
+        workspace_id = config.artifact_workspace_id
+        if created_repository:
+            assert config.artifact_root is not None
+            workspace_id = workspace_id or _artifact_workspace(config.artifact_root)
+        elif workspace_id is None:
+            raise ValueError(
+                "Injected Artifact repositories require an Artifact workspace identity"
+            )
+        selected_collector = artifact_collector
+        if selected_collector is None and _has_methods(selected_repository, ("collect_orphans",)):
+            selected_collector = cast(ArtifactGarbageCollector, selected_repository)
+        if selected_collector is not None:
+            _require_methods(selected_collector, ("collect_orphans",))
         execution_store = SQLiteToolExecutionStore(_tool_execution_path(config))
         await execution_store.recover_abandoned()
         read_entry = read_artifact_entry(
             selected_repository,
-            workspace_id=_artifact_workspace(config.artifact_root),
+            workspace_id=workspace_id,
             max_read_bytes=config.max_artifact_read_bytes,
             max_result_bytes=config.max_inline_artifact_bytes,
         )
@@ -309,11 +356,6 @@ async def create_production_agent(
         selected_tools = ToolRouter(
             {READ_ARTIFACT_TOOL_NAME: read_gateway},
             fallback=tools,
-        )
-        maintenance = ArtifactRetentionService(
-            journal=selected_journal,
-            artifacts=selected_repository,
-            max_reference_ids=config.max_orphan_reference_ids,
         )
         return _compose(
             config,
@@ -331,7 +373,7 @@ async def create_production_agent(
             owned_resources=(*owned_resources, *created),
             observer=observer,
             reserved_tool=read_entry.spec,
-            artifact_services=maintenance,
+            artifact_collector=selected_collector,
         )
     except BaseException as error:
         await _cleanup_and_raise(error, created)
@@ -354,9 +396,14 @@ def _compose(
     owned_resources: tuple[object, ...],
     observer: PostCommitObserver | None,
     reserved_tool: ToolSpec | None = None,
-    artifact_services: ArtifactRetentionService | None = None,
+    artifact_collector: ArtifactGarbageCollector | None = None,
 ) -> Agent:
     bounded_journal = BoundedRunJournal(journal, config.max_serialized_run_state_bytes)
+    artifact_lifecycle = ArtifactLifecycleService(
+        journal=bounded_journal,
+        ownership=bounded_journal,
+        max_conflict_retries=config.max_advances_per_operation,
+    )
     submissions = SubmissionService(
         bounded_journal, ids, clock, config.limits, config.max_user_message_bytes
     )
@@ -442,6 +489,7 @@ def _compose(
     runtime = RuntimeCoordinator(
         submissions=submissions,
         journal=bounded_journal,
+        artifact_lifecycle=artifact_lifecycle,
         coordinator_factory=coordinator_factory,
         ids=ids,
         clock=clock,
@@ -461,6 +509,17 @@ def _compose(
             if artifact_repository is not None
             else None
         ),
+    )
+    artifact_services = (
+        ArtifactRetentionService(
+            retirement=bounded_journal,
+            references=bounded_journal,
+            artifacts=artifact_repository,
+            collector=artifact_collector,
+            max_reference_ids=config.max_orphan_reference_ids,
+        )
+        if artifact_repository is not None
+        else None
     )
     return Agent(runtime, ids, profile_id, artifacts=artifact_services)
 
@@ -505,7 +564,7 @@ def _validate_composition_inputs(
     )
     _require_methods(clock, ("now", "monotonic"))
     if journal is not None:
-        _require_methods(journal, _JOURNAL_METHODS)
+        _require_methods(journal, _ATOMIC_ARTIFACT_AUTHORITY_METHODS)
     if artifacts is not None:
         _require_methods(artifacts, ("externalize",))
     if artifact_repository is not None:
@@ -525,7 +584,7 @@ def _validate_composition_inputs(
     return config, profile
 
 
-_JOURNAL_METHODS = (
+_RUN_JOURNAL_METHODS = (
     "commit",
     "load_head",
     "load_session",
@@ -535,12 +594,23 @@ _JOURNAL_METHODS = (
     "read_page",
     "find_run_state",
     "find_run_state_by_id",
+)
+_ARTIFACT_OWNERSHIP_METHODS = (
     "load_artifact_attachments",
     "artifact_has_active_attachments",
+    "load_artifact_facts",
+)
+_ARTIFACT_RETIREMENT_METHODS = (
     "reserve_artifact_retirement",
     "complete_artifact_retirement",
     "abort_artifact_retirement",
-    "load_artifact_facts",
+)
+_ARTIFACT_REFERENCE_METHODS = ("load_referenced_artifact_ids",)
+_ATOMIC_ARTIFACT_AUTHORITY_METHODS = (
+    *_RUN_JOURNAL_METHODS,
+    *_ARTIFACT_OWNERSHIP_METHODS,
+    *_ARTIFACT_RETIREMENT_METHODS,
+    *_ARTIFACT_REFERENCE_METHODS,
 )
 
 
@@ -616,6 +686,7 @@ def _snapshot_application_config(value: object) -> ApplicationConfig:
             sqlite_path=object.__getattribute__(value, "sqlite_path"),
             tool_execution_path=object.__getattribute__(value, "tool_execution_path"),
             artifact_root=object.__getattribute__(value, "artifact_root"),
+            artifact_workspace_id=object.__getattribute__(value, "artifact_workspace_id"),
             observer_timeout_seconds=object.__getattribute__(value, "observer_timeout_seconds"),
         )
     except (AttributeError, TypeError, ValueError):

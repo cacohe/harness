@@ -286,7 +286,9 @@ def test_retired_content_can_be_published_by_a_later_run(tmp_path):
             first.run_id,
             roles=(ArtifactAttachmentRole.FINAL_OUTPUT,),
         )
-        await ArtifactRetentionService(journal=journal, artifacts=repository).retire(artifact_id)
+        await ArtifactRetentionService(
+            retirement=journal, references=journal, artifacts=repository
+        ).retire(artifact_id)
         assert await repository.stat(artifact_id) is None
 
         second = await session.submit("second", SubmissionId("second"))

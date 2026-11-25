@@ -135,3 +135,6 @@ class BoundedRunJournal:
         return await self._artifact_lifecycle.load_artifact_facts(
             session_id, run_id, after_index, limit
         )
+
+    async def load_referenced_artifact_ids(self, limit: int) -> tuple[str, ...]:
+        return await self._artifact_lifecycle.load_referenced_artifact_ids(limit)

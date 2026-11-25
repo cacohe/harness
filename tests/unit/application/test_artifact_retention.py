@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import cast
 
 import pytest
@@ -18,6 +19,54 @@ from src.core.execution.errors import RunErrorCode
 from src.core.execution.state import RunStatus
 from src.core.persistence.journal import JournalError
 from tests.unit.core.test_journal_contract import acceptance
+
+
+def test_retention_uses_explicit_reference_and_collector_ports() -> None:
+    class References:
+        async def load_referenced_artifact_ids(self, limit: int) -> tuple[str, ...]:
+            assert limit == 4
+            return ("sha256:" + "a" * 64,)
+
+    class Collector:
+        async def collect_orphans(self, referenced_ids, older_than):
+            assert referenced_ids == ("sha256:" + "a" * 64,)
+            assert older_than.tzinfo is not None
+            return 2
+
+    journal = InMemoryRunJournal()
+    repository = InMemoryArtifactRepository(1_024)
+    service = ArtifactRetentionService(
+        retirement=journal,
+        references=References(),
+        artifacts=repository,
+        collector=Collector(),
+        max_reference_ids=3,
+    )
+    result = asyncio.run(service.collect_orphans(datetime(2026, 11, 25, tzinfo=timezone.utc)))
+    assert result == 2
+
+
+def test_retention_rejects_missing_capabilities_before_inventory_reads() -> None:
+    journal = InMemoryRunJournal()
+    repository = InMemoryArtifactRepository(1_024)
+    with pytest.raises(ValueError, match="retirement"):
+        ArtifactRetentionService(
+            retirement=object(),  # type: ignore[arg-type]
+            references=journal,
+            artifacts=repository,
+        )
+
+    class UnreadableReferences:
+        async def load_referenced_artifact_ids(self, _limit: int) -> tuple[str, ...]:
+            raise AssertionError("References must not be read without a collector")
+
+    service = ArtifactRetentionService(
+        retirement=journal,
+        references=UnreadableReferences(),
+        artifacts=repository,
+    )
+    with pytest.raises(RuntimeError, match="unavailable"):
+        asyncio.run(service.collect_orphans(datetime(2026, 11, 25, tzinfo=timezone.utc)))
 
 
 def test_retirement_requires_all_durable_attachments_to_be_detached() -> None:
@@ -58,12 +107,14 @@ def test_retirement_requires_all_durable_attachments_to_be_detached() -> None:
             ref,
         )
         await journal.commit(replace(other, artifact_facts=(other_fact,)), 0)
-        service = ArtifactRetentionService(journal=journal, artifacts=repository)
+        service = ArtifactRetentionService(
+            retirement=journal, references=journal, artifacts=repository
+        )
         with pytest.raises(ArtifactRetentionBlocked):
             await service.retire(ref.artifact_id)
         assert await repository.stat(ref.artifact_id) == ref
 
-        lifecycle = ArtifactLifecycleService(journal=journal)
+        lifecycle = ArtifactLifecycleService(journal=journal, ownership=journal)
         await lifecycle.detach(batch.state.session_id, batch.state.run_id)
         with pytest.raises(ArtifactRetentionBlocked):
             await service.retire(ref.artifact_id)
@@ -97,8 +148,10 @@ def test_concurrent_detach_and_retire_never_deletes_an_active_owner() -> None:
             ref,
         )
         await journal.commit(replace(batch, artifact_facts=(fact,)), 0)
-        lifecycle = ArtifactLifecycleService(journal=journal)
-        retention = ArtifactRetentionService(journal=journal, artifacts=repository)
+        lifecycle = ArtifactLifecycleService(journal=journal, ownership=journal)
+        retention = ArtifactRetentionService(
+            retirement=journal, references=journal, artifacts=repository
+        )
         detached, retired = await asyncio.gather(
             lifecycle.detach(batch.state.session_id, batch.state.run_id),
             retention.retire(ref.artifact_id),
@@ -138,7 +191,9 @@ def test_retiring_and_retired_tombstones_block_attachment_resurrection() -> None
         repository = BlockingRepository(ref)
         retirement = asyncio.create_task(
             ArtifactRetentionService(
-                journal=journal, artifacts=cast(ArtifactRepository, repository)
+                retirement=journal,
+                references=journal,
+                artifacts=cast(ArtifactRepository, repository),
             ).retire(ref.artifact_id)
         )
         await repository.started.wait()
@@ -179,7 +234,9 @@ def test_delete_failure_aborts_reservation_and_allows_attach() -> None:
 
         journal = InMemoryRunJournal()
         service = ArtifactRetentionService(
-            journal=journal, artifacts=cast(ArtifactRepository, FailingRepository())
+            retirement=journal,
+            references=journal,
+            artifacts=cast(ArtifactRepository, FailingRepository()),
         )
         with pytest.raises(RuntimeError, match="delete failed"):
             await service.retire(ref.artifact_id)
@@ -213,7 +270,9 @@ def test_sqlite_restart_resumes_retirement_saga(tmp_path, crash_point: str) -> N
         if crash_point == "before-complete":
             await repository.delete(ref.artifact_id)
         reopened = SQLiteRunJournal(path)
-        service = ArtifactRetentionService(journal=reopened, artifacts=repository)
+        service = ArtifactRetentionService(
+            retirement=reopened, references=reopened, artifacts=repository
+        )
         await service.retire(ref.artifact_id)
         await service.retire(ref.artifact_id)
         assert await repository.stat(ref.artifact_id) is None
