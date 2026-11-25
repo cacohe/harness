@@ -9,14 +9,14 @@ from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.application.artifact_lifecycle import ArtifactLifecycleService
 from src.application.artifact_retention import ArtifactRetentionBlocked, ArtifactRetentionService
 from src.core.artifacts.contracts import ArtifactRef, ArtifactRepository, ArtifactWrite
-from src.core.execution.errors import RunErrorCode
-from src.core.execution.state import RunStatus
-from src.core.persistence.journal import (
+from src.core.artifacts.lifecycle import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,
-    JournalError,
 )
+from src.core.execution.errors import RunErrorCode
+from src.core.execution.state import RunStatus
+from src.core.persistence.journal import JournalError
 from tests.unit.core.test_journal_contract import acceptance
 
 

@@ -21,6 +21,7 @@ from src.adapters.tools import (
 )
 from src.application.artifact_retention import ArtifactRetentionService
 from src.application.composition import ApplicationConfig, create_development_agent
+from src.core.artifacts.lifecycle import ArtifactAttachmentRole
 from src.core.context.contracts import (
     ContextBudget,
     ContextRequest,
@@ -29,7 +30,6 @@ from src.core.context.model import ModelMessage, ModelResponse, ModelRole, Model
 from src.core.execution.commands import RunLimits
 from src.core.execution.state import RunStatus
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
-from src.core.persistence.journal import ArtifactAttachmentRole
 from src.core.tools.contracts import ToolSpec
 
 

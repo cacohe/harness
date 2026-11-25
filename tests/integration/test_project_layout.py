@@ -47,6 +47,7 @@ EXPECTED_CORE_PATHS = {
     "tools/contracts.py",
     "artifacts/__init__.py",
     "artifacts/contracts.py",
+    "artifacts/lifecycle.py",
     "artifacts/validation.py",
     "persistence/__init__.py",
     "persistence/journal.py",

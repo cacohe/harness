@@ -45,6 +45,13 @@ from src.adapters.persistence.sqlite_integrity import (
     summary_record_hash,
     validate_hash,
 )
+from src.core.artifacts.lifecycle import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
+    ArtifactFactRecord,
+    ArtifactRetirementReservation,
+    ArtifactRetirementState,
+)
 from src.core.context.contracts import (
     ConversationCoverage,
     ConversationCoverageSegment,
@@ -54,11 +61,6 @@ from src.core.execution.errors import RunErrorCode
 from src.core.execution.state import RunState
 from src.core.ids import ProfileId, RunId, SessionId, SubmissionId
 from src.core.persistence.journal import (
-    ArtifactAttachmentAction,
-    ArtifactAttachmentFact,
-    ArtifactFactRecord,
-    ArtifactRetirementReservation,
-    ArtifactRetirementState,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,

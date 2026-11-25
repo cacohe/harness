@@ -9,13 +9,15 @@ import pytest
 import src.adapters.persistence.sqlite as sqlite_module
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.adapters.persistence.sqlite_codec import decode, encode
+from src.core.artifacts.lifecycle import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
+    ArtifactAttachmentRole,
+)
 from src.core.execution.errors import RunErrorCode, RunFailure
 from src.core.execution.state import RunState, RunStatus
 from src.core.ids import EventId, ProfileId, RunId, SessionId
 from src.core.persistence.journal import (
-    ArtifactAttachmentAction,
-    ArtifactAttachmentFact,
-    ArtifactAttachmentRole,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,

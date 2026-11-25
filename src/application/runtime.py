@@ -13,6 +13,7 @@ from src.application.artifact_lifecycle import ArtifactLifecycleService
 from src.application.observability import Observation, PostCommitObserver
 from src.application.recovery import RecoveryService
 from src.application.submissions import AcceptedRun, SubmissionService
+from src.core.artifacts.lifecycle import ArtifactAttachmentFact, ArtifactAttachmentRole
 from src.core.context.contracts import ContextBudgetExceeded
 from src.core.execution.commands import (
     AdvanceRun,
@@ -27,8 +28,6 @@ from src.core.execution.errors import InvalidTransition, RunErrorCode, RunFailur
 from src.core.execution.state import RunState, RunStatus, TaskStateMachine
 from src.core.ids import Clock, IdGenerator, ProfileId, RunId, SessionId, SubmissionId
 from src.core.persistence.journal import (
-    ArtifactAttachmentFact,
-    ArtifactAttachmentRole,
     JournalCommit,
     JournalError,
     JournalHead,

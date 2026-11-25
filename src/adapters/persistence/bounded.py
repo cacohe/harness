@@ -3,14 +3,17 @@ from __future__ import annotations
 from typing import cast
 
 from src.adapters.persistence.sqlite_codec import encode
+from src.core.artifacts.lifecycle import (
+    ArtifactAttachmentFact,
+    ArtifactFactRecord,
+    ArtifactLifecycleStore,
+    ArtifactRetirementReservation,
+)
 from src.core.context.contracts import ConversationPage, ConversationReader
 from src.core.execution.errors import RunErrorCode
 from src.core.execution.state import RunState
 from src.core.ids import ProfileId, RunId, SessionId, SubmissionId
 from src.core.persistence.journal import (
-    ArtifactAttachmentFact,
-    ArtifactFactRecord,
-    ArtifactRetirementReservation,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,
@@ -29,6 +32,7 @@ class BoundedRunJournal:
         if type(max_state_bytes) is not int or not 1_024 <= max_state_bytes <= 16 * 1_048_576:
             raise ValueError("Serialized RunState envelope is invalid")
         self._delegate = delegate
+        self._artifact_lifecycle = cast(ArtifactLifecycleStore, delegate)
         self.max_state_bytes = max_state_bytes
 
     async def commit(self, batch: JournalCommit, expected_version: int) -> JournalSnapshot:
@@ -101,25 +105,25 @@ class BoundedRunJournal:
     async def load_artifact_attachments(
         self, session_id: SessionId, run_id: RunId
     ) -> tuple[ArtifactAttachmentFact, ...]:
-        return await self._delegate.load_artifact_attachments(session_id, run_id)
+        return await self._artifact_lifecycle.load_artifact_attachments(session_id, run_id)
 
     async def artifact_has_active_attachments(self, artifact_id: str) -> bool:
-        return await self._delegate.artifact_has_active_attachments(artifact_id)
+        return await self._artifact_lifecycle.artifact_has_active_attachments(artifact_id)
 
     async def reserve_artifact_retirement(
         self, artifact_id: str
     ) -> ArtifactRetirementReservation | None:
-        return await self._delegate.reserve_artifact_retirement(artifact_id)
+        return await self._artifact_lifecycle.reserve_artifact_retirement(artifact_id)
 
     async def complete_artifact_retirement(
         self, reservation: ArtifactRetirementReservation
     ) -> ArtifactRetirementReservation:
-        return await self._delegate.complete_artifact_retirement(reservation)
+        return await self._artifact_lifecycle.complete_artifact_retirement(reservation)
 
     async def abort_artifact_retirement(
         self, reservation: ArtifactRetirementReservation
     ) -> ArtifactRetirementReservation:
-        return await self._delegate.abort_artifact_retirement(reservation)
+        return await self._artifact_lifecycle.abort_artifact_retirement(reservation)
 
     async def load_artifact_facts(
         self,
@@ -128,4 +132,6 @@ class BoundedRunJournal:
         after_index: int,
         limit: int,
     ) -> tuple[ArtifactFactRecord, ...]:
-        return await self._delegate.load_artifact_facts(session_id, run_id, after_index, limit)
+        return await self._artifact_lifecycle.load_artifact_facts(
+            session_id, run_id, after_index, limit
+        )

@@ -4,14 +4,16 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from src.core.artifacts.contracts import ArtifactRef
+from src.core.artifacts.lifecycle import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
+    ArtifactAttachmentRole,
+)
 from src.core.execution.commands import CommandContext, CoreCommand, FailRun
 from src.core.execution.errors import RunErrorCode, RunFailure
 from src.core.execution.events import DomainEvent
 from src.core.execution.state import RunState, StateTransition, TaskStateMachine
 from src.core.persistence.journal import (
-    ArtifactAttachmentAction,
-    ArtifactAttachmentFact,
-    ArtifactAttachmentRole,
     ConversationSummaryCheckpoint,
     JournalCommit,
     TranscriptEntry,

@@ -6,14 +6,16 @@ from typing import cast
 
 import pytest
 from src.adapters.persistence.memory import InMemoryRunJournal, _Store
-from src.core.execution.errors import RunErrorCode
-from src.core.execution.events import DomainEvent, JsonValue
-from src.core.ids import EventId, RunId, SessionId
-from src.core.persistence.journal import (
+from src.core.artifacts.lifecycle import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,
     ArtifactFactRecord,
+)
+from src.core.execution.errors import RunErrorCode
+from src.core.execution.events import DomainEvent, JsonValue
+from src.core.ids import EventId, RunId, SessionId
+from src.core.persistence.journal import (
     JournalCommit,
     JournalError,
     JournalSnapshot,

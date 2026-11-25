@@ -4,6 +4,11 @@ from datetime import datetime, timezone
 import pytest
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.core.artifacts.contracts import ArtifactRef, ExternalizedContent, InlineContent
+from src.core.artifacts.lifecycle import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
+    ArtifactAttachmentRole,
+)
 from src.core.execution.commands import RunLimits, ToolCallRequest
 from src.core.execution.errors import RunErrorCode, RunFailure
 from src.core.execution.events import DomainEvent, DomainEventType
@@ -17,9 +22,6 @@ from src.core.execution.state import (
 )
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 from src.core.persistence.journal import (
-    ArtifactAttachmentAction,
-    ArtifactAttachmentFact,
-    ArtifactAttachmentRole,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,

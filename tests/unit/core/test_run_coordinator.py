@@ -10,6 +10,7 @@ from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.context.tokenizers import ExactTokenCounter
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.core.artifacts.contracts import ArtifactRef, InlineContent
+from src.core.artifacts.lifecycle import ArtifactAttachmentRole
 from src.core.context.contracts import (
     ContextBudget,
     ContextBudgetExceeded,
@@ -32,11 +33,7 @@ from src.core.execution.coordinator import RunCoordinator
 from src.core.execution.errors import RunErrorCode, RunFailure
 from src.core.execution.state import RunState, RunStatus
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
-from src.core.persistence.journal import (
-    ArtifactAttachmentRole,
-    ConversationSummaryCheckpoint,
-    JournalError,
-)
+from src.core.persistence.journal import ConversationSummaryCheckpoint, JournalError
 from src.core.tools.contracts import ToolApproval, ToolResult, ToolResultStatus, ToolSpec
 
 NOW = datetime(2026, 11, 18, tzinfo=timezone.utc)

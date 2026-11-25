@@ -11,6 +11,14 @@ from src.adapters.context.journal_history import (
     newest_transcript_interactions,
 )
 from src.core.artifacts.contracts import ArtifactRef, ExternalizedContent, snapshot_artifact_ref
+from src.core.artifacts.lifecycle import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
+    ArtifactAttachmentRole,
+    ArtifactFactRecord,
+    ArtifactRetirementReservation,
+    ArtifactRetirementState,
+)
 from src.core.context.contracts import (
     ConversationCoverage,
     ConversationCoverageSegment,
@@ -29,12 +37,6 @@ from src.core.execution.state import (
 )
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 from src.core.persistence.journal import (
-    ArtifactAttachmentAction,
-    ArtifactAttachmentFact,
-    ArtifactAttachmentRole,
-    ArtifactFactRecord,
-    ArtifactRetirementReservation,
-    ArtifactRetirementState,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,

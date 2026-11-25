@@ -10,15 +10,17 @@ from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.application.artifact_lifecycle import ArtifactLifecycleService
 from src.application.recovery import RecoveryCorruption, RecoveryService
 from src.core.artifacts.contracts import ArtifactRef, ArtifactRepository, ExternalizedContent
+from src.core.artifacts.lifecycle import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
+    ArtifactAttachmentRole,
+)
 from src.core.execution.commands import RunLimits
 from src.core.execution.errors import RunErrorCode
 from src.core.execution.events import DomainEvent, DomainEventType
 from src.core.execution.state import RunState, RunStatus
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 from src.core.persistence.journal import (
-    ArtifactAttachmentAction,
-    ArtifactAttachmentFact,
-    ArtifactAttachmentRole,
     ConversationSummaryCheckpoint,
     JournalCommit,
 )

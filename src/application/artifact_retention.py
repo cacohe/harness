@@ -1,7 +1,9 @@
 from datetime import datetime, timezone
+from typing import cast
 
 from src.core.artifacts.contracts import ArtifactRepository
-from src.core.persistence.journal import ArtifactRetirementState, RunJournal
+from src.core.artifacts.lifecycle import ArtifactLifecycleStore, ArtifactRetirementState
+from src.core.persistence.journal import RunJournal
 
 
 class ArtifactRetentionBlocked(RuntimeError):
@@ -21,13 +23,14 @@ class ArtifactRetentionService:
         if type(max_reference_ids) is not int or not 1 <= max_reference_ids <= 1_000_000:
             raise ValueError("Artifact maintenance limit is invalid")
         self._journal = journal
+        self._artifact_lifecycle = cast(ArtifactLifecycleStore, journal)
         self._artifacts = artifacts
         self._max_reference_ids = max_reference_ids
 
     async def retire(self, artifact_id: str) -> None:
         if type(artifact_id) is not str or not artifact_id:
             raise ValueError("Artifact id is invalid")
-        reservation = await self._journal.reserve_artifact_retirement(artifact_id)
+        reservation = await self._artifact_lifecycle.reserve_artifact_retirement(artifact_id)
         if reservation is None:
             raise ArtifactRetentionBlocked("Artifact has active attachments")
         if reservation.state is ArtifactRetirementState.RETIRED:
@@ -40,11 +43,11 @@ class ArtifactRetentionService:
             except Exception:
                 raise
             if current is None:
-                await self._journal.complete_artifact_retirement(reservation)
+                await self._artifact_lifecycle.complete_artifact_retirement(reservation)
             else:
-                await self._journal.abort_artifact_retirement(reservation)
+                await self._artifact_lifecycle.abort_artifact_retirement(reservation)
             raise
-        await self._journal.complete_artifact_retirement(reservation)
+        await self._artifact_lifecycle.complete_artifact_retirement(reservation)
 
     async def collect_orphans(self, older_than: datetime) -> int:
         if (

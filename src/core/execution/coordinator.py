@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 
 from src.core.artifacts.contracts import ArtifactExternalizer, ArtifactRef, ExternalizedContent
+from src.core.artifacts.lifecycle import ArtifactAttachmentRole
 from src.core.context.contracts import (
     ContextBudget,
     ContextBudgetExceeded,
@@ -44,10 +45,7 @@ from src.core.execution.projection import (
 )
 from src.core.execution.state import RunState, RunStatus, ToolCallState
 from src.core.ids import Clock, IdGenerator
-from src.core.persistence.journal import (
-    ArtifactAttachmentRole,
-    RunJournal,
-)
+from src.core.persistence.journal import RunJournal
 from src.core.tools.contracts import (
     ToolApproval,
     ToolGateway,
