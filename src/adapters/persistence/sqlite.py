@@ -931,7 +931,7 @@ class SQLiteRunJournal:
                     + f"\nPRAGMA user_version = {_SCHEMA_VERSION};\nCOMMIT;"
                 )
             elif version != _SCHEMA_VERSION:
-                raise ValueError("SQLite journal requires an exact schema v6 database")
+                raise ValueError("SQLite journal requires an exact schema v7 database")
             self._validate_schema(connection)
             if str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() != "wal":
                 raise ValueError("SQLite journal requires WAL mode")
@@ -2107,13 +2107,13 @@ class SQLiteRunJournal:
     @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:
         if _schema_signature(connection) != _expected_schema_signature():
-            raise ValueError("SQLite journal schema v6 definition has drifted")
+            raise ValueError("SQLite journal schema v7 definition has drifted")
         for table, expected in _EXPECTED_COLUMNS.items():
             columns = tuple(
                 str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")
             )
             if columns != expected:
-                raise ValueError("SQLite journal schema v6 has drifted")
+                raise ValueError("SQLite journal schema v7 has drifted")
         indexes = {
             str(row[0])
             for row in connection.execute(
@@ -2121,13 +2121,13 @@ class SQLiteRunJournal:
             )
         }
         if not set(_EXPECTED_INDEXES) <= indexes:
-            raise ValueError("SQLite journal schema v6 is missing required indexes")
+            raise ValueError("SQLite journal schema v7 is missing required indexes")
         for index, expected_columns in _EXPECTED_INDEXES.items():
             actual_columns = tuple(
                 str(row[2]) for row in connection.execute(f"PRAGMA index_info({index})")
             )
             if actual_columns != expected_columns:
-                raise ValueError("SQLite journal schema v6 index has drifted")
+                raise ValueError("SQLite journal schema v7 index has drifted")
         for table in (
             "journal_entries",
             "runs",
@@ -2151,7 +2151,7 @@ class SQLiteRunJournal:
                 and str(row[6]).upper() == "CASCADE"
                 for row in foreign
             ):
-                raise ValueError("SQLite journal schema v6 is missing a Session foreign key")
+                raise ValueError("SQLite journal schema v7 is missing a Session foreign key")
 
 
 def _schema_signature(connection: sqlite3.Connection) -> tuple[tuple[str, str, str, str], ...]:
