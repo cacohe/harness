@@ -3,7 +3,9 @@ from enum import StrEnum
 from typing import TypeAlias, assert_never
 
 from src.core.artifacts.contracts import ArtifactRef, ExternalizedContent, snapshot_artifact_ref
+from src.core.context.skills import MAX_ACTIVE_SKILLS, SkillBinding, snapshot_skill_binding
 from src.core.execution.commands import (
+    ActivateSkill,
     AdvanceRun,
     CancelRun,
     CompleteRun,
@@ -109,6 +111,7 @@ class RunState:
     elapsed_seconds: float = 0
     used_step_ids: frozenset[str] = frozenset()
     used_tool_call_ids: frozenset[str] = frozenset()
+    active_skills: tuple[SkillBinding, ...] = ()
     final_text: str | None = None
     final_artifacts: tuple[ArtifactRef, ...] = ()
     failure: RunFailure | None = None
@@ -216,7 +219,8 @@ def _advance(state: RunState, command: CoreCommand) -> tuple[RunState, _EventFac
 def _advance_running(
     state: RunState,
     command: (
-        StartStep
+        ActivateSkill
+        | StartStep
         | FinishStep
         | StartModelCall
         | FinishModelCall
@@ -226,6 +230,28 @@ def _advance_running(
     ),
 ) -> tuple[RunState, _EventFact | None]:
     match command:
+        case ActivateSkill():
+            try:
+                binding = snapshot_skill_binding(command.binding)
+            except ValueError:
+                raise InvalidTransition from None
+            existing = next(
+                (item for item in state.active_skills if item.name == binding.name), None
+            )
+            if existing is not None:
+                if existing != binding:
+                    raise InvalidTransition
+                return state, None
+            if len(state.active_skills) >= MAX_ACTIVE_SKILLS:
+                raise InvalidTransition
+            return replace(state, active_skills=(*state.active_skills, binding)), (
+                DomainEventType.SKILL_ACTIVATED,
+                {
+                    "name": binding.name,
+                    "version": binding.version,
+                    "content_sha256": binding.content_sha256,
+                },
+            )
         case CompleteRun():
             if state.current_step is not None:
                 raise InvalidTransition

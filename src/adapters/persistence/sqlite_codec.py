@@ -14,6 +14,7 @@ from src.core.artifacts.lifecycle import (
     ArtifactRetirementReservation,
     ArtifactRetirementState,
 )
+from src.core.context.skills import SkillBinding
 from src.core.execution.commands import RunLimits, ToolCallRequest
 from src.core.execution.errors import RunErrorCode, RunFailure
 from src.core.execution.events import DomainEvent, DomainEventType
@@ -54,6 +55,7 @@ _RECORDS: dict[str, type[Any]] = {
         StepState,
         ToolCallState,
         ToolCallRequest,
+        SkillBinding,
         SubmissionRecord,
         TranscriptEntry,
         ConversationSummaryCheckpoint,

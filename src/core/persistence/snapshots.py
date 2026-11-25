@@ -16,6 +16,7 @@ from src.core.artifacts.lifecycle import (
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,
 )
+from src.core.context.skills import snapshot_skill_bindings
 from src.core.execution.commands import RunLimits, ToolCallRequest, snapshot_tool_call
 from src.core.execution.errors import RunErrorCode, RunFailure
 from src.core.execution.events import DomainEvent, DomainEventType
@@ -98,6 +99,7 @@ def snapshot_run_state(value: object) -> RunState:
     failure = None if failure_value is None else _snapshot_failure(failure_value)
     used_steps = _snapshot_string_set(_raw(value, "used_step_ids"))
     used_tools = _snapshot_string_set(_raw(value, "used_tool_call_ids"))
+    active_skills = snapshot_skill_bindings(_raw(value, "active_skills"))
     status = _snapshot_run_status(_raw(value, "status"))
     elapsed = _raw(value, "elapsed_seconds")
     if type(elapsed) is not int and type(elapsed) is not float:
@@ -117,6 +119,7 @@ def snapshot_run_state(value: object) -> RunState:
         elapsed_seconds=float(elapsed),
         used_step_ids=used_steps,
         used_tool_call_ids=used_tools,
+        active_skills=active_skills,
         final_text=final_text,
         final_artifacts=final_artifacts,
         failure=failure,

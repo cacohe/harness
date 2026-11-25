@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -9,6 +10,7 @@ from src.core.artifacts.lifecycle import (
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,
 )
+from src.core.context.skills import SkillBinding
 from src.core.execution.commands import RunLimits, ToolCallRequest
 from src.core.execution.errors import RunErrorCode, RunFailure
 from src.core.execution.events import DomainEvent, DomainEventType
@@ -296,6 +298,25 @@ def test_receipt_rebuild_returns_an_independent_trusted_snapshot():
     assert rebuilt.submission is not original.submission
     assert rebuilt.artifact_facts == original.artifact_facts
     assert rebuilt.artifact_facts[0] is not original.artifact_facts[0]
+
+
+def test_receipt_rebuild_snapshots_active_skill_bindings():
+    binding = SkillBinding("review", "v1", "a" * 64)
+    batch = direct_batch()
+    batch = JournalCommit(
+        replace(batch.state, active_skills=(binding,)),
+        events=batch.events,
+        transcript=batch.transcript,
+        summary=batch.summary,
+        submission=batch.submission,
+        artifact_facts=batch.artifact_facts,
+    )
+    rebuilt = receipt(batch)
+
+    assert rebuilt.state.active_skills == (binding,)
+    assert rebuilt.state.active_skills[0] is not binding
+    object.__setattr__(binding, "content_sha256", "b" * 64)
+    assert rebuilt.state.active_skills[0].content_sha256 == "a" * 64
 
 
 def test_receipt_rejects_tampered_artifact_attachment_descriptor() -> None:

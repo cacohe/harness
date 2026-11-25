@@ -73,7 +73,7 @@ from src.core.persistence.journal import (
 )
 from src.core.persistence.receipt import validate_commit_receipt
 
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 _COVERAGE_BLOCK_SIZE = 128
 _COVERAGE_DEPTH = 32
 _SUMMARY_DEPTH = 32
