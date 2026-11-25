@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +19,7 @@ from src.core.context.skills import (
     ResolvedSkill,
     SkillBinding,
     SkillCatalogEntry,
+    skill_content_sha256,
     snapshot_skill_binding,
     snapshot_skill_catalog,
 )
@@ -211,12 +211,13 @@ def _parse_document(directory_name: str, text: str) -> _Document:
     body = "\n".join(lines[5:]).strip()
     if not body:
         raise SkillProviderError("Skill body must be non-blank")
+    content = f"Skill: {entry.name}\nVersion: {entry.version}\n\n{body}"
     try:
-        message = ModelMessage(ModelRole.SYSTEM, body)
+        message = ModelMessage(ModelRole.SYSTEM, content)
     except ValueError:
         raise SkillProviderError("Skill body is invalid") from None
     assert message.content is not None
-    digest = hashlib.sha256(message.content.encode("utf-8")).hexdigest()
+    digest = skill_content_sha256((message,))
     return _Document(entry, message.content, digest)
 
 

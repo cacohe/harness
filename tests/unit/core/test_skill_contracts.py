@@ -6,14 +6,15 @@ from src.core.context.skills import (
     ResolvedSkill,
     SkillBinding,
     SkillCatalogEntry,
+    skill_content_sha256,
     snapshot_skill_catalog,
 )
 
 
 def test_skill_values_are_bounded_immutable_and_copy_isolated():
     entry = SkillCatalogEntry("review", "Review a change", "v1")
-    binding = SkillBinding("review", "v1", "a" * 64)
     message = ModelMessage(ModelRole.SYSTEM, "Follow the review workflow")
+    binding = SkillBinding("review", "v1", skill_content_sha256((message,)))
     resolved = ResolvedSkill(binding, (message,))
 
     assert snapshot_skill_catalog((entry,)) == (entry,)
@@ -40,6 +41,10 @@ def test_skill_values_are_bounded_immutable_and_copy_isolated():
             (ModelMessage(ModelRole.USER, "not system"),),
         ),
         lambda: ResolvedSkill(SkillBinding("name", "v1", "a" * 64), ()),
+        lambda: ResolvedSkill(
+            SkillBinding("name", "v1", "a" * 64),
+            (ModelMessage(ModelRole.SYSTEM, "digest mismatch"),),
+        ),
     ],
 )
 def test_skill_values_reject_invalid_or_unbounded_data(factory):

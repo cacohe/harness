@@ -1,3 +1,4 @@
+import hashlib
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from typing import Protocol
@@ -24,6 +25,7 @@ __all__ = [
     "snapshot_skill_bindings",
     "snapshot_skill_catalog",
     "snapshot_skill_catalog_entry",
+    "skill_content_sha256",
 ]
 
 MAX_SKILL_CATALOG_ENTRIES = 128
@@ -68,6 +70,8 @@ class ResolvedSkill:
             )
             for message in self.messages
         )
+        if skill_content_sha256(messages) != binding.content_sha256:
+            raise ValueError("Resolved Skill content does not match its binding digest")
         object.__setattr__(self, "binding", binding)
         object.__setattr__(self, "messages", messages)
 
@@ -78,6 +82,20 @@ class SkillProvider(Protocol):
     def activate(self, name: str, *, profile_id: ProfileId) -> Awaitable[ResolvedSkill]: ...
 
     def resolve(self, binding: SkillBinding, *, profile_id: ProfileId) -> Awaitable[ResolvedSkill]: ...
+
+
+def skill_content_sha256(messages: tuple[ModelMessage, ...]) -> str:
+    if type(messages) is not tuple or not messages:
+        raise ValueError("Skill content requires messages")
+    digest = hashlib.sha256()
+    for message in messages:
+        if type(message) is not ModelMessage or message.role is not ModelRole.SYSTEM:
+            raise ValueError("Skill content requires system messages")
+        assert message.content is not None
+        encoded = message.content.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
 
 
 def snapshot_skill_catalog(value: object) -> tuple[SkillCatalogEntry, ...]:

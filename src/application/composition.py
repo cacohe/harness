@@ -49,8 +49,10 @@ from src.core.context.contracts import (
     TokenCounter,
 )
 from src.core.context.model import ModelGateway
+from src.core.context.skills import SkillProvider
 from src.core.execution.commands import RunLimits
 from src.core.execution.coordinator import RunCoordinator
+from src.core.execution.projection import load_skill_tool_spec
 from src.core.execution.state import RunState
 from src.core.ids import Clock, IdGenerator, ProfileId
 from src.core.persistence.journal import RunJournal
@@ -161,6 +163,7 @@ async def create_development_agent(
     artifact_repository: ArtifactRepository | None = None,
     owned_resources: tuple[object, ...] = (),
     observer: PostCommitObserver | None = None,
+    skills: SkillProvider | None = None,
 ) -> Agent:
     config, profile_id = _validate_composition_inputs(
         config,
@@ -177,6 +180,7 @@ async def create_development_agent(
         artifact_repository=artifact_repository,
         owned_resources=owned_resources,
         observer=observer,
+        skills=skills,
     )
     created: list[object] = []
     try:
@@ -217,6 +221,7 @@ async def create_development_agent(
             artifact_repository=selected_repository,
             owned_resources=(*owned_resources, *created),
             observer=observer,
+            skills=skills,
             artifact_collector=(
                 cast(ArtifactGarbageCollector, selected_repository)
                 if selected_repository is not None
@@ -248,6 +253,7 @@ async def create_production_agent(
     artifact_collector: ArtifactGarbageCollector | None = None,
     owned_resources: tuple[object, ...] = (),
     observer: PostCommitObserver | None = None,
+    skills: SkillProvider | None = None,
 ) -> Agent:
     config, profile_id = _validate_composition_inputs(
         config,
@@ -264,6 +270,7 @@ async def create_production_agent(
         artifact_repository=artifact_repository,
         owned_resources=owned_resources,
         observer=observer,
+        skills=skills,
         allow_missing_tools=True,
     )
     if journal is None and config.sqlite_path is None:
@@ -372,8 +379,9 @@ async def create_production_agent(
             artifact_repository=selected_repository,
             owned_resources=(*owned_resources, *created),
             observer=observer,
-            reserved_tool=read_entry.spec,
+            reserved_tools=(read_entry.spec,),
             artifact_collector=selected_collector,
+            skills=skills,
         )
     except BaseException as error:
         await _cleanup_and_raise(error, created)
@@ -395,8 +403,9 @@ def _compose(
     artifact_repository: ArtifactRepository | None,
     owned_resources: tuple[object, ...],
     observer: PostCommitObserver | None,
-    reserved_tool: ToolSpec | None = None,
+    reserved_tools: tuple[ToolSpec, ...] = (),
     artifact_collector: ArtifactGarbageCollector | None = None,
+    skills: SkillProvider | None = None,
 ) -> Agent:
     bounded_journal = BoundedRunJournal(journal, config.max_serialized_run_state_bytes)
     artifact_lifecycle = ArtifactLifecycleService(
@@ -407,6 +416,11 @@ def _compose(
     submissions = SubmissionService(
         bounded_journal, ids, clock, config.limits, config.max_user_message_bytes
     )
+    skill_tool = load_skill_tool_spec() if skills is not None else None
+    all_reserved_tools = (
+        *reserved_tools,
+        *((skill_tool,) if skill_tool is not None else ()),
+    )
 
     async def coordinator_factory(state: RunState, user_input: str) -> RunCoordinator:
         request = context_request_factory(state, user_input)
@@ -414,10 +428,13 @@ def _compose(
             raise ValueError("Context request factory returned an invalid request")
         if request.session_id != state.session_id or request.profile_id != state.profile_id:
             raise ValueError("Context request factory returned mismatched identities")
-        if reserved_tool is not None:
+        if skills is not None and request.skill_messages:
+            raise ValueError("Skill provider requires an empty caller Skill context")
+        for reserved_tool in all_reserved_tools:
             if any(tool.name == reserved_tool.name for tool in request.tools):
                 raise ValueError("Context request collides with a reserved production tool")
-            request = replace(request, tools=(*request.tools, reserved_tool))
+        if all_reserved_tools:
+            request = replace(request, tools=(*request.tools, *all_reserved_tools))
         summaries = await bounded_journal.load_context_summaries(
             state.session_id,
             state.profile_id,
@@ -484,6 +501,8 @@ def _compose(
             context_request=request,
             context_budget=config.context_budget,
             context_counter=context_counter,
+            skills=skills,
+            skill_tool=skill_tool,
         )
 
     runtime = RuntimeCoordinator(
@@ -540,6 +559,7 @@ def _validate_composition_inputs(
     artifact_repository: ArtifactRepository | None,
     owned_resources: tuple[object, ...],
     observer: PostCommitObserver | None,
+    skills: SkillProvider | None,
     allow_missing_tools: bool = False,
 ) -> tuple[ApplicationConfig, ProfileId]:
     if (
@@ -581,6 +601,8 @@ def _validate_composition_inputs(
         raise ValueError("Model output limit exceeds the reserved output context")
     if observer is not None:
         _require_methods(observer, ("observe",))
+    if skills is not None:
+        _require_methods(skills, ("catalog", "activate", "resolve"))
     return config, profile
 
 

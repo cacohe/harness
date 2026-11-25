@@ -44,7 +44,7 @@ def test_catalog_activation_and_pinned_resolution_are_deterministic(tmp_path: Pa
     assert resolved.binding.version == "2"
     assert len(resolved.binding.content_sha256) == 64
     assert tuple(message.content for message in resolved.messages) == (
-        "Use focused tests before implementation.",
+        "Skill: python-testing\nVersion: 2\n\nUse focused tests before implementation.",
     )
     again = asyncio.run(provider.resolve(resolved.binding, profile_id=PROFILE))
     assert again == resolved
