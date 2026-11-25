@@ -14,7 +14,7 @@ from src.core.json_values import MAX_TOOL_ARGUMENT_BYTES, validate_json_text
 from src.core.tools.approval import validate_approval_binding
 
 if TYPE_CHECKING:
-    from src.core.context.skills import SkillBinding
+    from src.core.context._skill_values import SkillBinding
 
 _MAX_CHILD_ID_BYTES = 256
 
@@ -97,7 +97,7 @@ class ActivateSkill(_RunCommand):
     binding: SkillBinding
 
     def __post_init__(self) -> None:
-        from src.core.context.skills import snapshot_skill_binding
+        from src.core.context._skill_values import snapshot_skill_binding
 
         try:
             object.__setattr__(self, "binding", snapshot_skill_binding(self.binding))
