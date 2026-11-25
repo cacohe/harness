@@ -306,9 +306,7 @@ def test_load_skill_is_persisted_and_applies_to_every_later_model_step():
     skills = Skills()
     responses = [
         ModelResponse(
-            tool_calls=(
-                ModelToolCall("load-1", LOAD_SKILL_TOOL_NAME, '{"name":"review"}'),
-            )
+            tool_calls=(ModelToolCall("load-1", LOAD_SKILL_TOOL_NAME, '{"name":"review"}'),)
         ),
         ModelResponse("answer"),
     ]

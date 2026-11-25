@@ -327,8 +327,7 @@ def test_progressive_skill_catalog_activation_and_persistent_context():
     assert "ACTIVE REVIEW INSTRUCTIONS" not in first_system
     assert sum(tool.name == LOAD_SKILL_TOOL_NAME for tool in model.requests[0].tools) == 1
     assert any(
-        message.content == "ACTIVE REVIEW INSTRUCTIONS"
-        for message in model.requests[1].messages
+        message.content == "ACTIVE REVIEW INSTRUCTIONS" for message in model.requests[1].messages
     )
     assert skills.calls == ["catalog", "activate", "catalog", "resolve"]
     assert tools.effects == Counter()

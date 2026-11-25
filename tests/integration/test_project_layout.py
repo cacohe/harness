@@ -312,6 +312,23 @@ def test_reliable_runtime_documents_only_the_async_single_track_api():
     assert "RunJournal.commit(batch, expected_version)" in text
 
 
+def test_public_docs_cover_artifact_and_progressive_skill_boundaries():
+    documents = (
+        (ROOT / "README.md").read_text(encoding="utf-8"),
+        (ROOT / "README.zh-CN.md").read_text(encoding="utf-8"),
+        (ROOT / "docs" / "reliable-runtime.md").read_text(encoding="utf-8"),
+    )
+    for text in documents:
+        for claim in (
+            "artifact_workspace_id",
+            "SkillProvider",
+            "load_skill",
+            "content_sha256",
+            "FilesystemSkillProvider",
+        ):
+            assert claim in text
+
+
 @pytest.mark.parametrize(
     "statement",
     [

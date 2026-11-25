@@ -41,9 +41,7 @@ class SkillCatalogEntry:
 
     def __post_init__(self) -> None:
         bounded_skill_text(self.name, MAX_SKILL_ID_BYTES, "Skill name")
-        bounded_skill_text(
-            self.description, _MAX_SKILL_DESCRIPTION_BYTES, "Skill description"
-        )
+        bounded_skill_text(self.description, _MAX_SKILL_DESCRIPTION_BYTES, "Skill description")
         bounded_skill_text(self.version, MAX_SKILL_ID_BYTES, "Skill version")
 
 
@@ -81,7 +79,9 @@ class SkillProvider(Protocol):
 
     def activate(self, name: str, *, profile_id: ProfileId) -> Awaitable[ResolvedSkill]: ...
 
-    def resolve(self, binding: SkillBinding, *, profile_id: ProfileId) -> Awaitable[ResolvedSkill]: ...
+    def resolve(
+        self, binding: SkillBinding, *, profile_id: ProfileId
+    ) -> Awaitable[ResolvedSkill]: ...
 
 
 def skill_content_sha256(messages: tuple[ModelMessage, ...]) -> str:

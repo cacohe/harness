@@ -90,9 +90,7 @@ def test_catalog_bounds_and_duplicate_logical_names_are_rejected(tmp_path: Path)
     write_skill(tmp_path, "two", description="x" * 40)
     with pytest.raises(SkillProviderError):
         asyncio.run(
-            FilesystemSkillProvider(
-                tmp_path.resolve(), max_catalog_entries=1
-            ).catalog(PROFILE)
+            FilesystemSkillProvider(tmp_path.resolve(), max_catalog_entries=1).catalog(PROFILE)
         )
     with pytest.raises(SkillProviderError):
         asyncio.run(
@@ -121,9 +119,7 @@ def test_changed_version_or_content_cannot_replace_a_pinned_binding(tmp_path: Pa
         asyncio.run(provider.resolve(binding, profile_id=PROFILE))
     with pytest.raises(SkillProviderError):
         asyncio.run(
-            provider.resolve(
-                SkillBinding("skill", "3", binding.content_sha256), profile_id=PROFILE
-            )
+            provider.resolve(SkillBinding("skill", "3", binding.content_sha256), profile_id=PROFILE)
         )
 
 

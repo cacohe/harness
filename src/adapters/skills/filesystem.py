@@ -53,9 +53,7 @@ class FilesystemSkillProvider:
         if not isinstance(root, Path) or not root.is_absolute():
             raise ValueError("Skill root must be an absolute Path")
         _positive_limit(max_skill_bytes, _MAX_CONFIGURED_SKILL_BYTES, "max_skill_bytes")
-        _positive_limit(
-            max_catalog_entries, MAX_SKILL_CATALOG_ENTRIES, "max_catalog_entries"
-        )
+        _positive_limit(max_catalog_entries, MAX_SKILL_CATALOG_ENTRIES, "max_catalog_entries")
         _positive_limit(max_catalog_bytes, _CORE_MAX_CATALOG_BYTES, "max_catalog_bytes")
         try:
             root_info = directory_info(root.lstat())
@@ -124,10 +122,7 @@ class FilesystemSkillProvider:
 
     def _resolve_sync(self, binding: SkillBinding) -> ResolvedSkill:
         document = self._document(binding.name)
-        if (
-            document.entry.version != binding.version
-            or document.digest != binding.content_sha256
-        ):
+        if document.entry.version != binding.version or document.digest != binding.content_sha256:
             raise SkillProviderError("Pinned Skill content is no longer available")
         return _resolved(document)
 
@@ -203,9 +198,7 @@ def _parse_document(directory_name: str, text: str) -> _Document:
         raise SkillProviderError("Skill declaration does not match its directory")
     _logical_name(values["name"])
     try:
-        entry = SkillCatalogEntry(
-            values["name"], values["description"], values["version"]
-        )
+        entry = SkillCatalogEntry(values["name"], values["description"], values["version"])
     except ValueError:
         raise SkillProviderError("Skill frontmatter values are invalid") from None
     body = "\n".join(lines[5:]).strip()
