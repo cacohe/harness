@@ -29,7 +29,11 @@ async with agent:
 
 `create_development_agent()` has the same required ports and supplies memory-backed journal and
 Artifact implementations when they are omitted. `create_production_agent()` requires an explicit
-absolute SQLite path and Artifact root unless those ports are injected.
+absolute SQLite path. It requires an absolute Artifact root only when it creates the filesystem
+repository; an injected remote repository instead requires an explicit opaque
+`artifact_workspace_id`. Artifact ownership, retirement, and reference-index capabilities are
+separate ports, and production binds them to the same adapter object as the journal so attachment
+facts and Run state retain one atomic authority.
 
 ## Atomic facts and authenticated recovery
 
@@ -85,6 +89,10 @@ Model, builder and tool deadlines are adapter boundaries. Cancellation propagate
 container/client cleanup is shielded and bounded. Adapter exceptions are mapped to stable Core error
 codes before they reach durable state.
 
+The last permitted model step may complete with text, but it may not schedule tools. If its response
+contains any tool call, Core records `limit_exceeded` before persisting or executing that batch.
+Ordinary tools, approval requests, Artifact-producing tools, and `load_skill` all obey this rule.
+
 ## Bounded context and state
 
 Every model request is built through `ContextProvider.build(request, budget)`. The provider must
@@ -104,6 +112,27 @@ SYSTEM prefix as one indivisible group, including after process restart.
 
 A budget or state-envelope violation is a stable failure; the runtime does not send an oversized
 request or truncate JSON into an invalid value.
+
+## Progressive Skill loading
+
+An optional `SkillProvider` exposes a bounded catalog before each model decision. The canonical
+catalog message contains only `name`, `description`, and `version`; full instructions are absent
+until the model invokes the reserved `load_skill` control tool with one logical name. Core handles
+that tool directly and never routes it to the general Tool gateway.
+
+Activation durably appends a `SkillBinding(name, version, content_sha256)` to `RunState`. Every later
+model decision resolves each binding in activation order and verifies that the returned canonical
+SYSTEM messages still hash to the persisted digest. Resolution happens again after restart. Missing
+or changed content is an invariant failure before the next model request, not a silent version
+switch. Catalog and resolution are model-path operations only; cancellation, approval decisions,
+and resumption of already-persisted ordinary tools do not need the provider.
+
+`FilesystemSkillProvider` performs pinned, validated reads of `<root>/<name>/SKILL.md` off the event
+loop. Its trust boundary rejects non-absolute or replaced roots, traversal names, symlinks and
+Windows reparse points, hard links and non-regular files, invalid or duplicate frontmatter, invalid
+UTF-8, NUL, empty or oversized content, and replacement during a read. It is a single-machine
+adapter, not a remote registry, recursive discovery service, automatic selector, or hot-reload
+mechanism.
 
 ## Artifact durability
 
