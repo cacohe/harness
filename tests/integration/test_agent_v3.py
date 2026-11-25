@@ -127,6 +127,13 @@ class Model:
             raise TimeoutError("provider deadline")
         if message == "artifact-lifecycle":
             return ModelResponse("x" * 80)
+        if round_number == 0 and message == "final-step-tools":
+            return ModelResponse(
+                tool_calls=(
+                    ModelToolCall("call-first", "first", "{}"),
+                    ModelToolCall("call-guarded", "guarded", "{}"),
+                )
+            )
         if round_number == 0 and message == "tools":
             return ModelResponse(
                 tool_calls=(
@@ -196,7 +203,9 @@ def request_factory(state, message: str) -> ContextRequest:
     )
 
 
-async def rig(*, journal=None, model=None, tools=None, ids=None, observer=None, context=None):
+async def rig(
+    *, journal=None, model=None, tools=None, ids=None, observer=None, context=None, limits=None
+):
     selected_journal = journal or InMemoryRunJournal()
     selected_model = model or Model()
     selected_tools = tools or Tools()
@@ -214,7 +223,7 @@ async def rig(*, journal=None, model=None, tools=None, ids=None, observer=None, 
         ApplicationConfig(
             max_sessions=128,
             max_waiters_per_session=8,
-            limits=RunLimits(16, 30.0, 64),
+            limits=limits or RunLimits(16, 30.0, 64),
             context_budget=ContextBudget(2_048, 32, 16),
         ),
         model=selected_model,
@@ -366,6 +375,22 @@ def test_agent_runs_direct_answer_and_ordered_tool_batch_end_to_end():
         "tool",
         "assistant",
     ]
+
+
+def test_agent_final_step_tool_batch_has_no_tool_or_approval_side_effect() -> None:
+    async def scenario():
+        agent, journal, _, tools = await rig(limits=RunLimits(1, 30.0, 64))
+        session = await agent.open_session(SessionId("final-step-tools"))
+        state = await session.submit("final-step-tools", SubmissionId("final-step-tools"))
+        snapshot = await journal.load_session(SessionId("final-step-tools"))
+        await agent.close()
+        return state, snapshot, tools
+
+    state, snapshot, tools = asyncio.run(scenario())
+    assert state.status is RunStatus.FAILED
+    assert state.failure == RunFailure(RunErrorCode.LIMIT_EXCEEDED)
+    assert tools.effects == {}
+    assert [entry.role for entry in snapshot.transcript] == ["user"]
 
 
 def test_agent_session_publicly_detaches_production_generated_artifacts() -> None:

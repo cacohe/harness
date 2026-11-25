@@ -488,6 +488,63 @@ def test_direct_answer_orders_ports_and_commits_terminal_state_once():
     assert [entry.role for entry in journal.batches[0][0].transcript] == ["assistant"]
 
 
+def test_final_step_tool_batch_fails_before_any_tool_or_artifact_side_effect() -> None:
+    specs = (
+        ToolSpec("write", "write", "{}"),
+        ToolSpec(
+            "approve",
+            "approve",
+            "{}",
+            requires_approval=True,
+            approval_scope="write",
+            workspace_id="workspace",
+        ),
+    )
+    response = ModelResponse(
+        tool_calls=(
+            ModelToolCall("write-call", "write", "{}"),
+            ModelToolCall("approval-call", "approve", "{}"),
+        )
+    )
+    success = ToolResult(
+        ToolResultStatus.SUCCESS,
+        inline_content=InlineContent({"payload": "x" * 80}, "application/json"),
+    )
+    coordinator_, calls, journal, tools, _ = coordinator(
+        responses=[response], specs=specs, tool_results=[success]
+    )
+    limited = RunState.create(submit(), RunLimits(1, 60.0, 64))
+
+    outcome = run(coordinator_.advance(limited, submit()))
+    if not outcome.state.status.terminal:
+        outcome = run(
+            coordinator_.advance(
+                outcome.state,
+                AdvanceRun(RUN, SESSION, context=command_context("final-step-tools")),
+            )
+        )
+
+    assert outcome.state.status is RunStatus.FAILED
+    assert outcome.state.failure == RunFailure(RunErrorCode.LIMIT_EXCEEDED)
+    assert tools.requests == []
+    assert calls == ["context", "model", "journal"]
+    assert len(journal.batches) == 1
+    assert journal.batches[0][0].transcript == ()
+    assert journal.batches[0][0].artifact_facts == ()
+
+
+def test_final_step_direct_answer_still_completes() -> None:
+    coordinator_, calls, journal, _, _ = coordinator(responses=[ModelResponse("answer")])
+    limited = RunState.create(submit(), RunLimits(1, 60.0, 64))
+
+    outcome = run(coordinator_.advance(limited, submit()))
+
+    assert outcome.state.status is RunStatus.COMPLETED
+    assert outcome.state.final_text == "answer"
+    assert calls == ["context", "model", "journal"]
+    assert [entry.content for entry in journal.batches[0][0].transcript] == ["answer"]
+
+
 def test_large_direct_answer_becomes_final_artifact_reference_and_bounded_summary():
     answer = "x" * 80
     coordinator_, _, journal, _, repository = coordinator(responses=[ModelResponse(answer)])

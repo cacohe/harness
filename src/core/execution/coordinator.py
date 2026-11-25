@@ -192,6 +192,8 @@ class RunCoordinator:
             )
         except (InvalidTransition, ValueError):
             return self._outcome(await driver.fail(RunErrorCode.MODEL_FAILED))
+        if requests and driver.state.steps_started >= driver.state.limits.max_steps:
+            return self._outcome(await driver.fail(RunErrorCode.LIMIT_EXCEEDED))
         model_text = response.text or ""
         final_artifacts: tuple[ArtifactRef, ...] = ()
         if (
