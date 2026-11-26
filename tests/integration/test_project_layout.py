@@ -5,6 +5,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import yaml
 from src.application.agent import AgentSession
 from src.application.composition import create_development_agent, create_production_agent
 from src.core.persistence.journal import RunJournal
@@ -356,3 +357,30 @@ def test_uv_manages_a_non_packaged_project():
     assert config["tool"]["uv"]["package"] is False
     assert "build-system" not in config
     assert "dev" in config["dependency-groups"]
+
+
+def test_ci_bounds_and_isolates_slow_test_suites():
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text("utf-8"))
+    quality = workflow["jobs"]["quality"]
+    assert quality["timeout-minutes"] == 30
+
+    steps = {step.get("name"): step for step in quality["steps"]}
+    expected_timeouts = {
+        "Run tests": 15,
+        "Run filesystem Artifact tests": 10,
+        "Run SQLite journal tests": 10,
+    }
+    for name, timeout in expected_timeouts.items():
+        assert steps[name]["timeout-minutes"] == timeout
+
+    main_command = steps["Run tests"]["run"]
+    assert "--ignore=tests/unit/adapters/artifacts/test_filesystem_artifacts.py" in main_command
+    assert "--ignore=tests/unit/adapters/persistence/test_sqlite_journal.py" in main_command
+
+    artifact_command = steps["Run filesystem Artifact tests"]["run"]
+    assert "python -m pytest -vv" in artifact_command
+    assert "tests/unit/adapters/artifacts/test_filesystem_artifacts.py" in artifact_command
+
+    sqlite_command = steps["Run SQLite journal tests"]["run"]
+    assert "python -m pytest -vv" in sqlite_command
+    assert "tests/unit/adapters/persistence/test_sqlite_journal.py" in sqlite_command

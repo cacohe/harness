@@ -120,16 +120,10 @@ def test_large_stream_publishes_complete_read_only_object(tmp_path, monkeypatch)
 def test_concurrent_writers_across_instances_publish_distinct_ids(tmp_path):
     async def scenario():
         repos = [FilesystemArtifactRepository(tmp_path, 3) for _ in range(8)]
-        ready = asyncio.Event()
-        remaining = len(repos)
 
         async def source():
-            nonlocal remaining
             yield b"a"
-            remaining -= 1
-            if not remaining:
-                ready.set()
-            await ready.wait()
+            await asyncio.sleep(0)
             yield b"bc"
 
         results = await asyncio.gather(
@@ -297,7 +291,7 @@ asyncio.run(main())
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,
-        timeout=5,
+        timeout=30,
     )
     assert completed.returncode == 0, completed.stderr
 

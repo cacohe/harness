@@ -9,6 +9,7 @@ on:
 jobs:
   quality:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       LITELLM_LOCAL_MODEL_COST_MAP: "True"
     steps:
@@ -35,4 +36,20 @@ jobs:
         run: uv run --locked mypy src
 
       - name: Run tests
-        run: uv run --locked python -m pytest
+        timeout-minutes: 15
+        run: >-
+          uv run --locked python -m pytest
+          --ignore=tests/unit/adapters/artifacts/test_filesystem_artifacts.py
+          --ignore=tests/unit/adapters/persistence/test_sqlite_journal.py
+
+      - name: Run filesystem Artifact tests
+        timeout-minutes: 10
+        run: >-
+          uv run --locked python -m pytest -vv
+          tests/unit/adapters/artifacts/test_filesystem_artifacts.py
+
+      - name: Run SQLite journal tests
+        timeout-minutes: 10
+        run: >-
+          uv run --locked python -m pytest -vv
+          tests/unit/adapters/persistence/test_sqlite_journal.py
