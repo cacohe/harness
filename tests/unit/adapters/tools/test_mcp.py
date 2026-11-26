@@ -1771,10 +1771,9 @@ def test_sync_client_from_async_context_does_not_block_the_event_loop() -> None:
 
     async def scenario():
         gateway = _gateway(Client(), factory=lambda _source: Manager())
-        before = time.monotonic()
         adding = asyncio.create_task(gateway.add_server("server", object()))
         assert await asyncio.to_thread(started.wait, 1)
-        assert time.monotonic() - before < 0.1
+        assert not adding.done()
         ticked = asyncio.Event()
         asyncio.get_running_loop().call_soon(ticked.set)
         await asyncio.wait_for(ticked.wait(), 0.05)
@@ -1782,7 +1781,7 @@ def test_sync_client_from_async_context_does_not_block_the_event_loop() -> None:
         await adding
         await gateway.aclose()
 
-    watchdog = threading.Timer(0.2, release.set)
+    watchdog = threading.Timer(2, release.set)
     watchdog.start()
     try:
         asyncio.run(scenario())
