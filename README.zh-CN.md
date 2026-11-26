@@ -123,9 +123,14 @@ CAS 原子提交。外层循环由 application runtime 驱动，受以下边界�
 
 `FilesystemSkillProvider` 是单机参考 loader，要求
 `<absolute-root>/<logical-name>/SKILL.md`，并使用精确的 `name`、`version`、`description`
-frontmatter。文件读取在线程中完成；路径穿越名称、symlink/reparse point、硬链接或非普通文件、错误或
-重复 metadata、非法 UTF-8、NUL、空/超限 body，以及验证读取期间发生变化的 entry 都会被拒绝。
-它不做递归发现、远程 registry 查询、自动激活或热更新。
+frontmatter。root 是排他且 fail-closed 的 Skill 容器：每个直接子项都必须是合法 Skill 目录，且每个目录
+只能包含 `SKILL.md`；`README.md`、`.gitkeep`、`desktop.ini` 等额外文件会使 catalog 失败，而不会
+被静默忽略。`max_catalog_bytes` 按实际发送给模型的规范 JSON catalog 计量，包括字段名、标点和转义。
+文件读取在线程中完成；路径穿越名称、symlink/reparse point、硬链接或非普通文件、错误或重复
+metadata、非法 UTF-8、NUL、空/超限 body，以及验证读取期间发生变化的 entry 都会被拒绝。每个
+provider 实例代表一个由调用方定义的信任域：它会校验 `profile_id`，但不会据此派生文件路径；需要
+profile 隔离时，调用方必须注入不同的 provider 或 root。它不做递归发现、远程 registry 查询、自动
+激活或热更新。
 
 ## Artifact 生命周期
 

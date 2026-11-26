@@ -25,6 +25,7 @@ from src.core.context.model import (
     snapshot_model_response,
 )
 from src.core.context.skills import ResolvedSkill, SkillProvider, snapshot_skill_catalog
+from src.core.context.support import MAX_OPTIONAL_CONTEXT_MESSAGES
 from src.core.execution._driver import _CommittedRun, _Driver
 from src.core.execution.commands import (
     ActivateSkill,
@@ -191,7 +192,7 @@ class RunCoordinator:
                     if resolved.binding != binding:
                         raise ValueError("Skill provider changed a pinned binding")
                     active_messages.extend(resolved.messages)
-                if len(active_messages) > 127:
+                if len(active_messages) >= MAX_OPTIONAL_CONTEXT_MESSAGES:
                     raise ContextBudgetExceeded
                 request = dataclass_replace(
                     request,

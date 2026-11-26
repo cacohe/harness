@@ -15,10 +15,12 @@ from src.adapters.artifacts.filesystem_platform import (
 )
 from src.core.context.model import ModelMessage, ModelRole
 from src.core.context.skills import (
+    MAX_SKILL_CATALOG_BYTES,
     MAX_SKILL_CATALOG_ENTRIES,
     ResolvedSkill,
     SkillBinding,
     SkillCatalogEntry,
+    encode_skill_catalog,
     skill_content_sha256,
     snapshot_skill_binding,
     snapshot_skill_catalog,
@@ -26,7 +28,6 @@ from src.core.context.skills import (
 from src.core.ids import ProfileId
 
 _MAX_CONFIGURED_SKILL_BYTES = 1_048_576
-_CORE_MAX_CATALOG_BYTES = 65_536
 _DOCUMENT_NAME = "SKILL.md"
 
 
@@ -48,13 +49,13 @@ class FilesystemSkillProvider:
         *,
         max_skill_bytes: int = 262_144,
         max_catalog_entries: int = MAX_SKILL_CATALOG_ENTRIES,
-        max_catalog_bytes: int = _CORE_MAX_CATALOG_BYTES,
+        max_catalog_bytes: int = MAX_SKILL_CATALOG_BYTES,
     ) -> None:
         if not isinstance(root, Path) or not root.is_absolute():
             raise ValueError("Skill root must be an absolute Path")
         _positive_limit(max_skill_bytes, _MAX_CONFIGURED_SKILL_BYTES, "max_skill_bytes")
         _positive_limit(max_catalog_entries, MAX_SKILL_CATALOG_ENTRIES, "max_catalog_entries")
-        _positive_limit(max_catalog_bytes, _CORE_MAX_CATALOG_BYTES, "max_catalog_bytes")
+        _positive_limit(max_catalog_bytes, MAX_SKILL_CATALOG_BYTES, "max_catalog_bytes")
         try:
             root_info = directory_info(root.lstat())
             if root.resolve(strict=True) != root:
@@ -103,12 +104,9 @@ class FilesystemSkillProvider:
             entries = tuple(sorted(entries, key=lambda entry: entry.name))
             if len({entry.name for entry in entries}) != len(entries):
                 raise SkillProviderError("Skill catalog contains duplicate logical names")
-            size = sum(
-                len(value.encode("utf-8"))
-                for entry in entries
-                for value in (entry.name, entry.version, entry.description)
-            )
-            if size > self._max_catalog_bytes:
+            try:
+                encode_skill_catalog(entries, max_bytes=self._max_catalog_bytes)
+            except ValueError:
                 raise SkillProviderError("Skill catalog exceeds its byte limit")
             return snapshot_skill_catalog(entries)
         except SkillProviderError:

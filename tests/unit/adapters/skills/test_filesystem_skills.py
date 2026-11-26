@@ -98,6 +98,21 @@ def test_catalog_bounds_and_duplicate_logical_names_are_rejected(tmp_path: Path)
         )
 
 
+def test_catalog_byte_limit_uses_canonical_context_encoding(tmp_path: Path):
+    for index in range(16):
+        write_skill(
+            tmp_path,
+            f"skill-{index:02d}",
+            version="v" * 128,
+            description="d" * 3_950,
+        )
+
+    provider = FilesystemSkillProvider(tmp_path.resolve())
+
+    with pytest.raises(SkillProviderError, match="byte limit"):
+        asyncio.run(provider.catalog(PROFILE))
+
+
 @pytest.mark.parametrize("name", ["../skill", "a/b", r"a\b", ".", "..", ""])
 def test_activate_accepts_only_a_logical_name(tmp_path: Path, name: str):
     write_skill(tmp_path, "skill")

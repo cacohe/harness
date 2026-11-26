@@ -1,4 +1,5 @@
 import hashlib
+import json
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from typing import Protocol
@@ -16,11 +17,13 @@ from src.core.ids import ProfileId
 
 __all__ = [
     "MAX_ACTIVE_SKILLS",
+    "MAX_SKILL_CATALOG_BYTES",
     "MAX_SKILL_CATALOG_ENTRIES",
     "ResolvedSkill",
     "SkillBinding",
     "SkillCatalogEntry",
     "SkillProvider",
+    "encode_skill_catalog",
     "snapshot_skill_binding",
     "snapshot_skill_bindings",
     "snapshot_skill_catalog",
@@ -29,6 +32,7 @@ __all__ = [
 ]
 
 MAX_SKILL_CATALOG_ENTRIES = 128
+MAX_SKILL_CATALOG_BYTES = 65_536
 _MAX_SKILL_DESCRIPTION_BYTES = 4_096
 _MAX_SKILL_MESSAGES = 16
 
@@ -82,6 +86,30 @@ class SkillProvider(Protocol):
     def resolve(
         self, binding: SkillBinding, *, profile_id: ProfileId
     ) -> Awaitable[ResolvedSkill]: ...
+
+
+def encode_skill_catalog(entries: object, *, max_bytes: int = MAX_SKILL_CATALOG_BYTES) -> str:
+    if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_SKILL_CATALOG_BYTES:
+        raise ValueError("Skill catalog byte limit is invalid")
+    catalog = snapshot_skill_catalog(entries)
+    encoded = json.dumps(
+        {
+            "skills": [
+                {
+                    "name": entry.name,
+                    "description": entry.description,
+                    "version": entry.version,
+                }
+                for entry in catalog
+            ]
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(encoded.encode("utf-8")) > max_bytes:
+        raise ValueError("Skill catalog exceeds its context byte limit")
+    return encoded
 
 
 def skill_content_sha256(messages: tuple[ModelMessage, ...]) -> str:

@@ -128,11 +128,15 @@ switch. Catalog and resolution are model-path operations only; cancellation, app
 and resumption of already-persisted ordinary tools do not need the provider.
 
 `FilesystemSkillProvider` performs pinned, validated reads of `<root>/<name>/SKILL.md` off the event
-loop. Its trust boundary rejects non-absolute or replaced roots, traversal names, symlinks and
-Windows reparse points, hard links and non-regular files, invalid or duplicate frontmatter, invalid
-UTF-8, NUL, empty or oversized content, and replacement during a read. It is a single-machine
-adapter, not a remote registry, recursive discovery service, automatic selector, or hot-reload
-mechanism.
+loop. The root is an exclusive, fail-closed container: every direct child must be a valid Skill
+directory containing only `SKILL.md`; unrelated files invalidate the catalog. Catalog byte limits
+measure the exact canonical JSON disclosed to the model, including encoding overhead. Its trust
+boundary rejects non-absolute or replaced roots, traversal names, symlinks and Windows reparse
+points, hard links and non-regular files, invalid or duplicate frontmatter, invalid UTF-8, NUL,
+empty or oversized content, and replacement during a read. A provider instance is one
+caller-defined trust domain; `profile_id` is validated but does not select a filesystem subtree, so
+profile isolation requires separate providers or roots. It is a single-machine adapter, not a
+remote registry, recursive discovery service, automatic selector, or hot-reload mechanism.
 
 ## Artifact durability
 

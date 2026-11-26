@@ -6,7 +6,7 @@ from src.core.ids import ProfileId, SessionId
 from src.core.persistence.journal import ConversationSummaryCheckpoint
 
 _MAX_TOKEN_COUNT = (1 << 63) - 1
-_MAX_OPTIONAL_MESSAGES = 128
+MAX_OPTIONAL_CONTEXT_MESSAGES = 128
 _MAX_POLICY_BYTES = 256
 
 
@@ -102,7 +102,7 @@ def optional_system_messages(
 ) -> tuple[ModelMessage, ...]:
     if (
         type(messages) is not tuple
-        or len(messages) > _MAX_OPTIONAL_MESSAGES
+        or len(messages) > MAX_OPTIONAL_CONTEXT_MESSAGES
         or any(type(message) is not ModelMessage for message in messages)
     ):
         raise ValueError(f"{name} context requires a bounded tuple of messages")

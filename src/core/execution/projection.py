@@ -5,7 +5,7 @@ from dataclasses import replace
 from src.core.artifacts.contracts import ExternalizedContent
 from src.core.context.contracts import ContextRequest, summary_system_messages
 from src.core.context.model import ModelMessage, ModelResponse, ModelRole
-from src.core.context.skills import snapshot_skill_catalog
+from src.core.context.skills import encode_skill_catalog
 from src.core.execution.commands import ToolCallRequest, _check_child_id
 from src.core.execution.errors import RunErrorCode, RunFailure
 from src.core.execution.state import RunState, ToolCallState
@@ -13,7 +13,6 @@ from src.core.persistence.journal import TranscriptEntry, TranscriptEntryType
 from src.core.tools.contracts import ToolResult, ToolResultStatus, ToolSpec
 
 LOAD_SKILL_TOOL_NAME = "load_skill"
-_MAX_SKILL_CATALOG_BYTES = 65_536
 
 
 def load_skill_tool_spec() -> ToolSpec:
@@ -28,21 +27,7 @@ def load_skill_tool_spec() -> ToolSpec:
 
 
 def skill_catalog_message(entries: object) -> ModelMessage:
-    catalog = snapshot_skill_catalog(entries)
-    payload = {
-        "skills": [
-            {
-                "name": entry.name,
-                "description": entry.description,
-                "version": entry.version,
-            }
-            for entry in catalog
-        ]
-    }
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    if len(encoded.encode("utf-8")) > _MAX_SKILL_CATALOG_BYTES:
-        raise ValueError("Skill catalog exceeds its context byte limit")
-    return ModelMessage(ModelRole.SYSTEM, encoded)
+    return ModelMessage(ModelRole.SYSTEM, encode_skill_catalog(entries))
 
 
 def load_skill_name(arguments_json: str) -> str:
