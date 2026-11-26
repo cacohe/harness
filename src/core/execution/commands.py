@@ -16,6 +16,8 @@ _MAX_CHILD_ID_BYTES = 256
 
 @dataclass(frozen=True)
 class RunLimits:
+    """Hard bounds enforced across every coordinator advance for a Run."""
+
     max_steps: int
     max_elapsed_seconds: float
     max_inline_result_bytes: int
@@ -65,11 +67,14 @@ class CommandContext:
 
 @dataclass(frozen=True)
 class _RunCommand:
+    """Common identity and deterministic transition context for all commands."""
+
     run_id: RunId
     session_id: SessionId
     context: CommandContext = field(kw_only=True)
 
 
+# Caller-facing commands enter or control the durable Run lifecycle.
 @dataclass(frozen=True)
 class SubmitRun(_RunCommand):
     submission_id: SubmissionId
@@ -98,6 +103,7 @@ class DecideToolCall(_RunCommand):
     approved: bool
 
 
+# Coordinator-only commands describe the internal step/model/tool lifecycle.
 @dataclass(frozen=True)
 class StartStep(_RunCommand):
     step_id: str
@@ -217,6 +223,7 @@ class FailRun(_RunCommand):
     failure: RunFailure
 
 
+# The state machine accepts both caller-facing controls and coordinator-owned progress commands.
 CoreCommand: TypeAlias = (
     SubmitRun
     | AdvanceRun

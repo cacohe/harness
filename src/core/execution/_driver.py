@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class _CommittedRun:
+    """Validated durable outcome returned by one coordinator advance."""
+
     state: RunState
     journal_version: int
     sequence: int
@@ -31,6 +33,8 @@ class _CommittedRun:
 
 
 class _Driver:
+    """Accumulate state transitions and journal facts for one atomic commit."""
+
     def __init__(self, owner: RunCoordinator, state: RunState, supplied: CommandContext) -> None:
         self.owner = owner
         self.state = state
@@ -50,6 +54,7 @@ class _Driver:
         return self.state.session_id
 
     def context(self) -> CommandContext:
+        # Every transition receives a fresh event ID; unused IDs are not persisted.
         elapsed = self.elapsed_seconds()
         return CommandContext(self.owner._clock.now(), elapsed, (self.owner._ids.event(),))
 
@@ -96,11 +101,14 @@ class _Driver:
         )
 
     async def commit(self) -> _CommittedRun:
+        # The journal version is a Session-scoped compare-and-swap token.
         expected = self.state.journal_version
+        # Only events and transcript entries consume positions in the shared sequence.
         sequence = self.state.journal_sequence + len(self.events) + len(self.transcript)
         persisted = replace(self.state, journal_version=expected + 1, journal_sequence=sequence)
         facts = list(self.artifact_facts)
         if self.checkpoint is not None:
+            # Summary artifacts must be attached in the same commit as their checkpoint.
             owner = (
                 f"{self.checkpoint.policy_version}:"
                 f"{self.checkpoint.covered_from_sequence}-{self.checkpoint.covered_through_sequence}"
@@ -128,6 +136,7 @@ class _Driver:
             artifact_facts=tuple(facts),
         )
         receipt = await self.owner._journal.commit(batch, expected)
+        # Do not expose the new state until the adapter proves exactly what it committed.
         receipt = validate_commit_receipt(
             receipt,
             batch,

@@ -30,6 +30,8 @@ from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 
 
 class RunStatus(StrEnum):
+    """Lifecycle states persisted in the current Run projection."""
+
     CREATED = "created"
     RUNNING = "running"
     WAITING_APPROVAL = "waiting_approval"
@@ -44,12 +46,16 @@ class RunStatus(StrEnum):
 
 @dataclass(frozen=True)
 class ApprovalState:
+    """Two-phase approval: a decision is recorded before the Run is resumed."""
+
     approved: bool | None = None
     resumed: bool = False
 
 
 @dataclass(frozen=True)
 class ToolCallState:
+    """A persisted tool request together with approval and execution progress."""
+
     request: ToolCallRequest
     requires_approval: bool
     approval: ApprovalState | None = None
@@ -68,6 +74,8 @@ class ToolCallState:
 
 @dataclass(frozen=True)
 class ModelCallState:
+    """The model result and ordered tool batch produced for one step."""
+
     model_call_id: str
     result: str | None = None
     tool_requests: tuple[ToolCallRequest, ...] = ()
@@ -83,9 +91,12 @@ class ModelCallState:
 
 @dataclass(frozen=True)
 class StepState:
+    """One model decision plus its serially processed tool calls."""
+
     step_id: str
     model_call: ModelCallState | None = None
     tool_calls: tuple[ToolCallState, ...] = ()
+    # Durable cursor pointing at the next tool request that must be settled.
     next_tool_index: int = 0
 
     @property
@@ -98,6 +109,8 @@ class StepState:
 
 @dataclass(frozen=True)
 class RunState:
+    """Immutable durable projection of a Run and its current in-flight step."""
+
     run_id: RunId
     session_id: SessionId
     submission_id: SubmissionId
@@ -149,6 +162,8 @@ _EventFact: TypeAlias = tuple[DomainEventType, dict[str, JsonValue]]
 
 
 class TaskStateMachine:
+    """Validate commands and derive the next immutable state plus domain event."""
+
     @staticmethod
     def apply(state: RunState, command: CoreCommand) -> StateTransition:
         if command.run_id != state.run_id or command.session_id != state.session_id:
@@ -159,6 +174,7 @@ class TaskStateMachine:
 
         advancing = replace(state, version=state.version + 1)
         next_state, fact = _advance(advancing, command)
+        # Time exhaustion wins over ordinary progress, but explicit close commands remain stable.
         if (
             not isinstance(command, (CancelRun, FailRun))
             and elapsed > state.limits.max_elapsed_seconds
@@ -168,6 +184,7 @@ class TaskStateMachine:
         event_ids = command.context.event_ids
         events: tuple[DomainEvent, ...] = ()
         if fact:
+            # Each emitted fact consumes the matching prefix of caller-allocated event IDs.
             if not event_ids:
                 raise InvalidTransition
             event_type, payload = fact
@@ -191,6 +208,7 @@ class TaskStateMachine:
 
 
 def _advance(state: RunState, command: CoreCommand) -> tuple[RunState, _EventFact | None]:
+    # CREATED and WAITING_APPROVAL have narrow command sets; all other work is RUNNING-only.
     if state.status is RunStatus.CREATED:
         if not isinstance(command, SubmitRun) or (
             command.submission_id != state.submission_id or command.profile_id != state.profile_id
@@ -362,6 +380,7 @@ def _approval(state: RunState, command: CoreCommand) -> tuple[RunState, _EventFa
         raise InvalidTransition
 
     if isinstance(command, ResumeRun) and approval.approved is not None:
+        # A rejected call is settled by advancing the cursor; an approved call executes next.
         tool = replace(tool, approval=replace(approval, resumed=True))
         next_index = step.next_tool_index + (approval.approved is False)
         tools = (
@@ -382,6 +401,7 @@ def _approval(state: RunState, command: CoreCommand) -> tuple[RunState, _EventFa
         and approval.approved is None
         and type(command.approved) is bool
     ):
+        # Recording the decision deliberately keeps the Run paused until an explicit resume.
         tool = replace(tool, approval=ApprovalState(command.approved))
         tools = (
             *step.tool_calls[: step.next_tool_index],

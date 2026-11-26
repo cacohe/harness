@@ -59,6 +59,8 @@ from src.core.tools.contracts import (
 
 @dataclass(frozen=True, slots=True)
 class RunOutcome:
+    """Durable state and journal position produced by one coordinator advance."""
+
     state: RunState
     journal_version: int
     sequence: int
@@ -102,6 +104,9 @@ class RunCoordinator:
         return RunOutcome(result.state, result.journal_version, result.sequence, result.events)
 
     async def advance(self, state: RunState, command: CoreCommand) -> RunOutcome:
+        """Perform at most one model decision or one recoverable tool batch."""
+
+        # Bind every command and context request to the supplied durable projection.
         if type(state) is not RunState or command.run_id != state.run_id:
             raise InvalidTransition
         if command.session_id != state.session_id:
@@ -119,6 +124,7 @@ class RunCoordinator:
             if state.status is not RunStatus.RUNNING:
                 raise InvalidTransition
             if state.current_step is not None:
+                # A persisted open step always resumes its pending tools before another model call.
                 return await self._continue_tools(driver)
         else:
             driver.apply(command)
@@ -133,8 +139,11 @@ class RunCoordinator:
         return await self._model_step(driver)
 
     async def _model_step(self, driver: _Driver) -> RunOutcome:
+        """Build trusted context, make one model call, and persist its decision."""
+
         step_id = self._ids.step()
         model_call_id = self._ids.model_call()
+        # Establish the in-flight step and model call before crossing adapter boundaries.
         if driver.apply(
             StartStep(driver.run_id, driver.session_id, step_id, context=driver.context())
         ):
@@ -152,6 +161,7 @@ class RunCoordinator:
         try:
             window = await self._context.build(self._request, self._budget)
             estimate = self._counter.count(window.messages, window.tools)
+            # Treat provider output as untrusted until its request binding and budget are verified.
             if (
                 window.policy_version != self._request.policy_version
                 or window.tools != self._request.tools
@@ -172,6 +182,7 @@ class RunCoordinator:
             if remaining <= 0:
                 return self._outcome(await driver.fail(RunErrorCode.LIMIT_EXCEEDED))
             async with asyncio.timeout(remaining):
+                # The coordinator's remaining run budget bounds the external model call.
                 try:
                     raw_response = await self._model.complete(
                         ModelRequest(window.messages, window.tools)
@@ -186,6 +197,7 @@ class RunCoordinator:
         except Exception:
             return self._outcome(await driver.fail(RunErrorCode.MODEL_FAILED))
         try:
+            # Normalize model tool calls and scope any reused IDs before they enter durable state.
             requests = scope_reused_tool_call_ids(
                 model_tool_requests(response, window.tools),
                 driver.state.used_tool_call_ids,
@@ -203,6 +215,7 @@ class RunCoordinator:
             return self._outcome(await driver.fail(RunErrorCode.MODEL_FAILED))
         if not requests:
             try:
+                # Final text may be replaced by an inline pointer before the terminal commit.
                 model_text, final_artifacts = await externalize_final_text(
                     model_text, driver.state.limits.max_inline_result_bytes, self._artifacts
                 )
@@ -226,6 +239,7 @@ class RunCoordinator:
             return self._outcome(await driver.fail(RunErrorCode.MODEL_FAILED))
         driver.checkpoint = window.new_checkpoint
         if requests:
+            # Persist the model decision; tools run only on a later, retryable advance.
             return self._outcome(await driver.commit())
         if driver.apply(
             FinishStep(driver.run_id, driver.session_id, step_id, context=driver.context())
@@ -244,16 +258,20 @@ class RunCoordinator:
         return self._outcome(await driver.commit())
 
     async def _continue_tools(self, driver: _Driver) -> RunOutcome:
+        """Execute the persisted tool batch in order and commit its transcript."""
+
         step = driver.state.current_step
         if step is None or step.model_call is None:
             raise InvalidTransition
         step_id = step.step_id
         model_call_id = step.model_call.model_call_id
+        # next_tool_index is the durable cursor, so a retry never skips an unsettled call.
         while step.next_tool_index < len(step.model_call.tool_requests):
             index = step.next_tool_index
             request = step.model_call.tool_requests[index]
             current = step.tool_calls[index] if index < len(step.tool_calls) else None
             if current is None:
+                # Approval-required calls commit a paused state before they may execute.
                 if driver.apply(
                     StartToolCall(
                         driver.run_id,
@@ -287,6 +305,7 @@ class RunCoordinator:
             step = driver.state.current_step
             assert step is not None
         driver.transcript = tool_transcript(driver.state)
+        # Publish the complete assistant/tool exchange only after the whole batch settles.
         if driver.apply(
             FinishStep(driver.run_id, driver.session_id, step_id, context=driver.context())
         ):
@@ -296,6 +315,8 @@ class RunCoordinator:
     async def _execute(
         self, driver: _Driver, call: ToolCallState
     ) -> ExternalizedContent | RunFailure:
+        """Execute one authorized call and convert adapter failures into stable results."""
+
         if not call.request.available:
             driver.checkpoint = None
             return RunFailure(RunErrorCode.TOOL_FAILED)
@@ -316,6 +337,7 @@ class RunCoordinator:
         )
         try:
             result = snapshot_tool_result(await self._tools.execute(request))
+            # The gateway must return the result for this exact idempotency binding.
             if result.execution_key != request.idempotency_key:
                 raise ValueError
         except Exception:
@@ -325,6 +347,7 @@ class RunCoordinator:
             driver.checkpoint = None
             return tool_failure(result)
         try:
+            # Externalize oversized payloads before their descriptors become durable facts.
             externalized = await externalize_tool_result(
                 result, driver.state.limits.max_inline_result_bytes, self._artifacts
             )
