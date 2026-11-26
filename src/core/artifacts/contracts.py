@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field, fields
+from datetime import datetime
 from hashlib import sha256 as _sha256
 from io import StringIO
 from typing import NoReturn, Protocol, TypeAlias, TypeVar, cast
@@ -458,6 +459,12 @@ class ArtifactRepository(Protocol):
     async def delete(self, artifact_id: str) -> None:
         """Delete a stored artifact. Missing addresses are ignored."""
         ...
+
+
+class ArtifactGarbageCollector(Protocol):
+    def collect_orphans(
+        self, referenced_ids: tuple[str, ...], older_than: datetime
+    ) -> Awaitable[int]: ...
 
 
 class ArtifactExternalizer(Protocol):

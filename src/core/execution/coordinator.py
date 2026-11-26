@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 
-from src.core.artifacts.contracts import ArtifactExternalizer, ArtifactRef, ExternalizedContent
+from src.core.artifacts.contracts import (
+    ArtifactExternalizer,
+    ArtifactRef,
+    ExternalizedContent,
+    InlineContent,
+)
+from src.core.artifacts.lifecycle import ArtifactAttachmentRole
 from src.core.context.contracts import (
     ContextBudget,
     ContextBudgetExceeded,
@@ -13,11 +20,15 @@ from src.core.context.contracts import (
 )
 from src.core.context.model import (
     ModelGateway,
+    ModelMessage,
     ModelRequest,
     snapshot_model_response,
 )
+from src.core.context.skills import ResolvedSkill, SkillProvider, snapshot_skill_catalog
+from src.core.context.support import MAX_OPTIONAL_CONTEXT_MESSAGES
 from src.core.execution._driver import _CommittedRun, _Driver
 from src.core.execution.commands import (
+    ActivateSkill,
     AdvanceRun,
     CancelRun,
     CompleteRun,
@@ -36,23 +47,25 @@ from src.core.execution.content import externalize_final_text, externalize_tool_
 from src.core.execution.errors import InvalidTransition, RunErrorCode, RunFailure
 from src.core.execution.events import DomainEvent
 from src.core.execution.projection import (
+    LOAD_SKILL_TOOL_NAME,
+    load_skill_name,
+    load_skill_tool_spec,
     matches_trusted_context_shape,
     model_tool_requests,
     scope_reused_tool_call_ids,
+    skill_catalog_message,
     tool_failure,
     tool_transcript,
 )
 from src.core.execution.state import RunState, RunStatus, ToolCallState
 from src.core.ids import Clock, IdGenerator
-from src.core.persistence.journal import (
-    ArtifactAttachmentRole,
-    RunJournal,
-)
+from src.core.persistence.journal import RunJournal
 from src.core.tools.contracts import (
     ToolApproval,
     ToolGateway,
     ToolRequest,
     ToolResultStatus,
+    ToolSpec,
     snapshot_tool_result,
 )
 
@@ -87,6 +100,8 @@ class RunCoordinator:
         context_request: ContextRequest,
         context_budget: ContextBudget,
         context_counter: TokenCounter,
+        skills: SkillProvider | None = None,
+        skill_tool: ToolSpec | None = None,
     ) -> None:
         self._context = context
         self._model = model
@@ -98,6 +113,16 @@ class RunCoordinator:
         self._request = context_request
         self._budget = context_budget
         self._counter = context_counter
+        if (skills is None) != (skill_tool is None):
+            raise ValueError("Skill provider and reserved tool must be configured together")
+        if skill_tool is not None and (
+            skill_tool != load_skill_tool_spec()
+            or sum(tool.name == LOAD_SKILL_TOOL_NAME for tool in context_request.tools) != 1
+            or context_request.skill_messages
+        ):
+            raise ValueError("Skill composition binding is invalid")
+        self._skills = skills
+        self._skill_tool = skill_tool
 
     @staticmethod
     def _outcome(result: _CommittedRun) -> RunOutcome:
@@ -159,13 +184,36 @@ class RunCoordinator:
         ):
             return self._outcome(await driver.commit())
         try:
-            window = await self._context.build(self._request, self._budget)
+            request = self._request
+            if self._skills is not None:
+                catalog = snapshot_skill_catalog(
+                    await self._skills.catalog(driver.state.profile_id)
+                )
+                active_messages: list[ModelMessage] = []
+                for binding in driver.state.active_skills:
+                    raw = await self._skills.resolve(
+                        binding,
+                        profile_id=driver.state.profile_id,
+                    )
+                    if type(raw) is not ResolvedSkill:
+                        raise ValueError("Skill provider returned an invalid resolution")
+                    resolved = ResolvedSkill(raw.binding, raw.messages)
+                    if resolved.binding != binding:
+                        raise ValueError("Skill provider changed a pinned binding")
+                    active_messages.extend(resolved.messages)
+                if len(active_messages) >= MAX_OPTIONAL_CONTEXT_MESSAGES:
+                    raise ContextBudgetExceeded
+                request = dataclass_replace(
+                    request,
+                    skill_messages=(skill_catalog_message(catalog), *active_messages),
+                )
+            window = await self._context.build(request, self._budget)
             estimate = self._counter.count(window.messages, window.tools)
             # Treat provider output as untrusted until its request binding and budget are verified.
             if (
-                window.policy_version != self._request.policy_version
-                or window.tools != self._request.tools
-                or not matches_trusted_context_shape(window.messages, self._request)
+                window.policy_version != request.policy_version
+                or window.tools != request.tools
+                or not matches_trusted_context_shape(window.messages, request)
             ):
                 raise ValueError("Context window does not match its request binding")
             if (
@@ -206,6 +254,8 @@ class RunCoordinator:
             )
         except (InvalidTransition, ValueError):
             return self._outcome(await driver.fail(RunErrorCode.MODEL_FAILED))
+        if requests and driver.state.steps_started >= driver.state.limits.max_steps:
+            return self._outcome(await driver.fail(RunErrorCode.LIMIT_EXCEEDED))
         model_text = response.text or ""
         final_artifacts: tuple[ArtifactRef, ...] = ()
         if (
@@ -320,6 +370,43 @@ class RunCoordinator:
         if not call.request.available:
             driver.checkpoint = None
             return RunFailure(RunErrorCode.TOOL_FAILED)
+        if call.request.name == LOAD_SKILL_TOOL_NAME and self._skills is not None:
+            try:
+                name = load_skill_name(call.request.arguments_json)
+                raw = await self._skills.activate(name, profile_id=driver.state.profile_id)
+                if type(raw) is not ResolvedSkill:
+                    raise ValueError
+                resolved = ResolvedSkill(raw.binding, raw.messages)
+                if resolved.binding.name != name:
+                    raise ValueError
+                confirmation = ExternalizedContent(
+                    InlineContent(
+                        {
+                            "name": resolved.binding.name,
+                            "version": resolved.binding.version,
+                            "content_sha256": resolved.binding.content_sha256,
+                        },
+                        "application/json",
+                    )
+                )
+                inline = confirmation.inline_content
+                assert inline is not None
+                if inline.size_bytes > driver.state.limits.max_inline_result_bytes:
+                    return RunFailure(RunErrorCode.TOOL_FAILED)
+                driver.apply(
+                    ActivateSkill(
+                        driver.run_id,
+                        driver.session_id,
+                        resolved.binding,
+                        context=driver.context(),
+                    )
+                )
+                return confirmation
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                driver.checkpoint = None
+                return RunFailure(RunErrorCode.TOOL_FAILED)
         approval = ToolApproval.NOT_REQUIRED
         if call.approval is not None:
             if call.approval.approved is False:

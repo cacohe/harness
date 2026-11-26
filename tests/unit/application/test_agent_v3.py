@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from src.application.artifact_lifecycle import ArtifactLifecycleService
 from src.core.context.contracts import ContextBudget
 from src.core.execution.commands import RunLimits
 from src.core.ids import ProfileId, SessionId, SubmissionId
@@ -27,6 +28,7 @@ async def test_agent_exposes_only_async_first_session_and_submit_surface():
     runtime = RuntimeCoordinator(
         submissions=Submissions(journal),
         journal=journal,
+        artifact_lifecycle=_artifact_lifecycle(journal),
         coordinator_factory=lambda run, _message: CompletingCoordinator(journal, run, []),
         ids=Ids(),
         clock=Clock(),
@@ -96,7 +98,7 @@ def test_production_composition_requires_explicit_durable_adapter_paths(tmp_path
         asyncio.run(
             create_production_agent(ApplicationConfig(), **dependencies)  # type: ignore[arg-type]
         )
-    with pytest.raises(ValueError, match="Artifact root"):
+    with pytest.raises(ValueError, match="workspace identity"):
         asyncio.run(
             create_production_agent(
                 ApplicationConfig(),
@@ -287,6 +289,9 @@ def test_third_resource_failure_closes_prior_resources_in_reverse_order(monkeypa
             def __init__(self, *_args):
                 pass
 
+            async def put(self, _request):
+                raise AssertionError("No Artifact writes are expected during composition")
+
             async def stat(self, _artifact_id):
                 return None
 
@@ -420,6 +425,9 @@ def test_successful_production_composition_owns_created_resources(monkeypatch, t
         class Repository:
             def __init__(self, *_args):
                 pass
+
+            async def put(self, _request):
+                raise AssertionError("No Artifact writes are expected during composition")
 
             async def stat(self, _artifact_id):
                 return None
@@ -671,3 +679,18 @@ def _production_config(composition, tmp_path):
         sqlite_path=tmp_path / "journal.sqlite3",
         artifact_root=tmp_path / "artifacts",
     )
+
+
+class _NoArtifactOwnership:
+    async def load_artifact_attachments(self, *_args):
+        return ()
+
+    async def artifact_has_active_attachments(self, *_args):
+        return False
+
+    async def load_artifact_facts(self, *_args):
+        return ()
+
+
+def _artifact_lifecycle(journal) -> ArtifactLifecycleService:
+    return ArtifactLifecycleService(journal=journal, ownership=_NoArtifactOwnership())

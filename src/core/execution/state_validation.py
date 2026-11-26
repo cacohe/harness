@@ -1,6 +1,7 @@
 import math
 
 from src.core.artifacts.contracts import ArtifactRef, ExternalizedContent
+from src.core.context.skills import snapshot_skill_bindings
 from src.core.execution.commands import (
     RunLimits,
     ToolCallRequest,
@@ -20,6 +21,12 @@ from src.core.ids import ProfileId, RunId, SessionId, SubmissionId
 
 
 def validate_state(state: RunState) -> None:
+    try:
+        active_skills = snapshot_skill_bindings(state.active_skills)
+    except ValueError:
+        raise InvalidTransition from None
+    if active_skills != state.active_skills:
+        raise InvalidTransition
     if (
         type(state.run_id) is not RunId
         or type(state.session_id) is not SessionId

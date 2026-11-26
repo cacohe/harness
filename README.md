@@ -31,7 +31,7 @@ from src.application import ApplicationConfig, create_production_agent
 from src.core.context.contracts import ContextBudget
 from src.core.execution.commands import RunLimits
 from src.core.ids import ProfileId
-from src.core.persistence.journal import ArtifactAttachmentRole
+from src.core.artifacts.lifecycle import ArtifactAttachmentRole
 
 config = ApplicationConfig(
     limits=RunLimits(max_steps=32, max_elapsed_seconds=300.0, max_inline_result_bytes=65_536),
@@ -71,7 +71,7 @@ async with agent:
     collected = await agent.artifacts.collect_orphans(orphan_cutoff_utc)
 ```
 
-`create_development_agent()` uses an in-memory journal and an in-memory Artifact repository. Production composition requires a stably identifiable Artifact root and uses a separate `tool_execution_path` to persist exactly-once tool claims. When it is not provided explicitly, a sibling `*.tools` file is derived from the explicit `sqlite_path`; the current working directory is never used. Both factories are async-only, and resources are created and closed on the caller's event loop.
+`create_development_agent()` uses an in-memory journal and an in-memory Artifact repository. Production creates a filesystem repository only when `artifact_repository` is omitted; that default requires an absolute `artifact_root`. An injected repository may be remote and needs no local root, but it requires an explicit opaque `artifact_workspace_id`, an externalizer, and any maintenance capabilities the deployment needs. Artifact ownership, retirement, and reference-index ports are separate from `RunJournal`, while production requires their adapter object to be the same atomic persistence authority as the journal. Production uses a separate `tool_execution_path` to persist exactly-once tool claims. When it is not provided explicitly, a sibling `*.tools` file is derived from the explicit `sqlite_path`; the current working directory is never used. Both factories are async-only, and resources are created and closed on the caller's event loop.
 
 At startup, the builder performs abandoned-claim recovery on the tool execution store. Production startup for the same `tool_execution_path` must be serialized and owned by a single process. For multi-process or multi-node execution, replace the reference SQLite store with an external ToolGateway that provides leases or coordination instead of sharing it across builders.
 
@@ -86,7 +86,17 @@ Each `RunCoordinator.advance()` performs at most one model call or one durable t
 - `ApplicationConfig.max_serialized_run_state_bytes`;
 - `ContextBudget.input_allowance_tokens`.
 
+If the last allowed model decision returns any tool calls, Core terminates the Run with `limit_exceeded` before persisting or executing that batch. This applies to ordinary tools, approval-bound tools, Artifact-producing tools, and `load_skill`; a result that no later model step can consume therefore causes no tool-side effect.
+
 `BoundedContextProvider` builds requests through a paginated reader and authenticated coverage. Histories with 10,000 or more records are not copied into `RunState`; the SQLite reader uses indexed pagination and bounded authenticated aggregation. Summary checkpoints record the source range, policy version, profile, and Artifact references. If the budget cannot be satisfied, the provider returns the stable `context_budget_exceeded` failure and does not send an oversized request to the model.
+
+## Progressive Skills
+
+Both composition factories accept an optional `SkillProvider`. When configured, every model decision receives one bounded, deterministic catalog SYSTEM message containing only each Skill's `name`, `description`, and `version`, plus a reserved `load_skill` tool. The model selects a validated logical name; the reserved call is handled by Core and is never sent to the ordinary `ToolGateway`.
+
+A successful activation persists only `name + version + content_sha256` in `RunState`. The full SYSTEM instructions remain active for the rest of that Run: before every later model decision, including after restart, the provider must resolve exactly the persisted binding and return content whose canonical digest matches it. Changed or missing content fails the Run before another model request instead of silently hot-reloading. New Runs may select newer versions. Catalogs, active bindings, messages, and confirmation results are bounded, and activated content still counts against the normal context budget.
+
+`FilesystemSkillProvider` is the single-machine reference loader. It expects `<absolute-root>/<logical-name>/SKILL.md` with exact `name`, `version`, and `description` frontmatter. The root is an exclusive, fail-closed Skill container: every direct child must be a valid Skill directory and every Skill directory must contain only `SKILL.md`; files such as `README.md`, `.gitkeep`, or `desktop.ini` invalidate the catalog instead of being ignored. `max_catalog_bytes` is measured against the exact canonical JSON catalog sent to the model, including field names, punctuation, and escaping. Reads run off the event loop and reject traversal names, symlinks/reparse points, hard-linked or non-regular files, malformed or duplicate metadata, invalid UTF-8, NUL, empty/oversized bodies, and entries changed during a validated read. One provider instance represents one caller-defined trust domain: it validates `profile_id` but does not derive filesystem paths from it, so callers requiring profile isolation must inject separate providers or roots. It performs no recursive discovery, remote registry lookup, automatic activation, or hot reload.
 
 ## Artifact Lifecycle
 
@@ -117,6 +127,7 @@ SQLite does not treat the derived active index or the retirement current row as 
 | Model | `ModelGateway` | `LiteLLMModelGateway` |
 | Tools | `ToolGateway` | local / Docker / MCP |
 | Context | `ContextProvider` | bounded + tokenizer/compactor |
+| Skills | `SkillProvider` | bounded filesystem loader or injected provider |
 | Artifact | `ArtifactRepository`, `ArtifactExternalizer` | memory / filesystem |
 | Persistence | `RunJournal` | memory / SQLite |
 | Observability | post-commit observer | event / metrics sinks |

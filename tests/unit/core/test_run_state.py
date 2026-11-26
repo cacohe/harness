@@ -6,7 +6,9 @@ from itertools import product
 import pytest
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.core.artifacts.contracts import ExternalizedContent, InlineContent
+from src.core.context.skills import SkillBinding
 from src.core.execution.commands import (
+    ActivateSkill,
     CancelRun,
     CommandContext,
     CompleteRun,
@@ -140,6 +142,55 @@ def finish_step(step_id: str = "step") -> FinishStep:
 
 def complete() -> CompleteRun:
     return CompleteRun(RUN, SESSION, "answer", context=context("complete"))
+
+
+def activate_skill(
+    name: str = "review", version: str = "v1", digest: str = "a" * 64
+) -> ActivateSkill:
+    return ActivateSkill(
+        RUN,
+        SESSION,
+        SkillBinding(name, version, digest),
+        context=context(f"skill-{name}"),
+    )
+
+
+def test_skill_activation_is_persistent_idempotent_and_version_pinned():
+    running = advance(initial(), submit())
+    first = TaskStateMachine.apply(running, activate_skill())
+    assert first.state.active_skills == (SkillBinding("review", "v1", "a" * 64),)
+    assert first.events[0].type is DomainEventType.SKILL_ACTIVATED
+    assert first.events[0].payload == {
+        "name": "review",
+        "version": "v1",
+        "content_sha256": "a" * 64,
+    }
+
+    repeated = TaskStateMachine.apply(first.state, activate_skill())
+    assert repeated.state.active_skills == first.state.active_skills
+    assert repeated.events == ()
+
+    for changed in (
+        activate_skill(version="v2"),
+        activate_skill(digest="b" * 64),
+    ):
+        with pytest.raises(InvalidTransition):
+            TaskStateMachine.apply(first.state, changed)
+
+
+def test_skill_activation_is_bounded_and_rejected_after_terminal_state():
+    state = advance(initial(), submit())
+    for index in range(16):
+        state = advance(
+            state,
+            activate_skill(f"skill-{index}", digest=f"{index:064x}"),
+        )
+    with pytest.raises(InvalidTransition):
+        TaskStateMachine.apply(state, activate_skill("overflow", digest="f" * 64))
+
+    completed = advance(state, complete())
+    with pytest.raises(InvalidTransition):
+        TaskStateMachine.apply(completed, activate_skill("late", digest="e" * 64))
 
 
 def test_approval_flow_emits_only_ordered_facts_and_keeps_previous_states():

@@ -7,8 +7,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from src.adapters.artifacts.filesystem import FilesystemArtifactRepository
+from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.context.bounded import BoundedContextProvider
 from src.adapters.context.tokenizers import ExactTokenCounter
+from src.adapters.persistence.memory import InMemoryRunJournal
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.application.artifact_retention import ArtifactRetentionBlocked
 from src.application.composition import ApplicationConfig, create_production_agent
@@ -18,6 +20,7 @@ from src.core.context.model import ModelMessage, ModelResponse, ModelRole, Model
 from src.core.execution.commands import RunLimits
 from src.core.execution.state import RunStatus
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
+from tests.unit.application.test_agent_v3 import _valid_composition_dependencies
 
 
 class _Ids:
@@ -56,6 +59,11 @@ class _Clock:
 
     def monotonic(self):
         return time.monotonic()
+
+
+class _Collector:
+    async def collect_orphans(self, referenced_ids: tuple[str, ...], older_than: datetime) -> int:
+        return 0
 
 
 async def _chunks(data: bytes):
@@ -116,6 +124,7 @@ def test_production_builder_wires_read_retention_gc_and_durable_tool_store(tmp_p
                 sqlite_path=tmp_path / "runs.sqlite3",
                 tool_execution_path=tmp_path / "tool-executions.sqlite3",
                 artifact_root=tmp_path / "artifacts",
+                artifact_workspace_id="production-artifacts",
                 max_inline_artifact_bytes=512,
                 max_artifact_summary_bytes=256,
                 max_artifact_read_bytes=64,
@@ -206,3 +215,44 @@ def test_production_config_rejects_shared_sqlite_and_unsafe_read_limits(tmp_path
             )
 
     asyncio.run(scenario())
+
+
+def test_injected_remote_artifacts_need_workspace_identity_not_local_root(tmp_path) -> None:
+    async def scenario() -> None:
+        agent = await create_production_agent(
+            ApplicationConfig(
+                artifact_workspace_id="remote-artifacts",
+                tool_execution_path=(tmp_path / "tools.sqlite3").resolve(),
+            ),
+            journal=InMemoryRunJournal(),
+            artifact_repository=InMemoryArtifactRepository(1_048_576),
+            artifact_collector=_Collector(),
+            **_valid_composition_dependencies(),
+        )
+        await agent.close()
+
+    asyncio.run(scenario())
+
+
+def test_production_rejects_split_atomic_artifact_authorities(tmp_path) -> None:
+    journal = InMemoryRunJournal()
+    with pytest.raises(ValueError, match="same atomic persistence authority"):
+        asyncio.run(
+            create_production_agent(
+                ApplicationConfig(
+                    artifact_workspace_id="remote-artifacts",
+                    tool_execution_path=(tmp_path / "tools.sqlite3").resolve(),
+                ),
+                journal=journal,
+                artifact_ownership=InMemoryRunJournal(),
+                artifact_repository=InMemoryArtifactRepository(1_048_576),
+                artifact_collector=_Collector(),
+                **_valid_composition_dependencies(),
+            )
+        )
+
+
+@pytest.mark.parametrize("workspace_id", ("", "../escape", "a" * 257))
+def test_production_rejects_invalid_artifact_workspace_identity(workspace_id: str) -> None:
+    with pytest.raises(ValueError, match="workspace"):
+        ApplicationConfig(artifact_workspace_id=workspace_id)

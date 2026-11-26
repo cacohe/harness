@@ -5,16 +5,27 @@ import pytest
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.application.artifact_lifecycle import ArtifactLifecycleService
-from src.core.execution.errors import RunErrorCode
-from src.core.execution.state import RunStatus
-from src.core.persistence.journal import (
+from src.core.artifacts.lifecycle import (
     ArtifactAttachmentAction,
     ArtifactAttachmentFact,
     ArtifactAttachmentRole,
+)
+from src.core.execution.errors import RunErrorCode
+from src.core.execution.state import RunStatus
+from src.core.persistence.journal import (
     JournalCommit,
     JournalError,
 )
 from tests.unit.core.test_journal_contract import acceptance, artifact_ref
+
+
+def test_lifecycle_requires_an_explicit_ownership_port() -> None:
+    journal = InMemoryRunJournal()
+    service = ArtifactLifecycleService(journal=journal, ownership=journal)
+    assert service is not None
+
+    with pytest.raises(ValueError, match="ownership"):
+        ArtifactLifecycleService(journal=journal, ownership=object())  # type: ignore[arg-type]
 
 
 def test_detach_uses_authoritative_descriptors_filters_roles_and_is_idempotent() -> None:
@@ -46,7 +57,7 @@ def test_detach_uses_authoritative_descriptors_filters_roles_and_is_idempotent()
         await journal.commit(
             replace(batch, state=terminal, artifact_facts=(tool, final, summary)), 0
         )
-        lifecycle = ArtifactLifecycleService(journal=journal)
+        lifecycle = ArtifactLifecycleService(journal=journal, ownership=journal)
 
         detached = await lifecycle.detach(
             terminal.session_id,
@@ -81,7 +92,7 @@ def test_detach_rejects_non_terminal_or_wrong_run() -> None:
         journal = InMemoryRunJournal()
         batch = acceptance("open-lifecycle")
         await journal.commit(batch, 0)
-        lifecycle = ArtifactLifecycleService(journal=journal)
+        lifecycle = ArtifactLifecycleService(journal=journal, ownership=journal)
         with pytest.raises(ValueError):
             await lifecycle.detach(batch.state.session_id, batch.state.run_id)
         with pytest.raises(ValueError):
@@ -134,7 +145,7 @@ def test_sqlite_restart_detaches_historical_owner_without_releasing_shared_diges
         )
 
         reopened = SQLiteRunJournal(path)
-        lifecycle = ArtifactLifecycleService(journal=reopened)
+        lifecycle = ArtifactLifecycleService(journal=reopened, ownership=reopened)
         detached = await lifecycle.detach(first_state.session_id, first_state.run_id)
         assert detached == (replace(first_fact, action=ArtifactAttachmentAction.DETACHED),)
         assert await reopened.load_artifact_attachments(
@@ -160,8 +171,8 @@ def test_concurrent_detach_is_single_commit_and_retry_is_idempotent() -> None:
             artifact_ref("f"),
         )
         await journal.commit(replace(batch, state=terminal, artifact_facts=(fact,)), 0)
-        first = ArtifactLifecycleService(journal=journal)
-        second = ArtifactLifecycleService(journal=journal)
+        first = ArtifactLifecycleService(journal=journal, ownership=journal)
+        second = ArtifactLifecycleService(journal=journal, ownership=journal)
         results = await asyncio.gather(
             first.detach(terminal.session_id, terminal.run_id),
             second.detach(terminal.session_id, terminal.run_id),
@@ -201,7 +212,7 @@ def test_stale_cas_is_reloaded_before_detach_retry() -> None:
         )
         await journal.commit(replace(batch, state=terminal, artifact_facts=(fact,)), 0)
         journal.fail_next = True
-        detached = await ArtifactLifecycleService(journal=journal).detach(
+        detached = await ArtifactLifecycleService(journal=journal, ownership=journal).detach(
             terminal.session_id, terminal.run_id
         )
         assert detached == (replace(fact, action=ArtifactAttachmentAction.DETACHED),)

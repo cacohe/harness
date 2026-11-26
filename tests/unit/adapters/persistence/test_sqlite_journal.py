@@ -9,13 +9,16 @@ import pytest
 import src.adapters.persistence.sqlite as sqlite_module
 from src.adapters.persistence.sqlite import SQLiteRunJournal
 from src.adapters.persistence.sqlite_codec import decode, encode
+from src.core.artifacts.lifecycle import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
+    ArtifactAttachmentRole,
+)
+from src.core.context.skills import SkillBinding
 from src.core.execution.errors import RunErrorCode, RunFailure
 from src.core.execution.state import RunState, RunStatus
 from src.core.ids import EventId, ProfileId, RunId, SessionId
 from src.core.persistence.journal import (
-    ArtifactAttachmentAction,
-    ArtifactAttachmentFact,
-    ArtifactAttachmentRole,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,
@@ -37,6 +40,26 @@ from tests.unit.core.test_run_state import (
 
 def make_journal(tmp_path: Path) -> SQLiteRunJournal:
     return SQLiteRunJournal((tmp_path / "journal.sqlite3").resolve())
+
+
+def test_active_skill_bindings_round_trip_and_reject_codec_tampering(tmp_path: Path) -> None:
+    journal = make_journal(tmp_path)
+    batch = acceptance("skills")
+    binding = SkillBinding("review", "v1", "a" * 64)
+    batch = replace(batch, state=replace(batch.state, active_skills=(binding,)))
+
+    asyncio.run(journal.commit(batch, 0))
+    reopened = SQLiteRunJournal(journal.path)
+    restored = asyncio.run(reopened.load_head(batch.state.session_id))
+    assert restored.state is not None
+    assert restored.state.active_skills == (binding,)
+    assert restored.state.active_skills[0] is not binding
+
+    encoded = encode(batch.state)
+    tampered = encoded.replace("a" * 64, "A" * 64)
+    assert tampered != encoded
+    with pytest.raises(ValueError):
+        decode(tampered, RunState)
 
 
 @pytest.mark.parametrize("attack", ("fact", "active-update", "active-delete", "active-insert"))
@@ -988,10 +1011,10 @@ def test_two_connections_can_advance_different_sessions(tmp_path: Path) -> None:
     assert [(item.version, item.sequence) for item in receipts] == [(1, 2), (1, 2)]
 
 
-def test_schema_is_exact_v6_and_has_required_indexes(tmp_path: Path) -> None:
+def test_schema_is_exact_v7_and_has_required_indexes(tmp_path: Path) -> None:
     journal = make_journal(tmp_path)
     with sqlite3.connect(journal.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         tables = {
             row[0]
             for row in connection.execute(
@@ -1034,7 +1057,7 @@ def test_schema_is_exact_v6_and_has_required_indexes(tmp_path: Path) -> None:
         } <= indexes
 
 
-@pytest.mark.parametrize("version", [1, 2, 4, 5, 7])
+@pytest.mark.parametrize("version", [1, 2, 4, 5, 6, 8])
 def test_old_or_future_schema_is_rejected_without_mutation(tmp_path: Path, version: int) -> None:
     path = (tmp_path / "old.sqlite3").resolve()
     with sqlite3.connect(path) as connection:
@@ -1070,7 +1093,7 @@ def test_version_zero_unknown_objects_are_rejected_without_mutation(
             )
         )
 
-    with pytest.raises(ValueError, match="schema v6"):
+    with pytest.raises(ValueError, match="schema v7"):
         SQLiteRunJournal(path)
 
     assert path.read_bytes() == before_bytes
@@ -1140,7 +1163,7 @@ def test_schema_definition_drift_is_rejected(tmp_path: Path, changed_ddl: str) -
     with sqlite3.connect(path) as connection:
         connection.executescript(changed_ddl)
         connection.execute("PRAGMA user_version=5")
-    with pytest.raises(ValueError, match="schema v6"):
+    with pytest.raises(ValueError, match="schema v7"):
         SQLiteRunJournal(path)
 
 

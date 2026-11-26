@@ -39,14 +39,17 @@ EXPECTED_CORE_PATHS = {
     "execution/state.py",
     "execution/state_validation.py",
     "context/__init__.py",
+    "context/_skill_values.py",
     "context/contracts.py",
     "context/model.py",
+    "context/skills.py",
     "context/support.py",
     "tools/__init__.py",
     "tools/approval.py",
     "tools/contracts.py",
     "artifacts/__init__.py",
     "artifacts/contracts.py",
+    "artifacts/lifecycle.py",
     "artifacts/validation.py",
     "persistence/__init__.py",
     "persistence/journal.py",
@@ -307,6 +310,23 @@ def test_reliable_runtime_documents_only_the_async_single_track_api():
         "expected_version",
     ]
     assert "RunJournal.commit(batch, expected_version)" in text
+
+
+def test_public_docs_cover_artifact_and_progressive_skill_boundaries():
+    documents = (
+        (ROOT / "README.md").read_text(encoding="utf-8"),
+        (ROOT / "README.zh-CN.md").read_text(encoding="utf-8"),
+        (ROOT / "docs" / "reliable-runtime.md").read_text(encoding="utf-8"),
+    )
+    for text in documents:
+        for claim in (
+            "artifact_workspace_id",
+            "SkillProvider",
+            "load_skill",
+            "content_sha256",
+            "FilesystemSkillProvider",
+        ):
+            assert claim in text
 
 
 @pytest.mark.parametrize(

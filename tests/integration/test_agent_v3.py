@@ -23,8 +23,15 @@ from src.core.context.contracts import (
     TokenEstimate,
 )
 from src.core.context.model import ModelMessage, ModelResponse, ModelRole, ModelToolCall
+from src.core.context.skills import (
+    ResolvedSkill,
+    SkillBinding,
+    SkillCatalogEntry,
+    skill_content_sha256,
+)
 from src.core.execution.commands import RunLimits
 from src.core.execution.errors import RunErrorCode, RunFailure
+from src.core.execution.projection import LOAD_SKILL_TOOL_NAME
 from src.core.execution.state import RunStatus
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 from src.core.tools.contracts import ToolResult, ToolResultStatus, ToolSpec
@@ -86,7 +93,12 @@ TOOLS = (
 
 class Context:
     async def build(self, request: ContextRequest, budget: ContextBudget) -> ContextWindow:
-        messages = (request.system_message, request.current_input, *request.open_tool_messages)
+        messages = (
+            request.system_message,
+            *request.skill_messages,
+            request.current_input,
+            *request.open_tool_messages,
+        )
         return ContextWindow(
             messages,
             request.tools,
@@ -127,6 +139,23 @@ class Model:
             raise TimeoutError("provider deadline")
         if message == "artifact-lifecycle":
             return ModelResponse("x" * 80)
+        if round_number == 0 and message == "skills":
+            return ModelResponse(
+                tool_calls=(
+                    ModelToolCall(
+                        "call-load-skill",
+                        LOAD_SKILL_TOOL_NAME,
+                        '{"name":"review"}',
+                    ),
+                )
+            )
+        if round_number == 0 and message == "final-step-tools":
+            return ModelResponse(
+                tool_calls=(
+                    ModelToolCall("call-first", "first", "{}"),
+                    ModelToolCall("call-guarded", "guarded", "{}"),
+                )
+            )
         if round_number == 0 and message == "tools":
             return ModelResponse(
                 tool_calls=(
@@ -177,6 +206,33 @@ class Tools:
         return result
 
 
+class Skills:
+    def __init__(self) -> None:
+        message = ModelMessage(ModelRole.SYSTEM, "ACTIVE REVIEW INSTRUCTIONS")
+        self.binding = SkillBinding("review", "v1", skill_content_sha256((message,)))
+        self.calls = []
+
+    async def catalog(self, profile_id):
+        self.calls.append("catalog")
+        return (SkillCatalogEntry("review", "Review changes", "v1"),)
+
+    async def activate(self, name, *, profile_id):
+        self.calls.append("activate")
+        assert name == "review"
+        return ResolvedSkill(
+            self.binding,
+            (ModelMessage(ModelRole.SYSTEM, "ACTIVE REVIEW INSTRUCTIONS"),),
+        )
+
+    async def resolve(self, binding, *, profile_id):
+        self.calls.append("resolve")
+        assert binding == self.binding
+        return ResolvedSkill(
+            self.binding,
+            (ModelMessage(ModelRole.SYSTEM, "ACTIVE REVIEW INSTRUCTIONS"),),
+        )
+
+
 def request_factory(state, message: str) -> ContextRequest:
     payload = json.dumps(
         {
@@ -196,7 +252,17 @@ def request_factory(state, message: str) -> ContextRequest:
     )
 
 
-async def rig(*, journal=None, model=None, tools=None, ids=None, observer=None, context=None):
+async def rig(
+    *,
+    journal=None,
+    model=None,
+    tools=None,
+    ids=None,
+    observer=None,
+    context=None,
+    limits=None,
+    skills=None,
+):
     selected_journal = journal or InMemoryRunJournal()
     selected_model = model or Model()
     selected_tools = tools or Tools()
@@ -214,7 +280,7 @@ async def rig(*, journal=None, model=None, tools=None, ids=None, observer=None, 
         ApplicationConfig(
             max_sessions=128,
             max_waiters_per_session=8,
-            limits=RunLimits(16, 30.0, 64),
+            limits=limits or RunLimits(16, 30.0, 64),
             context_budget=ContextBudget(2_048, 32, 16),
         ),
         model=selected_model,
@@ -228,8 +294,43 @@ async def rig(*, journal=None, model=None, tools=None, ids=None, observer=None, 
         journal=selected_journal,
         artifacts=externalizer,
         observer=observer,
+        skills=skills,
     )
     return agent, selected_journal, selected_model, selected_tools
+
+
+def test_progressive_skill_catalog_activation_and_persistent_context():
+    async def scenario():
+        skills = Skills()
+        model = Model()
+        tools = Tools()
+        agent, _, _, _ = await rig(
+            model=model,
+            tools=tools,
+            skills=skills,
+            limits=RunLimits(16, 30.0, 256),
+        )
+        session = await agent.open_session(SessionId("skills"))
+        state = await session.submit("skills", SubmissionId("skills"))
+        await agent.close()
+        return state, model, tools, skills
+
+    state, model, tools, skills = asyncio.run(scenario())
+    assert state.status is RunStatus.COMPLETED
+    assert state.active_skills == (skills.binding,)
+    first_system = "\n".join(
+        message.content or ""
+        for message in model.requests[0].messages
+        if message.role is ModelRole.SYSTEM
+    )
+    assert '"description":"Review changes"' in first_system
+    assert "ACTIVE REVIEW INSTRUCTIONS" not in first_system
+    assert sum(tool.name == LOAD_SKILL_TOOL_NAME for tool in model.requests[0].tools) == 1
+    assert any(
+        message.content == "ACTIVE REVIEW INSTRUCTIONS" for message in model.requests[1].messages
+    )
+    assert skills.calls == ["catalog", "activate", "catalog", "resolve"]
+    assert tools.effects == Counter()
 
 
 def test_real_bounded_context_deduplicates_current_input_and_protects_latest_tool_batch():
@@ -366,6 +467,22 @@ def test_agent_runs_direct_answer_and_ordered_tool_batch_end_to_end():
         "tool",
         "assistant",
     ]
+
+
+def test_agent_final_step_tool_batch_has_no_tool_or_approval_side_effect() -> None:
+    async def scenario():
+        agent, journal, _, tools = await rig(limits=RunLimits(1, 30.0, 64))
+        session = await agent.open_session(SessionId("final-step-tools"))
+        state = await session.submit("final-step-tools", SubmissionId("final-step-tools"))
+        snapshot = await journal.load_session(SessionId("final-step-tools"))
+        await agent.close()
+        return state, snapshot, tools
+
+    state, snapshot, tools = asyncio.run(scenario())
+    assert state.status is RunStatus.FAILED
+    assert state.failure == RunFailure(RunErrorCode.LIMIT_EXCEEDED)
+    assert tools.effects == {}
+    assert [entry.role for entry in snapshot.transcript] == ["user"]
 
 
 def test_agent_session_publicly_detaches_production_generated_artifacts() -> None:

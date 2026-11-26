@@ -10,6 +10,7 @@ from src.adapters.artifacts.memory import InMemoryArtifactRepository
 from src.adapters.context.tokenizers import ExactTokenCounter
 from src.adapters.persistence.memory import InMemoryRunJournal
 from src.core.artifacts.contracts import ArtifactRef, InlineContent
+from src.core.artifacts.lifecycle import ArtifactAttachmentRole
 from src.core.context.contracts import (
     ContextBudget,
     ContextBudgetExceeded,
@@ -19,6 +20,12 @@ from src.core.context.contracts import (
     TokenEstimate,
 )
 from src.core.context.model import ModelMessage, ModelResponse, ModelRole, ModelToolCall
+from src.core.context.skills import (
+    ResolvedSkill,
+    SkillBinding,
+    SkillCatalogEntry,
+    skill_content_sha256,
+)
 from src.core.execution.commands import (
     AdvanceRun,
     CancelRun,
@@ -30,13 +37,10 @@ from src.core.execution.commands import (
 )
 from src.core.execution.coordinator import RunCoordinator
 from src.core.execution.errors import RunErrorCode, RunFailure
+from src.core.execution.projection import LOAD_SKILL_TOOL_NAME, load_skill_tool_spec
 from src.core.execution.state import RunState, RunStatus
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
-from src.core.persistence.journal import (
-    ArtifactAttachmentRole,
-    ConversationSummaryCheckpoint,
-    JournalError,
-)
+from src.core.persistence.journal import ConversationSummaryCheckpoint, JournalError
 from src.core.tools.contracts import ToolApproval, ToolResult, ToolResultStatus, ToolSpec
 
 NOW = datetime(2026, 11, 18, tzinfo=timezone.utc)
@@ -46,6 +50,7 @@ SUBMISSION = SubmissionId("submission")
 PROFILE = ProfileId("profile")
 LIMITS = RunLimits(8, 60, 64)
 BUDGET = ContextBudget(100, 10, 5)
+SKILL_BUDGET = ContextBudget(1_000, 10, 5)
 
 
 class Clock:
@@ -87,7 +92,7 @@ class Context:
         if self.failure:
             raise self.failure
         return ContextWindow(
-            (request.system_message, request.current_input),
+            (request.system_message, *request.skill_messages, request.current_input),
             request.tools,
             TokenEstimate(2, EstimateQuality.EXACT),
             budget,
@@ -108,6 +113,37 @@ class Model:
         if isinstance(value, BaseException):
             raise value
         return value
+
+
+class Skills:
+    def __init__(self, *, body="Activated instructions", fail_resolve=False):
+        self.calls = []
+        self.body = body
+        self.fail_resolve = fail_resolve
+        message = ModelMessage(ModelRole.SYSTEM, self.body)
+        self.binding = SkillBinding("review", "v1", skill_content_sha256((message,)))
+
+    async def catalog(self, profile_id):
+        self.calls.append(("catalog", profile_id))
+        return (SkillCatalogEntry("review", "Review changes", "v1"),)
+
+    async def activate(self, name, *, profile_id):
+        self.calls.append(("activate", name, profile_id))
+        if name != "review":
+            raise ValueError("missing")
+        return ResolvedSkill(
+            self.binding,
+            (ModelMessage(ModelRole.SYSTEM, self.body),),
+        )
+
+    async def resolve(self, binding, *, profile_id):
+        self.calls.append(("resolve", binding, profile_id))
+        if self.fail_resolve:
+            raise ValueError("changed")
+        return ResolvedSkill(
+            self.binding,
+            (ModelMessage(ModelRole.SYSTEM, self.body),),
+        )
 
 
 class Tools:
@@ -172,8 +208,8 @@ def request(tools=()):
     )
 
 
-def initial():
-    return RunState.create(submit(), LIMITS)
+def initial(limits=LIMITS):
+    return RunState.create(submit(), limits)
 
 
 def coordinator(
@@ -188,6 +224,7 @@ def coordinator(
     context_request=None,
     context_budget=BUDGET,
     model=None,
+    skills=None,
 ):
     calls = []
     journal = journal or Journal(calls)
@@ -205,11 +242,157 @@ def coordinator(
         journal=journal,
         clock=Clock(),
         ids=Ids(),
-        context_request=context_request or request(specs),
+        context_request=context_request
+        or request((*specs, load_skill_tool_spec()) if skills is not None else specs),
         context_budget=context_budget,
         context_counter=ExactTokenCounter(),
+        skills=skills,
+        skill_tool=load_skill_tool_spec() if skills is not None else None,
     )
     return result, calls, journal, tools, repository
+
+
+def test_skill_catalog_is_disclosed_without_bodies_before_activation():
+    captured = []
+
+    class CapturingModel:
+        async def complete(self, model_request):
+            captured.append(model_request)
+            return ModelResponse("answer")
+
+    skills = Skills(body="SECRET BODY")
+    coordinator_, _, _, _, _ = coordinator(
+        responses=[], model=CapturingModel(), skills=skills, context_budget=SKILL_BUDGET
+    )
+
+    outcome = run(coordinator_.advance(initial(), submit()))
+
+    assert outcome.state.status is RunStatus.COMPLETED
+    assert [tool.name for tool in captured[0].tools] == [LOAD_SKILL_TOOL_NAME]
+    system_text = "\n".join(
+        message.content or ""
+        for message in captured[0].messages
+        if message.role is ModelRole.SYSTEM
+    )
+    assert '"name":"review"' in system_text
+    assert '"description":"Review changes"' in system_text
+    assert "SECRET BODY" not in system_text
+    assert [call[0] for call in skills.calls] == ["catalog"]
+
+
+def test_skill_provider_rejects_prepopulated_skill_context():
+    skills = Skills()
+    prepopulated = replace(
+        request((load_skill_tool_spec(),)),
+        skill_messages=(ModelMessage(ModelRole.SYSTEM, "untrusted preloaded Skill"),),
+    )
+    with pytest.raises(ValueError, match="Skill composition"):
+        coordinator(
+            responses=[ModelResponse("unused")],
+            skills=skills,
+            context_request=prepopulated,
+            context_budget=SKILL_BUDGET,
+        )
+
+
+def test_load_skill_is_persisted_and_applies_to_every_later_model_step():
+    captured = []
+
+    class CapturingModel(Model):
+        async def complete(self, model_request):
+            captured.append(model_request)
+            return await super().complete(model_request)
+
+    skills = Skills()
+    responses = [
+        ModelResponse(
+            tool_calls=(ModelToolCall("load-1", LOAD_SKILL_TOOL_NAME, '{"name":"review"}'),)
+        ),
+        ModelResponse("answer"),
+    ]
+    coordinator_, calls, _, tools, _ = coordinator(
+        responses=[],
+        model=CapturingModel(calls := [], responses),
+        skills=skills,
+        context_budget=SKILL_BUDGET,
+    )
+
+    first = run(
+        coordinator_.advance(
+            initial(RunLimits(8, 60, 256)),
+            submit(),
+        )
+    )
+    second = run(
+        coordinator_.advance(
+            first.state,
+            AdvanceRun(RUN, SESSION, context=command_context("continue-tools")),
+        )
+    )
+    final = run(
+        coordinator_.advance(
+            second.state,
+            AdvanceRun(RUN, SESSION, context=command_context("next-model")),
+        )
+    )
+
+    assert tools.requests == []
+    assert second.state.active_skills == (skills.binding,)
+    assert final.state.status is RunStatus.COMPLETED
+    assert any(message.content == skills.body for message in captured[1].messages)
+    assert [call[0] for call in skills.calls] == ["catalog", "activate", "catalog", "resolve"]
+
+
+def test_changed_active_skill_fails_before_another_model_request():
+    skills = Skills(fail_resolve=True)
+    state = replace(
+        initial(),
+        status=RunStatus.RUNNING,
+        version=2,
+        active_skills=(skills.binding,),
+    )
+    coordinator_, calls, _, _, _ = coordinator(
+        responses=[ModelResponse("must-not-run")],
+        skills=skills,
+        context_budget=SKILL_BUDGET,
+    )
+
+    outcome = run(
+        coordinator_.advance(
+            state,
+            AdvanceRun(RUN, SESSION, context=command_context("advance")),
+        )
+    )
+
+    assert outcome.state.status is RunStatus.FAILED
+    assert outcome.state.failure == RunFailure(RunErrorCode.INVARIANT_VIOLATION)
+    assert "model" not in calls
+
+
+def test_final_step_mixed_skill_and_ordinary_tools_execute_neither():
+    skills = Skills()
+    ordinary = ToolSpec("ordinary", "ordinary", '{"type":"object"}')
+    limits = RunLimits(1, 60, 64)
+    state = RunState.create(submit(), limits)
+    response = ModelResponse(
+        tool_calls=(
+            ModelToolCall("load", LOAD_SKILL_TOOL_NAME, '{"name":"review"}'),
+            ModelToolCall("ordinary", "ordinary", "{}"),
+        )
+    )
+    coordinator_, _, _, tools, _ = coordinator(
+        responses=[response],
+        specs=(ordinary,),
+        skills=skills,
+        context_budget=SKILL_BUDGET,
+    )
+
+    outcome = run(coordinator_.advance(state, submit()))
+
+    assert outcome.state.status is RunStatus.FAILED
+    assert outcome.state.failure == RunFailure(RunErrorCode.LIMIT_EXCEEDED)
+    assert not any(call[0] == "activate" for call in skills.calls)
+    assert tools.requests == []
 
 
 def test_model_is_not_called_when_context_window_exceeds_core_owned_budget():
@@ -489,6 +672,63 @@ def test_direct_answer_orders_ports_and_commits_terminal_state_once():
     assert outcome.journal_version == 1
     assert len(journal.batches) == 1
     assert [entry.role for entry in journal.batches[0][0].transcript] == ["assistant"]
+
+
+def test_final_step_tool_batch_fails_before_any_tool_or_artifact_side_effect() -> None:
+    specs = (
+        ToolSpec("write", "write", "{}"),
+        ToolSpec(
+            "approve",
+            "approve",
+            "{}",
+            requires_approval=True,
+            approval_scope="write",
+            workspace_id="workspace",
+        ),
+    )
+    response = ModelResponse(
+        tool_calls=(
+            ModelToolCall("write-call", "write", "{}"),
+            ModelToolCall("approval-call", "approve", "{}"),
+        )
+    )
+    success = ToolResult(
+        ToolResultStatus.SUCCESS,
+        inline_content=InlineContent({"payload": "x" * 80}, "application/json"),
+    )
+    coordinator_, calls, journal, tools, _ = coordinator(
+        responses=[response], specs=specs, tool_results=[success]
+    )
+    limited = RunState.create(submit(), RunLimits(1, 60.0, 64))
+
+    outcome = run(coordinator_.advance(limited, submit()))
+    if not outcome.state.status.terminal:
+        outcome = run(
+            coordinator_.advance(
+                outcome.state,
+                AdvanceRun(RUN, SESSION, context=command_context("final-step-tools")),
+            )
+        )
+
+    assert outcome.state.status is RunStatus.FAILED
+    assert outcome.state.failure == RunFailure(RunErrorCode.LIMIT_EXCEEDED)
+    assert tools.requests == []
+    assert calls == ["context", "model", "journal"]
+    assert len(journal.batches) == 1
+    assert journal.batches[0][0].transcript == ()
+    assert journal.batches[0][0].artifact_facts == ()
+
+
+def test_final_step_direct_answer_still_completes() -> None:
+    coordinator_, calls, journal, _, _ = coordinator(responses=[ModelResponse("answer")])
+    limited = RunState.create(submit(), RunLimits(1, 60.0, 64))
+
+    outcome = run(coordinator_.advance(limited, submit()))
+
+    assert outcome.state.status is RunStatus.COMPLETED
+    assert outcome.state.final_text == "answer"
+    assert calls == ["context", "model", "journal"]
+    assert [entry.content for entry in journal.batches[0][0].transcript] == ["answer"]
 
 
 def test_large_direct_answer_becomes_final_artifact_reference_and_bounded_summary():

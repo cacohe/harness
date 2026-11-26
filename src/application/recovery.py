@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import cast
 
 from src.core.artifacts.contracts import ArtifactRef, ArtifactRepository, snapshot_artifact_ref
+from src.core.artifacts.lifecycle import ArtifactOwnershipStore
 from src.core.execution.commands import CommandContext, FailRun
 from src.core.execution.errors import RunErrorCode, RunFailure
 from src.core.execution.state import RunState, RunStatus, TaskStateMachine
@@ -29,6 +31,7 @@ class RecoveryService:
         ids: IdGenerator,
     ) -> None:
         self._journal = journal
+        self._ownership = cast(ArtifactOwnershipStore, journal)
         self._artifacts = artifacts
         self._clock = clock
         self._ids = ids
@@ -38,7 +41,7 @@ class RecoveryService:
         state = head.state
         if state is None:
             return RecoveryOutcome(None, False)
-        attachments = await self._journal.load_artifact_attachments(session_id, state.run_id)
+        attachments = await self._ownership.load_artifact_attachments(session_id, state.run_id)
         refs = tuple(fact.artifact for fact in attachments)
         missing = await self._has_dangling_ref(refs)
         if state.status.terminal:

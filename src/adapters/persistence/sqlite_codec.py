@@ -7,6 +7,14 @@ from datetime import datetime, timezone
 from typing import Any, TypeVar, cast
 
 from src.core.artifacts.contracts import ArtifactRef, ExternalizedContent, InlineContent
+from src.core.artifacts.lifecycle import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
+    ArtifactAttachmentRole,
+    ArtifactRetirementReservation,
+    ArtifactRetirementState,
+)
+from src.core.context.skills import SkillBinding
 from src.core.execution.commands import RunLimits, ToolCallRequest
 from src.core.execution.errors import RunErrorCode, RunFailure
 from src.core.execution.events import DomainEvent, DomainEventType
@@ -20,11 +28,6 @@ from src.core.execution.state import (
 )
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 from src.core.persistence.journal import (
-    ArtifactAttachmentAction,
-    ArtifactAttachmentFact,
-    ArtifactAttachmentRole,
-    ArtifactRetirementReservation,
-    ArtifactRetirementState,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalEvent,
@@ -52,6 +55,7 @@ _RECORDS: dict[str, type[Any]] = {
         StepState,
         ToolCallState,
         ToolCallRequest,
+        SkillBinding,
         SubmissionRecord,
         TranscriptEntry,
         ConversationSummaryCheckpoint,

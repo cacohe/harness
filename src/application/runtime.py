@@ -13,6 +13,7 @@ from src.application.artifact_lifecycle import ArtifactLifecycleService
 from src.application.observability import Observation, PostCommitObserver
 from src.application.recovery import RecoveryService
 from src.application.submissions import AcceptedRun, SubmissionService
+from src.core.artifacts.lifecycle import ArtifactAttachmentFact, ArtifactAttachmentRole
 from src.core.context.contracts import ContextBudgetExceeded
 from src.core.execution.commands import (
     AdvanceRun,
@@ -27,8 +28,6 @@ from src.core.execution.errors import InvalidTransition, RunErrorCode, RunFailur
 from src.core.execution.state import RunState, RunStatus, TaskStateMachine
 from src.core.ids import Clock, IdGenerator, ProfileId, RunId, SessionId, SubmissionId
 from src.core.persistence.journal import (
-    ArtifactAttachmentFact,
-    ArtifactAttachmentRole,
     JournalCommit,
     JournalError,
     JournalHead,
@@ -144,6 +143,7 @@ class RuntimeCoordinator:
         *,
         submissions: SubmissionService,
         journal: RunJournal,
+        artifact_lifecycle: ArtifactLifecycleService,
         coordinator_factory: CoordinatorFactory,
         ids: IdGenerator,
         clock: Clock,
@@ -172,9 +172,9 @@ class RuntimeCoordinator:
             raise ValueError("Runtime limits and resources are invalid")
         self._submissions = submissions
         self._journal = journal
-        self._artifact_lifecycle = ArtifactLifecycleService(
-            journal=journal, max_conflict_retries=max_advances_per_operation
-        )
+        if type(artifact_lifecycle) is not ArtifactLifecycleService:
+            raise ValueError("Artifact lifecycle service is invalid")
+        self._artifact_lifecycle = artifact_lifecycle
         self._coordinator_factory = coordinator_factory
         self._ids = ids
         self._clock = clock

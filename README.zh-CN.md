@@ -32,7 +32,7 @@ from src.application import ApplicationConfig, create_production_agent
 from src.core.context.contracts import ContextBudget
 from src.core.execution.commands import RunLimits
 from src.core.ids import ProfileId
-from src.core.persistence.journal import ArtifactAttachmentRole
+from src.core.artifacts.lifecycle import ArtifactAttachmentRole
 
 config = ApplicationConfig(
     limits=RunLimits(max_steps=32, max_elapsed_seconds=300.0, max_inline_result_bytes=65_536),
@@ -72,8 +72,12 @@ async with agent:
     collected = await agent.artifacts.collect_orphans(orphan_cutoff_utc)
 ```
 
-`create_development_agent()` 使用内存 journal 与内存 Artifact repository。生产组合要求可稳定
-识别的 Artifact root，并使用独立的 `tool_execution_path` 保存工具 exactly-once claim；未显式
+`create_development_agent()` 使用内存 journal 与内存 Artifact repository。只有未注入
+`artifact_repository` 时，生产组合才会创建文件系统 repository，并要求绝对 `artifact_root`。
+注入的 repository 可以是远程实现，不需要本地 root，但必须提供显式、不透明的
+`artifact_workspace_id`、externalizer，以及部署实际需要的维护能力。Artifact ownership、retirement
+和 reference-index port 已与 `RunJournal` 分离；生产组合仍要求这些 port 的适配器对象与 journal
+是同一个原子持久化权威。生产组合使用独立的 `tool_execution_path` 保存工具 exactly-once claim；未显式
 提供时会从显式 `sqlite_path` 派生同目录的 `*.tools` 文件，不会使用当前工作目录。两个 factory
 都是 async-only，资源在调用方 event loop 中创建和关闭。
 
@@ -96,10 +100,37 @@ CAS 原子提交。外层循环由 application runtime 驱动，受以下边界�
 - `ApplicationConfig.max_serialized_run_state_bytes`；
 - `ContextBudget.input_allowance_tokens`。
 
+如果最后一个允许的模型决策返回任何工具调用，Core 会在持久化或执行该批次之前以
+`limit_exceeded` 终止 Run。普通工具、需要审批的工具、会写 Artifact 的工具以及 `load_skill`
+都遵循这一规则，因此不会产生没有后续模型步骤可消费的副作用。
+
 `BoundedContextProvider` 通过分页 reader 和认证 coverage 构建请求。10,000 条以上历史不会被
 复制到 `RunState`，SQLite reader 使用索引分页与有界认证聚合；摘要 checkpoint 记录来源范围、
 策略版本、profile 和 Artifact 引用。无法满足预算时返回稳定的
 `context_budget_exceeded`，不会把超限请求发送给模型。
+
+## 渐进式 Skills
+
+两个 composition factory 都接受可选 `SkillProvider`。配置后，每次模型决策会收到一个有界、确定性
+的 catalog SYSTEM message，其中仅包含每个 Skill 的 `name`、`description` 和 `version`，同时暴露保留
+工具 `load_skill`。模型只能选择经过验证的逻辑名称；该保留调用由 Core 处理，绝不会转发给普通
+`ToolGateway`。
+
+激活成功后，`RunState` 只持久化 `name + version + content_sha256`。完整 SYSTEM 指令会在该 Run
+余下生命周期持续生效：每次后续模型决策（包括进程重启后）都必须由 provider 精确解析已持久化绑定，
+且返回内容的规范摘要必须一致。内容缺失或变化会在下一次模型请求前使 Run 失败，不会静默热更新；
+新 Run 可以选择新版本。catalog、激活绑定、消息和确认结果都有明确上限，激活内容也计入普通上下文预算。
+
+`FilesystemSkillProvider` 是单机参考 loader，要求
+`<absolute-root>/<logical-name>/SKILL.md`，并使用精确的 `name`、`version`、`description`
+frontmatter。root 是排他且 fail-closed 的 Skill 容器：每个直接子项都必须是合法 Skill 目录，且每个目录
+只能包含 `SKILL.md`；`README.md`、`.gitkeep`、`desktop.ini` 等额外文件会使 catalog 失败，而不会
+被静默忽略。`max_catalog_bytes` 按实际发送给模型的规范 JSON catalog 计量，包括字段名、标点和转义。
+文件读取在线程中完成；路径穿越名称、symlink/reparse point、硬链接或非普通文件、错误或重复
+metadata、非法 UTF-8、NUL、空/超限 body，以及验证读取期间发生变化的 entry 都会被拒绝。每个
+provider 实例代表一个由调用方定义的信任域：它会校验 `profile_id`，但不会据此派生文件路径；需要
+profile 隔离时，调用方必须注入不同的 provider 或 root。它不做递归发现、远程 registry 查询、自动
+激活或热更新。
 
 ## Artifact 生命周期
 
@@ -149,6 +180,7 @@ UTC cutoff 的对象，不会把 detach 当成 orphan。引用清单读取受
 | 模型 | `ModelGateway` | `LiteLLMModelGateway` |
 | 工具 | `ToolGateway` | local / Docker / MCP |
 | 上下文 | `ContextProvider` | bounded + tokenizer/compactor |
+| Skills | `SkillProvider` | 有界文件系统 loader 或注入的 provider |
 | Artifact | `ArtifactRepository`, `ArtifactExternalizer` | memory / filesystem |
 | 持久化 | `RunJournal` | memory / SQLite |
 | 观测 | post-commit observer | event / metrics sinks |

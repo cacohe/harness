@@ -5,11 +5,40 @@ from dataclasses import replace
 from src.core.artifacts.contracts import ExternalizedContent
 from src.core.context.contracts import ContextRequest, summary_system_messages
 from src.core.context.model import ModelMessage, ModelResponse, ModelRole
-from src.core.execution.commands import ToolCallRequest
+from src.core.context.skills import encode_skill_catalog
+from src.core.execution.commands import ToolCallRequest, _check_child_id
 from src.core.execution.errors import RunErrorCode, RunFailure
 from src.core.execution.state import RunState, ToolCallState
 from src.core.persistence.journal import TranscriptEntry, TranscriptEntryType
 from src.core.tools.contracts import ToolResult, ToolResultStatus, ToolSpec
+
+LOAD_SKILL_TOOL_NAME = "load_skill"
+
+
+def load_skill_tool_spec() -> ToolSpec:
+    return ToolSpec(
+        LOAD_SKILL_TOOL_NAME,
+        "Activate one available Skill by its logical name for the remainder of this Run.",
+        '{"type":"object","properties":{"name":{"type":"string"}},'
+        '"required":["name"],"additionalProperties":false}',
+        approval_scope="skill",
+        workspace_id="run",
+    )
+
+
+def skill_catalog_message(entries: object) -> ModelMessage:
+    return ModelMessage(ModelRole.SYSTEM, encode_skill_catalog(entries))
+
+
+def load_skill_name(arguments_json: str) -> str:
+    value = json.loads(arguments_json)
+    if type(value) is not dict or set(value) != {"name"} or type(value["name"]) is not str:
+        raise ValueError("load_skill requires exactly one logical name")
+    try:
+        _check_child_id(value["name"])
+    except Exception:
+        raise ValueError("load_skill name is invalid") from None
+    return value["name"]
 
 
 def matches_trusted_context_shape(

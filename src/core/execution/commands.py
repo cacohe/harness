@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TypeAlias
+from typing import TYPE_CHECKING, TypeAlias
 from unicodedata import category
 
 from src.core.artifacts.contracts import ArtifactRef, ExternalizedContent, snapshot_artifact_ref
@@ -10,6 +12,9 @@ from src.core.execution.events import _contains_host_path
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 from src.core.json_values import MAX_TOOL_ARGUMENT_BYTES, validate_json_text
 from src.core.tools.approval import validate_approval_binding
+
+if TYPE_CHECKING:
+    from src.core.context._skill_values import SkillBinding
 
 _MAX_CHILD_ID_BYTES = 256
 
@@ -90,6 +95,19 @@ class ResumeRun(_RunCommand):
 @dataclass(frozen=True)
 class AdvanceRun(_RunCommand):
     """Request one coordinator-owned model/tool step for a running Run."""
+
+
+@dataclass(frozen=True)
+class ActivateSkill(_RunCommand):
+    binding: SkillBinding
+
+    def __post_init__(self) -> None:
+        from src.core.context._skill_values import snapshot_skill_binding
+
+        try:
+            object.__setattr__(self, "binding", snapshot_skill_binding(self.binding))
+        except ValueError:
+            raise InvalidTransition from None
 
 
 @dataclass(frozen=True)
@@ -227,6 +245,7 @@ class FailRun(_RunCommand):
 CoreCommand: TypeAlias = (
     SubmitRun
     | AdvanceRun
+    | ActivateSkill
     | ResumeRun
     | CancelRun
     | DecideToolCall

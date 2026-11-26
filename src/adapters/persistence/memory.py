@@ -11,11 +11,20 @@ from src.adapters.context.journal_history import (
     newest_transcript_interactions,
 )
 from src.core.artifacts.contracts import ArtifactRef, ExternalizedContent, snapshot_artifact_ref
+from src.core.artifacts.lifecycle import (
+    ArtifactAttachmentAction,
+    ArtifactAttachmentFact,
+    ArtifactAttachmentRole,
+    ArtifactFactRecord,
+    ArtifactRetirementReservation,
+    ArtifactRetirementState,
+)
 from src.core.context.contracts import (
     ConversationCoverage,
     ConversationCoverageSegment,
     ConversationPage,
 )
+from src.core.context.skills import SkillBinding, snapshot_skill_binding
 from src.core.execution.commands import RunLimits, ToolCallRequest
 from src.core.execution.errors import RunErrorCode, RunFailure
 from src.core.execution.events import DomainEvent, DomainEventType, _is_canonical_timestamp
@@ -29,12 +38,6 @@ from src.core.execution.state import (
 )
 from src.core.ids import EventId, ProfileId, RunId, SessionId, SubmissionId
 from src.core.persistence.journal import (
-    ArtifactAttachmentAction,
-    ArtifactAttachmentFact,
-    ArtifactAttachmentRole,
-    ArtifactFactRecord,
-    ArtifactRetirementReservation,
-    ArtifactRetirementState,
     ConversationSummaryCheckpoint,
     JournalCommit,
     JournalError,
@@ -736,6 +739,8 @@ def _rebuild(value: object) -> Any:
             raise JournalError(RunErrorCode.INVARIANT_VIOLATION) from None
     if type(value) is ExternalizedContent:
         return ExternalizedContent(value.inline_content, value.artifacts, value.summary)
+    if type(value) is SkillBinding:
+        return snapshot_skill_binding(value)
     if type(value) is tuple:
         return tuple(_rebuild(item) for item in value)
     if type(value) is frozenset and all(type(item) is str for item in value):
@@ -821,6 +826,12 @@ def _intent_value(value: object) -> _IntentValue:
                 _intent_value(rebuilt.artifacts),
                 rebuilt.summary,
             ),
+        )
+    if type(value) is SkillBinding:
+        binding = snapshot_skill_binding(value)
+        return (
+            "skill_binding",
+            (binding.name, binding.version, binding.content_sha256),
         )
     if (
         type(value) is RunStatus

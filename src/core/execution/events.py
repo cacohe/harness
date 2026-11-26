@@ -36,6 +36,7 @@ class DomainEventType(StrEnum):
     RUN_FAILED = "run.failed"
     RUN_CANCELLED = "run.cancelled"
     TOOL_CALL_DECIDED = "tool.call.decided"
+    SKILL_ACTIVATED = "skill.activated"
 
 
 def _text_outside_web_urls(value: str) -> str:
